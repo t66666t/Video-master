@@ -3,6 +3,8 @@ name: Build iOS IPA (Unsigned)
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -21,6 +23,12 @@ jobs:
 
       - name: Get Flutter dependencies
         run: flutter pub get
+      
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install --repo-update
+          cd ..
 
       - name: Build iOS App (No Codesign)
         run: |
