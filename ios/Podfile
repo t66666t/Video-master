@@ -32,8 +32,7 @@ target 'Runner' do
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   
-  # Fix for FFmpegKit 404 error - use local podspec with SourceForge mirror
-  pod 'ffmpeg-kit-ios-min-gpl', :podspec => './ffmpeg-kit-ios-min-gpl.podspec'
+  pod 'ffmpeg-kit-ios-min-gpl', '6.0.2'
 end
 
 post_install do |installer|
