@@ -1,0 +1,43 @@
+name: Build iOS IPA (Unsigned)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-unsigned:
+    name: Build iOS IPA (Unsigned)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          flutter-version: '3.27.1'
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build iOS App (No Codesign)
+        run: |
+          # 构建 Release 版本的 App，但不进行签名
+          flutter build ios --release --no-codesign
+
+      - name: Package into IPA
+        run: |
+          # 创建 Payload 文件夹结构 (iOS IPA 的标准结构)
+          mkdir -p Payload
+          # 将构建生成的 .app 复制到 Payload 中
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          # 压缩为 .ipa 文件
+          zip -r video_player_app_unsigned.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video_player_app_unsigned
+          path: video_player_app_unsigned.ipa
