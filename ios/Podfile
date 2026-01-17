@@ -32,7 +32,7 @@ target 'Runner' do
 
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   
-  pod 'ffmpeg-kit-ios-min-gpl', '6.0.2'
+  pod 'ffmpeg-kit-ios-min-gpl', :podspec => './ffmpeg-kit-ios-min-gpl.podspec'
 end
 
 post_install do |installer|
