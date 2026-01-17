@@ -37,7 +37,7 @@ Pod::Spec.new do |s|
   s.subspec 'min-gpl' do |ss|
     ss.source_files         = 'Classes/**/*'
     ss.public_header_files  = 'Classes/**/*.h'
-    ss.dependency 'ffmpeg-kit-ios-min-gpl', "6.0"
+    ss.dependency 'ffmpeg-kit-ios-min-gpl', "5.1"
     ss.ios.deployment_target = '12.1'
   end
 
