@@ -71,7 +71,7 @@ class SubtitleOverlay extends StatelessWidget {
               decoration: BoxDecoration(
                 color: (image != null && !isDragging) 
                     ? Colors.transparent // No background for images unless dragging
-                    : effectiveStyle.backgroundColor.withOpacity(effectiveStyle.backgroundOpacity),
+                    : effectiveStyle.backgroundColor.withValues(alpha: effectiveStyle.backgroundOpacity),
                 borderRadius: BorderRadius.circular(8 * scale),
                 border: isDragging ? Border.all(color: Colors.greenAccent, width: 2 * scale) : null,
               ),
@@ -186,15 +186,6 @@ class SubtitleOverlay extends StatelessWidget {
     return RichText(
       textAlign: TextAlign.center,
       text: TextSpan(children: spans),
-    );
-  }
-
-  Widget _buildRichText(String text, SubtitleStyle effectiveStyle, {required bool isStroke}) {
-    return RichText(
-      textAlign: TextAlign.center,
-      text: TextSpan(
-        children: _buildSpans(text, effectiveStyle, isStroke: isStroke),
-      ),
     );
   }
 

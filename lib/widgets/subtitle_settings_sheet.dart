@@ -24,11 +24,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
     final paddingValue = isSmallScreen ? 6.0 : 20.0;
     
     // Adaptive sizes
-    final double headerFontSize = isSmallScreen ? 14 : 16;
     final double titleFontSize = isSmallScreen ? 11 : 12;
-    final double baseFontSize = isSmallScreen ? 11 : 12;
-    final double iconSize = isSmallScreen ? 12 : 14;
-    final double switchScale = isSmallScreen ? 0.7 : 0.8; 
     
     final fonts = ['System', 'OPPO Sans 4.0', '方正黑体', 'MiSans', 'Noto Serif CJK SC', 'Swei Gothic CJK SC', '方正楷体', 'Comic Relief'];
 
@@ -78,7 +74,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                   padding: const EdgeInsets.all(16),
                   margin: const EdgeInsets.only(bottom: 20),
                   decoration: BoxDecoration(
-                    color: style.backgroundColor.withOpacity(style.backgroundOpacity),
+                    color: style.backgroundColor.withValues(alpha: style.backgroundOpacity),
                     borderRadius: BorderRadius.circular(8),
                     border: style.hasBorder ? Border.all(color: style.borderColor, width: style.borderWidth) : null,
                   ),
@@ -195,7 +191,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                         Switch(
                           value: style.fontWeightChinese == FontWeight.bold, 
                           onChanged: (val) => onStyleChanged(style.copyWith(fontWeightChinese: val ? FontWeight.bold : FontWeight.normal)),
-                          activeColor: Colors.blueAccent,
+                          activeThumbColor: Colors.blueAccent,
                         )
                      ],
                    ),
@@ -236,7 +232,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                         Switch(
                           value: style.fontWeightEnglish == FontWeight.bold, 
                           onChanged: (val) => onStyleChanged(style.copyWith(fontWeightEnglish: val ? FontWeight.bold : FontWeight.normal)),
-                          activeColor: Colors.blueAccent,
+                          activeThumbColor: Colors.blueAccent,
                         )
                      ],
                    ),
@@ -278,9 +274,9 @@ class SubtitleSettingsSheet extends StatelessWidget {
                 _buildSectionTitle(context, "背景颜色", Icons.format_color_fill),
                 _buildColorPicker(
                   context,
-                  selectedColor: style.backgroundColor.withOpacity(1.0),
+                  selectedColor: style.backgroundColor.withValues(alpha: 1.0),
                   onColorChanged: (c) => onStyleChanged(style.copyWith(
-                    backgroundColor: c.withOpacity(style.backgroundOpacity),
+                    backgroundColor: c.withValues(alpha: style.backgroundOpacity),
                   )),
                 ),
                 const SizedBox(height: 8),
@@ -297,7 +293,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                         label: "${(style.backgroundOpacity * 100).round()}%",
                         onChanged: (val) => onStyleChanged(style.copyWith(
                           backgroundOpacity: val,
-                          backgroundColor: style.backgroundColor.withOpacity(val),
+                          backgroundColor: style.backgroundColor.withValues(alpha: val),
                         )),
                       ),
                     ),
@@ -443,8 +439,11 @@ class SubtitleSettingsSheet extends StatelessWidget {
     if (currentIndex == -1) {
        // ... logic to find closest ...
        // For now, default to Regular (w400) index
-       if (fontFamily == 'MiSans') currentIndex = 3; 
-       else currentIndex = 0;
+       if (fontFamily == 'MiSans') {
+         currentIndex = 3;
+       } else {
+         currentIndex = 0;
+       }
     }
 
     return Column(
@@ -492,7 +491,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
       padding: const EdgeInsets.only(bottom: 8),
       child: Row(
         children: [
-          Icon(icon, size: isSmallScreen ? 12 : 14, color: Colors.blueAccent.withOpacity(0.8)),
+          Icon(icon, size: isSmallScreen ? 12 : 14, color: Colors.blueAccent.withValues(alpha: 0.8)),
           const SizedBox(width: 6),
           Text(text, style: TextStyle(color: Colors.white70, fontSize: isSmallScreen ? 11 : 12, fontWeight: FontWeight.w500)),
         ],
@@ -538,7 +537,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
       child: Container(
         padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 8 : 12, vertical: isSmallScreen ? 4 : 6),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent : Colors.white.withOpacity(0.05),
+          color: isSelected ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(color: isSelected ? Colors.blueAccent : Colors.white10),
         ),
@@ -565,7 +564,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
       child: Container(
         padding: EdgeInsets.all(isSmallScreen ? 6 : 8),
         decoration: BoxDecoration(
-          color: isActive ? Colors.blueAccent : Colors.white.withOpacity(0.05),
+          color: isActive ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(6),
           border: Border.all(color: isActive ? Colors.blueAccent : Colors.white10),
         ),
@@ -586,7 +585,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
       scrollDirection: Axis.horizontal,
       child: Row(
         children: colors.map((color) {
-          final isSelected = color.value == selectedColor.value; 
+          final isSelected = color.toARGB32() == selectedColor.toARGB32(); 
           return GestureDetector(
             onTap: () => onColorChanged(color),
             child: Container(
@@ -601,7 +600,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                   width: isSelected ? 2 : 1,
                 ),
                 boxShadow: isSelected ? [
-                  BoxShadow(color: Colors.white.withOpacity(0.3), blurRadius: 4, spreadRadius: 1)
+                  BoxShadow(color: Colors.white.withValues(alpha: 0.3), blurRadius: 4, spreadRadius: 1)
                 ] : null,
               ),
               child: isSelected 
@@ -630,7 +629,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                 child: Switch(
                   value: value,
                   onChanged: onChanged,
-                  activeColor: Colors.blueAccent,
+                  activeThumbColor: Colors.blueAccent,
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
               ),
@@ -642,7 +641,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.03),
+              color: Colors.white.withValues(alpha: 0.03),
               borderRadius: BorderRadius.circular(8),
               border: Border.all(color: Colors.white10),
             ),

@@ -78,15 +78,15 @@ class PgsParser {
             // If normal, it might use previous.
             
             // For now, let's create a closure that captures current data
-            if (currentPcs!.state != CompositionState.epochStart && 
-                currentPcs!.state != CompositionState.acquisitionPoint &&
-                currentPcs!.state != CompositionState.normal) {
+            if (currentPcs.state != CompositionState.epochStart && 
+                currentPcs.state != CompositionState.acquisitionPoint &&
+                currentPcs.state != CompositionState.normal) {
                // Only display if we have content? 
                // Actually PCS defines what is displayed.
             }
             
             // Only if we have an object to show
-            if (currentPcs!.objects.isNotEmpty) {
+            if (currentPcs.objects.isNotEmpty) {
                // We need a valid ODS and PDS. 
                // In a robust parser, we'd store them in a cache (id -> object).
                // For simplicity, we assume one object per set or use the last seen.
@@ -95,7 +95,7 @@ class PgsParser {
                final capturedPcs = currentPcs;
                
                if (capturedPds != null && capturedOds != null) {
-                 final startTime = Duration(milliseconds: (capturedPcs!.pts / 90).round());
+                 final startTime = Duration(milliseconds: (capturedPcs.pts / 90).round());
                  // End time is usually defined by the next PCS or explicit cleanup.
                  // We will set a default duration or update it later.
                  // PGS doesn't always have explicit duration in one segment.
@@ -116,7 +116,7 @@ class PgsParser {
             } else {
               // PCS with 0 objects -> Clear screen.
               // We can use this to set the endTime of the previous subtitle.
-               final clearTime = Duration(milliseconds: (currentPcs!.pts / 90).round());
+               final clearTime = Duration(milliseconds: (currentPcs.pts / 90).round());
                if (subtitles.isNotEmpty) {
                  final last = subtitles.last;
                  if (last.endTime > clearTime) { // If default was too long
@@ -393,17 +393,17 @@ class PgsPds {
       // Standard HDTV (BT.709) or SDTV (BT.601)? PGS is typically HD (BT.709).
       // But standard formulas work reasonably well.
       
-      final Y = y.toDouble();
-      final Cb = cb.toDouble();
-      final Cr = cr.toDouble();
+      final yValue = y.toDouble();
+      final cbValue = cb.toDouble();
+      final crValue = cr.toDouble();
       
-      final R = (Y + 1.402 * (Cr - 128)).clamp(0, 255).toInt();
-      final G = (Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)).clamp(0, 255).toInt();
-      final B = (Y + 1.772 * (Cb - 128)).clamp(0, 255).toInt();
+      final r = (yValue + 1.402 * (crValue - 128)).clamp(0, 255).toInt();
+      final g = (yValue - 0.344136 * (cbValue - 128) - 0.714136 * (crValue - 128)).clamp(0, 255).toInt();
+      final b = (yValue + 1.772 * (cbValue - 128)).clamp(0, 255).toInt();
       
       // Alpha in PGS is 0=Transparent, 255=Opaque.
       // Store as Int32 ARGB
-      palette[index] = (a << 24) | (R << 16) | (G << 8) | B;
+      palette[index] = (a << 24) | (r << 16) | (g << 8) | b;
       
       offset += 5;
     }

@@ -324,7 +324,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
           
           // Header Row
           Container(
-            color: Colors.white.withOpacity(0.05),
+            color: Colors.white.withValues(alpha: 0.05),
             height: 40,
             child: Row(
               children: [
@@ -374,7 +374,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                             height: rowHeight,
                             decoration: BoxDecoration(
                               border: Border(bottom: BorderSide(color: Colors.white12)),
-                              color: index % 2 == 0 ? Colors.white.withOpacity(0.02) : Colors.transparent,
+                              color: index % 2 == 0 ? Colors.white.withValues(alpha: 0.02) : Colors.transparent,
                             ),
                             child: item.path == null 
                               ? Center(child: Text("--", style: TextStyle(color: Colors.white24, fontSize: fontSize * 0.8)))
@@ -448,7 +448,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                             height: rowHeight,
                             decoration: BoxDecoration(
                               border: Border(bottom: BorderSide(color: Colors.white12)),
-                              color: index % 2 == 0 ? Colors.white.withOpacity(0.02) : Colors.transparent,
+                              color: index % 2 == 0 ? Colors.white.withValues(alpha: 0.02) : Colors.transparent,
                             ),
                             child: item.path == null
                                 ? Center(child: Text("--", style: TextStyle(color: Colors.white24, fontSize: fontSize * 0.8)))
@@ -500,7 +500,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                         height: rowHeight,
                         decoration: BoxDecoration(
                           border: Border(bottom: BorderSide(color: Colors.white12)),
-                          color: index % 2 == 0 ? Colors.white.withOpacity(0.02) : Colors.transparent,
+                          color: index % 2 == 0 ? Colors.white.withValues(alpha: 0.02) : Colors.transparent,
                         ),
                         child: Row(
                           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -513,10 +513,12 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                                   size: fontSize + 4,
                                 ),
                                 onPressed: () {
+                                   final videoPath = videoItem?.path;
+                                   if (videoPath == null) return;
                                    if (isImported) {
-                                     _handleUndo(videoItem!.path!);
+                                     _handleUndo(videoPath);
                                    } else {
-                                     _handleMerge(videoItem!.path!, subItem?.path);
+                                     _handleMerge(videoPath, subItem?.path);
                                    }
                                 },
                               ),

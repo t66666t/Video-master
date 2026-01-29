@@ -3,9 +3,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
-import 'package:image_picker/image_picker.dart';
+import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
@@ -22,6 +21,46 @@ class VideoActionButtons extends StatelessWidget {
     this.collectionId,
     this.isHorizontal = false,
   });
+
+  static void _showTopBanner(
+    BuildContext context,
+    String message, {
+    Color backgroundColor = const Color(0xFF2C2C2C),
+    Duration? autoHideDuration,
+    String? actionText,
+    VoidCallback? onActionPressed,
+  }) {
+    if (!context.mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    messenger.hideCurrentMaterialBanner();
+    messenger.showMaterialBanner(
+      MaterialBanner(
+        content: Text(message, style: const TextStyle(color: Colors.white)),
+        backgroundColor: backgroundColor,
+        actions: [
+          if (actionText != null && onActionPressed != null)
+            TextButton(
+              onPressed: () {
+                messenger.hideCurrentMaterialBanner();
+                onActionPressed();
+              },
+              child: Text(actionText, style: const TextStyle(color: Colors.white)),
+            ),
+          TextButton(
+            onPressed: () => messenger.hideCurrentMaterialBanner(),
+            child: const Text("关闭", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+    if (autoHideDuration != null) {
+      Future.delayed(autoHideDuration, () {
+        if (!context.mounted) return;
+        messenger.hideCurrentMaterialBanner();
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -213,126 +252,84 @@ class VideoActionButtons extends StatelessWidget {
 
   static Future<void> _pickFromGallery(BuildContext context, String? collectionId) async {
     try {
-      // Ensure permissions on Android
-      if (Platform.isAndroid) {
-        if (await Permission.videos.request().isGranted) {
-        } else if (await Permission.storage.request().isGranted) {
-        } else if (await Permission.manageExternalStorage.request().isGranted) {
-        }
-      }
-
-      final ImagePicker picker = ImagePicker();
-      List<XFile> medias = [];
-
-      if (Platform.isAndroid) {
-        // On Android, use pickMedia to support both video and audio
-        final XFile? media = await picker.pickMedia();
-        if (media != null) {
-          medias = [media];
-        }
-      } else {
-        medias = await picker.pickMultipleMedia();
-      }
-      
-      if (medias.isNotEmpty) {
-         if (context.mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-               const SnackBar(content: Text("正在处理媒体文件...")),
-            );
-         }
-
-         // Prepare application storage
-         final appDir = await getApplicationDocumentsDirectory();
-         final importedDir = Directory(p.join(appDir.path, 'imported_videos'));
-         if (!await importedDir.exists()) {
-           await importedDir.create(recursive: true);
-         }
-
-         final List<String> savedPaths = [];
-         final List<String> originalTitles = [];
-         
-         // Process and copy files
-         for (var f in medias) {
-            // Check if it's a video or audio (relaxed check)
-            if (!Platform.isAndroid) {
-               final videoExtensions = {
-                 '.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.wmv', '.3gp', '.m4v', '.ts',
-                 '.rmvb', '.mpg', '.mpeg', '.f4v', '.m2ts', '.mts', '.vob', '.ogv', '.divx'
-               };
-               final audioExtensions = {
-                 '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.wma', '.opus', '.m4b', '.aiff'
-               };
-               final ext = p.extension(f.path).toLowerCase();
-               final isVideoExt = videoExtensions.contains(ext);
-               final isAudioExt = audioExtensions.contains(ext);
-               final isVideoMime = f.mimeType != null && f.mimeType!.startsWith('video/');
-               final isAudioMime = f.mimeType != null && f.mimeType!.startsWith('audio/');
-               if (!isVideoExt && !isAudioExt && !isVideoMime && !isAudioMime) continue;
-            }
-
-            try {
-                // 保存原始文件名，用于设置视频标题
-                final sourceFileName = f.name ?? p.basename(f.path);
-                originalTitles.add(sourceFileName);
-                
-                // 复制到内部存储时使用原始文件名
-                var savedFileName = sourceFileName;
-                var savedPath = p.join(importedDir.path, savedFileName);
-                
-                // 检查文件是否已存在，如果存在则添加后缀
-                int counter = 1;
-                while (await File(savedPath).exists()) {
-                  final ext = p.extension(savedFileName);
-                  final baseName = p.basenameWithoutExtension(savedFileName);
-                  savedFileName = "${baseName}_$counter$ext";
-                  savedPath = p.join(importedDir.path, savedFileName);
-                  counter++;
-                }
-                
-                // 使用更可靠的文件复制方式
-                final bytes = await f.readAsBytes();
-                final file = File(savedPath);
-                await file.writeAsBytes(bytes);
-                
-                if (await file.exists() && await file.length() > 0) {
-                  savedPaths.add(savedPath);
-                }
-            } catch (e) {
-              debugPrint("Failed to save file ${f.path}: $e");
-            }
-         }
-         
-         if (savedPaths.isEmpty) {
-             if (context.mounted) {
-                ScaffoldMessenger.of(context).clearSnackBars();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("未找到支持的媒体文件或保存失败")),
-                );
-             }
-             return;
-         }
-         
-         if (context.mounted) {
-            final library = Provider.of<LibraryService>(context, listen: false);
-            ScaffoldMessenger.of(context).clearSnackBars();
-            ScaffoldMessenger.of(context).showSnackBar(
-               SnackBar(content: Text("已开始后台导入 ${savedPaths.length} 个媒体文件")),
-            );
-            // 传递原始标题列表，使用相册源文件的原始名称
-            library.importVideosBackground(savedPaths, collectionId, shouldCopy: false, originalTitles: originalTitles);
-         }
-      } else {
+      final permission = await PhotoManager.requestPermissionExtend();
+      if (!permission.isAuth && !permission.isLimited) {
         if (context.mounted) {
-           ScaffoldMessenger.of(context).showSnackBar(
-             const SnackBar(content: Text("未选择任何媒体")),
-           );
+          _showTopBanner(
+            context,
+            "未获得相册权限，请在系统设置中开启",
+            backgroundColor: const Color(0xFFB00020),
+            actionText: "去设置",
+            onActionPressed: () {
+              openAppSettings();
+            },
+          );
         }
+        return;
+      }
+
+      if (!context.mounted) return;
+      final List<AssetEntity>? assets = await AssetPicker.pickAssets(
+        context,
+        pickerConfig: const AssetPickerConfig(
+          requestType: RequestType.video,
+          maxAssets: 999,
+        ),
+      );
+
+      if (assets == null || assets.isEmpty) {
+        if (context.mounted) {
+          _showTopBanner(
+            context,
+            "未选择任何媒体",
+            autoHideDuration: const Duration(seconds: 2),
+          );
+        }
+        return;
+      }
+
+      if (context.mounted) {
+        _showTopBanner(context, "正在处理媒体文件...");
+      }
+
+      final List<String> paths = [];
+      final List<String> originalTitles = [];
+
+      for (final asset in assets) {
+        final File? file = await asset.file;
+        if (file == null) continue;
+        paths.add(file.path);
+        originalTitles.add(asset.title ?? p.basename(file.path));
+      }
+
+      if (paths.isEmpty) {
+        if (context.mounted) {
+          _showTopBanner(
+            context,
+            "未找到可用的视频文件",
+            backgroundColor: const Color(0xFFB00020),
+            autoHideDuration: const Duration(seconds: 2),
+          );
+        }
+        return;
+      }
+
+      if (context.mounted) {
+        final library = Provider.of<LibraryService>(context, listen: false);
+        _showTopBanner(
+          context,
+          "已开始后台导入 ${paths.length} 个媒体文件",
+          autoHideDuration: const Duration(seconds: 2),
+        );
+        library.importVideosBackground(paths, collectionId, shouldCopy: false, originalTitles: originalTitles);
       }
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("相册导入失败: $e")),
+        _showTopBanner(
+          context,
+          "相册导入失败: $e",
+          backgroundColor: const Color(0xFFB00020),
+          autoHideDuration: const Duration(seconds: 3),
         );
       }
     }
@@ -347,6 +344,7 @@ class VideoActionButtons extends StatelessWidget {
         }
       }
 
+      if (!context.mounted) return;
       final library = Provider.of<LibraryService>(context, listen: false);
 
       final result = await FilePicker.platform.pickFiles(
@@ -367,9 +365,10 @@ class VideoActionButtons extends StatelessWidget {
         final paths = result.files.where((f) => f.path != null).map((f) => f.path!).toList();
         
         if (context.mounted) {
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("已开始后台导入 ${paths.length} 个媒体文件")),
+          _showTopBanner(
+            context,
+            "已开始后台导入 ${paths.length} 个媒体文件",
+            autoHideDuration: const Duration(seconds: 2),
           );
         }
 
@@ -377,9 +376,11 @@ class VideoActionButtons extends StatelessWidget {
       }
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("导入启动失败: $e")),
+        _showTopBanner(
+          context,
+          "导入启动失败: $e",
+          backgroundColor: const Color(0xFFB00020),
+          autoHideDuration: const Duration(seconds: 3),
         );
       }
     }

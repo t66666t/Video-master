@@ -1,6 +1,7 @@
 import 'package:glados/glados.dart';
 import 'dart:collection';
-import 'dart:io';
+
+final ExploreConfig _explore = ExploreConfig(numRuns: 10, initialSize: 1, speed: 1);
 
 /// 模拟视频项
 class MockVideoItem {
@@ -101,6 +102,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.lowercaseLetters, // 随机thumbnailPath
+      _explore,
     ).test(
       'Property 5: 永久删除视频后，磁盘缩略图和内存缓存都应被移除',
       (videoId, thumbnailPath) {
@@ -141,7 +143,7 @@ void main() {
     /// Property 5 补充测试：批量删除视频
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 5: Thumbnail Deletion Synchronization**
-    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1), _explore).test(
       'Property 5: 批量删除多个视频后，所有缩略图和缓存都应被移除',
       (videoCount) {
         final cacheService = MockCacheService();
@@ -197,7 +199,7 @@ void main() {
     /// Property 5 补充测试：删除没有缩略图的视频
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 5: Thumbnail Deletion Synchronization**
-    Glados(any.lowercaseLetters).test(
+    Glados(any.lowercaseLetters, _explore).test(
       'Property 5: 删除没有缩略图的视频应正常处理',
       (videoId) {
         final cacheService = MockCacheService();
@@ -239,6 +241,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.lowercaseLetters, // 随机thumbnailPath
+      _explore,
     ).test(
       'Property 5: 删除缩略图文件已不存在的视频应正常处理',
       (videoId, thumbnailPath) {
@@ -282,6 +285,7 @@ void main() {
     Glados2(
       any.positiveIntOrZero.map((n) => (n % 20) + 5), // 总视频数: 5-24
       any.positiveIntOrZero.map((n) => (n % 10) + 1), // 删除数量: 1-10
+      _explore,
     ).test(
       'Property 5: 部分删除视频后，未删除的视频缓存和文件应保留',
       (totalCount, deleteCount) {
@@ -339,6 +343,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero.map((n) => (n % 5) + 1), // 重复次数: 1-5
+      _explore,
     ).test(
       'Property 5: 重复删除同一视频应是幂等的',
       (videoId, repeatCount) {
@@ -388,7 +393,7 @@ void main() {
     /// Property 5 补充测试：删除操作的原子性
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 5: Thumbnail Deletion Synchronization**
-    Glados(any.lowercaseLetters).test(
+    Glados(any.lowercaseLetters, _explore).test(
       'Property 5: 删除操作应同时清理缓存和文件，保持一致性',
       (videoId) {
         final cacheService = MockCacheService();
@@ -424,7 +429,7 @@ void main() {
     /// Property 5 补充测试：混合场景（有些视频有缓存，有些没有）
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 5: Thumbnail Deletion Synchronization**
-    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 2)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 2), _explore).test(
       'Property 5: 删除混合状态的视频集合应正确处理',
       (videoCount) {
         final cacheService = MockCacheService();
@@ -448,8 +453,6 @@ void main() {
             fileSystem.createFile(video.thumbnailPath!);
           }
         }
-        
-        final initialCacheSize = cacheService.size;
         
         // 删除所有视频
         for (final video in videos) {

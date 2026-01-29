@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:developer' as developer;
 
 /// Simple manual Protobuf writer/reader for specific Bilibili messages.
 /// Avoids heavy dependencies.
@@ -216,37 +217,37 @@ class DmViewReply {
     final reply = DmViewReply();
     final reader = ProtoReader(bytes);
     
-    print("  [Parser] Starting DmViewReply parse, total bytes: ${bytes.length}");
+    developer.log('  [Parser] Starting DmViewReply parse, total bytes: ${bytes.length}');
     
     while (reader.hasMore()) {
       final tag = reader.readTag();
-      print("  [Parser] Tag: field=${tag.field}, wireType=${tag.wireType}");
+      developer.log('  [Parser] Tag: field=${tag.field}, wireType=${tag.wireType}');
       
       if (tag.field == 2) { 
         final subBytes = reader.readBytes();
-        print("  [Parser] Found field 2 (VideoSubtitle?), bytes: ${subBytes.length}");
+        developer.log('  [Parser] Found field 2 (VideoSubtitle?), bytes: ${subBytes.length}');
         _parseVideoSubtitle(subBytes, reply);
       } else if (tag.field == 1) {
-         print("  [Parser] Skipping field 1 (closed?)");
+         developer.log('  [Parser] Skipping field 1 (closed?)');
          reader.skip(tag.wireType); 
       } else {
-        print("  [Parser] Skipping unknown field ${tag.field}");
+        developer.log('  [Parser] Skipping unknown field ${tag.field}');
         reader.skip(tag.wireType);
       }
     }
     
     if (reply.subtitles.isEmpty) {
-        print("  [Parser] Warning: Subtitles list is empty after standard parsing. Trying heuristic scan...");
+        developer.log('  [Parser] Warning: Subtitles list is empty after standard parsing. Trying heuristic scan...');
         final reader2 = ProtoReader(bytes);
         while(reader2.hasMore()) {
              final tag = reader2.readTag();
              if (tag.wireType == 2) {
                  final payload = reader2.readBytes();
                  try {
-                     print("  [Parser] Heuristic: Trying to parse field ${tag.field} as SubtitleItem...");
+                     developer.log('  [Parser] Heuristic: Trying to parse field ${tag.field} as SubtitleItem...');
                      final item = _parseSubtitleItem(payload);
                      if (item != null) {
-                        print("  [Parser] Heuristic success! Found item: ${item.lan}");
+                        developer.log('  [Parser] Heuristic success! Found item: ${item.lan}');
                         reply.subtitles.add(item);
                      }
                  } catch (e) {
@@ -263,24 +264,24 @@ class DmViewReply {
   
   static void _parseVideoSubtitle(Uint8List bytes, DmViewReply reply) {
     final reader = ProtoReader(bytes);
-    print("  [Parser] Parsing VideoSubtitle...");
+    developer.log('  [Parser] Parsing VideoSubtitle...');
     while (reader.hasMore()) {
       final tag = reader.readTag();
-      print("  [Parser] VideoSubtitle Tag: field=${tag.field}, wireType=${tag.wireType}");
+      developer.log('  [Parser] VideoSubtitle Tag: field=${tag.field}, wireType=${tag.wireType}');
       
       if (tag.field == 1) { 
          try {
              final itemBytes = reader.readBytes(); 
-             print("  [Parser] Found field 1, trying to parse as SubtitleItem (${itemBytes.length} bytes)...");
+             developer.log('  [Parser] Found field 1, trying to parse as SubtitleItem (${itemBytes.length} bytes)...');
              final item = _parseSubtitleItem(itemBytes);
              if (item != null) {
-                print("  [Parser] Success! Added subtitle: ${item.lan}");
+                developer.log('  [Parser] Success! Added subtitle: ${item.lan}');
                 reply.subtitles.add(item);
              } else {
-                print("  [Parser] Failed to parse item.");
+                developer.log('  [Parser] Failed to parse item.');
              }
          } catch(e) {
-             print("  [Parser] Error reading field 1: $e");
+             developer.log('  [Parser] Error reading field 1', error: e);
          }
       } else {
         reader.skip(tag.wireType);
@@ -384,4 +385,3 @@ class Tag {
   final int wireType;
   Tag(this.field, this.wireType);
 }
-

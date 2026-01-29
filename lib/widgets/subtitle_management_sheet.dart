@@ -38,9 +38,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   bool _isLoading = true;
   int? _extractingTrackIndex; 
   List<String> _selectedPaths = []; // Track selected items
-  String? _previewPath; // For preview tracking
 
-  Map<int, String> _extractedTrackPaths = {}; // Map track index to extracted path
+  final Map<int, String> _extractedTrackPaths = {}; // Map track index to extracted path
 
   @override
   void initState() {
@@ -52,6 +51,18 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   @override
   void didUpdateWidget(SubtitleManagementSheet oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.videoPath != oldWidget.videoPath) {
+      setState(() {
+        _isLoading = true;
+        _subtitleFiles = [];
+        _embeddedTracks = [];
+        _extractingTrackIndex = null;
+        _selectedPaths = List<String>.from(widget.initialSelectedPaths);
+        _extractedTrackPaths.clear();
+      });
+      _loadSubtitles();
+      return;
+    }
     if (widget.initialSelectedPaths != oldWidget.initialSelectedPaths) {
       // Only update if the lengths or contents differ
       bool changed = widget.initialSelectedPaths.length != oldWidget.initialSelectedPaths.length;
@@ -75,16 +86,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   Future<void> _loadSubtitles() async {
     setState(() => _isLoading = true);
     try {
+      _extractedTrackPaths.clear();
       // 1. Load Local Files
       final videoFile = File(widget.videoPath);
       final dir = videoFile.parent;
       final videoName = p.basenameWithoutExtension(widget.videoPath);
+      final extractedPrefix = "$videoName.stream_";
       
       if (await dir.exists()) {
         final files = dir.listSync();
         _subtitleFiles = files.whereType<File>().where((file) {
           final name = p.basename(file.path);
           if (!name.startsWith(videoName)) return false;
+          if (name.startsWith(extractedPrefix)) return false;
           final ext = p.extension(file.path).toLowerCase();
           return ['.srt', '.vtt', '.ass', '.ssa', '.sup', '.lrc', '.sub', '.idx', '.scc'].contains(ext);
         }).toList();
@@ -94,26 +108,32 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       final appDocDir = await getApplicationDocumentsDirectory();
       final subDir = Directory(p.join(appDocDir.path, 'subtitles'));
       if (await subDir.exists()) {
-         final extractedFiles = subDir.listSync().whereType<File>().where((file) {
-            final name = p.basename(file.path);
-            // Match extracted files naming convention: videoName.stream_...
-            if (!name.contains(videoName)) return false; 
-            final ext = p.extension(file.path).toLowerCase();
-            return ['.srt', '.vtt', '.ass', '.ssa', '.sup', '.lrc', '.sub', '.idx', '.scc'].contains(ext);
-         });
-         
-         // Add unique files only
-         for (var file in extractedFiles) {
-            if (!_subtitleFiles.any((f) => f.path == file.path)) {
-               _subtitleFiles.add(file);
-            }
-         }
+        final extractedFiles = subDir.listSync().whereType<File>().where((file) {
+          final name = p.basename(file.path);
+          if (!name.startsWith(extractedPrefix)) return false;
+          final ext = p.extension(file.path).toLowerCase();
+          return ['.srt', '.vtt', '.ass', '.ssa', '.sup', '.lrc', '.sub', '.idx', '.scc'].contains(ext);
+        });
+
+        final pattern = RegExp('^${RegExp.escape(videoName)}\\.stream_(\\d+)');
+        for (final file in extractedFiles) {
+          final name = p.basename(file.path);
+          final match = pattern.firstMatch(name);
+          if (match == null) continue;
+          final index = int.tryParse(match.group(1) ?? '');
+          if (index == null) continue;
+          _extractedTrackPaths[index] = file.path;
+        }
       }
       
       // 3. Ensure selected paths are in the list (if they exist)
       for (final path in _selectedPaths) {
          final file = File(path);
          if (await file.exists()) {
+            final name = p.basename(path);
+            if (name.startsWith(extractedPrefix)) {
+              continue;
+            }
             if (!_subtitleFiles.any((f) => f.path == path)) {
                _subtitleFiles.add(file);
             }
@@ -173,33 +193,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
              ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text("内嵌字幕提取成功")),
             );
-            
-            // Auto preview after extraction
-            setState(() {
-              _previewPath = path;
-              
-              // Handle selection logic:
-              // If already selected, do nothing (or toggle?)
-              // If not selected:
-              if (_selectedPaths.contains(path)) {
-                 _selectedPaths.remove(path);
-              } else {
-                 if (_selectedPaths.length >= 2) _selectedPaths.removeLast();
-                 _selectedPaths.add(path);
-              }
-              
-              // Add to Local Files list so user can see it selected
-              final file = File(path);
-              if (!_subtitleFiles.any((f) => f.path == path)) {
-                 _subtitleFiles.insert(0, file);
-              }
-            });
-            
-            if (widget.onSubtitlePreview != null) {
-              widget.onSubtitlePreview!(path);
-            } else if (widget.onSubtitleSelected != null) {
-              widget.onSubtitleSelected!(_selectedPaths);
-            }
+
+            _handleSelection(path);
           }
         } else {
           if (mounted) {
@@ -320,6 +315,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final shownPaths = <String>{};
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       decoration: const BoxDecoration(
@@ -356,7 +352,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           Expanded(
             child: _isLoading
               ? const Center(child: CircularProgressIndicator())
-              : (_subtitleFiles.isEmpty && _embeddedTracks.isEmpty && (widget.additionalSubtitles == null || widget.additionalSubtitles!.isEmpty))
+              : (_subtitleFiles.isEmpty && _embeddedTracks.isEmpty && _extractedTrackPaths.isEmpty && (widget.additionalSubtitles == null || widget.additionalSubtitles!.isEmpty))
                 ? const Center(
                     child: Text("暂无关联字幕文件", 
                       style: TextStyle(color: Colors.white54), textAlign: TextAlign.center),
@@ -370,7 +366,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                           child: Text("媒体库关联字幕", 
                             style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold)),
                         ),
-                        ...widget.additionalSubtitles!.entries.map((entry) {
+                        ...widget.additionalSubtitles!.entries.where((entry) => shownPaths.add(entry.value)).map((entry) {
                            final label = entry.key;
                            final path = entry.value;
                            final file = File(path);
@@ -379,9 +375,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                            return Container(
                               margin: const EdgeInsets.only(bottom: 4),
                               decoration: BoxDecoration(
-                                color: Colors.purpleAccent.withOpacity(0.1),
+                                color: Colors.purpleAccent.withValues(alpha: 0.1),
                                 borderRadius: BorderRadius.circular(6),
-                                border: Border.all(color: Colors.purpleAccent.withOpacity(0.2)),
+                                border: Border.all(color: Colors.purpleAccent.withValues(alpha: 0.2)),
                               ),
                               child: ListTile(
                                 dense: true,
@@ -425,19 +421,56 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                       ],
 
                       // 2. Embedded Tracks Section
-                      if (_embeddedTracks.isNotEmpty) ...[
+                      if (_embeddedTracks.isNotEmpty || _extractedTrackPaths.isNotEmpty) ...[
                         const Padding(
                           padding: EdgeInsets.only(bottom: 4, top: 4),
                           child: Text("内嵌字幕 (点击提取)", 
                             style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold)),
                         ),
+                        if (_embeddedTracks.isEmpty) ...[
+                          ..._extractedTrackPaths.entries.where((e) => shownPaths.add(e.value)).map((entry) {
+                            final trackIndex = entry.key;
+                            final path = entry.value;
+                            final exists = File(path).existsSync();
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.blueAccent.withValues(alpha: 0.1),
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.2)),
+                              ),
+                              child: ListTile(
+                                dense: true,
+                                visualDensity: VisualDensity.compact,
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
+                                leading: const Icon(Icons.closed_caption, color: Colors.blueAccent, size: 20),
+                                title: Text(
+                                  "Track $trackIndex",
+                                  style: TextStyle(
+                                    color: _selectedPaths.contains(path) ? Colors.blueAccent : Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: _selectedPaths.contains(path) ? FontWeight.bold : FontWeight.normal,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  exists ? p.basename(path) : "文件丢失",
+                                  style: TextStyle(color: exists ? Colors.white30 : Colors.redAccent, fontSize: 11),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                trailing: _buildSelectionBadge(path),
+                                onTap: exists ? () => _handleSelection(path) : null,
+                              ),
+                            );
+                          }),
+                        ],
                         ..._embeddedTracks.map((track) {
                            return Container(
                             margin: const EdgeInsets.only(bottom: 4),
                             decoration: BoxDecoration(
-                              color: Colors.blueAccent.withOpacity(0.1),
+                              color: Colors.blueAccent.withValues(alpha: 0.1),
                               borderRadius: BorderRadius.circular(6),
-                              border: Border.all(color: Colors.blueAccent.withOpacity(0.2)),
+                              border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.2)),
                             ),
                             child: ListTile(
                               dense: true,
@@ -474,14 +507,14 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                           child: Text("本地字幕", 
                             style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold)),
                         ),
-                         ..._subtitleFiles.map((file) {
+                         ..._subtitleFiles.where((file) => shownPaths.add(file.path)).map((file) {
                             final name = p.basename(file.path);
                             final isAi = name.contains(".ai.");
                             
                             return Container(
                               margin: const EdgeInsets.only(bottom: 4),
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.05),
+                                color: Colors.white.withValues(alpha: 0.05),
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: ListTile(

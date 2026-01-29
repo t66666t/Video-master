@@ -1,6 +1,10 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
+
+import '../models/video_item.dart';
+import '../services/media_playback_service.dart';
 
 class SimpleVideoPlayerScreen extends StatefulWidget {
   final String videoPath;
@@ -17,25 +21,58 @@ class SimpleVideoPlayerScreen extends StatefulWidget {
 }
 
 class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
-  late VideoPlayerController _controller;
-  bool _initialized = false;
+  bool _requestedPlay = false;
+  String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.file(File(widget.videoPath))
-      ..initialize().then((_) {
-        setState(() {
-          _initialized = true;
-          _controller.play();
-        });
-      });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _startPlaybackIfNeeded();
+    });
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (playbackService.currentItem?.id == widget.videoPath) {
+        playbackService.stop();
+      }
+    } catch (_) {}
     super.dispose();
+  }
+
+  Future<void> _startPlaybackIfNeeded() async {
+    if (_requestedPlay) return;
+    _requestedPlay = true;
+
+    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+    final file = File(widget.videoPath);
+    if (!await file.exists()) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = "媒体文件不存在，可能已被移动或删除";
+      });
+      return;
+    }
+
+    final item = VideoItem(
+      id: widget.videoPath,
+      path: widget.videoPath,
+      title: widget.title,
+      durationMs: 0,
+      lastUpdated: DateTime.now().millisecondsSinceEpoch,
+      type: MediaType.video,
+    );
+
+    await playbackService.play(item);
+    if (!mounted) return;
+    if (playbackService.state == PlaybackState.error || playbackService.controller == null) {
+      setState(() {
+        _errorMessage = "播放失败：无法加载该媒体";
+      });
+    }
   }
 
   @override
@@ -48,24 +85,64 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
         elevation: 0,
       ),
       body: Center(
-        child: _initialized
-            ? AspectRatio(
-                aspectRatio: _controller.value.aspectRatio,
-                child: VideoPlayer(_controller),
-              )
-            : const CircularProgressIndicator(),
+        child: Consumer<MediaPlaybackService>(
+          builder: (context, playbackService, child) {
+            final errorMessage = _errorMessage;
+            if (errorMessage != null) {
+              return Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
+                    const SizedBox(height: 12),
+                    Text(
+                      errorMessage,
+                      style: const TextStyle(color: Colors.white70),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 20),
+                    ElevatedButton(
+                      onPressed: () => Navigator.of(context).maybePop(),
+                      child: const Text("返回"),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            final controller = playbackService.controller;
+            final isCurrent = playbackService.currentItem?.id == widget.videoPath;
+            final isReady = isCurrent && controller != null && controller.value.isInitialized;
+
+            if (!isReady) return const CircularProgressIndicator();
+
+            return AspectRatio(
+              aspectRatio: controller.value.aspectRatio,
+              child: VideoPlayer(controller),
+            );
+          },
+        ),
       ),
-      bottomSheet: _initialized ? _buildProgressBar() : null,
+      bottomSheet: Consumer<MediaPlaybackService>(
+        builder: (context, playbackService, child) {
+          final controller = playbackService.controller;
+          final isCurrent = playbackService.currentItem?.id == widget.videoPath;
+          final isReady = isCurrent && controller != null && controller.value.isInitialized;
+          if (!isReady) return const SizedBox.shrink();
+          return _buildProgressBar(controller);
+        },
+      ),
     );
   }
 
-  Widget _buildProgressBar() {
+  Widget _buildProgressBar(VideoPlayerController controller) {
     return Container(
       color: Colors.black54,
       height: 40,
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: VideoProgressIndicator(
-        _controller,
+        controller,
         allowScrubbing: true,
         colors: const VideoProgressColors(
           playedColor: Colors.pinkAccent,

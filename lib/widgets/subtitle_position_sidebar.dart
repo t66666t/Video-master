@@ -105,7 +105,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     Switch(
                       value: widget.isGhostModeEnabled,
                       onChanged: widget.onGhostModeToggle,
-                      activeColor: Colors.blueAccent,
+                      activeThumbColor: Colors.blueAccent,
                     ),
                     const SizedBox(width: 8),
                     IconButton(
@@ -113,7 +113,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                       onPressed: widget.isGhostModeEnabled ? widget.onEnterGhostMode : null,
                       tooltip: "调整幽灵模式位置",
                       style: IconButton.styleFrom(
-                        backgroundColor: widget.isGhostModeActive ? Colors.green.withOpacity(0.2) : Colors.white.withOpacity(0.1),
+                        backgroundColor: widget.isGhostModeActive ? Colors.green.withValues(alpha: 0.2) : Colors.white.withValues(alpha: 0.1),
                         foregroundColor: widget.isGhostModeActive ? Colors.green : Colors.white,
                       ),
                     ),
@@ -273,7 +273,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                             width: buttonSize * 0.8,
                             height: buttonSize * 0.8,
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.05),
+                              color: Colors.white.withValues(alpha: 0.05),
                               shape: BoxShape.circle,
                             ),
                             child: Icon(Icons.open_with, color: Colors.white38, size: iconSize * 0.8),
@@ -297,7 +297,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                         icon: const Icon(Icons.save_as, size: 16),
                         label: const Text("保存当前位置"),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blueAccent.withOpacity(0.2),
+                          backgroundColor: Colors.blueAccent.withValues(alpha: 0.2),
                           foregroundColor: Colors.blueAccent,
                         ),
                       ),
@@ -359,7 +359,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
         width: size,
         height: size,
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.1),
+          color: Colors.white.withValues(alpha: 0.1),
           shape: BoxShape.circle,
         ),
         child: Icon(icon, color: Colors.white, size: iconSize),
@@ -374,7 +374,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
     return ActionChip(
       label: Text(label),
       avatar: isCustom ? const Icon(Icons.bookmark, size: 14) : null,
-      backgroundColor: isSelected ? Colors.blueAccent : Colors.white.withOpacity(0.05),
+      backgroundColor: isSelected ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
       labelStyle: TextStyle(color: isSelected ? Colors.white : Colors.white70, fontSize: 12),
       onPressed: () => widget.onAlignmentChanged(Alignment(x, y)),
       side: BorderSide.none,

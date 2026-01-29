@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 
 class SubtitleUtil {
   static const Map<String, String> _lanMap = {
@@ -184,7 +185,7 @@ class SubtitleUtil {
         buffer.writeln(); // Blank line
       }
     } catch (e) {
-      print("Error converting subtitle: $e");
+      developer.log('Error converting subtitle', error: e);
       return "";
     }
     return buffer.toString();

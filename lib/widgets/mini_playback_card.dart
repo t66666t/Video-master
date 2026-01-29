@@ -53,7 +53,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     // 初始化标题滚动动画控制器
     _scrollController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 10), // 10秒完成一次滚动
+      duration: const Duration(seconds: 20),
     );
     
     _scrollAnimation = Tween<double>(
@@ -292,7 +292,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
           final containerWidth = constraints.maxWidth;
           
           // 如果文本宽度超过容器宽度，启用滚动
-          if (textWidth > containerWidth) {
+          if (textWidth > containerWidth && widget.isVisible) {
             // 启动滚动动画
             if (!_scrollController.isAnimating && _scrollController.status != AnimationStatus.completed) {
               _scrollController.repeat();
@@ -621,7 +621,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
             // 上一句字幕按钮 - 使用圆形背景和不同图标
             Container(
               decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.1),
+                color: Colors.white.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
               child: IconButton(
@@ -642,7 +642,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
             // 下一句字幕按钮 - 使用圆形背景和不同图标
             Container(
               decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.1),
+                color: Colors.white.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
               child: IconButton(

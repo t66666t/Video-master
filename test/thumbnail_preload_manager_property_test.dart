@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:glados/glados.dart';
 
+final ExploreConfig _explore = ExploreConfig(numRuns: 10, initialSize: 1, speed: 1);
+
 /// 用于测试的简化版预加载管理器
 /// 
 /// 由于ThumbnailPreloadManager是单例且依赖ThumbnailCacheService，
@@ -184,7 +186,7 @@ void main() {
     /// **Validates: Requirements 2.5**
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 4: Preload Respects Concurrency Limit**
-    Glados(any.positiveIntOrZero.map((n) => (n % 50) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 50) + 1), _explore).test(
       'Property 4: 对于任意数量的预加载请求，并发操作数不应超过配置的最大值',
       (taskCount) async {
         const maxConcurrent = 4;
@@ -220,6 +222,7 @@ void main() {
     Glados2(
       any.positiveIntOrZero.map((n) => (n % 10) + 1), // maxConcurrent: 1-10
       any.positiveIntOrZero.map((n) => (n % 30) + 5), // taskCount: 5-34
+      _explore,
     ).test(
       'Property 4: 对于任意maxConcurrentPreloads配置，并发数不应超过该值',
       (maxConcurrent, taskCount) async {
@@ -248,7 +251,7 @@ void main() {
     /// Property 4 补充测试：任务数少于maxConcurrent时的行为
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 4: Preload Respects Concurrency Limit**
-    Glados(any.positiveIntOrZero.map((n) => (n % 3) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 3) + 1), _explore).test(
       'Property 4: 当任务数少于maxConcurrent时，峰值并发数应等于任务数',
       (taskCount) async {
         const maxConcurrent = 4;
@@ -276,7 +279,7 @@ void main() {
     /// Property 4 补充测试：取消任务不影响并发限制
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 4: Preload Respects Concurrency Limit**
-    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 10)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 10), _explore).test(
       'Property 4: 取消任务后，并发数仍不应超过最大值',
       (taskCount) async {
         const maxConcurrent = 4;
@@ -312,6 +315,7 @@ void main() {
     Glados2(
       any.positiveIntOrZero.map((n) => (n % 5) + 1), // 批次数: 1-5
       any.positiveIntOrZero.map((n) => (n % 10) + 1), // 每批任务数: 1-10
+      _explore,
     ).test(
       'Property 4: 连续多批次添加任务时，并发数不应超过最大值',
       (batchCount, tasksPerBatch) async {
@@ -352,7 +356,7 @@ void main() {
     /// Property 4 补充测试：大量任务时的并发限制
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 4: Preload Respects Concurrency Limit**
-    Glados(any.positiveIntOrZero.map((n) => (n % 100) + 50)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 100) + 50), _explore).test(
       'Property 4: 大量任务时并发数仍不应超过最大值',
       (taskCount) async {
         const maxConcurrent = 4;

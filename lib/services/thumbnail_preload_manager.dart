@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
 import '../models/video_item.dart';
 import 'thumbnail_cache_service.dart';

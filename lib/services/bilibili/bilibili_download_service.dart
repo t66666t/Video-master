@@ -316,7 +316,6 @@ class BilibiliDownloadService extends ChangeNotifier {
           );
        }
     }
-    return null;
   }
 
   // --- Sequential Export Logic ---
@@ -455,40 +454,36 @@ class BilibiliDownloadService extends ChangeNotifier {
      // If it is ready to export, trigger it.
      // We only trigger ONE successor to maintain sequential order.
      
-     for (int i = currentIndex + 1; i < allEpisodes.length; i++) {
-        final nextEp = allEpisodes[i];
+     final nextIndex = currentIndex + 1;
+     if (nextIndex >= allEpisodes.length) return;
+     
+     final nextEp = allEpisodes[nextIndex];
+     
+     // We are looking for the *first* successor that is "Completed AND Not Exported".
+     // If we find one that is NOT completed (e.g. still downloading), we should probably stop?
+     // User wants sequential export. If A is done, B is downloading, C is done.
+     // Should C export? No, "Sequential". C waits for B.
+     // So we only care about the *immediate* next episode.
+     // If the immediate next is ready, export it.
+     // If the immediate next is NOT ready (downloading/failed/pending), we stop.
+     
+     if (nextEp.status == DownloadStatus.completed && !nextEp.isExported && nextEp.outputPath != null) {
+        debugPrint("Sequential Check: Found candidate successor ${nextEp.page.part}");
         
-        // We are looking for the *first* successor that is "Completed AND Not Exported".
-        // If we find one that is NOT completed (e.g. still downloading), we should probably stop?
-        // User wants sequential export. If A is done, B is downloading, C is done.
-        // Should C export? No, "Sequential". C waits for B.
-        // So we only care about the *immediate* next episode.
-        // If the immediate next is ready, export it.
-        // If the immediate next is NOT ready (downloading/failed/pending), we stop.
-        
-        if (nextEp.status == DownloadStatus.completed && !nextEp.isExported && nextEp.outputPath != null) {
-           debugPrint("Sequential Check: Found candidate successor ${nextEp.page.part}");
+        // Force a fresh check of predecessors on the LIVE object in the list
+        if (!_hasActivePredecessor(nextEp)) {
+           debugPrint("Sequential export: Triggering export for ${nextEp.page.part}");
+           nextEp.downloadSpeed = "正在导出...";
+           notifyListeners(); // Update UI immediately
            
-           // Force a fresh check of predecessors on the LIVE object in the list
-           if (!_hasActivePredecessor(nextEp)) {
-              debugPrint("Sequential export: Triggering export for ${nextEp.page.part}");
-              nextEp.downloadSpeed = "正在导出...";
-              notifyListeners(); // Update UI immediately
-              
-              if (libraryService != null) {
-                 // Async call, don't await here to allow the loop to finish (though we break immediately)
-                 importToLibrary(libraryService!, episode: nextEp);
-              }
-           } else {
-              debugPrint("Sequential Check: Successor ${nextEp.page.part} still has active predecessors.");
-              // If we are blocked, we should probably check WHY.
-              // But for now, just logging.
+           if (libraryService != null) {
+              importToLibrary(libraryService!, episode: nextEp);
            }
+        } else {
+           debugPrint("Sequential Check: Successor ${nextEp.page.part} still has active predecessors.");
+           // If we are blocked, we should probably check WHY.
+           // But for now, just logging.
         }
-        
-        // Since it is sequential, we stop at the first next episode, regardless of its state.
-        // We only bridge the gap if the *immediate next* was waiting for *this* one.
-        break;
      }
   }
 
@@ -711,8 +706,6 @@ class BilibiliDownloadService extends ChangeNotifier {
         final audioStream = streamInfo.audioStreams.isNotEmpty ? streamInfo.audioStreams.first : null;
         if (audioStream == null) throw Exception("No audio stream");
 
-        final task = tasks.firstWhere((t) => t.videos.any((v) => v.episodes.contains(ep)));
-        
         // Use a safe, unique filename
         final String safeFileName = "merged_${ep.bvid}_${ep.page.cid}_${DateTime.now().millisecondsSinceEpoch}";
         
@@ -971,7 +964,9 @@ class BilibiliDownloadService extends ChangeNotifier {
         t.isSelected = target;
         for (var v in t.videos) {
            v.isSelected = target;
-           for (var e in v.episodes) e.isSelected = target;
+           for (var e in v.episodes) {
+             e.isSelected = target;
+           }
         }
       }
       notifyListeners();

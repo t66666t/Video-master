@@ -50,5 +50,7 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>用于从相册选择视频导入</string>
 </dict>
 </plist>

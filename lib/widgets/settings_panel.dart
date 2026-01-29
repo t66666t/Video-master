@@ -130,10 +130,6 @@ class _SettingsPanelState extends State<SettingsPanel> {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmallScreen = screenWidth < 600;
     
-    final panelWidth = isSmallScreen 
-        ? (screenWidth * 0.75).clamp(240.0, 300.0) 
-        : 320.0;
-        
     final paddingValue = isSmallScreen ? 8.0 : 20.0;
     final spacingValue = isSmallScreen ? 12.0 : 24.0;
 
@@ -228,7 +224,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 _buildSectionTitle("播放行为", Icons.play_circle_outline),
                 Container(
                   decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.04),
+                    color: Colors.white.withValues(alpha: 0.04),
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: Colors.white10),
                   ),
@@ -239,7 +235,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("退出播放页面时自动暂停视频", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.autoPauseOnExit,
                         onChanged: widget.onAutoPauseOnExitChanged,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -249,7 +245,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("切换到上/下一集时自动开始播放", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.autoPlayNextVideo,
                         onChanged: widget.onAutoPlayNextVideoChanged,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -264,7 +260,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 _buildSectionTitle("字幕设置", Icons.subtitles),
                 Container(
                   decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.04),
+                    color: Colors.white.withValues(alpha: 0.04),
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: Colors.white10),
                   ),
@@ -275,7 +271,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("字幕结束时间延后到下一条字幕开始", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.continuousSubtitle,
                         onChanged: widget.onContinuousSubtitleChanged,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -284,7 +280,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         title: const Text("显示字幕", style: TextStyle(color: Colors.white70, fontSize: 13)),
                         value: widget.showSubtitles,
                         onChanged: widget.onSubtitleToggle,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -294,7 +290,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("导入后自动复制到本地", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.autoCacheSubtitles,
                         onChanged: widget.onAutoCacheSubtitlesChanged,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -304,7 +300,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("第二行为副字幕。关闭则全部为主字幕", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.splitSubtitleByLine,
                         onChanged: widget.onSplitSubtitleByLineChanged,
-                        activeColor: Colors.blueAccent,
+                        activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
@@ -404,7 +400,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                    padding: const EdgeInsets.only(top: 8, left: 4),
                    child: Text(
                       "注: 播放器默认自动选择最佳解码方式。如遇播放问题，请尝试转码。",
-                      style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 10),
+                      style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 10),
                    ),
                 ),
                 
@@ -416,7 +412,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                   subtitle: const Text("开启后，双击左侧跳转上一句字幕，双击右侧跳转下一句", style: TextStyle(color: Colors.white30, fontSize: 10)),
                   value: widget.enableDoubleTapSubtitleSeek,
                   onChanged: widget.onDoubleTapSubtitleSeekChanged,
-                  activeColor: Colors.blueAccent,
+                  activeThumbColor: Colors.blueAccent,
                   dense: true,
                   contentPadding: EdgeInsets.zero,
                   visualDensity: VisualDensity.compact,
@@ -487,7 +483,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
       padding: const EdgeInsets.only(bottom: 10),
       child: Row(
         children: [
-          Icon(icon, size: 14, color: Colors.blueAccent.withOpacity(0.8)),
+          Icon(icon, size: 14, color: Colors.blueAccent.withValues(alpha: 0.8)),
           const SizedBox(width: 6),
           Text(
             text,
@@ -505,7 +501,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
         margin: const EdgeInsets.only(right: 8),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent : Colors.white.withOpacity(0.05),
+          color: isSelected ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: isSelected ? Colors.blueAccent : Colors.white10),
         ),
@@ -534,7 +530,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
           isDense: true,
           contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 0),
           filled: true,
-          fillColor: Colors.white.withOpacity(0.05),
+          fillColor: Colors.white.withValues(alpha: 0.05),
           enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: const BorderSide(color: Colors.white10)),
           focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(4), borderSide: const BorderSide(color: Colors.blueAccent)),
         ),
@@ -576,7 +572,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 10),
         decoration: BoxDecoration(
-          color: isActive ? Colors.blueAccent.withOpacity(0.2) : Colors.white.withOpacity(0.05),
+          color: isActive ? Colors.blueAccent.withValues(alpha: 0.2) : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
             color: isActive ? Colors.blueAccent : Colors.transparent,

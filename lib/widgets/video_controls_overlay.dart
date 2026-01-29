@@ -20,9 +20,11 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback onBackPressed;
   final VoidCallback? onExitPressed; // New: For Windows direct exit
   final VoidCallback? onToggleSidebar;
+  final bool isSubtitleSidebarVisible;
   final VoidCallback? onOpenSettings;
   final VoidCallback onToggleLock; 
   final VoidCallback? onToggleFullScreen; // New: For desktop full screen toggle
+  final ValueChanged<Duration>? onSeekTo;
   final ValueChanged<double> onSpeedUpdate;
   final int doubleTapSeekSeconds;
   final bool enableDoubleTapSubtitleSeek;
@@ -57,9 +59,11 @@ class VideoControlsOverlay extends StatefulWidget {
     required this.onBackPressed,
     this.onExitPressed,
     this.onToggleSidebar,
+    this.isSubtitleSidebarVisible = false,
     this.onOpenSettings,
     required this.onToggleLock,
     this.onToggleFullScreen,
+    this.onSeekTo,
     required this.onSpeedUpdate,
     this.doubleTapSeekSeconds = 5,
     this.enableDoubleTapSubtitleSeek = true,
@@ -134,13 +138,25 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   @override
    void initState() {
      super.initState();
+     if (Platform.isAndroid) {
+       VolumeController.instance.showSystemUI = false;
+     }
      _initVolumeBrightness();
+     _rebuildSubtitleIndex();
      // Auto request focus to enable keyboard listening
      WidgetsBinding.instance.addPostFrameCallback((_) {
        if (mounted) {
          (widget.focusNode ?? _focusNode).requestFocus();
        }
      });
+   }
+
+   @override
+   void didUpdateWidget(VideoControlsOverlay oldWidget) {
+     super.didUpdateWidget(oldWidget);
+     if (oldWidget.subtitles != widget.subtitles) {
+       _rebuildSubtitleIndex();
+     }
    }
 
    @override
@@ -261,7 +277,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _endZoneLongPress();
       // 如果长按前是播放状态，确保长按结束后继续播放，不触发 tap 的切换逻辑
       if (_wasPlayingBeforeLongPress && !widget.controller.value.isPlaying) {
-        widget.controller.play();
+        widget.onTogglePlay();
       }
       setState(() {
         _isKeyboardLongPressing = false;
@@ -306,13 +322,14 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   int _subtitleSeekAccumulator = 0;
   Duration? _initialSeekPosition;
   Timer? _seekDebounceTimer;
+  final List<int> _subtitleStartMs = <int>[];
 
   // -- initState and dispose moved to top of file --
   
   Future<void> _initVolumeBrightness() async {
     try {
       if (Platform.isAndroid || Platform.isIOS) {
-        _currentBrightness = await ScreenBrightness().current;
+        _currentBrightness = await ScreenBrightness().application;
       } else {
         _currentBrightness = 0.5;
       }
@@ -336,13 +353,89 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     return "$twoDigitMinutes:$twoDigitSeconds";
   }
 
+  void _rebuildSubtitleIndex() {
+    _subtitleStartMs
+      ..clear()
+      ..addAll(widget.subtitles.map((e) => e.startTime.inMilliseconds));
+  }
+
+  void _ensureSubtitleIndexUpToDate() {
+    if (widget.subtitles.isEmpty) {
+      if (_subtitleStartMs.isNotEmpty) _subtitleStartMs.clear();
+      return;
+    }
+
+    final int first = widget.subtitles.first.startTime.inMilliseconds;
+    final int last = widget.subtitles.last.startTime.inMilliseconds;
+
+    if (_subtitleStartMs.length != widget.subtitles.length) {
+      _rebuildSubtitleIndex();
+      return;
+    }
+
+    if (_subtitleStartMs.isNotEmpty && (_subtitleStartMs.first != first || _subtitleStartMs.last != last)) {
+      _rebuildSubtitleIndex();
+    }
+  }
+
+  int _binarySearchLastStartLE(int posMs) {
+    int low = 0;
+    int high = _subtitleStartMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (_subtitleStartMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  int _binarySearchFirstStartGT(int posMs) {
+    int low = 0;
+    int high = _subtitleStartMs.length - 1;
+    int ans = _subtitleStartMs.length;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (_subtitleStartMs[mid] > posMs) {
+        ans = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return ans;
+  }
+
+  int _findCurrentSubtitleIndexByPositionMs(int posMs) {
+    if (widget.subtitles.isEmpty) return -1;
+    _ensureSubtitleIndexUpToDate();
+    final int candidate = _binarySearchLastStartLE(posMs);
+    if (candidate < 0 || candidate >= widget.subtitles.length) return -1;
+    final int endMs = widget.subtitles[candidate].endTime.inMilliseconds;
+    if (posMs <= endMs) return candidate;
+    return -1;
+  }
+
+  void _seekTo(Duration position) {
+    final handler = widget.onSeekTo;
+    if (handler != null) {
+      handler(position);
+      return;
+    }
+    widget.controller.seekTo(position);
+  }
+
   // Helper for keyboard seek
   void _seekRelative(int seconds) {
     if (!widget.controller.value.isInitialized) return;
     final newPos = widget.controller.value.position + Duration(seconds: seconds);
     final total = widget.controller.value.duration;
     final clamped = newPos < Duration.zero ? Duration.zero : (newPos > total ? total : newPos);
-    widget.controller.seekTo(clamped);
+    _seekTo(clamped);
     
     // Show feedback (optional, reusing gesture UI or similar)
     // For now just seek
@@ -408,7 +501,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (!_isGestureSeeking) return;
 
     if (!_isGestureCanceling && !widget.isLocked) {
-      widget.controller.seekTo(_gestureTargetTime);
+      _seekTo(_gestureTargetTime);
     }
 
     setState(() {
@@ -425,6 +518,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     final dx = localPosition.dx;
     final isLeft = dx < width * 0.2; // 20%
     final isRight = dx > width * 0.8; // 20%
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final Duration subtitleOffset = settings.subtitleOffset;
 
     // Center Double Tap: Play/Pause
     if (!isLeft && !isRight) {
@@ -445,13 +540,14 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
     // Subtitle Seek Logic with Accumulation
     if (widget.enableDoubleTapSubtitleSeek && widget.subtitles.isNotEmpty) {
+       _ensureSubtitleIndexUpToDate();
        // Reset or Init Accumulator
        if (_seekResetTimer?.isActive ?? false) {
           _seekResetTimer?.cancel();
        } else {
           // New seek sequence started
           _subtitleSeekAccumulator = 0;
-          _initialSeekPosition = currentPos;
+          _initialSeekPosition = currentPos - subtitleOffset;
        }
        
        // Determine direction
@@ -465,63 +561,18 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
        
        // Calculate Target based on Initial Position + Accumulator
        // Find the starting index corresponding to _initialSeekPosition
-       int baseIndex = -1;
-       
-       // Find subtitle at or just before _initialSeekPosition
-       for (int i = 0; i < widget.subtitles.length; i++) {
-          final sub = widget.subtitles[i];
-          if (sub.startTime <= _initialSeekPosition! && sub.endTime >= _initialSeekPosition!) {
-             // Inside a subtitle
-             // If we are deep inside (>500ms), this counts as "Current".
-             // If we are at start (<500ms), this counts as "Previous" relative to index i+1?
-             // Actually, let's simplify:
-             // If inside sub i:
-             //   Left -> Start of i (Accumulator -1)
-             //   Left again -> Start of i-1 (Accumulator -2)
-             
-             // Wait, the accumulator logic needs to map to indices.
-             // Let "0" be the current playback moment.
-             baseIndex = i;
-             
-             // Special case: If we are just starting this subtitle (< 500ms), 
-             // "Left" should imply going to previous one immediately?
-             // The user said: "If I double tap twice... it keeps resetting to current... I want it to go back to previous"
-             
-             // If we are at start of i, treat "Current" as i-1 effectively for the first jump?
-             if (_initialSeekPosition! < sub.startTime + const Duration(milliseconds: 500)) {
-                // We are at start of i.
-                // A "Left" (-1) should go to i-1.
-                // So effective base is i. But the jump logic below will handle it.
-             }
-             break;
-          }
-          if (sub.startTime > _initialSeekPosition!) {
-             // We are in a gap before sub i.
-             // So "Current" context is effectively gap between i-1 and i.
-             // Left (-1) -> Start of i-1.
-             // Right (+1) -> Start of i.
-             baseIndex = i; // Let's say next is i.
-             // Adjust base logic below.
-             break;
-          }
-       }
-       
-       if (baseIndex == -1) {
-          // After last subtitle?
-          baseIndex = widget.subtitles.length;
-       }
-       
        // Logic to resolve Accumulator to Target Index
        int targetIndex = -1;
        String feedback = "";
        
        // Re-evaluate base index more robustly
        // We want to find "Current/Next" boundary
-       int nextSubIndex = widget.subtitles.indexWhere((s) => s.startTime > _initialSeekPosition!);
-       if (nextSubIndex == -1) nextSubIndex = widget.subtitles.length;
+       final int initialPosMs = _initialSeekPosition!.inMilliseconds;
+       int nextSubIndex = _binarySearchFirstStartGT(initialPosMs);
+       if (nextSubIndex < 0) nextSubIndex = 0;
+       if (nextSubIndex > widget.subtitles.length) nextSubIndex = widget.subtitles.length;
        
-       // Current Subtitle Index (if inside one)
-       int currentSubIndex = widget.subtitles.indexWhere((s) => s.startTime <= _initialSeekPosition! && s.endTime >= _initialSeekPosition!);
+       int currentSubIndex = _findCurrentSubtitleIndexByPositionMs(initialPosMs);
        
        // Determine "Pivot" index from which we add accumulator
        // Case A: Inside Subtitle X (currentSubIndex = X)
@@ -539,7 +590,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
        
        if (currentSubIndex != -1) {
           pivotIndex = currentSubIndex;
-          if (_initialSeekPosition! < widget.subtitles[currentSubIndex].startTime + const Duration(milliseconds: 500)) {
+          if (initialPosMs < widget.subtitles[currentSubIndex].startTime.inMilliseconds + 500) {
              isAtStartOfSub = true;
           }
        } else {
@@ -575,7 +626,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           // So if we are at pivotIndex, next start is pivotIndex + 1.
           targetIndex = pivotIndex + _subtitleSeekAccumulator;
           
-          feedback = "下一句${_subtitleSeekAccumulator > 1 ? " x${_subtitleSeekAccumulator}" : ""}";
+          feedback = "下一句${_subtitleSeekAccumulator > 1 ? " x$_subtitleSeekAccumulator" : ""}";
        }
        
        // Clamping
@@ -586,7 +637,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           target = duration;
           feedback = "结尾";
        } else {
-          target = widget.subtitles[targetIndex].startTime;
+          target = widget.subtitles[targetIndex].startTime + subtitleOffset;
        }
        
        _zoneFeedbackText = feedback;
@@ -613,8 +664,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
     // Debounce/Throttle Seek to prevent UI lag
     _seekDebounceTimer?.cancel();
-    _seekDebounceTimer = Timer(const Duration(milliseconds: 100), () {
-        widget.controller.seekTo(target);
+    _seekDebounceTimer = Timer(const Duration(milliseconds: 30), () {
+        _seekTo(target);
     });
 
     setState(() {
@@ -683,7 +734,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       // Brightness (Left 20%) - Only on mobile
       if (Platform.isAndroid || Platform.isIOS) {
         try {
-          _startDragValue = await ScreenBrightness().current;
+          _startDragValue = await ScreenBrightness().application;
         } catch (_) {
           _startDragValue = 0.5;
         }
@@ -722,7 +773,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     setState(() {
       if (_isAdjustingBrightness && (Platform.isAndroid || Platform.isIOS)) {
         _currentBrightness = (_currentBrightness + change).clamp(0.0, 1.0);
-        ScreenBrightness().setScreenBrightness(_currentBrightness);
+        ScreenBrightness().setApplicationScreenBrightness(_currentBrightness);
       } else if (_isAdjustingVolume && (Platform.isAndroid || Platform.isIOS)) {
         // System Volume Control (Gesture)
         _currentVolume = (_currentVolume + change).clamp(0.0, 1.0);
@@ -933,8 +984,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
                           decoration: BoxDecoration(
                             color: _isGestureCanceling 
-                                ? Colors.red.withOpacity(0.8)
-                                : Colors.black.withOpacity(0.7),
+                                ? Colors.red.withValues(alpha: 0.8)
+                                : Colors.black.withValues(alpha: 0.7),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           child: Column(
@@ -978,7 +1029,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                           width: 150,
                           padding: const EdgeInsets.symmetric(vertical: 20),
                           decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.7),
+                            color: Colors.black.withValues(alpha: 0.7),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           child: Column(
@@ -1012,7 +1063,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                          top: 0, left: 0, right: 0,
                          height: height * 0.2,
                          child: Container(
-                           color: Colors.white.withOpacity(0.1),
+                           color: Colors.white.withValues(alpha: 0.1),
                            alignment: Alignment.center,
                            child: const Text("上滑至此区域取消", style: TextStyle(color: Colors.white70)),
                          ),
@@ -1099,7 +1150,11 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                       ),
                       if (widget.onToggleSidebar != null)
                         IconButton(
-                          icon: const Icon(Icons.subtitles, color: Colors.white),
+                          icon: Icon(
+                            widget.isSubtitleSidebarVisible ? Icons.menu_open : Icons.menu,
+                            color: Colors.white,
+                          ),
+                          tooltip: widget.isSubtitleSidebarVisible ? "隐藏字幕边栏" : "显示字幕边栏",
                           onPressed: widget.onToggleSidebar,
                           iconSize: iconSize,
                         ),
@@ -1182,7 +1237,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                         });
                                       } : null,
                                       onChangeEnd: (newValue) {
-                                        widget.controller.seekTo(Duration(milliseconds: newValue.toInt()));
+                                        _seekTo(Duration(milliseconds: newValue.toInt()));
                                         setState(() {
                                           _isDraggingProgress = false;
                                         });
@@ -1231,7 +1286,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                               onTap: () {
                                                 if (!widget.controller.value.isInitialized) return;
                                                 final newPos = widget.controller.value.position - Duration(seconds: widget.doubleTapSeekSeconds);
-                                                widget.controller.seekTo(newPos < Duration.zero ? Duration.zero : newPos);
+                                                _seekTo(newPos < Duration.zero ? Duration.zero : newPos);
                                               },
                                               borderRadius: BorderRadius.circular(20),
                                               child: SizedBox(
@@ -1269,7 +1324,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                 if (!widget.controller.value.isInitialized) return;
                                                 final newPos = widget.controller.value.position + Duration(seconds: widget.doubleTapSeekSeconds);
                                                 final duration = widget.controller.value.duration;
-                                                widget.controller.seekTo(newPos > duration ? duration : newPos);
+                                                _seekTo(newPos > duration ? duration : newPos);
                                               },
                                               borderRadius: BorderRadius.circular(20),
                                               child: SizedBox(

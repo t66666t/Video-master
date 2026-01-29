@@ -1,10 +1,10 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
-import 'package:video_player/video_player.dart';
 import 'package:path/path.dart' as p;
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
@@ -60,11 +60,25 @@ class LibraryService extends ChangeNotifier {
   VideoItem? getVideo(String id) => _videos[id];
   VideoCollection? getCollection(String id) => _collections[id];
   
-  /// 获取指定文件夹中的所有视频（不包括回收站中的）
+  /// 获取指定文件夹中的所有视频（不包括回收站中的），并按照正确的顺序排列
   List<VideoItem> getVideosInFolder(String? folderId) {
-    return _videos.values
-        .where((v) => v.parentId == folderId && !v.isRecycled)
-        .toList();
+    List<String> sourceIds;
+    if (folderId == null) {
+      sourceIds = _rootChildrenIds;
+    } else {
+      final collection = _collections[folderId];
+      if (collection == null) return [];
+      sourceIds = collection.childrenIds;
+    }
+
+    final List<VideoItem> result = [];
+    for (var id in sourceIds) {
+      final video = _videos[id];
+      if (video != null && !video.isRecycled) {
+        result.add(video);
+      }
+    }
+    return result;
   }
   
   // Helper function to detect media type from file extension
@@ -111,7 +125,7 @@ class LibraryService extends ChangeNotifier {
           // Restore main file from backup
           await backupFile.copy(file.path);
         } catch (e) {
-          print("Error loading backup library: $e");
+          developer.log('Error loading backup library', error: e);
         }
       }
       return;
@@ -122,16 +136,16 @@ class LibraryService extends ChangeNotifier {
       if (jsonString.isEmpty) throw const FormatException("Empty JSON file");
       await _parseLibraryData(jsonString);
     } catch (e) {
-      print("Error loading library: $e");
+      developer.log('Error loading library', error: e);
       // Try backup
       if (await backupFile.exists()) {
-        print("Attempting to load from backup...");
+        developer.log('Attempting to load from backup...');
         try {
           await _parseLibraryData(await backupFile.readAsString());
           // We don't overwrite the corrupt main file immediately to allow manual inspection if needed,
           // but the next save will overwrite it.
         } catch (e2) {
-          print("Error loading backup library: $e2");
+          developer.log('Error loading backup library', error: e2);
         }
       }
     }
@@ -311,9 +325,6 @@ class LibraryService extends ChangeNotifier {
       isImporting.value = true;
       importProgress.value = 0.0;
       importStatus.value = "正在检查重复文件...";
-      
-      // Pre-fetch existing paths for O(1) lookup
-      final existingPaths = _videos.values.map((v) => v.path).toSet();
       
       List<String> newIds = [];
       DateTime lastNotifyTime = DateTime.now();
@@ -644,7 +655,7 @@ class LibraryService extends ChangeNotifier {
           await file.delete();
         }
       } catch (e) {
-        print("Error deleting thumbnail: $e");
+        developer.log('Error deleting thumbnail', error: e);
       }
     }
     
@@ -656,7 +667,7 @@ class LibraryService extends ChangeNotifier {
            await file.delete();
          }
        } catch (e) {
-         print("Error deleting subtitle: $e");
+         developer.log('Error deleting subtitle', error: e);
        }
     }
     if (vid.isSecondarySubtitleCached && vid.secondarySubtitlePath != null) {
@@ -666,7 +677,7 @@ class LibraryService extends ChangeNotifier {
            await file.delete();
          }
        } catch (e) {
-         print("Error deleting secondary subtitle: $e");
+         developer.log('Error deleting secondary subtitle', error: e);
        }
     }
 
@@ -1042,7 +1053,7 @@ class LibraryService extends ChangeNotifier {
       );
       return fileName;
     } catch (e) {
-      print("Thumbnail error: $e");
+      developer.log('Thumbnail error', error: e);
       return null;
     }
   }
@@ -1092,7 +1103,7 @@ class LibraryService extends ChangeNotifier {
                await File(subtitlePath).copy(newPath);
                finalPath = newPath;
             } catch (e) {
-               print("Error copying primary subtitle: $e");
+              developer.log('Error copying primary subtitle', error: e);
             }
           }
         }
@@ -1117,7 +1128,7 @@ class LibraryService extends ChangeNotifier {
                await File(secondarySubtitlePath).copy(newPath);
                finalSecPath = newPath;
             } catch (e) {
-               print("Error copying secondary subtitle: $e");
+              developer.log('Error copying secondary subtitle', error: e);
             }
           }
         }

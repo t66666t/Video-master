@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:ui';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -181,7 +182,7 @@ class SettingsService extends ChangeNotifier {
       try {
         subtitleStyleLandscape = SubtitleStyle.fromJson(json.decode(styleJson));
       } catch (e) {
-        print("Error loading subtitle style: $e");
+        developer.log('Error loading subtitle style', error: e);
       }
     }
     
@@ -191,7 +192,7 @@ class SettingsService extends ChangeNotifier {
       try {
         subtitleStyleLandscape = SubtitleStyle.fromJson(json.decode(styleLandJson));
       } catch (e) {
-         print("Error loading landscape subtitle style: $e");
+        developer.log('Error loading landscape subtitle style', error: e);
       }
     }
 
@@ -201,7 +202,7 @@ class SettingsService extends ChangeNotifier {
       try {
         subtitleStylePortrait = SubtitleStyle.fromJson(json.decode(stylePortJson));
       } catch (e) {
-         print("Error loading portrait subtitle style: $e");
+        developer.log('Error loading portrait subtitle style', error: e);
       }
     } else {
       // Fallback: Copy from Landscape (or legacy)
@@ -214,7 +215,7 @@ class SettingsService extends ChangeNotifier {
       try {
         audioSubtitleStyleLandscape = SubtitleStyle.fromJson(json.decode(audioStyleLandJson));
       } catch (e) {
-         print("Error loading audio landscape subtitle style: $e");
+        developer.log('Error loading audio landscape subtitle style', error: e);
       }
     }
 
@@ -224,7 +225,7 @@ class SettingsService extends ChangeNotifier {
       try {
         audioSubtitleStylePortrait = SubtitleStyle.fromJson(json.decode(audioStylePortJson));
       } catch (e) {
-         print("Error loading audio portrait subtitle style: $e");
+        developer.log('Error loading audio portrait subtitle style', error: e);
       }
     } else {
       // Fallback: Copy from Audio Landscape
@@ -237,7 +238,7 @@ class SettingsService extends ChangeNotifier {
         final List<dynamic> decoded = json.decode(presetsJson);
         subtitlePresets = decoded.map((e) => Map<String, double>.from(e)).toList();
       } catch (e) {
-        print("Error loading presets: $e");
+        developer.log('Error loading presets', error: e);
       }
     }
     

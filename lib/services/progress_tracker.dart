@@ -48,9 +48,12 @@ class ProgressTracker {
   // 依赖服务
   LibraryService? _libraryService;
 
-  // 防抖定时器
+  // 进度保存节流定时器
   Timer? _debounceTimer;
   static const Duration _debounceDuration = Duration(seconds: 5);
+  int _lastSaveTimestampMs = 0;
+  String? _pendingItemId;
+  Duration? _pendingPosition;
 
   // SharedPreferences 键
   static const String _playbackStateKey = 'playback_state_snapshot';
@@ -62,12 +65,29 @@ class ProgressTracker {
 
   /// 保存进度（防抖处理，最多每5秒保存一次）
   Future<void> saveProgress(String itemId, Duration position) async {
-    // 取消之前的定时器
-    _debounceTimer?.cancel();
-    
-    // 设置新的防抖定时器
-    _debounceTimer = Timer(_debounceDuration, () {
-      saveProgressImmediately(itemId, position);
+    _pendingItemId = itemId;
+    _pendingPosition = position;
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final elapsedMs = nowMs - _lastSaveTimestampMs;
+
+    if (_lastSaveTimestampMs == 0 || elapsedMs >= _debounceDuration.inMilliseconds) {
+      await saveProgressImmediately(itemId, position);
+      return;
+    }
+
+    if (_debounceTimer != null) return;
+
+    final remainingMs = (_debounceDuration.inMilliseconds - elapsedMs).clamp(0, _debounceDuration.inMilliseconds);
+    _debounceTimer = Timer(Duration(milliseconds: remainingMs), () {
+      final id = _pendingItemId;
+      final pos = _pendingPosition;
+      _pendingItemId = null;
+      _pendingPosition = null;
+      _debounceTimer = null;
+      if (id != null && pos != null) {
+        saveProgressImmediately(id, pos);
+      }
     });
   }
 
@@ -75,6 +95,9 @@ class ProgressTracker {
   Future<void> saveProgressImmediately(String itemId, Duration position) async {
     // 取消防抖定时器
     _debounceTimer?.cancel();
+    _debounceTimer = null;
+    _pendingItemId = null;
+    _pendingPosition = null;
     
     if (_libraryService == null) {
       debugPrint('ProgressTracker: LibraryService 未初始化');
@@ -84,9 +107,25 @@ class ProgressTracker {
     try {
       // 更新 VideoItem 的 lastPositionMs
       await _libraryService!.updateVideoProgress(itemId, position.inMilliseconds);
+      _lastSaveTimestampMs = DateTime.now().millisecondsSinceEpoch;
     } catch (e) {
       // 静默处理错误，不影响用户体验
       debugPrint('进度保存失败: $e');
+    }
+  }
+
+  /// 立即保存媒体时长（用于首次播放时补齐元数据）
+  Future<void> saveDurationImmediately(String itemId, Duration duration) async {
+    if (_libraryService == null) {
+      debugPrint('ProgressTracker: LibraryService 未初始化');
+      return;
+    }
+    if (duration <= Duration.zero) return;
+
+    try {
+      await _libraryService!.updateVideoDuration(itemId, duration.inMilliseconds);
+    } catch (e) {
+      debugPrint('时长保存失败: $e');
     }
   }
 

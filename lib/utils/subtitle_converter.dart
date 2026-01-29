@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:developer' as developer;
 import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:path/path.dart' as p;
@@ -14,7 +15,6 @@ class SubtitleConverter {
     final file = File(inputPath);
     if (!await file.exists()) return null;
 
-    final inputDir = p.dirname(inputPath);
     final inputName = p.basenameWithoutExtension(inputPath);
     
     // 使用临时目录存放转换结果，避免污染源目录
@@ -43,11 +43,11 @@ class SubtitleConverter {
         return outputPath;
       } else {
         final logs = await session.getAllLogsAsString();
-        print("Subtitle conversion failed: $logs");
+        developer.log('Subtitle conversion failed', error: logs);
         return null;
       }
     } catch (e) {
-      print("Subtitle conversion error: $e");
+      developer.log('Subtitle conversion error', error: e);
       return null;
     }
   }

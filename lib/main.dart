@@ -1,3 +1,5 @@
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -15,7 +17,6 @@ import 'services/bilibili/bilibili_download_service.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/progress_tracker.dart';
-import 'services/audio_session_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -130,22 +131,10 @@ void main() async {
   final progressTracker = ProgressTracker();
   progressTracker.initialize(libraryService: library);
   
-  // Initialize audio session service (for background playback) - Only on Android
-  AudioSessionService? audioSessionService;
-  if (Platform.isAndroid) {
-    audioSessionService = AudioSessionService();
-    try {
-      await audioSessionService.init();
-    } catch (e) {
-      debugPrint('AudioSessionService 初始化失败，后台播放功能将不可用: $e');
-    }
-  }
-  
   final mediaPlaybackService = MediaPlaybackService();
   mediaPlaybackService.initialize(
     playlistManager: playlistManager,
     progressTracker: progressTracker,
-    audioSessionService: audioSessionService,
   );
 
   // 恢复上次的播放状态 - 改为非阻塞方式,避免卡住应用启动
@@ -181,6 +170,14 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final isIOS = !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
+    final platformTextFontFamily = isIOS ? 'CupertinoSystemText' : 'MiSans';
+    final platformDisplayFontFamily = isIOS ? 'CupertinoSystemDisplay' : platformTextFontFamily;
+    final bodyFontWeight = isIOS ? FontWeight.w400 : FontWeight.w300;
+    final titleFontWeight = isIOS ? FontWeight.w600 : FontWeight.w300;
+    final labelFontWeight = isIOS ? FontWeight.w500 : FontWeight.w300;
+    final baseTextTheme = ThemeData.dark(useMaterial3: true).textTheme;
+
     return Shortcuts(
       shortcuts: <LogicalKeySet, Intent>{
         LogicalKeySet(LogicalKeyboardKey.f11): const ToggleFullScreenIntent(),
@@ -216,22 +213,31 @@ class MyApp extends StatelessWidget {
             brightness: Brightness.dark,
             primarySwatch: Colors.blue,
             scaffoldBackgroundColor: const Color(0xFF121212),
-            fontFamily: 'MiSans',
-            textTheme: const TextTheme().apply(bodyColor: Colors.white, displayColor: Colors.white, fontFamily: 'MiSans').copyWith(
-                bodyLarge: const TextStyle(fontWeight: FontWeight.w300),
-                bodyMedium: const TextStyle(fontWeight: FontWeight.w300),
-                bodySmall: const TextStyle(fontWeight: FontWeight.w300),
-                titleLarge: const TextStyle(fontWeight: FontWeight.w300),
-                titleMedium: const TextStyle(fontWeight: FontWeight.w300),
-                titleSmall: const TextStyle(fontWeight: FontWeight.w300),
-                labelLarge: const TextStyle(fontWeight: FontWeight.w300),
-                labelMedium: const TextStyle(fontWeight: FontWeight.w300),
-                labelSmall: const TextStyle(fontWeight: FontWeight.w300),
-              ),
+            typography: Typography.material2021(platform: isIOS ? TargetPlatform.iOS : defaultTargetPlatform),
+            fontFamily: platformTextFontFamily,
+            textTheme: baseTextTheme
+                .apply(bodyColor: Colors.white, displayColor: Colors.white, fontFamily: platformTextFontFamily)
+                .copyWith(
+                  displayLarge: baseTextTheme.displayLarge?.copyWith(fontFamily: platformDisplayFontFamily),
+                  displayMedium: baseTextTheme.displayMedium?.copyWith(fontFamily: platformDisplayFontFamily),
+                  displaySmall: baseTextTheme.displaySmall?.copyWith(fontFamily: platformDisplayFontFamily),
+                  headlineLarge: baseTextTheme.headlineLarge?.copyWith(fontFamily: platformDisplayFontFamily),
+                  headlineMedium: baseTextTheme.headlineMedium?.copyWith(fontFamily: platformDisplayFontFamily),
+                  headlineSmall: baseTextTheme.headlineSmall?.copyWith(fontFamily: platformDisplayFontFamily),
+                  bodyLarge: TextStyle(fontWeight: bodyFontWeight),
+                  bodyMedium: TextStyle(fontWeight: bodyFontWeight),
+                  bodySmall: TextStyle(fontWeight: bodyFontWeight),
+                  titleLarge: TextStyle(fontWeight: titleFontWeight, fontFamily: platformDisplayFontFamily),
+                  titleMedium: TextStyle(fontWeight: titleFontWeight, fontFamily: platformDisplayFontFamily),
+                  titleSmall: TextStyle(fontWeight: titleFontWeight, fontFamily: platformDisplayFontFamily),
+                  labelLarge: TextStyle(fontWeight: labelFontWeight),
+                  labelMedium: TextStyle(fontWeight: labelFontWeight),
+                  labelSmall: TextStyle(fontWeight: labelFontWeight),
+                ),
+            cupertinoOverrideTheme: isIOS ? const CupertinoThemeData(brightness: Brightness.dark) : null,
             colorScheme: const ColorScheme.dark(
               primary: Colors.blue,
               surface: Color(0xFF121212),
-              background: Color(0xFF121212),
             ),
             useMaterial3: true,
             appBarTheme: const AppBarTheme(
@@ -296,7 +302,11 @@ Future<void> _restorePlaybackState({
     }
     
     // 恢复播放位置
-    final position = Duration(milliseconds: snapshot.positionMs);
+    var positionMs = snapshot.positionMs;
+    if (videoItem.lastPositionMs > 0 && videoItem.lastUpdated > snapshot.timestamp) {
+      positionMs = videoItem.lastPositionMs;
+    }
+    final position = Duration(milliseconds: positionMs);
     
     // 播放媒体，但立即暂停（不自动播放）
     await mediaPlaybackService.play(videoItem, startPosition: position);

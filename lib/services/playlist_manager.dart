@@ -10,6 +10,8 @@ class PlaylistManager extends ChangeNotifier {
   // 当前播放列表
   List<VideoItem> _playlist = [];
   int _currentIndex = -1;
+  String? _currentFolderId;
+  bool _isFolderPlaylist = false;
 
   // Getters
   List<VideoItem> get playlist => List.unmodifiable(_playlist);
@@ -28,6 +30,7 @@ class PlaylistManager extends ChangeNotifier {
   void setPlaylist(List<VideoItem> items, {int startIndex = 0}) {
     _playlist = List.from(items);
     _currentIndex = items.isEmpty ? -1 : startIndex.clamp(0, items.length - 1);
+    _isFolderPlaylist = false;
     notifyListeners();
   }
 
@@ -45,6 +48,34 @@ class PlaylistManager extends ChangeNotifier {
     final currentIdx = folderItems.indexWhere((item) => item.id == currentItemId);
     
     setPlaylist(folderItems, startIndex: currentIdx >= 0 ? currentIdx : 0);
+    _isFolderPlaylist = true;
+    _currentFolderId = folderId;
+  }
+
+  /// 重新加载播放列表（用于同步文件夹内容变化）
+  void reloadPlaylist() {
+    if (!_isFolderPlaylist || _libraryService == null) return;
+
+    final currentItemId = currentItem?.id;
+    final folderItems = _libraryService!.getVideosInFolder(_currentFolderId);
+    
+    _playlist = List.from(folderItems);
+    
+    if (currentItemId != null) {
+      final newIndex = _playlist.indexWhere((item) => item.id == currentItemId);
+      if (newIndex >= 0) {
+        _currentIndex = newIndex;
+      } else {
+        // 如果当前项不在新列表中（可能被移走），保持索引在有效范围内
+        if (_currentIndex >= _playlist.length) {
+          _currentIndex = _playlist.isEmpty ? -1 : _playlist.length - 1;
+        }
+      }
+    } else {
+      _currentIndex = _playlist.isEmpty ? -1 : 0;
+    }
+    
+    notifyListeners();
   }
 
   /// 获取下一个媒体

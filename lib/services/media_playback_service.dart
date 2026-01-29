@@ -1,15 +1,12 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
-import 'package:fast_gbk/fast_gbk.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/video_item.dart';
 import '../models/subtitle_model.dart';
-import '../utils/subtitle_parser.dart';
 import 'playlist_manager.dart';
 import 'progress_tracker.dart';
-import 'audio_session_service.dart';
 
 import '../services/settings_service.dart';
 
@@ -32,21 +29,24 @@ class MediaPlaybackService extends ChangeNotifier {
   // 依赖服务
   PlaylistManager? _playlistManager;
   ProgressTracker? _progressTracker;
-  AudioSessionService? _audioSessionService;
 
   // 播放状态
   PlaybackState _state = PlaybackState.idle;
   VideoItem? _currentItem;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
+  Duration _bufferedPosition = Duration.zero;
   bool _isMuted = false;
   double _volume = 1.0;
   VideoPlayerController? _controller;
   
   // 字幕相关
   List<SubtitleItem> _subtitles = [];
+  List<SubtitleItem> _secondarySubtitles = [];
+  List<String> _subtitlePaths = [];
   SubtitleItem? _currentSubtitle;
   int _lastSubtitleIndex = 0;
+  final List<int> _subtitleStartMs = <int>[];
   
   // 进度追踪定时器
   Timer? _progressTimer;
@@ -54,42 +54,73 @@ class MediaPlaybackService extends ChangeNotifier {
   // 进度更新定时器（用于实时UI更新）
   Timer? _positionUpdateTimer;
   
-  // 通知栏进度更新定时器
-  Timer? _notificationUpdateTimer;
+  Timer? _seekPersistTimer;
+  int _seekRequestId = 0;
+  bool? _lastControllerIsPlaying;
+  bool _wakelockApplied = false;
+
+  void _applyWakelock(bool enable) {
+    try {
+      final Future<void> future = enable ? WakelockPlus.enable() : WakelockPlus.disable();
+      future.catchError((_) {});
+    } catch (_) {}
+  }
+
+  void _syncWakelockWithState() {
+    final bool shouldEnable = _state == PlaybackState.playing;
+    if (_wakelockApplied == shouldEnable) return;
+    _wakelockApplied = shouldEnable;
+    _applyWakelock(shouldEnable);
+  }
 
   // Getters
   PlaybackState get state => _state;
   VideoItem? get currentItem => _currentItem;
   Duration get position => _position;
   Duration get duration => _duration;
+  Duration get bufferedPosition => _bufferedPosition;
   bool get isPlaying => _state == PlaybackState.playing;
   bool get isMuted => _isMuted;
   double get volume => _volume;
   VideoPlayerController? get controller => _controller;
   List<SubtitleItem> get subtitles => _subtitles;
+  List<SubtitleItem> get secondarySubtitles => _secondarySubtitles;
+  List<String> get subtitlePaths => _subtitlePaths;
   SubtitleItem? get currentSubtitle => _currentSubtitle;
 
   /// 初始化服务依赖
   void initialize({
     required PlaylistManager playlistManager,
     required ProgressTracker progressTracker,
-    AudioSessionService? audioSessionService,
   }) {
     _playlistManager = playlistManager;
     _progressTracker = progressTracker;
-    _audioSessionService = audioSessionService;
-    
-    // 监听音频服务的媒体操作
-    _audioSessionService?.mediaActions.listen(_handleMediaAction);
   }
   
   /// 设置字幕列表
   void setSubtitles(List<SubtitleItem> subtitles) {
-    _subtitles = subtitles;
+    setSubtitleState(paths: const [], primary: subtitles, secondary: const []);
+  }
+
+  void setSubtitleState({
+    required List<String> paths,
+    required List<SubtitleItem> primary,
+    required List<SubtitleItem> secondary,
+  }) {
+    _subtitles = primary;
+    _secondarySubtitles = secondary;
+    _subtitlePaths = List<String>.from(paths);
     _lastSubtitleIndex = 0;
     _currentSubtitle = null;
+    _subtitleStartMs
+      ..clear()
+      ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
     _updateCurrentSubtitle();
     notifyListeners();
+  }
+
+  void clearSubtitleState() {
+    setSubtitleState(paths: const [], primary: const [], secondary: const []);
   }
   
   /// 设置外部控制器（用于UI创建的控制器移交给服务管理）
@@ -97,10 +128,14 @@ class MediaPlaybackService extends ChangeNotifier {
     // 如果是同一个控制器，无需处理
     if (_controller == controller) return;
     
-    // 如果之前有控制器且不是传入的这个，先释放旧的（如果服务持有所有权）
-    // 这里假设调用 setController 时，UI 已经负责了旧控制器的清理，或者服务接管了所有权
-    // 为安全起见，我们只更新引用，不 dispose，避免意外释放 UI 还在用的控制器
-    // 实际逻辑中，UI 切换视频时会 dispose 旧的
+    // 先移除旧控制器的监听器，防止状态冲突
+    if (_controller != null) {
+      try {
+        _controller!.removeListener(_onControllerUpdate);
+      } catch (e) {
+        // 忽略移除失败（可能已dispose）
+      }
+    }
     
     _controller = controller;
     
@@ -108,15 +143,12 @@ class MediaPlaybackService extends ChangeNotifier {
     if (_controller!.value.isInitialized) {
       _duration = _controller!.value.duration;
       _position = _controller!.value.position;
+      _bufferedPosition = _readBufferedPosition(_controller!);
       _state = _controller!.value.isPlaying ? PlaybackState.playing : PlaybackState.paused;
     }
+    _lastControllerIsPlaying = _controller!.value.isPlaying;
     
-    // 重新绑定监听器
-    try {
-      _controller!.removeListener(_onControllerUpdate);
-    } catch (e) {
-      // 忽略移除失败
-    }
+    // 添加新监听器
     _controller!.addListener(_onControllerUpdate);
     
     // 启动进度追踪
@@ -126,19 +158,40 @@ class MediaPlaybackService extends ChangeNotifier {
       _stopProgressTracking();
     }
     
+    _syncWakelockWithState();
     notifyListeners();
   }
 
-  /// 更新媒体元数据（用于同步通知栏信息）
+  /// 清除当前控制器引用（当UI销毁控制器时调用）
+  void clearController() {
+    if (_controller != null) {
+      try {
+        _controller!.removeListener(_onControllerUpdate);
+      } catch (e) {
+        // 忽略
+      }
+      _controller = null;
+    }
+  }
+
+  /// 更新媒体元数据
   Future<void> updateMetadata(VideoItem item) async {
     _currentItem = item;
+
+    if (_playlistManager != null) {
+      final idx = _playlistManager!.indexOfItem(item.id);
+      if (idx >= 0) {
+        _playlistManager!.setCurrentIndex(idx);
+      } else {
+        _playlistManager!.loadFolderPlaylist(item.parentId, item.id);
+      }
+    }
     
     // 如果控制器已就绪，确保时长准确
     if (_controller != null && _controller!.value.isInitialized) {
       _duration = _controller!.value.duration;
     }
     
-    await _updateAudioService();
     notifyListeners();
   }
 
@@ -179,13 +232,26 @@ class MediaPlaybackService extends ChangeNotifier {
     try {
       // 如果正在播放其他媒体，先保存进度并停止
       if (_currentItem != null && _currentItem!.id != item.id) {
+        clearSubtitleState();
         await _saveCurrentProgress();
+        _seekPersistTimer?.cancel();
+        _seekPersistTimer = null;
         await _disposeController();
       }
       
       _currentItem = item;
       _state = PlaybackState.loading;
+      _syncWakelockWithState();
       notifyListeners();
+
+      if (_playlistManager != null) {
+        final idx = _playlistManager!.indexOfItem(item.id);
+        if (idx >= 0) {
+          _playlistManager!.setCurrentIndex(idx);
+        } else {
+          _playlistManager!.loadFolderPlaylist(item.parentId, item.id);
+        }
+      }
       
       // 创建新的控制器
       final file = File(item.path);
@@ -204,6 +270,10 @@ class MediaPlaybackService extends ChangeNotifier {
       if (_controller == null) return; // 可能在初始化期间被停止
       
       _duration = _controller!.value.duration;
+      _bufferedPosition = _readBufferedPosition(_controller!);
+      if (_progressTracker != null && _duration > Duration.zero) {
+        await _progressTracker!.saveDurationImmediately(item.id, _duration);
+      }
       
       // 设置音量和静音状态
       await _controller!.setVolume(_isMuted ? 0.0 : _volume);
@@ -226,24 +296,27 @@ class MediaPlaybackService extends ChangeNotifier {
       if (initialPosition > Duration.zero && initialPosition < _duration) {
         await _controller!.seekTo(initialPosition);
         _position = initialPosition;
+        _bufferedPosition = _readBufferedPosition(_controller!);
       }
       
       if (autoPlay) {
-        // 开始播放
-        await _controller!.play();
+        // 乐观更新：立即设置状态为播放中
         _state = PlaybackState.playing;
+        _syncWakelockWithState();
+        notifyListeners();
         
         // 启动进度追踪定时器
         _startProgressTracking();
+        
+        // 开始播放
+        await _controller!.play();
       } else {
         // 保持暂停状态
         _state = PlaybackState.paused;
+        _syncWakelockWithState();
         // 暂停时也应该保存一次初始状态
         await _saveCurrentProgress(immediate: true);
       }
-      
-      // 更新音频服务的媒体信息和播放状态
-      await _updateAudioService();
       
       // 保存播放状态快照
       await _savePlaybackStateSnapshot();
@@ -252,6 +325,7 @@ class MediaPlaybackService extends ChangeNotifier {
     } catch (e) {
       debugPrint('MediaPlaybackService: 播放失败 $e');
       _state = PlaybackState.error;
+      _syncWakelockWithState();
       notifyListeners();
     }
   }
@@ -261,15 +335,20 @@ class MediaPlaybackService extends ChangeNotifier {
     if (_state != PlaybackState.playing) return;
     
     try {
-      await _controller?.pause();
+      // 乐观更新：立即设置状态为暂停
       _state = PlaybackState.paused;
+      _syncWakelockWithState();
+      notifyListeners();
       
       // 停止进度追踪定时器
       _stopProgressTracking();
       
+      await _controller?.pause();
+      
       // 更新最终位置
       if (_controller != null && _controller!.value.isInitialized) {
         _position = _controller!.value.position;
+        _bufferedPosition = _readBufferedPosition(_controller!);
       }
       
       // 暂停时立即保存进度
@@ -277,9 +356,6 @@ class MediaPlaybackService extends ChangeNotifier {
       
       // 保存播放状态快照
       await _savePlaybackStateSnapshot();
-      
-      // 更新音频服务状态
-      await _updateAudioService();
       
       notifyListeners();
     } catch (e) {
@@ -292,14 +368,15 @@ class MediaPlaybackService extends ChangeNotifier {
     if (_state != PlaybackState.paused) return;
     
     try {
-      await _controller?.play();
+      // 乐观更新：立即设置状态为播放中
       _state = PlaybackState.playing;
+      _syncWakelockWithState();
+      notifyListeners();
       
       // 重新启动进度追踪定时器
       _startProgressTracking();
       
-      // 更新音频服务状态
-      await _updateAudioService();
+      await _controller?.play();
       
       // 保存播放状态快照
       await _savePlaybackStateSnapshot();
@@ -329,19 +406,17 @@ class MediaPlaybackService extends ChangeNotifier {
       
       // 更新最终位置
       _position = _controller!.value.position;
+      _bufferedPosition = _readBufferedPosition(_controller!);
       
       // 暂停时立即保存进度
       _saveCurrentProgress(immediate: true);
     }
+
+    _syncWakelockWithState();
     
     // 异步保存播放状态快照（不阻塞UI）
     _savePlaybackStateSnapshot().catchError((e) {
       debugPrint('保存播放状态快照失败: $e');
-    });
-    
-    // 异步更新音频服务（不阻塞UI）
-    _updateAudioService().catchError((e) {
-      debugPrint('更新音频服务失败: $e');
     });
     
     // 通知监听器，触发 UI 更新
@@ -354,21 +429,32 @@ class MediaPlaybackService extends ChangeNotifier {
     await _saveCurrentProgress(immediate: true);
     
     // 保存播放状态快照（停止状态）
-    await _savePlaybackStateSnapshot();
+    if (_progressTracker != null) {
+      await _progressTracker!.savePlaybackState(
+        PlaybackStateSnapshot(
+          currentItemId: null,
+          positionMs: 0,
+          wasPlaying: false,
+          playlistFolderId: null,
+        ),
+      );
+    }
     
     // 停止进度追踪
     _stopProgressTracking();
-    
-    // 停止音频服务
-    await _audioSessionService?.stop();
+    _seekPersistTimer?.cancel();
+    _seekPersistTimer = null;
     
     // 释放控制器
     await _disposeController();
     
     _state = PlaybackState.idle;
+    _syncWakelockWithState();
+    clearSubtitleState();
     _currentItem = null;
     _position = Duration.zero;
     _duration = Duration.zero;
+    _bufferedPosition = Duration.zero;
     
     notifyListeners();
   }
@@ -378,12 +464,41 @@ class MediaPlaybackService extends ChangeNotifier {
     if (_controller == null || !_controller!.value.isInitialized) return;
     
     try {
-      await _controller!.seekTo(position);
-      _position = position;
-      
-      // 跳转后立即保存进度
-      await _saveCurrentProgress(immediate: true);
-      
+      final controllerDuration = _controller!.value.duration;
+      if (controllerDuration > Duration.zero && controllerDuration != _duration) {
+        _duration = controllerDuration;
+      }
+
+      final clampedPosition = _duration > Duration.zero
+          ? Duration(
+              milliseconds: position.inMilliseconds.clamp(0, _duration.inMilliseconds).toInt(),
+            )
+          : (position.inMilliseconds < 0 ? Duration.zero : position);
+
+      _position = clampedPosition;
+      notifyListeners();
+
+      final requestId = ++_seekRequestId;
+      await _controller!.seekTo(clampedPosition);
+      if (requestId != _seekRequestId) return;
+
+      final actualPosition = _controller!.value.position;
+      if (actualPosition != _position) {
+        _position = actualPosition;
+        notifyListeners();
+      }
+      _bufferedPosition = _readBufferedPosition(_controller!);
+
+      _seekPersistTimer?.cancel();
+      _seekPersistTimer = Timer(const Duration(milliseconds: 500), () {
+        _saveCurrentProgress(immediate: true).catchError((e) {
+          debugPrint('MediaPlaybackService: 保存进度失败 $e');
+        });
+        _savePlaybackStateSnapshot().catchError((e) {
+          debugPrint('MediaPlaybackService: 保存播放状态快照失败 $e');
+        });
+      });
+
       notifyListeners();
     } catch (e) {
       debugPrint('MediaPlaybackService: 跳转失败 $e');
@@ -414,6 +529,9 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// 播放下一个媒体
   Future<void> playNext({bool autoPlay = true}) async {
+    // 确保播放列表是最新的
+    _playlistManager?.reloadPlaylist();
+    
     final nextItem = _playlistManager?.getNext();
     if (nextItem != null) {
       // 保存当前进度
@@ -431,6 +549,9 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// 播放上一个媒体
   Future<void> playPrevious({bool autoPlay = true}) async {
+    // 确保播放列表是最新的
+    _playlistManager?.reloadPlaylist();
+
     final previousItem = _playlistManager?.getPrevious();
     if (previousItem != null) {
       // 保存当前进度
@@ -456,9 +577,19 @@ class MediaPlaybackService extends ChangeNotifier {
     // 检查播放完成
     final position = _controller!.value.position;
     final duration = _controller!.value.duration;
+    final controllerIsPlaying = _controller!.value.isPlaying;
+    final bufferedPosition = _readBufferedPosition(_controller!);
+    if (bufferedPosition != _bufferedPosition) {
+      _bufferedPosition = bufferedPosition;
+    }
     
     if (position >= duration && duration > Duration.zero && _state == PlaybackState.playing) {
       _onPlaybackCompleted();
+    }
+
+    if (_lastControllerIsPlaying != controllerIsPlaying) {
+      _lastControllerIsPlaying = controllerIsPlaying;
+      updatePlaybackStateFromController();
     }
   }
   
@@ -471,37 +602,63 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
     
-    final position = _position;
-    
-    // 重置索引如果越界
-    if (_lastSubtitleIndex >= _subtitles.length || 
-        (_lastSubtitleIndex > 0 && position < _subtitles[_lastSubtitleIndex].startTime)) {
-      _lastSubtitleIndex = 0;
+    if (_subtitleStartMs.length != _subtitles.length) {
+      _subtitleStartMs
+        ..clear()
+        ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
     }
-    
+
+    final int posMs = _position.inMilliseconds;
+
+    int foundIndex = -1;
+    if (_lastSubtitleIndex >= 0 && _lastSubtitleIndex < _subtitles.length) {
+      final int lastStart = _subtitleStartMs[_lastSubtitleIndex];
+      final int lastEnd = (_lastSubtitleIndex + 1 < _subtitles.length)
+          ? _subtitleStartMs[_lastSubtitleIndex + 1]
+          : _subtitles[_lastSubtitleIndex].endTime.inMilliseconds;
+      if (posMs >= lastStart && posMs < lastEnd) {
+        foundIndex = _lastSubtitleIndex;
+      } else if (_lastSubtitleIndex + 1 < _subtitles.length) {
+        final int nextIndex = _lastSubtitleIndex + 1;
+        final int nextStart = _subtitleStartMs[nextIndex];
+        final int nextEnd = (nextIndex + 1 < _subtitles.length)
+            ? _subtitleStartMs[nextIndex + 1]
+            : _subtitles[nextIndex].endTime.inMilliseconds;
+        if (posMs >= nextStart && posMs < nextEnd) {
+          foundIndex = nextIndex;
+        }
+      }
+    }
+
+    if (foundIndex == -1) {
+      int low = 0;
+      int high = _subtitleStartMs.length - 1;
+      int ans = -1;
+      while (low <= high) {
+        final int mid = (low + high) >> 1;
+        if (_subtitleStartMs[mid] <= posMs) {
+          ans = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      if (ans >= 0 && ans < _subtitles.length) {
+        final int endMs = (ans + 1 < _subtitles.length)
+            ? _subtitleStartMs[ans + 1]
+            : _subtitles[ans].endTime.inMilliseconds;
+        if (posMs < endMs) {
+          foundIndex = ans;
+        }
+      }
+    }
+
     SubtitleItem? foundSubtitle;
-    
-    // 从上次索引开始查找
-    for (int i = _lastSubtitleIndex; i < _subtitles.length; i++) {
-      final item = _subtitles[i];
-      
-      // 如果位置在字幕开始之前，停止查找
-      if (position < item.startTime) break;
-      
-      // 计算有效结束时间（连续字幕：延伸到下一句开始）
-      Duration effectiveEndTime = item.endTime;
-      if (i + 1 < _subtitles.length) {
-        effectiveEndTime = _subtitles[i + 1].startTime;
-      }
-      
-      // 如果位置在有效时间范围内
-      if (position < effectiveEndTime) {
-        foundSubtitle = item;
-        _lastSubtitleIndex = i;
-        break;
-      }
-      
-      _lastSubtitleIndex = i + 1;
+    if (foundIndex >= 0 && foundIndex < _subtitles.length) {
+      foundSubtitle = _subtitles[foundIndex];
+      _lastSubtitleIndex = foundIndex;
+    } else {
+      _lastSubtitleIndex = 0;
     }
     
     if (_currentSubtitle != foundSubtitle) {
@@ -530,17 +687,12 @@ class MediaPlaybackService extends ChangeNotifier {
     
     // 每5秒保存一次进度
     _progressTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      _saveCurrentProgress();
+      _saveCurrentProgress(immediate: true);
+      _savePlaybackStateSnapshot();
     });
     
-    // 每100毫秒更新一次UI位置（确保实时同步）
-    _positionUpdateTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _positionUpdateTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
       _updatePosition();
-    });
-    
-    // 每1秒更新一次通知栏进度（避免过于频繁）
-    _notificationUpdateTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _updateNotificationProgress();
     });
   }
   
@@ -550,8 +702,6 @@ class MediaPlaybackService extends ChangeNotifier {
     _progressTimer = null;
     _positionUpdateTimer?.cancel();
     _positionUpdateTimer = null;
-    _notificationUpdateTimer?.cancel();
-    _notificationUpdateTimer = null;
   }
   
   /// 更新播放位置（用于实时UI同步）
@@ -561,11 +711,26 @@ class MediaPlaybackService extends ChangeNotifier {
     
     final newPosition = _controller!.value.position;
     final newDuration = _controller!.value.duration;
+    final newBufferedPosition = _readBufferedPosition(_controller!);
+    final durationChanged = newDuration != _duration;
     
     // 只有当位置或时长发生变化时才通知监听器
-    if (newPosition != _position || newDuration != _duration) {
+    if (newPosition != _position || newDuration != _duration || newBufferedPosition != _bufferedPosition) {
       _position = newPosition;
       _duration = newDuration;
+      _bufferedPosition = newBufferedPosition;
+      if (_currentItem != null && _progressTracker != null && _duration > Duration.zero) {
+        final durationMs = _duration.inMilliseconds;
+        if (_currentItem!.durationMs == 0 || _currentItem!.durationMs != durationMs) {
+          _progressTracker!.saveDurationImmediately(_currentItem!.id, _duration);
+        }
+      }
+
+      if (durationChanged &&
+          _currentItem != null &&
+          _duration > Duration.zero) {
+        // _lastPushedMediaDuration was removed
+      }
       
       // 更新当前字幕
       _updateCurrentSubtitle();
@@ -579,21 +744,7 @@ class MediaPlaybackService extends ChangeNotifier {
     }
   }
   
-  /// 更新通知栏进度（每秒更新一次）
-  void _updateNotificationProgress() {
-    if (_audioSessionService == null || _currentItem == null) return;
-    if (_state != PlaybackState.playing) return;
-    
-    try {
-      _audioSessionService!.updatePlaybackState(
-        playing: true,
-        position: _position,
-        duration: _duration,
-      );
-    } catch (e) {
-      debugPrint('MediaPlaybackService: 更新通知栏进度失败 $e');
-    }
-  }
+  // _updateNotificationProgress 已移除，改用事件驱动
   
   /// 保存当前播放进度
   Future<void> _saveCurrentProgress({bool immediate = false}) async {
@@ -617,79 +768,25 @@ class MediaPlaybackService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _seekPersistTimer?.cancel();
+    _seekPersistTimer = null;
     _stopProgressTracking();
     _disposeController();
+    _applyWakelock(false);
+    _wakelockApplied = false;
     super.dispose();
   }
   
-  /// 更新音频服务的媒体信息和播放状态
-  Future<void> _updateAudioService() async {
-    if (_audioSessionService == null || _currentItem == null) return;
-    
-    try {
-      // 设置播放队列（如果还没有设置）
-      if (_playlistManager != null && _playlistManager!.playlist.isNotEmpty) {
-        final currentIndex = _playlistManager!.currentIndex;
-        final mediaInfoList = _playlistManager!.playlist.map((item) => MediaInfo(
-          title: item.title,
-          duration: Duration(milliseconds: item.durationMs),
-          artworkPath: item.thumbnailPath,
-        )).toList();
-        
-        await _audioSessionService!.setQueue(mediaInfoList, currentIndex);
+  Duration _readBufferedPosition(VideoPlayerController controller) {
+    final ranges = controller.value.buffered;
+    if (ranges.isEmpty) return Duration.zero;
+    Duration maxEnd = Duration.zero;
+    for (final range in ranges) {
+      if (range.end > maxEnd) {
+        maxEnd = range.end;
       }
-      
-      // 更新媒体信息
-      await _audioSessionService!.updateMediaInfo(
-        MediaInfo(
-          title: _currentItem!.title,
-          duration: _duration,
-          artworkPath: _currentItem!.thumbnailPath,
-        ),
-      );
-      
-      // 更新播放状态（包含时长信息）
-      await _audioSessionService!.updatePlaybackState(
-        playing: _state == PlaybackState.playing,
-        position: _position,
-        duration: _duration,
-      );
-      
-      // 根据播放状态调用 play 或 pause
-      if (_state == PlaybackState.playing) {
-        await _audioSessionService!.play();
-      } else if (_state == PlaybackState.paused) {
-        await _audioSessionService!.pause();
-      }
-    } catch (e) {
-      debugPrint('MediaPlaybackService: 更新音频服务失败 $e');
     }
-  }
-  
-  /// 处理来自音频服务的媒体操作
-  void _handleMediaAction(MediaActionEvent event) {
-    switch (event.action) {
-      case CustomMediaAction.play:
-        resume();
-        break;
-      case CustomMediaAction.pause:
-        pause();
-        break;
-      case CustomMediaAction.stop:
-        stop();
-        break;
-      case CustomMediaAction.next:
-        playNext();
-        break;
-      case CustomMediaAction.previous:
-        playPrevious();
-        break;
-      case CustomMediaAction.seekTo:
-        if (event.seekPosition != null) {
-          seekTo(event.seekPosition!);
-        }
-        break;
-    }
+    return maxEnd;
   }
   
   /// 保存播放状态快照

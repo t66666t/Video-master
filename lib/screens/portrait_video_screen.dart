@@ -1,6 +1,7 @@
+import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -53,8 +54,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   bool _isLocked = false;
   String _currentSubtitleText = "";
   String? _currentSecondaryText;
+  int _currentSubtitleIndex = -1;
+  int _currentSecondarySubtitleIndex = -1;
   int _lastSubtitleIndex = 0;
   int _lastSecondarySubtitleIndex = 0;
+  final List<int> _subtitleStartMs = <int>[];
+  final List<int> _secondarySubtitleStartMs = <int>[];
+  Timer? _subtitleSeekTimer;
   bool _isSubtitleDragMode = false;
   bool _isSubtitleSnapped = false;
   PortraitPanel _activePanel = PortraitPanel.subtitles;
@@ -62,7 +68,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   // Bottom Control Bar State
   bool _isDraggingProgress = false;
   double _dragProgressValue = 0.0;
-  bool _showVolumeSlider = false;
+  final bool _showVolumeSlider = false;
   final LayerLink _volumeButtonLayerLink = LayerLink();
 
   bool _isOrientationSetup = false;
@@ -72,6 +78,15 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   // Audio state
   bool _isAudio = false;
   late VideoItem _currentItem;
+  SettingsService? _settingsService;
+  bool? _lastShowSubtitles;
+  Duration? _lastSubtitleOffset;
+  bool? _lastSplitSubtitleByLine;
+  bool? _lastVideoContinuousSubtitle;
+  bool? _lastAudioContinuousSubtitle;
+  bool? _lastIsPlayingForServiceSync;
+  String? _autoEmbeddedAttemptedForItemId;
+  bool _isLoadingEmbeddedSubtitle = false;
 
   @override
   void initState() {
@@ -86,6 +101,42 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         Provider.of<MediaPlaybackService>(context, listen: false).addListener(_onPlaybackServiceChange);
       }
     });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      _settingsService = settings;
+      _lastShowSubtitles = settings.showSubtitles;
+      _lastSubtitleOffset = settings.subtitleOffset;
+      _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+      _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+      _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+      settings.addListener(_onSettingsChanged);
+      _onSettingsChanged();
+    });
+  }
+
+  void _onSettingsChanged() {
+    final settings = _settingsService;
+    if (settings == null) return;
+
+    final bool changed = _lastShowSubtitles != settings.showSubtitles ||
+        _lastSubtitleOffset != settings.subtitleOffset ||
+        _lastSplitSubtitleByLine != settings.splitSubtitleByLine ||
+        _lastVideoContinuousSubtitle != settings.videoContinuousSubtitle ||
+        _lastAudioContinuousSubtitle != settings.audioContinuousSubtitle;
+
+    if (!changed) return;
+
+    _lastShowSubtitles = settings.showSubtitles;
+    _lastSubtitleOffset = settings.subtitleOffset;
+    _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+    _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+    _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+
+    if (_initialized) {
+      _updateSubtitle();
+    }
   }
   
   void _onPlaybackServiceChange() {
@@ -98,14 +149,70 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         _initialized = false;
         _isControllerAssigned = false;
         _subtitles = [];
+        _secondarySubtitles = [];
+        _currentSubtitlePaths = [];
         _currentSubtitleText = "";
+        _currentSecondaryText = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _autoEmbeddedAttemptedForItemId = null;
       });
       _initPlayer();
     } else if (!_initialized && service.currentItem?.id == _currentItem.id && 
                service.state != PlaybackState.loading && service.controller != null) {
       // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
       _initPlayer();
+    } else if (service.currentItem?.id == _currentItem.id) {
+      final bool pathsChanged = !_stringListEquals(service.subtitlePaths, _currentSubtitlePaths);
+      final bool primaryChanged = service.subtitles.length != _subtitles.length;
+      final bool secondaryChanged = service.secondarySubtitles.length != _secondarySubtitles.length;
+      if (pathsChanged || primaryChanged || secondaryChanged) {
+        setState(() {
+          _subtitles = service.subtitles;
+          _secondarySubtitles = service.secondarySubtitles;
+          _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
+          _lastSubtitleIndex = 0;
+          _lastSecondarySubtitleIndex = 0;
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+        });
+        _rebuildSubtitleIndex();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateSubtitle();
+        });
+      }
     }
+  }
+
+  bool _stringListEquals(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  void _maybeAutoLoadEmbeddedSubtitle() {
+    final currentId = _currentItem.id;
+    if (_autoEmbeddedAttemptedForItemId == currentId) return;
+    if (_currentItem.subtitlePath != null) return;
+    if (_currentSubtitlePaths.isNotEmpty) return;
+    if (_subtitles.isNotEmpty || _secondarySubtitles.isNotEmpty) return;
+    try {
+      final service = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (service.subtitlePaths.isNotEmpty || service.subtitles.isNotEmpty || service.secondarySubtitles.isNotEmpty) {
+        return;
+      }
+    } catch (_) {}
+
+    _autoEmbeddedAttemptedForItemId = currentId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _checkAndLoadEmbeddedSubtitle(showToastWhenNone: false, showLoadingIndicator: false);
+    });
   }
 
   @override
@@ -216,15 +323,44 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     }
   }
 
-  Future<void> _checkAndLoadEmbeddedSubtitle() async {
+  Future<void> _checkAndLoadEmbeddedSubtitle({
+    bool showToastWhenNone = true,
+    bool showLoadingIndicator = true,
+  }) async {
     // If we already have subtitles loaded (e.g. from file), don't override
     if (_subtitles.isNotEmpty) return;
+    if (_isLoadingEmbeddedSubtitle) return;
     
     // Determine video path
     String path = _currentItem.path;
     
     // Check embedded
     try {
+      final messenger = ScaffoldMessenger.of(context);
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final library = Provider.of<LibraryService>(context, listen: false);
+      _isLoadingEmbeddedSubtitle = true;
+      if (showLoadingIndicator && mounted) {
+        messenger.clearSnackBars();
+        messenger.showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                ),
+                SizedBox(width: 12),
+                Text("正在检测内嵌字幕..."),
+              ],
+            ),
+            duration: Duration(seconds: 10),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: Color(0xFF2C2C2C),
+          ),
+        );
+      }
       final service = Provider.of<EmbeddedSubtitleService>(context, listen: false);
       final tracks = await service.getEmbeddedSubtitles(path);
       
@@ -247,9 +383,30 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           if (_subtitles.isNotEmpty) return;
           
           await _loadSubtitles([extractedPath]);
+
+          if (_currentItem.subtitlePath == null) {
+            try {
+              final String? currentSecondary =
+                  _currentSubtitlePaths.length > 1 ? _currentSubtitlePaths[1] : _currentItem.secondarySubtitlePath;
+              await library.updateVideoSubtitles(
+                _currentItem.id,
+                extractedPath,
+                settings.autoCacheSubtitles,
+                secondarySubtitlePath: currentSecondary,
+                isSecondaryCached: settings.autoCacheSubtitles,
+              );
+              final updated = library.getVideo(_currentItem.id);
+              if (updated != null && mounted) {
+                setState(() {
+                  _currentItem = updated;
+                });
+              }
+            } catch (_) {}
+          }
           
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
+          if (!mounted) return;
+          messenger.clearSnackBars();
+          messenger.showSnackBar(
             SnackBar(
               content: Text("已加载内嵌字幕: ${track.title}"),
               duration: const Duration(seconds: 3),
@@ -260,11 +417,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         }
       } else {
         if (mounted) {
-           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("未找到内嵌字幕")));
+          messenger.clearSnackBars();
+          if (showToastWhenNone) {
+            messenger.showSnackBar(const SnackBar(content: Text("未找到内嵌字幕")));
+          }
         }
       }
     } catch (e) {
       debugPrint("Auto load embedded subtitle failed: $e");
+    } finally {
+      _isLoadingEmbeddedSubtitle = false;
     }
   }
 
@@ -334,15 +496,21 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
             paths.add(currentItem.secondarySubtitlePath!);
           }
           await _loadSubtitles(paths);
+        } else {
+          _maybeAutoLoadEmbeddedSubtitle();
         }
         
         // 不需要再次调用 play()，因为 MediaPlaybackService 已经在管理播放状态
         // 但为了保险起见，同步一次状态
+        playbackService.updatePlaybackStateFromController();
         if (playbackService.isPlaying) {
-           if (!_controller.value.isPlaying) _controller.play();
+          if (!_controller.value.isPlaying) playbackService.resume();
         } else {
-           if (_controller.value.isPlaying) _controller.pause();
+          if (_controller.value.isPlaying) playbackService.pause();
         }
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateSubtitle();
+        });
         return;
       }
     } catch (e) {
@@ -350,16 +518,33 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       // 继续使用原有逻辑创建新的 controller
     }
 
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (playbackService.currentItem?.id != currentItem.id || playbackService.controller == null) {
+        if (mounted) {
+          setState(() {
+            _initialized = false;
+          });
+        }
+        playbackService.play(currentItem);
+        return;
+      }
+    } catch (_) {}
+
     final file = File(currentItem.path);
     // Initialize controller immediately to prevent LateInitializationError in UI
     _controller = VideoPlayerController.file(file);
     _isControllerAssigned = true;
+    final messenger = ScaffoldMessenger.of(context);
+    final libraryService = Provider.of<LibraryService>(context, listen: false);
+    final settingsService = Provider.of<SettingsService>(context, listen: false);
+    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
 
     if (!await file.exists()) {
-      print("Video file not found: ${currentItem.path}");
+      developer.log('Video file not found: ${currentItem.path}');
       if (mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.clearSnackBars();
+        messenger.showSnackBar(
           SnackBar(
             content: Text("视频文件不存在: ${currentItem.path}"),
             backgroundColor: Colors.red,
@@ -379,8 +564,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       // Update duration if missing
       final duration = _controller.value.duration.inMilliseconds;
       if (currentItem.durationMs == 0 || currentItem.durationMs != duration) {
-        Provider.of<LibraryService>(context, listen: false)
-            .updateVideoDuration(currentItem.id, duration);
+        libraryService.updateVideoDuration(currentItem.id, duration);
       }
       
       // Seek to last position
@@ -389,8 +573,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       }
       
       // Apply global settings
-      final settings = Provider.of<SettingsService>(context, listen: false);
-      await _controller.setPlaybackSpeed(settings.playbackSpeed);
+      await _controller.setPlaybackSpeed(settingsService.playbackSpeed);
 
       // 首先检查是否有刚完成的AI字幕（即使 isResultConsumed 为 true）
       _checkAndLoadAiSubtitle(currentItem);
@@ -402,13 +585,25 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           paths.add(currentItem.secondarySubtitlePath!);
         }
         await _loadSubtitles(paths);
+      } else {
+        _maybeAutoLoadEmbeddedSubtitle();
       }
 
       setState(() {
         _initialized = true;
       });
-      _controller.play();
       _controller.addListener(_videoListener);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _updateSubtitle();
+      });
+
+      try {
+        playbackService.setController(_controller);
+        await playbackService.updateMetadata(currentItem);
+        await playbackService.resume();
+      } catch (e) {
+        debugPrint("Failed to register controller with service: $e");
+      }
 
       // Auto Load Embedded if enabled
       Future.delayed(const Duration(seconds: 1), () {
@@ -420,9 +615,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         }
       });
     } catch (e) {
-      print("Error initializing player: $e");
+      developer.log('Error initializing player', error: e);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(
             content: Text("无法加载视频: $e"),
             backgroundColor: Colors.red,
@@ -433,8 +628,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   }
   
   void _videoListener() {
-    // Periodic save (e.g., when paused or every X seconds) could be added here
-    // For now, we save on dispose/deactivate
+    final isPlayingNow = _controller.value.isPlaying;
+    if (_lastIsPlayingForServiceSync != isPlayingNow) {
+      _lastIsPlayingForServiceSync = isPlayingNow;
+      try {
+        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+        if (playbackService.controller == _controller) {
+          playbackService.updatePlaybackStateFromController();
+        }
+      } catch (_) {}
+    }
     _updateSubtitle();
   }
 
@@ -443,62 +646,66 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     final settings = Provider.of<SettingsService>(context, listen: false);
     
     if (!settings.showSubtitles) {
-      if (_currentSubtitleText.isNotEmpty) {
-        setState(() => _currentSubtitleText = "");
+      if (_currentSubtitleText.isNotEmpty || _currentSecondaryText != null || _currentSubtitleIndex != -1 || _currentSecondarySubtitleIndex != -1) {
+        setState(() {
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+        });
       }
       return;
     }
 
     final position = _controller.value.position;
     final adjustedPosition = position - settings.subtitleOffset;
+    final int posMs = adjustedPosition.inMilliseconds;
     final continuousSubtitleEnabled = _isAudio ? settings.audioContinuousSubtitle : settings.videoContinuousSubtitle;
     
     // --- Primary Subtitle ---
     SubtitleItem? currentItem;
+    int primaryIndex = -1;
     if (_subtitles.isNotEmpty) {
-      if (_lastSubtitleIndex >= _subtitles.length || 
-          (_lastSubtitleIndex > 0 && adjustedPosition < _subtitles[_lastSubtitleIndex].startTime)) {
-        _lastSubtitleIndex = 0;
+      if (_subtitleStartMs.length != _subtitles.length) {
+        _rebuildSubtitleIndex();
       }
-
-      for (int i = _lastSubtitleIndex; i < _subtitles.length; i++) {
-        final item = _subtitles[i];
-        if (adjustedPosition < item.startTime) break;
-        Duration effectiveEndTime = item.endTime;
-        if (continuousSubtitleEnabled && i + 1 < _subtitles.length) {
-          effectiveEndTime = _subtitles[i + 1].startTime;
-        }
-        if (adjustedPosition < effectiveEndTime) {
-          currentItem = item;
-          _lastSubtitleIndex = i;
-          break;
-        }
-        _lastSubtitleIndex = i + 1;
+      final int index = _findSubtitleIndexMs(
+        posMs: posMs,
+        subtitles: _subtitles,
+        startMs: _subtitleStartMs,
+        lastIndex: _lastSubtitleIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (index >= 0) {
+        currentItem = _subtitles[index];
+        _lastSubtitleIndex = index;
+        primaryIndex = index;
+      } else {
+        _lastSubtitleIndex = 0;
       }
     }
 
     // --- Secondary Subtitle ---
     SubtitleItem? currentSecondaryItem;
+    int secondaryIndex = -1;
     if (_secondarySubtitles.isNotEmpty) {
-       if (_lastSecondarySubtitleIndex >= _secondarySubtitles.length ||
-           (_lastSecondarySubtitleIndex > 0 && adjustedPosition < _secondarySubtitles[_lastSecondarySubtitleIndex].startTime)) {
-          _lastSecondarySubtitleIndex = 0;
-       }
-       
-       for (int i = _lastSecondarySubtitleIndex; i < _secondarySubtitles.length; i++) {
-          final item = _secondarySubtitles[i];
-          if (adjustedPosition < item.startTime) break;
-          Duration effectiveEndTime = item.endTime;
-          if (continuousSubtitleEnabled && i + 1 < _secondarySubtitles.length) {
-            effectiveEndTime = _secondarySubtitles[i + 1].startTime;
-          }
-          if (adjustedPosition < effectiveEndTime) {
-             currentSecondaryItem = item;
-             _lastSecondarySubtitleIndex = i;
-             break;
-          }
-          _lastSecondarySubtitleIndex = i + 1;
-       }
+      if (_secondarySubtitleStartMs.length != _secondarySubtitles.length) {
+        _rebuildSubtitleIndex();
+      }
+      final int index = _findSubtitleIndexMs(
+        posMs: posMs,
+        subtitles: _secondarySubtitles,
+        startMs: _secondarySubtitleStartMs,
+        lastIndex: _lastSecondarySubtitleIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (index >= 0) {
+        currentSecondaryItem = _secondarySubtitles[index];
+        _lastSecondarySubtitleIndex = index;
+        secondaryIndex = index;
+      } else {
+        _lastSecondarySubtitleIndex = 0;
+      }
     }
     
     String newText = currentItem?.text ?? "";
@@ -513,15 +720,53 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
        }
     }
     
-    if (_currentSubtitleText != newText || _currentSecondaryText != newSecondaryText) {
-      setState(() {
-        _currentSubtitleText = newText;
-        _currentSecondaryText = newSecondaryText;
-      });
+    final bool primaryChanged = primaryIndex != _currentSubtitleIndex;
+    final bool secondaryChanged = secondaryIndex != _currentSecondarySubtitleIndex;
+    if (!primaryChanged && !secondaryChanged) return;
+
+    setState(() {
+      _currentSubtitleIndex = primaryIndex;
+      _currentSecondarySubtitleIndex = secondaryIndex;
+      _currentSubtitleText = newText;
+      _currentSecondaryText = newSecondaryText;
+    });
+  }
+
+  void _seekToSubtitleFast(Duration target) {
+    if (!_initialized || !_controller.value.isInitialized) return;
+    final duration = _controller.value.duration;
+    Duration clamped = target;
+    if (clamped < Duration.zero) clamped = Duration.zero;
+    if (duration > Duration.zero && clamped > duration) clamped = duration;
+
+    _subtitleSeekTimer?.cancel();
+    _subtitleSeekTimer = null;
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (playbackService.controller == _controller) {
+        playbackService.seekTo(clamped);
+      } else {
+        _controller.seekTo(clamped);
+      }
+    } catch (_) {
+      _controller.seekTo(clamped);
     }
   }
 
   void _togglePlay() {
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (playbackService.controller == _controller) {
+        playbackService.updatePlaybackStateFromController();
+        if (_controller.value.isPlaying) {
+          playbackService.pause();
+        } else {
+          playbackService.resume();
+        }
+        return;
+      }
+    } catch (_) {}
+
     if (_controller.value.isPlaying) {
       _controller.pause();
     } else {
@@ -566,22 +811,36 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
 
   Future<void> _pickSubtitle() async {
     try {
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final library = Provider.of<LibraryService>(context, listen: false);
+
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['srt', 'lrc', 'vtt'],
         withData: true, 
       );
 
+      if (!mounted) return;
+
       if (result != null) {
         final file = result.files.single;
         String path = file.path!;
         
         // Auto Cache Logic
-        final settings = Provider.of<SettingsService>(context, listen: false);
-        await Provider.of<LibraryService>(context, listen: false)
-              .updateVideoSubtitles(_currentItem.id, path, settings.autoCacheSubtitles);
+        final String? currentSecondary = _currentSubtitlePaths.length > 1 ? _currentSubtitlePaths[1] : _currentItem.secondarySubtitlePath;
+        await library.updateVideoSubtitles(
+          _currentItem.id,
+          path,
+          settings.autoCacheSubtitles,
+          secondarySubtitlePath: currentSecondary,
+          isSecondaryCached: settings.autoCacheSubtitles,
+        );
         
-        await _loadSubtitles([path]);
+        final List<String> pathsToLoad = [path];
+        if (currentSecondary != null && currentSecondary.isNotEmpty) {
+          pathsToLoad.add(currentSecondary);
+        }
+        await _loadSubtitles(pathsToLoad);
         
         if (mounted) {
           ScaffoldMessenger.of(context).clearSnackBars();
@@ -591,22 +850,25 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         }
       }
     } catch (e) {
-      print("Error picking subtitle: $e");
+      developer.log('Error picking subtitle', error: e);
     }
   }
 
   void _openSubtitleStyleSettings() {
-    print("Opening subtitle style settings");
+    developer.log('Opening subtitle style settings');
     setState(() {
       _activePanel = PortraitPanel.subtitleStyle;
     });
   }
 
   Future<void> _loadSubtitles(List<String> paths) async {
+    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+
     if (paths.isEmpty) {
       // 清空字幕时也同步到 MediaPlaybackService
-      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-      playbackService.setSubtitles([]);
+      playbackService.clearSubtitleState();
+      _subtitleStartMs.clear();
+      _secondarySubtitleStartMs.clear();
       return;
     }
     
@@ -648,6 +910,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       secondary = await parseFile(paths[1]);
     }
 
+    if (!mounted) return;
+
     setState(() {
       _subtitles = primary;
       _secondarySubtitles = secondary;
@@ -656,11 +920,99 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _lastSecondarySubtitleIndex = 0;
       _currentSubtitleText = "";
       _currentSecondaryText = null;
+      _currentSubtitleIndex = -1;
+      _currentSecondarySubtitleIndex = -1;
     });
+    _rebuildSubtitleIndex();
     
-    // 同步主字幕到 MediaPlaybackService
-    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-    playbackService.setSubtitles(primary);
+    playbackService.setSubtitleState(paths: paths, primary: primary, secondary: secondary);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _updateSubtitle();
+    });
+  }
+
+  void _rebuildSubtitleIndex() {
+    _subtitleStartMs
+      ..clear()
+      ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
+    _secondarySubtitleStartMs
+      ..clear()
+      ..addAll(_secondarySubtitles.map((e) => e.startTime.inMilliseconds));
+  }
+
+  int _getEffectiveEndMs({
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required int index,
+    required bool continuousSubtitleEnabled,
+  }) {
+    final SubtitleItem item = subtitles[index];
+    if (!continuousSubtitleEnabled) return item.endTime.inMilliseconds;
+    if (index + 1 < subtitles.length) return startMs[index + 1];
+    return item.endTime.inMilliseconds;
+  }
+
+  int _binarySearchLastStartLE(List<int> startMs, int posMs) {
+    int low = 0;
+    int high = startMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (startMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  int _findSubtitleIndexMs({
+    required int posMs,
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required int lastIndex,
+    required bool continuousSubtitleEnabled,
+  }) {
+    if (subtitles.isEmpty) return -1;
+
+    if (lastIndex >= 0 && lastIndex < subtitles.length) {
+      final int lastStartMs = startMs[lastIndex];
+      final int lastEndMs = _getEffectiveEndMs(
+        subtitles: subtitles,
+        startMs: startMs,
+        index: lastIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (posMs >= lastStartMs && posMs < lastEndMs) {
+        return lastIndex;
+      }
+      final int nextIndex = lastIndex + 1;
+      if (nextIndex < subtitles.length) {
+        final int nextStartMs = startMs[nextIndex];
+        final int nextEndMs = _getEffectiveEndMs(
+          subtitles: subtitles,
+          startMs: startMs,
+          index: nextIndex,
+          continuousSubtitleEnabled: continuousSubtitleEnabled,
+        );
+        if (posMs >= nextStartMs && posMs < nextEndMs) {
+          return nextIndex;
+        }
+      }
+    }
+
+    final int candidate = _binarySearchLastStartLE(startMs, posMs);
+    if (candidate < 0 || candidate >= subtitles.length) return -1;
+    final int endMs = _getEffectiveEndMs(
+      subtitles: subtitles,
+      startMs: startMs,
+      index: candidate,
+      continuousSubtitleEnabled: continuousSubtitleEnabled,
+    );
+    if (posMs < endMs) return candidate;
+    return -1;
   }
 
   @override
@@ -678,13 +1030,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
 
   Future<void> _handleExit() async {
      try {
-       await _saveProgress();
-       
        final settings = Provider.of<SettingsService>(context, listen: false);
        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+       await _saveProgress();
        
        if (settings.autoPauseOnExit && _controller.value.isPlaying) {
-          await _controller.pause();
+          if (playbackService.controller == _controller) {
+            await playbackService.pause();
+          } else {
+            await _controller.pause();
+          }
        }
        
        // Force sync state
@@ -704,9 +1059,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     try {
       Provider.of<MediaPlaybackService>(context, listen: false).removeListener(_onPlaybackServiceChange);
     } catch (_) {}
+    _settingsService?.removeListener(_onSettingsChanged);
 
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
     _selectionFocusNode.dispose();
+    _subtitleSeekTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     // Restore orientations to default (allow all)
     SystemChrome.setPreferredOrientations([]);
@@ -714,6 +1071,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _controller.removeListener(_videoListener);
       // 只有当我们拥有 controller 时才 dispose
       if (_isControllerOwner) {
+        try {
+          final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+          if (playbackService.controller == _controller) {
+            playbackService.clearController();
+          }
+        } catch (e) {
+          debugPrint("Error clearing controller from service: $e");
+        }
         _controller.dispose();
       }
     }
@@ -739,6 +1104,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           videoFile: null, // Legacy param, ignored
           existingController: _controller, // Pass controller
           videoItem: _currentItem, // Pass item for context
+          skipAutoPauseOnExit: true,
         ),
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
           return FadeTransition(
@@ -757,20 +1123,32 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     
     // When returning, we need to refresh state if settings changed
     // And force reload subtitle in case it was changed in landscape
-    if (_currentItem.subtitlePath != null) {
-      await _loadSubtitles([_currentItem.subtitlePath!]);
+    try {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      final updated = library.getVideo(_currentItem.id);
+      if (updated != null) {
+        _currentItem = updated;
+      }
+    } catch (_) {}
+
+    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+    if (playbackService.subtitlePaths.isNotEmpty) {
+      await _loadSubtitles(playbackService.subtitlePaths);
+    } else if (_currentItem.subtitlePath != null) {
+      final List<String> paths = [_currentItem.subtitlePath!];
+      if (_currentItem.secondarySubtitlePath != null) {
+        paths.add(_currentItem.secondarySubtitlePath!);
+      }
+      await _loadSubtitles(paths);
     } else {
-      // If subtitle was removed
       setState(() {
         _subtitles = [];
         _secondarySubtitles = [];
+        _currentSubtitlePaths = [];
         _currentSubtitleText = "";
         _currentSecondaryText = null;
       });
-      
-      // 同步到 MediaPlaybackService
-      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-      playbackService.setSubtitles([]);
+      playbackService.clearSubtitleState();
     }
 
     setState(() {});
@@ -838,7 +1216,17 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                       });
                     },
                     onChangeEnd: (newValue) {
-                      _controller.seekTo(Duration(milliseconds: newValue.toInt()));
+                      final pos = Duration(milliseconds: newValue.toInt());
+                      try {
+                        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+                        if (playbackService.controller == _controller) {
+                          playbackService.seekTo(pos);
+                        } else {
+                          _controller.seekTo(pos);
+                        }
+                      } catch (_) {
+                        _controller.seekTo(pos);
+                      }
                       setState(() {
                         _isDraggingProgress = false;
                       });
@@ -856,6 +1244,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                 onSelected: (speed) {
                   _controller.setPlaybackSpeed(speed);
                   settings.updateSetting('playbackSpeed', speed);
+                  try {
+                    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+                    if (playbackService.controller == _controller) {
+                      playbackService.updatePlaybackStateFromController();
+                    }
+                  } catch (_) {}
                 },
                 constraints: const BoxConstraints(maxHeight: 400), // Limit height to ensure scrolling behavior is obvious
                 itemBuilder: (context) => [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0].map((speed) {
@@ -944,7 +1338,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
               InkWell(
                 onTap: () {
                    final newPos = value.position - Duration(seconds: settings.doubleTapSeekSeconds);
-                   _controller.seekTo(newPos < Duration.zero ? Duration.zero : newPos);
+                   final pos = newPos < Duration.zero ? Duration.zero : newPos;
+                   if (playbackService.controller == _controller) {
+                     playbackService.seekTo(pos);
+                   } else {
+                     _controller.seekTo(pos);
+                   }
                 },
                 borderRadius: BorderRadius.circular(30),
                 child: SizedBox(
@@ -987,7 +1386,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                 onTap: () {
                    final newPos = value.position + Duration(seconds: settings.doubleTapSeekSeconds);
                    final duration = value.duration;
-                   _controller.seekTo(newPos > duration ? duration : newPos);
+                   final pos = newPos > duration ? duration : newPos;
+                   if (playbackService.controller == _controller) {
+                     playbackService.seekTo(pos);
+                   } else {
+                     _controller.seekTo(pos);
+                   }
                 },
                 borderRadius: BorderRadius.circular(30),
                 child: SizedBox(
@@ -1035,30 +1439,36 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       builder: (context, settings, child) {
         // Use WillPopScope to handle back button and reset orientation early
         // This helps reduce the "jank" when returning to a landscape screen
-        return WillPopScope(
-          onWillPop: () async {
-            if (_forceExit) {
+        return PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, result) {
+            if (didPop) return;
+            final navigator = Navigator.of(context);
+            () async {
+              if (_forceExit) {
+                SystemChrome.setPreferredOrientations([]);
+                if (mounted) navigator.pop();
+                return;
+              }
+
+              if (_isSubtitleDragMode) {
+                _exitSubtitleDragMode();
+                return;
+              }
+
+              if (_activePanel != PortraitPanel.subtitles) {
+                if (!mounted) return;
+                setState(() {
+                  _activePanel = PortraitPanel.subtitles;
+                });
+                return;
+              }
+
+              await _handleExit();
+              if (!mounted) return;
               SystemChrome.setPreferredOrientations([]);
-              return true;
-            }
-            // 1. If in subtitle drag mode, exit it first
-            if (_isSubtitleDragMode) {
-              _exitSubtitleDragMode();
-              return false;
-            }
-
-            // 2. If a sub-panel is open (Settings, AI, Manager, Style), close it and return to Subtitles list
-            if (_activePanel != PortraitPanel.subtitles) {
-              setState(() {
-                _activePanel = PortraitPanel.subtitles;
-              });
-              return false;
-            }
-
-            // 3. Otherwise, allow pop (and reset orientation)
-            await _handleExit();
-            SystemChrome.setPreferredOrientations([]);
-            return true;
+              navigator.pop();
+            }();
           },
           child: Scaffold(
             backgroundColor: Colors.black,
@@ -1118,7 +1528,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                     Container(color: Colors.black),
                                   Center(
                                     child: CircularProgressIndicator(
-                                      color: Colors.white.withOpacity(0.5),
+                                      color: Colors.white.withValues(alpha: 0.5),
                                     ),
                                   ),
                                 ],
@@ -1144,6 +1554,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                       // Reset orientation immediately for smooth transition
                                       SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
                                       Navigator.of(context).maybePop();
+                                    },
+                                    onSeekTo: (position) {
+                                      try {
+                                        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+                                        if (playbackService.controller == _controller) {
+                                          playbackService.seekTo(position);
+                                        } else {
+                                          _controller.seekTo(position);
+                                        }
+                                      } catch (_) {
+                                        _controller.seekTo(position);
+                                      }
                                     },
                                     onExitPressed: () async {
                                       _forceExit = true;
@@ -1212,7 +1634,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                       child: Container(
                                         width: 2,
                                         height: double.infinity,
-                                        color: Colors.white.withOpacity(0.5),
+                                        color: Colors.white.withValues(alpha: 0.5),
                                       ),
                                     ),
                                   Positioned(
@@ -1363,15 +1785,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         return AiTranscriptionPanel(
           videoPath: _currentItem.path,
           onCompleted: (path) async {
+            final settingsService = Provider.of<SettingsService>(context, listen: false);
+            final libraryService = Provider.of<LibraryService>(context, listen: false);
+
             // Auto load generated subtitle
             if (await File(path).exists()) {
                await _loadSubtitles([path]);
                // Also update library
-               if (mounted) {
-                 final settings = Provider.of<SettingsService>(context, listen: false);
-                 Provider.of<LibraryService>(context, listen: false)
-                    .updateVideoSubtitles(_currentItem.id, path, settings.autoCacheSubtitles);
-               }
+               libraryService.updateVideoSubtitles(_currentItem.id, path, settingsService.autoCacheSubtitles);
             }
             // Go back to subtitle view
             if (mounted) {
@@ -1381,6 +1802,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         );
       case PortraitPanel.subtitleManager:
         return SubtitleManagementSheet(
+          key: ValueKey(_currentItem.path),
           videoPath: _currentItem.path,
           additionalSubtitles: _currentItem.additionalSubtitles,
           initialSelectedPaths: _currentSubtitlePaths,
@@ -1388,34 +1810,35 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
             // Reload if needed or handled by logic
           },
           onSubtitleSelected: (paths) async {
+             final settingsService = Provider.of<SettingsService>(context, listen: false);
+             final libraryService = Provider.of<LibraryService>(context, listen: false);
+
              await _loadSubtitles(paths);
              if (mounted) {
-               final settings = Provider.of<SettingsService>(context, listen: false);
-               
                String? path0;
                String? path1;
                
                if (paths.isNotEmpty) path0 = paths[0];
                if (paths.length > 1) path1 = paths[1];
                
-               Provider.of<LibraryService>(context, listen: false)
-                  .updateVideoSubtitles(
+               libraryService.updateVideoSubtitles(
                      _currentItem.id, 
                      path0, 
-                     settings.autoCacheSubtitles,
+                     settingsService.autoCacheSubtitles,
                      secondarySubtitlePath: path1,
-                     isSecondaryCached: settings.autoCacheSubtitles
+                     isSecondaryCached: settingsService.autoCacheSubtitles
                   );
                // Keep open, no pop needed here as it is an inline panel replacement
              }
           },
           onSubtitlePreview: (path) async {
+             final settingsService = Provider.of<SettingsService>(context, listen: false);
+             final libraryService = Provider.of<LibraryService>(context, listen: false);
+
              await _loadSubtitles([path]);
              // Do not close panel
              if (mounted) {
-               final settings = Provider.of<SettingsService>(context, listen: false);
-               Provider.of<LibraryService>(context, listen: false)
-                  .updateVideoSubtitles(_currentItem.id, path, settings.autoCacheSubtitles);
+               libraryService.updateVideoSubtitles(_currentItem.id, path, settingsService.autoCacheSubtitles);
              }
           },
           onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
@@ -1479,16 +1902,15 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           isAudio: _isAudio,
         );
       case PortraitPanel.subtitles:
-      default:
         return SubtitleSidebar(
           key: const ValueKey("SubtitleSidebar"),
           subtitles: _subtitles,
           secondarySubtitles: _secondarySubtitles,
           controller: _controller, 
-          onItemTap: (duration) => _controller.seekTo(duration),
+          onItemTap: _seekToSubtitleFast,
           onClose: () {}, // Maybe close app? or hide sidebar?
           onOpenSettings: () {
-            print("Opening settings panel");
+            developer.log('Opening settings panel');
             setState(() => _activePanel = PortraitPanel.settings);
           },
           onLoadSubtitle: _pickSubtitle,
@@ -1499,6 +1921,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           isCompact: true,
           isPortrait: true,
           focusNode: _videoFocusNode,
+          isVisible: _activePanel == PortraitPanel.subtitles,
         );
     }
   }

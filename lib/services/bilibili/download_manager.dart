@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:dio/dio.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
@@ -128,7 +129,7 @@ class BilibiliDownloadManager {
             hasSubtitle = true;
           }
         } catch (e) {
-          print("Subtitle download failed: $e");
+          developer.log('Subtitle download failed', error: e);
         }
       }
       
@@ -139,7 +140,7 @@ class BilibiliDownloadManager {
 
       // 4. Merge with FFmpeg (Serialized)
       await _enqueueMerge(() async {
-        print("Starting FFmpeg merge for $fileName...");
+        developer.log('Starting FFmpeg merge for $fileName...');
         
         int attempts = 0;
         bool success = false;
@@ -148,8 +149,6 @@ class BilibiliDownloadManager {
         while (attempts < 2 && !success) {
           attempts++;
           try {
-            String command;
-            
             // Check for HEVC to apply tag fix
             bool isHevc = videoStream.codecs.startsWith('hev1') || 
                           videoStream.codecs.startsWith('hvc1') || 
@@ -232,14 +231,14 @@ class BilibiliDownloadManager {
                     final srtOutputPath = "${tempDir.path}/$fileName.srt";
                     await File(subtitlePath).copy(srtOutputPath);
                   } catch (e) {
-                    print("Failed to save sidecar subtitle: $e");
+                    developer.log('Failed to save sidecar subtitle', error: e);
                   }
                }
                success = true;
              } else {
                // Fallback: If subtitle merge failed (ffmpeg error), try without subtitle
                if (hasSubtitle) {
-                  print("Merge with subtitle failed, trying without subtitle...");
+                  developer.log('Merge with subtitle failed, trying without subtitle...');
                   
                   // Fallback args (no subtitle)
                   List<String> fallbackArgs = ['-y', '-i', videoPath, '-i', audioPath];
@@ -265,7 +264,7 @@ class BilibiliDownloadManager {
                       final srtOutputPath = "${tempDir.path}/$fileName.srt";
                       await File(subtitlePath).copy(srtOutputPath);
                     } catch (e) {
-                      print("Failed to save sidecar subtitle (fallback): $e");
+                      developer.log('Failed to save sidecar subtitle (fallback)', error: e);
                     }
                     success = true;
                     return; 
@@ -274,7 +273,7 @@ class BilibiliDownloadManager {
                throw Exception("FFmpeg merge failed (Check logs in console)");
              }
           } catch (e) {
-            print("Merge attempt $attempts failed: $e");
+            developer.log('Merge attempt $attempts failed', error: e);
             lastError = e.toString();
             if (attempts < 2) {
                // Cleanup output before retry just in case
@@ -317,7 +316,7 @@ class BilibiliDownloadManager {
       return outputPath;
 
     } catch (e) {
-      print("Download error: $e");
+      developer.log('Download error', error: e);
       rethrow;
     } finally {
         // Cleanup temp files
@@ -344,7 +343,7 @@ class BilibiliDownloadManager {
       
       return true;
     } catch (e) {
-      print("Verification failed for ${file.path}: $e");
+      developer.log('Verification failed for ${file.path}', error: e);
       return false;
     } finally {
       controller?.dispose();
@@ -368,7 +367,7 @@ class BilibiliDownloadManager {
       repairPath
     ];
     
-    print("Starting repair transcoding");
+    developer.log('Starting repair transcoding');
 
     // Reset progress to 0 for repair phase
     if (onProgress != null) onProgress(0.0);
@@ -402,7 +401,7 @@ class BilibiliDownloadManager {
           }
        }
     } catch (e) {
-       print("Probe duration failed: $e");
+       developer.log('Probe duration failed', error: e);
     }
     
     await _enqueueMerge(() async {
@@ -483,11 +482,11 @@ class BilibiliDownloadManager {
          if (result.exitCode == 0) {
            return ReturnCode(0);
          } else {
-           print("FFmpeg Windows Error: ${result.stderr}");
+           developer.log('FFmpeg Windows Error', error: result.stderr);
            return ReturnCode(1);
          }
        } catch (e) {
-         print("Failed to run ffmpeg on Windows: $e");
+         developer.log('Failed to run ffmpeg on Windows', error: e);
          return ReturnCode(1);
        }
     } else {

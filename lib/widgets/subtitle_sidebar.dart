@@ -1,6 +1,6 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
-import 'dart:math' as math;
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:video_player/video_player.dart';
 import '../services/settings_service.dart';
@@ -21,6 +21,7 @@ class SubtitleSidebar extends StatefulWidget {
   final bool isCompact;
   final bool isPortrait;
   final FocusNode? focusNode; // New
+  final bool isVisible;
 
   const SubtitleSidebar({
     super.key,
@@ -38,13 +39,14 @@ class SubtitleSidebar extends StatefulWidget {
     this.isCompact = false,
     this.isPortrait = false,
     this.focusNode,
+    this.isVisible = true,
   });
 
   @override
-  State<SubtitleSidebar> createState() => _SubtitleSidebarState();
+  State<SubtitleSidebar> createState() => SubtitleSidebarState();
 }
 
-class _SubtitleSidebarState extends State<SubtitleSidebar> {
+class SubtitleSidebarState extends State<SubtitleSidebar> {
   bool _isArticleMode = false; // 默认为列表模式
   int _lineFilterMode = 0; // 0: 全部, 1: 第一行, 2: 第二行
   // bool _isAutoScroll = false; // Moved to SettingsService
@@ -58,6 +60,12 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
   // 自动滚动相关
   final ValueNotifier<int> _activeIndexNotifier = ValueNotifier<int>(-1);
   int _lastFoundIndex = -1;
+  final List<int> _subtitleStartMs = <int>[];
+  int _lastIndexComputeAtMs = 0;
+  int _lastIndexComputePosMs = -1;
+  Timer? _autoScrollTimer;
+  int _activePointerCount = 0;
+  int? _pointerDownStartIndex;
 
   // Article Mode Scroll Controller
   static const int _articleChunkSize = 4; // Smaller chunk size for better precision
@@ -81,6 +89,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
     
     widget.controller.addListener(_updateIndex);
     _checkBilingualSync();
+    _rebuildSubtitleIndex();
   }
 
   @override
@@ -92,6 +101,16 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
     }
     if (widget.subtitles != oldWidget.subtitles || widget.secondarySubtitles != oldWidget.secondarySubtitles) {
        _checkBilingualSync();
+       _rebuildSubtitleIndex();
+    }
+    if (!oldWidget.isVisible && widget.isVisible && SettingsService().autoScrollSubtitles) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _lastIndexComputeAtMs = 0;
+        _lastIndexComputePosMs = -1;
+        _updateIndex();
+        _scrollToActiveIndex();
+      });
     }
   }
 
@@ -145,64 +164,204 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
   void dispose() {
     widget.controller.removeListener(_updateIndex);
     _activeIndexNotifier.dispose();
+    _autoScrollTimer?.cancel();
     super.dispose();
+  }
+
+  void _rebuildSubtitleIndex() {
+    _subtitleStartMs
+      ..clear()
+      ..addAll(widget.subtitles.map((e) => e.startTime.inMilliseconds));
+    _lastFoundIndex = -1;
+    _lastIndexComputePosMs = -1;
   }
 
   void _updateIndex() {
     if (!mounted || widget.subtitles.isEmpty) return;
     
     final currentPosition = widget.controller.value.position;
-    final int index = _findCurrentIndex(currentPosition);
+    final int posMs = currentPosition.inMilliseconds;
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (_lastIndexComputePosMs != -1) {
+      final int deltaPos = (posMs - _lastIndexComputePosMs).abs();
+      final int deltaTime = nowMs - _lastIndexComputeAtMs;
+      if (deltaPos < 80 && deltaTime < 80) {
+        return;
+      }
+    }
+    _lastIndexComputePosMs = posMs;
+    _lastIndexComputeAtMs = nowMs;
+
+    final int index = _findCurrentIndexMs(posMs);
     
     if (index != _activeIndexNotifier.value) {
       _activeIndexNotifier.value = index;
-      if (SettingsService().autoScrollSubtitles) {
-        _scrollToActiveIndex(isAuto: true);
+      if (widget.isVisible && SettingsService().autoScrollSubtitles && _activePointerCount == 0) {
+        _scheduleAutoScroll(posMs);
       }
     }
   }
 
-  int _findCurrentIndex(Duration position) {
-    final settings = SettingsService();
-    final continuousSubtitleEnabled = settings.videoContinuousSubtitle;
+  int _getEffectiveEndTimeMs(int index, bool continuousSubtitleEnabled) {
+    final item = widget.subtitles[index];
+    if (!continuousSubtitleEnabled) {
+      return item.endTime.inMilliseconds;
+    }
+    if (index + 1 < widget.subtitles.length) {
+      if (_subtitleStartMs.length == widget.subtitles.length) {
+        return _subtitleStartMs[index + 1];
+      }
+      return widget.subtitles[index + 1].startTime.inMilliseconds;
+    }
+    final controllerValue = widget.controller.value;
+    if (controllerValue.isInitialized && controllerValue.duration > item.endTime) {
+      return controllerValue.duration.inMilliseconds;
+    }
+    return item.endTime.inMilliseconds;
+  }
+
+  int _binarySearchLastStartLE(int posMs) {
+    int low = 0;
+    int high = _subtitleStartMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (_subtitleStartMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  int _findCurrentIndexMs(int posMs, {bool useCache = true}) {
+    final continuousSubtitleEnabled = true;
     
     // Optimization: Check if close to last found index first
-    if (_lastFoundIndex >= 0 && _lastFoundIndex < widget.subtitles.length) {
-      final item = widget.subtitles[_lastFoundIndex];
-      Duration effectiveEndTime = item.endTime;
-      if (continuousSubtitleEnabled && _lastFoundIndex + 1 < widget.subtitles.length) {
-        effectiveEndTime = widget.subtitles[_lastFoundIndex + 1].startTime;
+    if (useCache && _lastFoundIndex >= 0 && _lastFoundIndex < widget.subtitles.length) {
+      if (_subtitleStartMs.length != widget.subtitles.length) {
+        _rebuildSubtitleIndex();
       }
-      if (position >= item.startTime && position < effectiveEndTime) {
+      final int startMs = _subtitleStartMs[_lastFoundIndex];
+      final int endMs = _getEffectiveEndTimeMs(_lastFoundIndex, continuousSubtitleEnabled);
+      if (posMs >= startMs && posMs < endMs) {
         return _lastFoundIndex;
       }
       // Check next one (sequential playback)
       if (_lastFoundIndex + 1 < widget.subtitles.length) {
-        final nextItem = widget.subtitles[_lastFoundIndex + 1];
-        Duration nextEffectiveEndTime = nextItem.endTime;
-        if (continuousSubtitleEnabled && _lastFoundIndex + 2 < widget.subtitles.length) {
-          nextEffectiveEndTime = widget.subtitles[_lastFoundIndex + 2].startTime;
-        }
-        if (position >= nextItem.startTime && position < nextEffectiveEndTime) {
+        final int nextStartMs = _subtitleStartMs[_lastFoundIndex + 1];
+        final int nextEndMs = _getEffectiveEndTimeMs(_lastFoundIndex + 1, continuousSubtitleEnabled);
+        if (posMs >= nextStartMs && posMs < nextEndMs) {
           _lastFoundIndex++;
           return _lastFoundIndex;
         }
       }
     }
     
-    // Fallback to linear search
-    for (int i = 0; i < widget.subtitles.length; i++) {
-      final item = widget.subtitles[i];
-      Duration effectiveEndTime = item.endTime;
-      if (continuousSubtitleEnabled && i + 1 < widget.subtitles.length) {
-        effectiveEndTime = widget.subtitles[i + 1].startTime;
-      }
-      if (position >= item.startTime && position < effectiveEndTime) {
-        _lastFoundIndex = i;
-        return i;
-      }
+    if (_subtitleStartMs.length != widget.subtitles.length) {
+      _rebuildSubtitleIndex();
+    }
+
+    final int candidate = _binarySearchLastStartLE(posMs);
+    if (candidate < 0 || candidate >= widget.subtitles.length) return -1;
+
+    final int endMs = _getEffectiveEndTimeMs(candidate, continuousSubtitleEnabled);
+    if (posMs < endMs) {
+      _lastFoundIndex = candidate;
+      return candidate;
     }
     return -1;
+  }
+
+  void _scheduleAutoScroll(int posMs) {
+    _autoScrollTimer?.cancel();
+    _autoScrollTimer = Timer(Duration.zero, () {
+      if (!mounted) return;
+      if (_activePointerCount != 0) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (_activePointerCount != 0) return;
+        _scrollToActiveIndex(isAuto: true);
+      });
+    });
+  }
+
+  void triggerLocateForAutoFollow() {
+    if (!mounted) return;
+    if (!widget.isVisible || !SettingsService().autoScrollSubtitles) return;
+    if (_activePointerCount != 0) return;
+    if (widget.subtitles.isEmpty) return;
+
+    final int posMs = widget.controller.value.position.inMilliseconds;
+    // Always recalculate index to ensure accuracy during mode switch
+    // This fixes the issue where the cached index might be stale or slightly off
+    final int index = _findCurrentIndexMs(posMs, useCache: false);
+    
+    if (index >= 0 && index < widget.subtitles.length) {
+      _activeIndexNotifier.value = index;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _scrollToActiveIndexAfterModeSwitch(isAuto: true, attempt: 0);
+    });
+  }
+
+  void _triggerLocateButtonAfterModeSwitch() {
+    triggerLocateForAutoFollow();
+  }
+
+  void _scrollToActiveIndexAfterModeSwitch({required bool isAuto, required int attempt}) {
+    if (!mounted) return;
+    if (_activePointerCount != 0) return;
+
+    final int index = _activeIndexNotifier.value;
+    if (index < 0 || index >= widget.subtitles.length) return;
+
+    const int maxAttempts = 6;
+    if (_isArticleMode) {
+      if (!_articleItemScrollController.isAttached) {
+        if (attempt < maxAttempts) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _scrollToActiveIndexAfterModeSwitch(isAuto: isAuto, attempt: attempt + 1);
+          });
+        }
+        return;
+      }
+    } else {
+      if (!_itemScrollController.isAttached) {
+        if (attempt < maxAttempts) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _scrollToActiveIndexAfterModeSwitch(isAuto: isAuto, attempt: attempt + 1);
+          });
+        }
+        return;
+      }
+    }
+
+    _scrollToActiveIndex(isAuto: isAuto);
+  }
+
+  void _onPointerDown(PointerDownEvent event) {
+    if (_activePointerCount == 0) {
+      _pointerDownStartIndex = _activeIndexNotifier.value;
+    }
+    _activePointerCount++;
+    _autoScrollTimer?.cancel();
+  }
+
+  void _onPointerUpOrCancel(PointerEvent event) {
+    _activePointerCount--;
+    if (_activePointerCount < 0) _activePointerCount = 0;
+    if (_activePointerCount == 0) {
+      final int? startIndex = _pointerDownStartIndex;
+      _pointerDownStartIndex = null;
+      if (startIndex != null && startIndex != _activeIndexNotifier.value) {
+        triggerLocateForAutoFollow();
+      }
+    }
   }
 
   String _getFilteredText(String text, int index) {
@@ -245,14 +404,14 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
        
        _articleItemScrollController.scrollTo(
           index: chunkIndex,
-          duration: const Duration(milliseconds: 300),
+          duration: isAuto ? const Duration(milliseconds: 200) : const Duration(milliseconds: 300),
           curve: Curves.easeInOut,
           alignment: 0.15, // Align near top to ensure visibility
        );
     } else {
       _itemScrollController.scrollTo(
         index: index,
-        duration: const Duration(milliseconds: 300),
+        duration: isAuto ? const Duration(milliseconds: 200) : const Duration(milliseconds: 300),
         curve: Curves.easeInOut,
         alignment: 0.30, // 30% from top
       );
@@ -278,6 +437,11 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
           widget.focusNode?.requestFocus();
         },
         behavior: HitTestBehavior.translucent,
+        child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: _onPointerDown,
+        onPointerUp: _onPointerUpOrCancel,
+        onPointerCancel: _onPointerUpOrCancel,
         child: Column(
           children: [
             // 1. 顶部栏 (切换模式 + 过滤 + 关闭)
@@ -308,6 +472,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
                               final isArticle = index == 1;
                               setState(() => _isArticleMode = isArticle);
                               SettingsService().updateSetting('subtitleViewMode', isArticle ? 1 : 0);
+                              _triggerLocateButtonAfterModeSwitch();
                             },
                             selectedIndex: _isArticleMode ? 1 : 0,
                           ),
@@ -324,7 +489,10 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
                               const Text("1", style: TextStyle(fontSize: 9)), // Larger
                               const Text("2", style: TextStyle(fontSize: 9)), // Larger
                             ],
-                            onTap: (index) => setState(() => _lineFilterMode = index),
+                            onTap: (index) {
+                              setState(() => _lineFilterMode = index);
+                              _triggerLocateButtonAfterModeSwitch();
+                            },
                             selectedIndex: _lineFilterMode,
                           ),
                         ),
@@ -423,9 +591,9 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
                               child: Container(
                                 padding: EdgeInsets.symmetric(horizontal: widget.isPortrait ? 4 : (widget.isCompact ? 2 : 4), vertical: widget.isPortrait ? 4 : 3),
                                 decoration: BoxDecoration(
-                                  border: Border.all(color: Colors.purpleAccent.withOpacity(0.5)),
+                                  border: Border.all(color: Colors.purpleAccent.withValues(alpha: 0.5)),
                                   borderRadius: BorderRadius.circular(4),
-                                  color: Colors.purpleAccent.withOpacity(0.1),
+                                  color: Colors.purpleAccent.withValues(alpha: 0.1),
                                 ),
                                 child: Row(
                                   children: [
@@ -522,7 +690,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
                 // 字体设置面板
                 if (_showFontSettings)
                   Container(
-                    color: Colors.white.withOpacity(0.05),
+                    color: Colors.white.withValues(alpha: 0.05),
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     child: Row(
                       children: [
@@ -588,6 +756,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
           ),
         ],
         ),
+        ),
       ),
       ),
       ),
@@ -602,7 +771,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
     return Container(
       height: height,
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
+        color: Colors.white.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(4),
         border: Border.all(color: Colors.white10),
       ),
@@ -693,6 +862,8 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
     return ScrollablePositionedList.builder(
         itemScrollController: _itemScrollController,
         itemPositionsListener: _itemPositionsListener,
+        initialScrollIndex: currentIndex >= 0 ? currentIndex : 0,
+        initialAlignment: 0.30,
         itemCount: widget.subtitles.length,
         itemBuilder: (context, index) {
           final item = widget.subtitles[index];
@@ -705,7 +876,7 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
             child: Padding(
               padding: EdgeInsets.only(bottom: itemGap), // 列表项之间的间距
               child: InkWell(
-                onTap: () {
+                onTapDown: (_) {
                   widget.onClearSelection?.call();
                   widget.onItemTap?.call(item.startTime);
                   // 确保在下一帧请求焦点，避免被 InkWell 重新抢占
@@ -716,9 +887,11 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
                 child: Container(
                   padding: EdgeInsets.symmetric(horizontal: innerH, vertical: innerV),
                   decoration: BoxDecoration(
-                    color: isCurrent ? Colors.blueAccent.withOpacity(0.15) : Colors.transparent,
+                    color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.15) : Colors.transparent,
                     borderRadius: BorderRadius.circular(4),
-                    border: isCurrent ? Border.all(color: Colors.blueAccent.withOpacity(0.3)) : null,
+                    border: Border.all(
+                      color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.3) : Colors.transparent,
+                    ),
                   ),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -764,10 +937,13 @@ class _SubtitleSidebarState extends State<SubtitleSidebar> {
   Widget _buildArticleView(int activeIndex) {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
     final int chunkCount = (widget.subtitles.length / _articleChunkSize).ceil();
+    final int initialChunkIndex = (activeIndex >= 0 ? (activeIndex ~/ _articleChunkSize) : 0);
 
     return ScrollablePositionedList.builder(
       itemScrollController: _articleItemScrollController,
       itemPositionsListener: _articleItemPositionsListener,
+      initialScrollIndex: initialChunkIndex < chunkCount ? initialChunkIndex : 0,
+      initialAlignment: 0.15,
       itemCount: chunkCount,
       padding: EdgeInsets.all(isSmallScreen ? 12 : 20),
       itemBuilder: (context, chunkIndex) {
@@ -894,7 +1070,7 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
       final text = rawText.replaceAll('\n', ' ');
 
       final recognizer = TapGestureRecognizer()
-        ..onTap = () {
+        ..onTapDown = (_) {
             widget.onClearSelection?.call();
             widget.onItemTap?.call(item.startTime);
             // 同样延迟请求焦点
@@ -910,7 +1086,7 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
             fontSize: (widget.isSmallScreen ? 13 : 15) * widget.fontSizeScale,
             height: 1.6,
             fontWeight: FontWeight.normal, // Keep consistent to prevent layout shift
-            backgroundColor: isCurrent ? Colors.blueAccent.withOpacity(0.1) : null,
+            backgroundColor: isCurrent ? Colors.blueAccent.withValues(alpha: 0.1) : null,
           ),
           recognizer: recognizer,
         ),

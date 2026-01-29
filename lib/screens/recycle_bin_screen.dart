@@ -91,13 +91,17 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                     final item = bin[index];
                     // Handle dynamic item type
                     final String id = item.id;
-                    final String name = item is VideoCollection ? item.name : (item as dynamic).title;
-                    final bool isFolder = item is VideoCollection;
+                    final VideoCollection? folder = item is VideoCollection ? item : null;
+                    final String name = folder?.name ?? (item as dynamic).title;
+                    final bool isFolder = folder != null;
+                    final String subtitleText = folder != null
+                        ? "${folder.childrenIds.length} 个项目"
+                        : (item as dynamic).path ?? "未知路径";
                     
                     final isSelected = _selectedIds.contains(id);
                     
                     return Card(
-                      color: isSelected ? Colors.blueAccent.withOpacity(0.2) : const Color(0xFF2C2C2C),
+                      color: isSelected ? Colors.blueAccent.withValues(alpha: 0.2) : const Color(0xFF2C2C2C),
                       margin: const EdgeInsets.only(bottom: 8),
                       child: ListTile(
                         leading: _isSelectionMode 
@@ -116,9 +120,7 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                           : Icon(isFolder ? Icons.folder : Icons.movie, color: isFolder ? Colors.amber : Colors.blue),
                         title: Text(name, style: const TextStyle(color: Colors.white)),
                         subtitle: Text(
-                          isFolder 
-                            ? "${(item as VideoCollection).childrenIds.length} 个项目" 
-                            : (item as dynamic).path ?? "未知路径", 
+                          subtitleText,
                           style: const TextStyle(color: Colors.white54, fontSize: 12),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
@@ -146,7 +148,7 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                               }
                             });
                           } else if (isFolder) {
-                             _navigateToFolderDetail(context, item as VideoCollection);
+                             _navigateToFolderDetail(context, folder);
                           }
                         },
                         onLongPress: () {
@@ -246,7 +248,7 @@ class RecycledFolderDetailScreen extends StatelessWidget {
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(12),
-                color: Colors.orange.withOpacity(0.1),
+                color: Colors.orange.withValues(alpha: 0.1),
                 child: Row(
                   children: [
                     const Icon(Icons.info_outline, color: Colors.orange, size: 20),
@@ -274,16 +276,16 @@ class RecycledFolderDetailScreen extends StatelessWidget {
                           final bool isFolder = item is VideoCollection;
 
                           return Card(
-                            color: const Color(0xFF2C2C2C).withOpacity(0.5), // Dimmed
+                            color: const Color(0xFF2C2C2C).withValues(alpha: 0.5), // Dimmed
                             margin: const EdgeInsets.only(bottom: 8),
                             child: ListTile(
                               leading: Icon(
                                 isFolder ? Icons.folder : Icons.movie, 
-                                color: (isFolder ? Colors.amber : Colors.blue).withOpacity(0.5)
+                                color: (isFolder ? Colors.amber : Colors.blue).withValues(alpha: 0.5)
                               ),
                               title: Text(
                                 name, 
-                                style: TextStyle(color: Colors.white.withOpacity(0.7))
+                                style: TextStyle(color: Colors.white.withValues(alpha: 0.7))
                               ),
                               subtitle: isFolder 
                                   ? Text("${item.childrenIds.length} 个项目", style: const TextStyle(color: Colors.white38, fontSize: 12))

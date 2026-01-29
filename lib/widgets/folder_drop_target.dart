@@ -9,13 +9,13 @@ class FolderDropTarget extends StatefulWidget {
   final Function(int draggedIndex, int newIndex) onReorder;
 
   const FolderDropTarget({
-    Key? key,
+    super.key,
     required this.child,
     required this.folderId,
     required this.index,
     required this.onMoveToFolder,
     required this.onReorder,
-  }) : super(key: key);
+  });
 
   @override
   State<FolderDropTarget> createState() => _FolderDropTargetState();
@@ -58,13 +58,15 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
   @override
   Widget build(BuildContext context) {
     return DragTarget<int>(
-      onWillAccept: (data) {
-        if (data == null || data == widget.index) return false;
+      onWillAcceptWithDetails: (details) {
+        final data = details.data;
+        if (data == widget.index) return false;
         _handleDragEnter();
         return true;
       },
       onLeave: (_) => _handleDragLeave(),
-      onAccept: (draggedIndex) {
+      onAcceptWithDetails: (details) {
+        final draggedIndex = details.data;
         _hoverTimer?.cancel();
         
         if (_isMoveMode) {
@@ -94,7 +96,7 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(16),
                   color: _isMoveMode 
-                      ? Colors.greenAccent.withOpacity(0.3) 
+                      ? Colors.greenAccent.withValues(alpha: 0.3) 
                       : Colors.transparent, // Reorder is handled by GridView usually, but here we show border
                   border: Border.all(
                     color: _isMoveMode ? Colors.greenAccent : Colors.blueAccent,

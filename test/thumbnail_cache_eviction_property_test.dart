@@ -1,13 +1,15 @@
 import 'package:glados/glados.dart';
 import 'dart:collection';
 
+final ExploreConfig _explore = ExploreConfig(numRuns: 10, initialSize: 1, speed: 1);
+
 /// 用于测试的简化版LRU缓存实现
 /// 
 /// 由于ThumbnailCacheService是单例且依赖Flutter的ImageProvider，
 /// 我们创建一个纯Dart的LRU缓存类来测试核心缓存清理逻辑。
 class TestLRUCache<K, V> {
   final LinkedHashMap<K, V> _cache = LinkedHashMap<K, V>();
-  int _maxSize;
+  final int _maxSize;
 
   TestLRUCache({int maxSize = 100}) : _maxSize = maxSize;
 
@@ -70,6 +72,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero, // 随机value
+      _explore,
     ).test(
       'Property 3: 对于任意视频ID，调用evict后，containsKey应返回false',
       (videoId, value) {
@@ -102,7 +105,7 @@ void main() {
     /// Property 3 补充测试：evict不存在的条目
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 3: Eviction Removes Entry Completely**
-    Glados(any.lowercaseLetters).test(
+    Glados(any.lowercaseLetters, _explore).test(
       'Property 3: evict不存在的条目应返回false且不影响缓存',
       (videoId) {
         final cache = TestLRUCache<String, int>(maxSize: 100);
@@ -130,6 +133,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero, // 随机value
+      _explore,
     ).test(
       'Property 3: evict后重新put应能正常添加到缓存',
       (videoId, value) {
@@ -162,7 +166,7 @@ void main() {
     /// Property 3 补充测试：批量evict
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 3: Eviction Removes Entry Completely**
-    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1), _explore).test(
       'Property 3: 批量evict多个条目后，所有条目都应不在缓存中',
       (itemCount) {
         final cache = TestLRUCache<String, int>(maxSize: 100);
@@ -204,6 +208,7 @@ void main() {
     Glados2(
       any.positiveIntOrZero.map((n) => (n % 20) + 5), // 总条目数: 5-24
       any.positiveIntOrZero.map((n) => (n % 10) + 1), // evict数量: 1-10
+      _explore,
     ).test(
       'Property 3: evict部分条目后，未evict的条目应仍在缓存中',
       (totalCount, evictCount) {
@@ -241,7 +246,7 @@ void main() {
     /// Property 3 补充测试：evict与LRU驱逐的独立性
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 3: Eviction Removes Entry Completely**
-    Glados(any.lowercaseLetters).test(
+    Glados(any.lowercaseLetters, _explore).test(
       'Property 3: 手动evict不应影响LRU驱逐逻辑',
       (videoId) {
         final cache = TestLRUCache<String, int>(maxSize: 3);
@@ -285,6 +290,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero.map((n) => (n % 10) + 1), // 重复次数: 1-10
+      _explore,
     ).test(
       'Property 3: 重复evict同一条目应是幂等的',
       (videoId, repeatCount) {
@@ -320,7 +326,7 @@ void main() {
     /// Property 3 补充测试：evict与clear的一致性
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 3: Eviction Removes Entry Completely**
-    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 1), _explore).test(
       'Property 3: 逐个evict所有条目应等价于clear',
       (itemCount) {
         final cache1 = TestLRUCache<String, int>(maxSize: 100);

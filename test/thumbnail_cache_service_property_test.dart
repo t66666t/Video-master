@@ -1,6 +1,8 @@
 import 'package:glados/glados.dart';
 import 'dart:collection';
 
+final ExploreConfig _explore = ExploreConfig(numRuns: 10, initialSize: 1, speed: 1);
+
 /// 用于测试的简化版LRU缓存实现
 /// 
 /// 由于ThumbnailCacheService是单例且依赖Flutter的ImageProvider，
@@ -92,7 +94,7 @@ void main() {
     /// **Validates: Requirements 1.1, 1.3, 1.5**
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 1: LRU Cache Eviction**
-    Glados2(any.lowercaseLetters, any.positiveIntOrZero).test(
+    Glados2(any.lowercaseLetters, any.positiveIntOrZero, _explore).test(
       'Property 1: 缓存满时应驱逐最久未访问的条目',
       (key, value) {
         final cache = TestLRUCache<String, int>(maxSize: 3);
@@ -129,7 +131,7 @@ void main() {
     /// Property 1 补充测试：验证LRU驱逐顺序
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 1: LRU Cache Eviction**
-    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 1), _explore).test(
       'Property 1: 对于任意访问序列，驱逐顺序应符合LRU策略',
       (accessCount) {
         final cache = TestLRUCache<String, int>(maxSize: 5);
@@ -167,7 +169,7 @@ void main() {
     /// Property 1 补充测试：连续插入超过缓存大小的条目
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 1: LRU Cache Eviction**
-    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 5)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 20) + 5), _explore).test(
       'Property 1: 连续插入N个条目后，缓存大小不超过maxSize',
       (insertCount) {
         const maxSize = 5;
@@ -205,7 +207,7 @@ void main() {
     /// Property 1 补充测试：访问操作更新LRU顺序
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 1: LRU Cache Eviction**
-    Glados(any.positiveIntOrZero.map((n) => n % 5)).test(
+    Glados(any.positiveIntOrZero.map((n) => n % 5), _explore).test(
       'Property 1: 访问条目应更新其LRU位置，防止被驱逐',
       (accessIndex) {
         final cache = TestLRUCache<String, int>(maxSize: 5);
@@ -246,6 +248,7 @@ void main() {
     Glados2(
       any.positiveIntOrZero.map((n) => (n % 10) + 5), // 初始条目数: 5-14
       any.positiveIntOrZero.map((n) => (n % 5) + 1),  // 新maxSize: 1-5
+      _explore,
     ).test(
       'Property 1: 减小maxSize应驱逐多余的最久未访问条目',
       (initialCount, newMaxSize) {
@@ -285,6 +288,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero, // 随机value
+      _explore,
     ).test(
       'Property 2: 对于已缓存的videoId，连续调用get应返回相同的值',
       (videoId, value) {
@@ -317,7 +321,7 @@ void main() {
     /// Property 2 补充测试：缓存命中不改变值
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 2: Cache Hit Returns Same Provider**
-    Glados(any.positiveIntOrZero.map((n) => (n % 50) + 1)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 50) + 1), _explore).test(
       'Property 2: 对于任意数量的连续get调用，返回值应始终相同',
       (accessCount) {
         final cache = TestLRUCache<String, int>(maxSize: 100);
@@ -355,6 +359,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero.map((n) => (n % 100) + 1), // 随机访问次数
+      _explore,
     ).test(
       'Property 2: 缓存命中后条目应保持可访问状态',
       (videoId, accessCount) {
@@ -382,7 +387,7 @@ void main() {
     /// Property 2 补充测试：多个条目的缓存命中
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 2: Cache Hit Returns Same Provider**
-    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 2)).test(
+    Glados(any.positiveIntOrZero.map((n) => (n % 10) + 2), _explore).test(
       'Property 2: 对于多个已缓存的条目，各自的get应返回各自的值',
       (itemCount) {
         final cache = TestLRUCache<String, int>(maxSize: 100);
@@ -418,7 +423,7 @@ void main() {
     /// Property 2 补充测试：缓存命中与未命中的区分
     /// 
     /// **Feature: thumbnail-loading-optimization, Property 2: Cache Hit Returns Same Provider**
-    Glados(any.lowercaseLetters).test(
+    Glados(any.lowercaseLetters, _explore).test(
       'Property 2: 未缓存的videoId调用get应返回null',
       (videoId) {
         final cache = TestLRUCache<String, int>(maxSize: 100);
@@ -442,6 +447,7 @@ void main() {
     Glados2(
       any.lowercaseLetters, // 随机videoId
       any.positiveIntOrZero, // 随机value
+      _explore,
     ).test(
       'Property 2: put后立即get应返回put的值',
       (videoId, value) {

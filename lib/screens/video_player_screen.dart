@@ -1,16 +1,17 @@
+import 'dart:async';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:math' as math;
+import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
-import 'package:cross_file/cross_file.dart'; 
+import 'package:cross_file/cross_file.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:fast_gbk/fast_gbk.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -24,13 +25,12 @@ import '../utils/subtitle_parser.dart';
 import '../utils/pgs_parser.dart';
 import '../utils/subtitle_converter.dart';
 import '../models/subtitle_model.dart';
-import '../models/subtitle_style.dart';
 import '../models/video_item.dart';
 import '../services/settings_service.dart';
 import '../services/library_service.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../widgets/video_controls_overlay.dart';
-import '../widgets/settings_panel.dart'; 
+import '../widgets/settings_panel.dart';
 import '../widgets/subtitle_settings_sheet.dart';
 import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_position_sidebar.dart';
@@ -44,27 +44,32 @@ class VideoPlayerScreen extends StatefulWidget {
   final XFile? videoFile; // Optional now
   final VideoPlayerController? existingController; // New
   final VideoItem? videoItem; // New
+  final bool skipAutoPauseOnExit;
 
   const VideoPlayerScreen({
     super.key, 
     this.videoFile,
     this.existingController,
     this.videoItem,
+    this.skipAutoPauseOnExit = false,
   });
 
   @override
   State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
 }
 
-class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
+class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindingObserver {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final GlobalKey<SelectableRegionState> _selectionKey = GlobalKey<SelectableRegionState>();
   final FocusNode _selectionFocusNode = FocusNode();
   final FocusNode _videoFocusNode = FocusNode(); // New: Dedicated focus node for video controls
+  final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey = GlobalKey<SubtitleSidebarState>();
   late VideoPlayerController _controller;
+  bool _controllerAssigned = false;
   bool _initialized = false;
   bool _isPlaying = false;
   bool _isControllerOwner = true; // Track ownership
+  bool _isSubtitleSidebarVisible = true;
   
   // Local UI State
   bool _isLocked = false;
@@ -97,8 +102,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   String? _currentSecondaryText; // New: Secondary text state
   Uint8List? _currentSubtitleImage;
   SubtitleItem? _currentSubtitleItem; // Track current item to avoid reloading images
+  int _currentSubtitleIndex = -1;
+  int _currentSecondarySubtitleIndex = -1;
   int _lastSubtitleIndex = 0;
   int _lastSecondarySubtitleIndex = 0; // New: Secondary index tracking
+  final List<int> _subtitleStartMs = <int>[];
+  final List<int> _secondarySubtitleStartMs = <int>[];
+  Timer? _subtitleSeekTimer;
   
   // Subtitle Positioning Mode
   bool _isSubtitleDragMode = false;
@@ -111,26 +121,33 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   
   // Audio state
   bool _isAudio = false;
+  String? _fatalErrorMessage;
   
   // Embedded subtitle loading state
   bool _isLoadingEmbeddedSubtitle = false;
-  bool _hasCheckedEmbeddedSubtitles = false;
+  String? _autoEmbeddedAttemptedForItemId;
   
   TranscriptionManager? _transcriptionManager;
   VideoItem? _currentItem;
+  SettingsService? _settingsService;
+  bool? _lastShowSubtitles;
+  Duration? _lastSubtitleOffset;
+  bool? _lastSplitSubtitleByLine;
+  bool? _lastVideoContinuousSubtitle;
+  bool? _lastAudioContinuousSubtitle;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _currentItem = widget.videoItem;
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
     
-    if (Platform.isWindows) {
-      _activeSidebar = SidebarType.subtitles;
-    } else if (Platform.isAndroid) {
+    _activeSidebar = SidebarType.subtitles;
+    if (Platform.isAndroid) {
       // 请求通知权限
       Permission.notification.request();
     }
@@ -142,6 +159,54 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         Provider.of<MediaPlaybackService>(context, listen: false).addListener(_onPlaybackServiceChange);
       }
     });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      _settingsService = settings;
+      _lastShowSubtitles = settings.showSubtitles;
+      _lastSubtitleOffset = settings.subtitleOffset;
+      _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+      _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+      _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+      settings.addListener(_onSettingsChanged);
+      _onSettingsChanged();
+    });
+  }
+
+  void _onSettingsChanged() {
+    final settings = _settingsService;
+    if (settings == null) return;
+
+    final bool changed = _lastShowSubtitles != settings.showSubtitles ||
+        _lastSubtitleOffset != settings.subtitleOffset ||
+        _lastSplitSubtitleByLine != settings.splitSubtitleByLine ||
+        _lastVideoContinuousSubtitle != settings.videoContinuousSubtitle ||
+        _lastAudioContinuousSubtitle != settings.audioContinuousSubtitle;
+
+    if (!changed) return;
+
+    _lastShowSubtitles = settings.showSubtitles;
+    _lastSubtitleOffset = settings.subtitleOffset;
+    _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+    _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+    _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+
+    if (_initialized) {
+      _updateSubtitle();
+    }
+  }
+
+  void _triggerSubtitleRefreshBurst() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _updateSubtitle();
+    });
+    Future.delayed(const Duration(milliseconds: 250), () {
+      if (mounted) _updateSubtitle();
+    });
+    Future.delayed(const Duration(milliseconds: 1000), () {
+      if (mounted) _updateSubtitle();
+    });
   }
   
   void _onPlaybackServiceChange() {
@@ -150,6 +215,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     
     // Debug Log
     debugPrint("VideoPlayerScreen: _onPlaybackServiceChange. Service Item: ${service.currentItem?.title}, State: ${service.state}");
+
+    if (service.currentItem?.id == _currentItem?.id &&
+        service.state == PlaybackState.error &&
+        _fatalErrorMessage == null) {
+      final path = service.currentItem?.path;
+      if (path != null && path.isNotEmpty && !File(path).existsSync()) {
+        _setFatalError("媒体文件不存在，可能已被移动或删除");
+      } else {
+        _setFatalError("媒体加载失败");
+      }
+      return;
+    }
     
     // 如果服务中的 currentItem 发生变化，且不是当前播放的项
     if (service.currentItem != null && 
@@ -161,25 +238,36 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         _currentItem = service.currentItem;
         _initialized = false;
         _isPlaying = false; // Reset play state until init
+        _fatalErrorMessage = null;
         _subtitles = [];
+        _secondarySubtitles = [];
+        _currentSubtitlePaths = [];
         _currentSubtitleText = "";
+        _currentSecondaryText = null;
+        _currentSubtitleImage = null;
+        _currentSubtitleItem = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _autoEmbeddedAttemptedForItemId = null;
         // Do not reset _isControllerOwner here. Let _initVideo handle it.
         // Otherwise we might accidentally dispose the service controller if we exit before init completes.
       });
       
-      // Stop old controller if we owned it
-      if (_isControllerOwner && _initialized) { // Check _initialized to avoid double dispose if we just reset it
-         // Actually _initVideo handles disposal if it creates new one? 
-         // But _initVideo logic is complex.
-         // Let's just call _initVideo, it should handle re-assignment.
-         // Wait, _initVideo checks "existingController". That's from widget.
-         // We need to make sure _initVideo prefers _currentItem from service if available.
+      final VideoPlayerController? serviceController = service.controller;
+      if (_controllerAssigned) {
+        try {
+          _controller.removeListener(_videoListener);
+        } catch (_) {}
       }
-      
-      // Clean up old controller listener before re-init?
-      // _initVideo attaches listener.
-      // If we reuse controller, we don't want double listeners.
-      _controller.removeListener(_videoListener);
+      if (serviceController != null) {
+        _controller = serviceController;
+        _controllerAssigned = true;
+        _isControllerOwner = false;
+        try {
+          _controller.removeListener(_videoListener);
+        } catch (_) {}
+        _controller.addListener(_videoListener);
+      }
       
       _initVideo();
     } else if (!_initialized && service.currentItem?.id == _currentItem?.id && 
@@ -187,16 +275,84 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
        debugPrint("VideoPlayerScreen: Service ready for current video. Re-initializing.");
        // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
        _initVideo();
+    } else if (service.currentItem?.id == _currentItem?.id) {
+      final bool pathsChanged = !_stringListEquals(service.subtitlePaths, _currentSubtitlePaths);
+      final bool primaryChanged = service.subtitles.length != _subtitles.length;
+      final bool secondaryChanged = service.secondarySubtitles.length != _secondarySubtitles.length;
+      if (pathsChanged || primaryChanged || secondaryChanged) {
+        setState(() {
+          _subtitles = service.subtitles;
+          _secondarySubtitles = service.secondarySubtitles;
+          _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
+          _lastSubtitleIndex = 0;
+          _lastSecondarySubtitleIndex = 0;
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleImage = null;
+          _currentSubtitleItem = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+        });
+        _rebuildSubtitleIndex();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateSubtitle();
+        });
+      }
     }
+  }
+
+  bool _stringListEquals(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  void _setFatalError(String message) {
+    if (!mounted) return;
+    setState(() {
+      _fatalErrorMessage = message;
+      _initialized = false;
+      _isPlaying = false;
+    });
+  }
+
+  void _maybeAutoLoadEmbeddedSubtitle() {
+    final currentId = _currentItem?.id ?? widget.videoFile?.path;
+    if (currentId == null) return;
+    if (_autoEmbeddedAttemptedForItemId == currentId) return;
+    if (_currentItem?.subtitlePath != null) return;
+    if (_currentSubtitlePaths.isNotEmpty) return;
+    if (_subtitles.isNotEmpty || _secondarySubtitles.isNotEmpty) return;
+    try {
+      final service = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (service.subtitlePaths.isNotEmpty || service.subtitles.isNotEmpty || service.secondarySubtitles.isNotEmpty) {
+        return;
+      }
+    } catch (_) {}
+
+    _autoEmbeddedAttemptedForItemId = currentId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _checkAndLoadEmbeddedSubtitle(showLoadingIndicator: false);
+    });
   }
   
   Future<void> _handleExit() async {
      try {
+       if (!_controllerAssigned) return;
        final settings = Provider.of<SettingsService>(context, listen: false);
        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
        
-       if (settings.autoPauseOnExit && _controller.value.isPlaying) {
-          await _controller.pause();
+       final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
+       if (!shouldSkipAutoPause && settings.autoPauseOnExit && _controller.value.isPlaying) {
+          if (playbackService.controller == _controller) {
+            await playbackService.pause();
+          } else {
+            await _controller.pause();
+          }
        }
        
        // Force sync state
@@ -214,17 +370,56 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     _handleExit();
     
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
+    _settingsService?.removeListener(_onSettingsChanged);
     // Restore orientations to default (allow all)
     SystemChrome.setPreferredOrientations([]);
     
     _selectionFocusNode.dispose();
+    _subtitleSeekTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     
-    _controller.removeListener(_videoListener);
-    if (_isControllerOwner) {
-      _controller.dispose();
+    if (_controllerAssigned) {
+      try {
+        _controller.removeListener(_videoListener);
+      } catch (_) {}
+      if (_isControllerOwner) {
+        // 告诉 Service 清理对该控制器的引用，防止持有已销毁的控制器
+        try {
+          final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+          if (playbackService.controller == _controller) {
+            playbackService.clearController();
+          }
+        } catch (e) {
+          debugPrint("Error clearing controller from service: $e");
+        }
+        try {
+          _controller.dispose();
+        } catch (_) {}
+      }
     }
     
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      _saveProgress();
+    }
+  }
+
+  @override
+  void deactivate() {
+    _saveProgress();
+    super.deactivate();
+  }
+
+  Future<void> _saveProgress() async {
+    if (!_initialized || _currentItem == null) return;
+    if (!_controller.value.isInitialized) return;
+    final position = _controller.value.position.inMilliseconds;
+    await Provider.of<LibraryService>(context, listen: false)
+        .updateVideoProgress(_currentItem!.id, position);
   }
 
   @override
@@ -352,6 +547,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     // Check embedded
     try {
       _isLoadingEmbeddedSubtitle = true;
+      final SettingsService settings = Provider.of<SettingsService>(context, listen: false);
+      final LibraryService library = Provider.of<LibraryService>(context, listen: false);
       
       // Show loading indicator if requested
       if (showLoadingIndicator && mounted) {
@@ -371,7 +568,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             ),
             duration: Duration(seconds: 10),
             behavior: SnackBarBehavior.floating,
-            backgroundColor: const Color(0xFF2C2C2C),
+            backgroundColor: Color(0xFF2C2C2C),
           ),
         );
       }
@@ -397,9 +594,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         if (extractedPath != null && mounted) {
           // Check again if user loaded something while we were extracting
           if (_subtitles.isNotEmpty) return;
+
+          await _loadSubtitles([extractedPath]);
+
+          if (_currentItem != null) {
+            try {
+              final String? currentSecondary = _currentSubtitlePaths.length > 1 ? _currentSubtitlePaths[1] : _currentItem!.secondarySubtitlePath;
+              await library.updateVideoSubtitles(
+                _currentItem!.id,
+                extractedPath,
+                settings.autoCacheSubtitles,
+                secondarySubtitlePath: currentSecondary,
+                isSecondaryCached: settings.autoCacheSubtitles,
+              );
+            } catch (_) {}
+          }
           
-          await _loadSubtitleFromFile(extractedPath);
-          
+          if (!mounted) return;
+
           ScaffoldMessenger.of(context).clearSnackBars();
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -427,9 +639,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                   Text("内嵌字幕提取失败"),
                 ],
               ),
-              duration: const Duration(seconds: 2),
+              duration: Duration(seconds: 2),
               behavior: SnackBarBehavior.floating,
-              backgroundColor: const Color(0xFF2C2C2C),
+              backgroundColor: Color(0xFF2C2C2C),
             ),
           );
         }
@@ -444,11 +656,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       }
     } finally {
       _isLoadingEmbeddedSubtitle = false;
-      _hasCheckedEmbeddedSubtitles = true;
     }
   }
 
   void _initVideo() {
+    if (_fatalErrorMessage != null && mounted) {
+      setState(() {
+        _fatalErrorMessage = null;
+      });
+    }
+
     // Refresh video item from library to ensure we have latest subtitle settings
     VideoItem? currentItem = _currentItem;
     if (currentItem != null) {
@@ -465,6 +682,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
     if (widget.existingController != null && _currentItem?.id == widget.videoItem?.id) {
       _controller = widget.existingController!;
+      _controllerAssigned = true;
       _isControllerOwner = false;
       _initialized = true;
       
@@ -475,20 +693,31 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         _isPlaying = playbackService.isPlaying;
         
         // 强制同步 controller 状态与 MediaPlaybackService 一致
+        playbackService.updatePlaybackStateFromController();
         if (_isPlaying) {
-          if (!_controller.value.isPlaying) _controller.play();
+          if (!_controller.value.isPlaying) playbackService.resume();
         } else {
-          if (_controller.value.isPlaying) _controller.pause();
+          if (_controller.value.isPlaying) playbackService.pause();
         }
         
-        // 从 MediaPlaybackService 获取已加载的字幕
         final existingSubtitles = playbackService.subtitles;
-        if (existingSubtitles.isNotEmpty) {
+        final existingSecondary = playbackService.secondarySubtitles;
+        final existingPaths = playbackService.subtitlePaths;
+        if (existingSubtitles.isNotEmpty || existingSecondary.isNotEmpty || existingPaths.isNotEmpty) {
           setState(() {
             _subtitles = existingSubtitles;
+            _secondarySubtitles = existingSecondary;
+            _currentSubtitlePaths = List<String>.from(existingPaths);
             _lastSubtitleIndex = 0;
+            _lastSecondarySubtitleIndex = 0;
             _currentSubtitleText = "";
+            _currentSecondaryText = null;
+            _currentSubtitleImage = null;
+            _currentSubtitleItem = null;
+            _currentSubtitleIndex = -1;
+            _currentSecondarySubtitleIndex = -1;
           });
+          _rebuildSubtitleIndex();
         }
       } catch (e) {
         // 如果无法获取 MediaPlaybackService，回退到使用 controller 的状态
@@ -497,6 +726,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       }
       
       _controller.addListener(_videoListener);
+      _triggerSubtitleRefreshBurst();
       
       // 首先检查是否有刚完成的AI字幕（即使 isResultConsumed 为 true）
       _checkAndLoadAiSubtitle(currentItem);
@@ -507,18 +737,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         if (currentItem.secondarySubtitlePath != null) {
           paths.add(currentItem.secondarySubtitlePath!);
         }
-        _loadSubtitles(paths);
+        _loadSubtitles(paths, autoEnableSubtitles: false);
       } else {
-        // Try auto-load embedded subtitles after UI is rendered to avoid resource contention during init
-        // Only if setting is enabled
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) {
-            final settings = Provider.of<SettingsService>(context, listen: false);
-            if (settings.autoLoadEmbeddedSubtitles) {
-              _checkAndLoadEmbeddedSubtitle();
-            }
-          }
-        });
+        _maybeAutoLoadEmbeddedSubtitle();
       }
     } else {
       // 尝试从 MediaPlaybackService 获取 controller (适用于视频切换或未传递 controller 的情况)
@@ -538,7 +759,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             return;
           }
 
+          bool canReuseController = false;
           if (playbackService.currentItem?.id == currentItem.id && playbackService.controller != null) {
+             try {
+               // 测试控制器是否存活
+               void noOp() {}
+               playbackService.controller!.addListener(noOp);
+               playbackService.controller!.removeListener(noOp);
+               canReuseController = true;
+             } catch (_) {
+               playbackService.clearController();
+             }
+          }
+
+          if (canReuseController) {
              // 如果之前持有本地 controller，先释放
              if (_initialized && _isControllerOwner) {
                 try {
@@ -550,11 +784,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
              }
 
              _controller = playbackService.controller!;
+             _controllerAssigned = true;
              _isControllerOwner = false;
              
              if (mounted) {
                setState(() {
-                 _initialized = true;
+                 _initialized = _controller.value.isInitialized;
                  _isPlaying = playbackService.isPlaying; // 同时更新播放状态
                });
              }
@@ -562,22 +797,35 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
              usedService = true;
              
              // Sync state logic
-             if (_isPlaying) {
-                if (!_controller.value.isPlaying) _controller.play();
-             } else {
-                if (_controller.value.isPlaying) _controller.pause();
+             if (_controller.value.isInitialized) {
+               playbackService.updatePlaybackStateFromController();
+               if (_isPlaying) {
+                  if (!_controller.value.isPlaying) playbackService.resume();
+               } else {
+                  if (_controller.value.isPlaying) playbackService.pause();
+               }
              }
              
              final existingSubtitles = playbackService.subtitles;
-             if (existingSubtitles.isNotEmpty) {
+             if (existingSubtitles.isNotEmpty || playbackService.secondarySubtitles.isNotEmpty) {
                 setState(() {
                   _subtitles = existingSubtitles;
+                  _secondarySubtitles = playbackService.secondarySubtitles;
+                  _currentSubtitlePaths = List<String>.from(playbackService.subtitlePaths);
                   _lastSubtitleIndex = 0;
+                  _lastSecondarySubtitleIndex = 0;
                   _currentSubtitleText = "";
+                  _currentSecondaryText = null;
+                  _currentSubtitleImage = null;
+                  _currentSubtitleItem = null;
+                  _currentSubtitleIndex = -1;
+                  _currentSecondarySubtitleIndex = -1;
                 });
+                _rebuildSubtitleIndex();
              }
              
              _controller.addListener(_videoListener);
+             _triggerSubtitleRefreshBurst();
              _checkAndLoadAiSubtitle(currentItem);
              
              if (currentItem.subtitlePath != null) {
@@ -585,7 +833,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 if (currentItem.secondarySubtitlePath != null) {
                    paths.add(currentItem.secondarySubtitlePath!);
                 }
-                _loadSubtitles(paths);
+                _loadSubtitles(paths, autoEnableSubtitles: false);
+             } else {
+                _maybeAutoLoadEmbeddedSubtitle();
              }
           }
         } catch (e) {
@@ -594,14 +844,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       }
 
       if (!usedService && (widget.videoFile != null || currentItem != null)) {
+        if (currentItem != null) {
+          try {
+            final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+            if (playbackService.currentItem?.id != currentItem.id || playbackService.controller == null) {
+              if (!File(currentItem.path).existsSync()) {
+                _setFatalError("媒体文件不存在，可能已被移动或删除");
+                return;
+              }
+              if (mounted) {
+                setState(() {
+                  _initialized = false;
+                  _isPlaying = false;
+                });
+              }
+              playbackService.play(currentItem);
+              return;
+            }
+          } catch (_) {}
+        }
+
         _isControllerOwner = true;
         String path = widget.videoFile?.path ?? currentItem!.path;
+        final file = File(path);
+        if (!kIsWeb && !file.existsSync()) {
+          _setFatalError("媒体文件不存在，可能已被移动或删除");
+          return;
+        }
         
         debugPrint("=== Video Player Debug Info ===");
         debugPrint("Platform: ${Platform.operatingSystem}");
         debugPrint("Video path: $path");
-        debugPrint("File exists: ${File(path).existsSync()}");
-        debugPrint("File size: ${File(path).lengthSync()}");
+        debugPrint("File exists: ${file.existsSync()}");
+        int? fileSize;
+        try {
+          fileSize = file.lengthSync();
+        } catch (_) {}
+        debugPrint("File size: ${fileSize ?? -1}");
         debugPrint("Is Windows: ${Platform.isWindows}");
         debugPrint("Is Audio: $_isAudio");
         debugPrint("===============================");
@@ -613,16 +892,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           );
         } else {
           _controller = VideoPlayerController.file(
-            File(path),
+            file,
             videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
           );
         }
-        _controller.initialize().then((_) {
+        _controllerAssigned = true;
+        _controller.initialize().then((_) async {
           if (!mounted) return;
           setState(() {
             _initialized = true;
-            _controller.play();
-            _isPlaying = true;
           });
           
           // 注册控制器到 MediaPlaybackService，确保通知栏控制生效
@@ -638,7 +916,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               lastUpdated: DateTime.now().millisecondsSinceEpoch,
               type: _isAudio ? MediaType.audio : MediaType.video,
             );
-            playbackService.updateMetadata(itemToSync);
+            await playbackService.updateMetadata(itemToSync);
+            await playbackService.resume();
+            if (mounted) {
+              setState(() {
+                _isPlaying = true;
+              });
+            }
           } catch (e) {
             debugPrint("Failed to register controller with service: $e");
           }
@@ -656,34 +940,48 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             if (currentItem.secondarySubtitlePath != null) {
               paths.add(currentItem.secondarySubtitlePath!);
             }
-            _loadSubtitles(paths);
+            _loadSubtitles(paths, autoEnableSubtitles: false);
           } else {
-            // Try auto-load embedded subtitles after UI is rendered to avoid resource contention during init
-            // Only if setting is enabled
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) {
-                final settings = Provider.of<SettingsService>(context, listen: false);
-                if (settings.autoLoadEmbeddedSubtitles) {
-                   _checkAndLoadEmbeddedSubtitle();
-                }
-              }
-            });
+            _maybeAutoLoadEmbeddedSubtitle();
           }
         }).catchError((error) {
           debugPrint("Error initializing video: $error");
           debugPrint("Error stack trace: ${StackTrace.current}");
+          _setFatalError("视频初始化失败");
         });
         _controller.addListener(_videoListener);
+        _triggerSubtitleRefreshBurst();
       }
     }
   }
   
   void _videoListener() {
     if (!mounted) return;
+    if (!_controllerAssigned) return;
+
+    try {
+      if (!_initialized && _controller.value.isInitialized) {
+        setState(() {
+          _initialized = true;
+        });
+        _triggerSubtitleRefreshBurst();
+      }
+    } catch (_) {
+      return;
+    }
     
     // Check for errors
     if (_controller.value.hasError && !_isRepairing) {
        final errorMsg = _controller.value.errorDescription ?? "";
+       final lower = errorMsg.toLowerCase();
+       if (_fatalErrorMessage == null &&
+           (lower.contains("no such file") ||
+               lower.contains("file not found") ||
+               lower.contains("cannot open") ||
+               lower.contains("filesystemexception"))) {
+         _setFatalError("媒体文件已不存在或无法访问");
+         return;
+       }
        // Specific check for HevcConfig or ExoPlaybackException: Source error
        if (errorMsg.contains("HevcConfig") || errorMsg.contains("Source error") || errorMsg.contains("VideoError")) {
           // Remove listener to prevent loop
@@ -884,62 +1182,68 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     final settings = Provider.of<SettingsService>(context, listen: false);
     
     if (!settings.showSubtitles) {
-      if (_currentSubtitleText.isNotEmpty) {
-        setState(() => _currentSubtitleText = "");
+      if (_currentSubtitleText.isNotEmpty || _currentSecondaryText != null || _currentSubtitleImage != null || _currentSubtitleIndex != -1 || _currentSecondarySubtitleIndex != -1) {
+        setState(() {
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleImage = null;
+          _currentSubtitleItem = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+        });
       }
       return;
     }
 
     final position = _controller.value.position;
     final adjustedPosition = position - settings.subtitleOffset;
+    final int posMs = adjustedPosition.inMilliseconds;
     final continuousSubtitleEnabled = _isAudio ? settings.audioContinuousSubtitle : settings.videoContinuousSubtitle;
     
     // --- Primary Subtitle ---
     SubtitleItem? currentItem;
+    int primaryIndex = -1;
     if (_subtitles.isNotEmpty) {
-      if (_lastSubtitleIndex >= _subtitles.length || 
-          (_lastSubtitleIndex > 0 && adjustedPosition < _subtitles[_lastSubtitleIndex].startTime)) {
-        _lastSubtitleIndex = 0;
+      if (_subtitleStartMs.length != _subtitles.length) {
+        _rebuildSubtitleIndex();
       }
-
-      for (int i = _lastSubtitleIndex; i < _subtitles.length; i++) {
-        final item = _subtitles[i];
-        if (adjustedPosition < item.startTime) break;
-        Duration effectiveEndTime = item.endTime;
-        if (continuousSubtitleEnabled && i + 1 < _subtitles.length) {
-          effectiveEndTime = _subtitles[i + 1].startTime;
-        }
-        if (adjustedPosition < effectiveEndTime) {
-          currentItem = item;
-          _lastSubtitleIndex = i;
-          break;
-        }
-        _lastSubtitleIndex = i + 1;
+      final int index = _findSubtitleIndexMs(
+        posMs: posMs,
+        subtitles: _subtitles,
+        startMs: _subtitleStartMs,
+        lastIndex: _lastSubtitleIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (index >= 0) {
+        currentItem = _subtitles[index];
+        _lastSubtitleIndex = index;
+        primaryIndex = index;
+      } else {
+        _lastSubtitleIndex = 0;
       }
     }
     
     // --- Secondary Subtitle ---
     SubtitleItem? currentSecondaryItem;
+    int secondaryIndex = -1;
     if (_secondarySubtitles.isNotEmpty) {
-       if (_lastSecondarySubtitleIndex >= _secondarySubtitles.length ||
-           (_lastSecondarySubtitleIndex > 0 && adjustedPosition < _secondarySubtitles[_lastSecondarySubtitleIndex].startTime)) {
-          _lastSecondarySubtitleIndex = 0;
-       }
-       
-       for (int i = _lastSecondarySubtitleIndex; i < _secondarySubtitles.length; i++) {
-          final item = _secondarySubtitles[i];
-          if (adjustedPosition < item.startTime) break;
-          Duration effectiveEndTime = item.endTime;
-          if (continuousSubtitleEnabled && i + 1 < _secondarySubtitles.length) {
-            effectiveEndTime = _secondarySubtitles[i + 1].startTime;
-          }
-          if (adjustedPosition < effectiveEndTime) {
-             currentSecondaryItem = item;
-             _lastSecondarySubtitleIndex = i;
-             break;
-          }
-          _lastSecondarySubtitleIndex = i + 1;
-       }
+      if (_secondarySubtitleStartMs.length != _secondarySubtitles.length) {
+        _rebuildSubtitleIndex();
+      }
+      final int index = _findSubtitleIndexMs(
+        posMs: posMs,
+        subtitles: _secondarySubtitles,
+        startMs: _secondarySubtitleStartMs,
+        lastIndex: _lastSecondarySubtitleIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (index >= 0) {
+        currentSecondaryItem = _secondarySubtitles[index];
+        _lastSecondarySubtitleIndex = index;
+        secondaryIndex = index;
+      } else {
+        _lastSecondarySubtitleIndex = 0;
+      }
     }
     
     // --- Logic for Text vs Split ---
@@ -955,83 +1259,99 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
        }
     }
     
-    // Check if item changed (Primary)
-    if (currentItem != _currentSubtitleItem) {
-      // If it's a new item
+    final bool primaryChanged = primaryIndex != _currentSubtitleIndex;
+    final bool secondaryChanged = secondaryIndex != _currentSecondarySubtitleIndex;
+    if (!primaryChanged && !secondaryChanged) return;
+
+    final bool hasImage = currentItem != null && currentItem.imageLoader != null;
+
+    setState(() {
+      _currentSubtitleIndex = primaryIndex;
+      _currentSecondarySubtitleIndex = secondaryIndex;
       _currentSubtitleItem = currentItem;
-      
-      if (currentItem != null && currentItem.imageLoader != null) {
-        // Load Image
-        currentItem.imageLoader!().then((image) {
-          if (mounted && _currentSubtitleItem == currentItem) {
-             setState(() {
-               _currentSubtitleImage = image;
-               _currentSubtitleText = ""; // Clear text if image exists (usually)
-               _currentSecondaryText = null; // Clear secondary
-             });
-          }
-        });
-      } else {
-        // Text based or empty
-        if (_currentSubtitleImage != null) {
-           // Clear image if not needed
-           setState(() {
-             _currentSubtitleImage = null;
-           });
+      _currentSubtitleImage = null;
+      _currentSubtitleText = hasImage ? "" : newText;
+      _currentSecondaryText = hasImage ? null : newSecondaryText;
+    });
+
+    final imageLoader = currentItem?.imageLoader;
+    if (imageLoader != null) {
+      imageLoader().then((image) {
+        if (mounted && _currentSubtitleItem == currentItem) {
+          setState(() {
+            _currentSubtitleImage = image;
+          });
         }
-      }
-    }
-    
-    if (_currentSubtitleText != newText || _currentSecondaryText != newSecondaryText) {
-      setState(() {
-        _currentSubtitleText = newText;
-        _currentSecondaryText = newSecondaryText;
       });
     }
   }
 
+  void _seekToSubtitleFast(Duration target) {
+    if (!_initialized || !_controller.value.isInitialized) return;
+    final duration = _controller.value.duration;
+    Duration clamped = target;
+    if (clamped < Duration.zero) clamped = Duration.zero;
+    if (duration > Duration.zero && clamped > duration) clamped = duration;
+
+    _subtitleSeekTimer?.cancel();
+    _subtitleSeekTimer = null;
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (playbackService.controller == _controller) {
+        playbackService.seekTo(clamped);
+      } else {
+        _controller.seekTo(clamped);
+      }
+    } catch (_) {
+      _controller.seekTo(clamped);
+    }
+  }
+
   void _togglePlay() async {
+    MediaPlaybackService? playbackService;
+    try {
+      playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+    } catch (_) {}
+
+    if (playbackService != null && playbackService.controller == _controller) {
+      playbackService.updatePlaybackStateFromController();
+      if (_controller.value.isPlaying) {
+        await playbackService.pause();
+      } else {
+        await playbackService.resume();
+      }
+      return;
+    }
+
     if (_controller.value.isPlaying) {
       await _controller.pause();
-      // 同步到 MediaPlaybackService，确保快捷播放卡片状态正确
-      if (!_isControllerOwner) {
-        try {
-          final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-          // 直接从 controller 读取状态并同步
-          playbackService.updatePlaybackStateFromController();
-        } catch (e) {
-          debugPrint("同步暂停状态失败: $e");
-        }
-      }
     } else {
       await _controller.play();
-      // 同步到 MediaPlaybackService，确保快捷播放卡片状态正确
-      if (!_isControllerOwner) {
-        try {
-          final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-          // 直接从 controller 读取状态并同步
-          playbackService.updatePlaybackStateFromController();
-        } catch (e) {
-          debugPrint("同步播放状态失败: $e");
-        }
-      }
+    }
+
+    if (playbackService != null && playbackService.controller == _controller) {
+      playbackService.updatePlaybackStateFromController();
     }
   }
 
   Future<void> _pickSubtitle() async {
     try {
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final library = Provider.of<LibraryService>(context, listen: false);
+
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['srt', 'lrc', 'vtt', 'ass', 'ssa', 'sup', 'sub', 'idx', 'scc'],
         withData: true, 
       );
 
+      if (!mounted) return;
+
       if (result != null) {
         final file = result.files.single;
         String path = file.path!;
         
         // Auto Cache Logic
-        final settings = Provider.of<SettingsService>(context, listen: false);
         if (_currentItem != null) {
           // Preserve secondary subtitle if it exists
           String? currentSecondary;
@@ -1039,8 +1359,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
             currentSecondary = _currentSubtitlePaths[1];
           }
 
-          await Provider.of<LibraryService>(context, listen: false)
-              .updateVideoSubtitles(
+          await library.updateVideoSubtitles(
                 _currentItem!.id, 
                 path, 
                 settings.autoCacheSubtitles,
@@ -1063,7 +1382,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         }
       }
     } catch (e) {
-      print("Error picking subtitle: $e");
+      developer.log('Error picking subtitle', error: e);
     }
   }
 
@@ -1074,7 +1393,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     });
   }
   
-  Future<void> _loadSubtitles(List<String> paths) async {
+  Future<void> _loadSubtitles(List<String> paths, {bool autoEnableSubtitles = true}) async {
+    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+    final settingsService = Provider.of<SettingsService>(context, listen: false);
+
     if (paths.isEmpty) {
       setState(() {
         _subtitles = [];
@@ -1082,13 +1404,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         _currentSubtitlePaths = [];
         _currentSubtitleText = "";
         _currentSecondaryText = null;
+        _currentSubtitleImage = null;
+        _currentSubtitleItem = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
       });
+      _rebuildSubtitleIndex();
       
       // 同步到 MediaPlaybackService
-      if (mounted) {
-        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-        playbackService.setSubtitles([]);
-      }
+      playbackService.setSubtitleState(paths: const [], primary: const [], secondary: const []);
+      _triggerSubtitleRefreshBurst();
       
       return;
     }
@@ -1102,6 +1427,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     }
     
     if (primaryList.isNotEmpty || secondaryList.isNotEmpty) {
+       if (!mounted) return;
+
        setState(() {
           _subtitles = primaryList;
           _secondarySubtitles = secondaryList;
@@ -1111,16 +1438,106 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           _currentSubtitleText = "";
           _currentSecondaryText = null;
           _currentSubtitleImage = null;
+          _currentSubtitleItem = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
        });
+       _rebuildSubtitleIndex();
        
-       // 同步主字幕到 MediaPlaybackService
-       if (mounted) {
-         final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-         playbackService.setSubtitles(primaryList);
+       playbackService.setSubtitleState(
+         paths: _currentSubtitlePaths,
+         primary: primaryList,
+         secondary: secondaryList,
+       );
+       if (autoEnableSubtitles) {
+         settingsService.updateSetting('showSubtitles', true);
        }
-       
-       Provider.of<SettingsService>(context, listen: false).updateSetting('showSubtitles', true);
+       _triggerSubtitleRefreshBurst();
     }
+  }
+
+  void _rebuildSubtitleIndex() {
+    _subtitleStartMs
+      ..clear()
+      ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
+    _secondarySubtitleStartMs
+      ..clear()
+      ..addAll(_secondarySubtitles.map((e) => e.startTime.inMilliseconds));
+  }
+
+  int _getEffectiveEndMs({
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required int index,
+    required bool continuousSubtitleEnabled,
+  }) {
+    final SubtitleItem item = subtitles[index];
+    if (!continuousSubtitleEnabled) return item.endTime.inMilliseconds;
+    if (index + 1 < subtitles.length) return startMs[index + 1];
+    return item.endTime.inMilliseconds;
+  }
+
+  int _binarySearchLastStartLE(List<int> startMs, int posMs) {
+    int low = 0;
+    int high = startMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (startMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  int _findSubtitleIndexMs({
+    required int posMs,
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required int lastIndex,
+    required bool continuousSubtitleEnabled,
+  }) {
+    if (subtitles.isEmpty) return -1;
+
+    if (lastIndex >= 0 && lastIndex < subtitles.length) {
+      final int lastStartMs = startMs[lastIndex];
+      final int lastEndMs = _getEffectiveEndMs(
+        subtitles: subtitles,
+        startMs: startMs,
+        index: lastIndex,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (posMs >= lastStartMs && posMs < lastEndMs) {
+        return lastIndex;
+      }
+      final int nextIndex = lastIndex + 1;
+      if (nextIndex < subtitles.length) {
+        final int nextStartMs = startMs[nextIndex];
+        final int nextEndMs = _getEffectiveEndMs(
+          subtitles: subtitles,
+          startMs: startMs,
+          index: nextIndex,
+          continuousSubtitleEnabled: continuousSubtitleEnabled,
+        );
+        if (posMs >= nextStartMs && posMs < nextEndMs) {
+          return nextIndex;
+        }
+      }
+    }
+
+    final int candidate = _binarySearchLastStartLE(startMs, posMs);
+    if (candidate < 0 || candidate >= subtitles.length) return -1;
+    final int endMs = _getEffectiveEndMs(
+      subtitles: subtitles,
+      startMs: startMs,
+      index: candidate,
+      continuousSubtitleEnabled: continuousSubtitleEnabled,
+    );
+    if (posMs < endMs) return candidate;
+    return -1;
   }
 
   Future<List<SubtitleItem>> _parseSubtitleFile(String path) async {
@@ -1162,7 +1579,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           try {
             content = gbk.decode(bytes);
           } catch (e2) {
-            print("Failed to decode: $e2");
+            developer.log('Failed to decode', error: e2);
           }
         }
         
@@ -1176,13 +1593,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       }
       return parsed;
     } catch (e) {
-      print("Load sub error: $e");
+      developer.log('Load sub error', error: e);
       return [];
     }
-  }
-
-  Future<void> _loadSubtitleFromFile(String path) async {
-     await _loadSubtitles([path]);
   }
 
   // --- Drag Logic ---
@@ -1211,7 +1624,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       if (_isGhostDragMode) {
         _activeSidebar = SidebarType.subtitles;
       } else {
-        _activeSidebar = SidebarType.none;
+        _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
       }
       _isSubtitleDragMode = false;
       _isGhostDragMode = false;
@@ -1251,39 +1664,40 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     // Consume SettingsService
     return Consumer<SettingsService>(
       builder: (context, settings, child) {
-        return WillPopScope(
-          onWillPop: () async {
-            if (_forceExit) {
+        return PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, result) {
+            if (didPop) return;
+            final navigator = Navigator.of(context);
+            () async {
+              if (_forceExit) {
+                SystemChrome.setPreferredOrientations([]);
+                if (mounted) navigator.pop();
+                return;
+              }
+
+              if (_isRepairing) return;
+
+              if (_isSubtitleDragMode || _isGhostDragMode) {
+                _exitSubtitleDragMode();
+                return;
+              }
+
+              if (_isSidebarOpen) {
+                if (!mounted) return;
+                if (_activeSidebar != SidebarType.subtitles) {
+                  setState(() {
+                    _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+                  });
+                  return;
+                }
+              }
+
+              await _handleExit();
+              if (!mounted) return;
               SystemChrome.setPreferredOrientations([]);
-              return true;
-            }
-            // Block pop if repairing
-            if (_isRepairing) return false;
-            
-            // 1. If in subtitle drag mode, exit it
-            if (_isSubtitleDragMode) {
-              _exitSubtitleDragMode();
-              return false;
-            }
-            
-            // 2. If in ghost drag mode, exit it
-            if (_isGhostDragMode) {
-              _exitSubtitleDragMode();
-              return false;
-            }
-
-            // 3. If a sidebar is open, close it
-            if (_isSidebarOpen) {
-              setState(() {
-                _activeSidebar = SidebarType.none;
-              });
-              return false;
-            }
-
-            // 4. Otherwise, allow pop (and reset orientation early)
-            await _handleExit();
-            SystemChrome.setPreferredOrientations([]);
-            return true;
+              navigator.pop();
+            }();
           },
           child: Scaffold(
             key: _scaffoldKey,
@@ -1315,7 +1729,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                         children: [
                           // 1. Video Layer
                           Center(
-                            child: _isRepairing 
+                            child: _fatalErrorMessage != null
+                              ? Container(
+                                  color: Colors.black,
+                                  padding: const EdgeInsets.all(24),
+                                  child: Center(
+                                    child: ConstrainedBox(
+                                      constraints: const BoxConstraints(maxWidth: 520),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
+                                          const SizedBox(height: 16),
+                                          const Text(
+                                            "无法播放该媒体",
+                                            style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Text(
+                                            _fatalErrorMessage!,
+                                            style: const TextStyle(color: Colors.white70),
+                                            textAlign: TextAlign.center,
+                                          ),
+                                          const SizedBox(height: 24),
+                                          ElevatedButton(
+                                            onPressed: () async {
+                                              _forceExit = true;
+                                              await _handleExit();
+                                              if (context.mounted) Navigator.of(context).pop();
+                                            },
+                                            child: const Text("返回"),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              : _isRepairing 
                               ? Column(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
@@ -1389,13 +1839,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                           Image.file(
                                             File(_currentItem!.thumbnailPath!),
                                             fit: BoxFit.cover,
-                                            errorBuilder: (_, __, ___) => Container(color: Colors.black),
+                                            errorBuilder: (context, error, stackTrace) => Container(color: Colors.black),
                                           )
                                         else
                                           Container(color: Colors.black),
                                         Center(
                                           child: CircularProgressIndicator(
-                                            color: Colors.white.withOpacity(0.5),
+                                            color: Colors.white.withValues(alpha: 0.5),
                                           ),
                                         ),
                                         // Top bar for loading state
@@ -1444,24 +1894,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                 isLocked: _isLocked,
                                 onTogglePlay: _togglePlay,
                                 onBackPressed: () => Navigator.of(context).maybePop(),
+                                onSeekTo: (position) {
+                                  try {
+                                    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+                                    if (playbackService.controller == _controller) {
+                                      playbackService.seekTo(position);
+                                    } else {
+                                      _controller.seekTo(position);
+                                    }
+                                  } catch (_) {
+                                    _controller.seekTo(position);
+                                  }
+                                },
                                 onExitPressed: () async {
                                   _forceExit = true;
                                   await _handleExit();
                                   if (context.mounted) Navigator.of(context).pop();
                                 },
                                 onOpenSettings: () => setState(() {
-                                  _previousSidebarType = SidebarType.none;
+                                  _previousSidebarType = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
                                   _activeSidebar = SidebarType.settings;
                                 }), 
                                 onToggleSidebar: () {
                                    setState(() {
-                                     if (_activeSidebar == SidebarType.subtitles) {
-                                       _activeSidebar = SidebarType.none;
+                                     if (_isSubtitleSidebarVisible) {
+                                       if (_activeSidebar == SidebarType.subtitles) {
+                                         _isSubtitleSidebarVisible = false;
+                                         _activeSidebar = SidebarType.none;
+                                       } else {
+                                         _activeSidebar = SidebarType.subtitles;
+                                       }
                                      } else {
+                                       _isSubtitleSidebarVisible = true;
                                        _activeSidebar = SidebarType.subtitles;
                                      }
                                    });
                                 },
+                                isSubtitleSidebarVisible: _isSubtitleSidebarVisible,
                                 onToggleFullScreen: () => settings.toggleFullScreen(),
                                 onToggleLock: () => setState(() => _isLocked = !_isLocked),
                                 onSpeedUpdate: (speed) {
@@ -1527,7 +1996,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                                 child: Center(
                                   child: Container(
                                     width: 2, height: double.infinity,
-                                    color: Colors.white.withOpacity(0.5),
+                                    color: Colors.white.withValues(alpha: 0.5),
                                   ),
                                 ),
                               ),
@@ -1580,7 +2049,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                             final screenWidth = MediaQuery.of(context).size.width;
                             settings.updateSetting('userSubtitleSidebarWidth', (screenWidth - details.globalPosition.dx).clamp(200.0, 600.0));
                           };
-                          instance.onLongPressEnd = (_) => setState(() => _isResizingSidebar = false);
+                          instance.onLongPressEnd = (_) {
+                            setState(() => _isResizingSidebar = false);
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              if (!mounted) return;
+                              _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
+                            });
+                          };
                         },
                       ),
                     },
@@ -1624,23 +2099,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     switch (_activeSidebar) {
       case SidebarType.subtitles:
         return SubtitleSidebar(
+          key: _subtitleSidebarKey,
           subtitles: _subtitles,
           secondarySubtitles: _secondarySubtitles,
           controller: _controller,
-          onItemTap: (time) => _controller.seekTo(time),
+          onItemTap: _seekToSubtitleFast,
           onOpenSettings: () => setState(() {
             _previousSidebarType = SidebarType.subtitles;
             _activeSidebar = SidebarType.settings;
           }),
-          onClose: () => setState(() => _activeSidebar = SidebarType.none),
+          onClose: () => setState(() => _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none),
           onLoadSubtitle: _pickSubtitle,
-          onOpenSubtitleStyle: () => setState(() => _activeSidebar = SidebarType.subtitleStyle),
+          onOpenSubtitleStyle: () => setState(() {
+            _previousSidebarType = SidebarType.subtitles;
+            _activeSidebar = SidebarType.subtitleStyle;
+          }),
           onOpenSubtitleManager: _showSubtitleManager,
           onClearSelection: () => _selectionKey.currentState?.clearSelection(),
           onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
           isCompact: true,
           isPortrait: false,
           focusNode: _videoFocusNode, // Pass focus node
+          isVisible: _isSubtitleSidebarVisible && _activeSidebar == SidebarType.subtitles,
         );
 
       case SidebarType.subtitleStyle:
@@ -1653,8 +2133,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               settings.saveSubtitleStyleLandscape(newStyle);
             }
           },
-          onClose: () => setState(() => _activeSidebar = SidebarType.none),
-          onBack: () => setState(() => _activeSidebar = SidebarType.subtitles),
+          onClose: () => setState(() {
+            _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+            _previousSidebarType = SidebarType.none;
+          }),
+          onBack: () => setState(() {
+            _activeSidebar = _previousSidebarType == SidebarType.settings ? SidebarType.settings : SidebarType.subtitles;
+            _previousSidebarType = SidebarType.none;
+          }),
           isAudio: _isAudio,
         );
       
@@ -1667,12 +2153,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           onLoadSubtitle: () async {
               await _pickSubtitle();
           },
-          onOpenSubtitleSettings: () => setState(() => _activeSidebar = SidebarType.subtitleStyle),
+          onOpenSubtitleSettings: () => setState(() {
+            _previousSidebarType = SidebarType.settings;
+            _activeSidebar = SidebarType.subtitleStyle;
+          }),
           onClose: () => setState(() {
             if (_previousSidebarType == SidebarType.subtitles) {
               _activeSidebar = SidebarType.subtitles;
             } else {
-              _activeSidebar = SidebarType.none;
+              _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
             }
             _previousSidebarType = SidebarType.none;
           }),
@@ -1724,21 +2213,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           autoPlayNextVideo: settings.autoPlayNextVideo,
           onAutoPlayNextVideoChanged: (value) => settings.updateSetting('autoPlayNextVideo', value),
         );
-
-      case SidebarType.subtitleStyle:
-        return SubtitleSettingsSheet(
-          style: _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape,
-          onStyleChanged: (newStyle) {
-            if (_isAudio) {
-              settings.saveAudioSubtitleStyleLandscape(newStyle);
-            } else {
-              settings.saveSubtitleStyleLandscape(newStyle);
-            }
-          },
-          onClose: () => setState(() => _activeSidebar = SidebarType.none),
-          onBack: () => setState(() => _activeSidebar = SidebarType.settings),
-          isAudio: _isAudio,
-        );
         
       case SidebarType.subtitlePosition:
         final isGhost = _isGhostDragMode;
@@ -1773,6 +2247,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
          if (path.isEmpty) return null;
          
          return SubtitleManagementSheet(
+           key: ValueKey(path),
            videoPath: path,
            additionalSubtitles: _currentItem?.additionalSubtitles,
            initialSelectedPaths: _currentSubtitlePaths,
@@ -1780,18 +2255,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
               // Logic to refresh if needed
            },
            onSubtitleSelected: (paths) async {
+              final settings = Provider.of<SettingsService>(context, listen: false);
+              final library = Provider.of<LibraryService>(context, listen: false);
+
               await _loadSubtitles(paths);
               if (_currentItem != null) {
-                 final settings = Provider.of<SettingsService>(context, listen: false);
-                 
                  String? path0;
                  String? path1;
                  
                  if (paths.isNotEmpty) path0 = paths[0];
                  if (paths.length > 1) path1 = paths[1];
                  
-                 Provider.of<LibraryService>(context, listen: false)
-                     .updateVideoSubtitles(
+                 library.updateVideoSubtitles(
                         _currentItem!.id, 
                         path0, 
                         settings.autoCacheSubtitles,

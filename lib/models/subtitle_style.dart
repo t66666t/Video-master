@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'dart:convert';
 
 class SubtitleStyle {
   final double fontSize;
@@ -93,8 +92,8 @@ class SubtitleStyle {
       fontSize: fontSize ?? this.fontSize,
       secondaryFontSize: secondaryFontSize ?? this.secondaryFontSize,
       lineSpacing: lineSpacing ?? this.lineSpacing,
-      fontFamilyChinese: fontFamilyChinese ?? (fontFamily != null ? fontFamily : this.fontFamilyChinese),
-      fontFamilyEnglish: fontFamilyEnglish ?? (fontFamily != null ? fontFamily : this.fontFamilyEnglish),
+      fontFamilyChinese: fontFamilyChinese ?? fontFamily ?? this.fontFamilyChinese,
+      fontFamilyEnglish: fontFamilyEnglish ?? fontFamily ?? this.fontFamilyEnglish,
       textColor: textColor ?? this.textColor,
       backgroundColor: backgroundColor ?? this.backgroundColor,
       hasBorder: hasBorder ?? this.hasBorder,
@@ -165,13 +164,13 @@ class SubtitleStyle {
       'lineSpacing': lineSpacing,
       'fontFamilyChinese': fontFamilyChinese,
       'fontFamilyEnglish': fontFamilyEnglish,
-      'textColor': textColor.value,
-      'backgroundColor': backgroundColor.value,
+      'textColor': textColor.toARGB32(),
+      'backgroundColor': backgroundColor.toARGB32(),
       'hasBorder': hasBorder,
-      'borderColor': borderColor.value,
+      'borderColor': borderColor.toARGB32(),
       'borderWidth': borderWidth,
       'hasShadow': hasShadow,
-      'shadowColor': shadowColor.value,
+      'shadowColor': shadowColor.toARGB32(),
       'shadowBlur': shadowBlur,
       'shadowOffsetDx': shadowOffset.dx,
       'shadowOffsetDy': shadowOffset.dy,
@@ -203,13 +202,13 @@ class SubtitleStyle {
       lineSpacing: (json['lineSpacing'] as num?)?.toDouble() ?? 0.0,
       fontFamilyChinese: json['fontFamilyChinese'] as String? ?? 'System',
       fontFamilyEnglish: json['fontFamilyEnglish'] as String? ?? 'System',
-      textColor: Color(json['textColor'] as int? ?? Colors.white.value),
-      backgroundColor: Color(json['backgroundColor'] as int? ?? Colors.black54.value),
+      textColor: Color(json['textColor'] as int? ?? Colors.white.toARGB32()),
+      backgroundColor: Color(json['backgroundColor'] as int? ?? Colors.black54.toARGB32()),
       hasBorder: json['hasBorder'] as bool? ?? true,
-      borderColor: Color(json['borderColor'] as int? ?? Colors.black.value),
+      borderColor: Color(json['borderColor'] as int? ?? Colors.black.toARGB32()),
       borderWidth: (json['borderWidth'] as num?)?.toDouble() ?? 3.0,
       hasShadow: json['hasShadow'] as bool? ?? true,
-      shadowColor: Color(json['shadowColor'] as int? ?? Colors.black.value),
+      shadowColor: Color(json['shadowColor'] as int? ?? Colors.black.toARGB32()),
       shadowBlur: (json['shadowBlur'] as num?)?.toDouble() ?? 2.0,
       shadowOffset: Offset(
         (json['shadowOffsetDx'] as num?)?.toDouble() ?? 1.0,

@@ -136,9 +136,6 @@ class SubtitleParser {
         // The standard says: "The last field is always the text field, so it can contain commas."
         // So we split formatLen - 1 times.
         
-        int currentIdx = 0;
-        int lastCommaPos = -1;
-        
         // Simple approach: Split by comma formatLen-1 times.
         // Dart's split doesn't support limit like "split first N".
         // We can loop.

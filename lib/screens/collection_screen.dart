@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
@@ -12,12 +10,6 @@ import '../widgets/folder_drop_target.dart';
 import '../widgets/cached_thumbnail_widget.dart';
 import '../services/thumbnail_preload_manager.dart';
 import 'portrait_video_screen.dart';
-import '../services/batch_import_service.dart';
-import 'batch_import_screen.dart';
-
-import 'package:image_picker/image_picker.dart';
-import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import '../widgets/mini_playback_card.dart';
 import '../widgets/video_action_buttons.dart';
 import '../services/media_playback_service.dart';
@@ -38,7 +30,6 @@ class _CollectionScreenState extends State<CollectionScreen> {
   final Set<String> _selectedIds = {};
 
   // Pinch to zoom state
-  double _baseScale = 1.0;
   int _baseCrossAxisCount = 2;
 
   // Thumbnail preloading
@@ -201,8 +192,9 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
   Widget _buildMoveOutTarget(BuildContext context, LibraryService library, VideoCollection collection) {
     return DragTarget<int>(
-      onWillAccept: (data) => true,
-      onAccept: (draggedIndex) {
+      onWillAcceptWithDetails: (_) => true,
+      onAcceptWithDetails: (details) {
+        final draggedIndex = details.data;
          final contents = library.getContents(widget.collectionId);
          if (draggedIndex >= 0 && draggedIndex < contents.length) {
             final draggedItem = contents[draggedIndex];
@@ -232,7 +224,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
           height: 60,
           margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
           decoration: BoxDecoration(
-            color: isHovering ? Colors.blueAccent.withOpacity(0.3) : const Color(0xFF2C2C2C),
+            color: isHovering ? Colors.blueAccent.withValues(alpha: 0.3) : const Color(0xFF2C2C2C),
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
               color: isHovering ? Colors.blueAccent : Colors.white24,
@@ -276,7 +268,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
         return PopScope(
           canPop: !_isSelectionMode,
-          onPopInvoked: (didPop) {
+          onPopInvokedWithResult: (didPop, _) {
             if (didPop) return;
             setState(() {
               _isSelectionMode = false;
@@ -388,7 +380,6 @@ class _CollectionScreenState extends State<CollectionScreen> {
                           child: GestureDetector(
                             onScaleStart: (details) {
                               _baseCrossAxisCount = settings.videoCardCrossAxisCount;
-                              _baseScale = 1.0;
                             },
                             onScaleUpdate: (details) {
                               double newScale = details.scale;
@@ -448,21 +439,41 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       isVisible: isVisible,
                       onTap: () {
                         // 点击卡片进入全屏播放页面
-                        if (playbackService.currentItem != null) {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (context) {
-                                if (Platform.isWindows) {
-                                  return VideoPlayerScreen(
-                                    videoItem: playbackService.currentItem,
-                                    existingController: playbackService.controller,
-                                  );
-                                }
-                                return PortraitVideoScreen(videoItem: playbackService.currentItem!);
-                              },
+                        final currentItem = playbackService.currentItem;
+                        if (currentItem == null) return;
+                        if (!File(currentItem.path).existsSync()) {
+                          ScaffoldMessenger.of(context).clearSnackBars();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text("媒体文件不存在，可能已被移动或删除"),
+                              backgroundColor: Colors.red,
                             ),
                           );
+                          return;
                         }
+                        if (playbackService.controller == null) {
+                          ScaffoldMessenger.of(context).clearSnackBars();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text("播放器尚未准备好，请稍后重试"),
+                              backgroundColor: Colors.red,
+                            ),
+                          );
+                          return;
+                        }
+                        Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (context) {
+                              if (Platform.isWindows) {
+                                return VideoPlayerScreen(
+                                  videoItem: currentItem,
+                                  existingController: playbackService.controller,
+                                );
+                              }
+                              return PortraitVideoScreen(videoItem: currentItem);
+                            },
+                          ),
+                        );
                       },
                     );
                   },
@@ -542,7 +553,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
               child: Icon(
                 Icons.folder, 
                 size: 64, 
-                color: Colors.blueAccent.withOpacity(0.8)
+                color: Colors.blueAccent.withValues(alpha: 0.8)
               ),
             ),
           ),
@@ -551,7 +562,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
         Expanded(
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            color: isSelected ? Colors.blueAccent.withOpacity(0.1) : Colors.transparent,
+            color: isSelected ? Colors.blueAccent.withValues(alpha: 0.1) : Colors.transparent,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -581,7 +592,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
     // 2. Interaction Wrapper
     Widget interactiveCard = Card(
-      color: isSelected ? Colors.blueAccent.withOpacity(0.2) : const Color(0xFF2C2C2C),
+      color: isSelected ? Colors.blueAccent.withValues(alpha: 0.2) : const Color(0xFF2C2C2C),
       elevation: isSelected ? 4 : 2,
       clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
@@ -775,21 +786,42 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     );
                   },
                 ),
-                // Progress Bar
-                if (item.durationMs > 0 && item.lastPositionMs > 0)
-                  Positioned(
-                    bottom: 0,
-                    left: 0,
-                    right: 0,
-                    child: Container(
-                      height: 4,
-                      child: LinearProgressIndicator(
-                        value: (item.lastPositionMs / item.durationMs).clamp(0.0, 1.0),
-                        backgroundColor: Colors.white24,
-                        color: Colors.redAccent,
-                      ),
-                    ),
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Selector<MediaPlaybackService, ({bool isCurrent, int positionMs, int durationMs})>(
+                    selector: (context, service) {
+                      final isCurrent = service.currentItem?.id == item.id;
+                      if (!isCurrent) {
+                        return (isCurrent: false, positionMs: 0, durationMs: 0);
+                      }
+                      return (
+                        isCurrent: true,
+                        positionMs: service.position.inMilliseconds,
+                        durationMs: service.duration.inMilliseconds,
+                      );
+                    },
+                    builder: (context, data, child) {
+                      final bool isCurrent = data.isCurrent;
+                      final int durationMs = isCurrent ? data.durationMs : item.durationMs;
+                      final int positionMs = isCurrent ? data.positionMs : item.lastPositionMs;
+
+                      final shouldShow = durationMs > 0 && (isCurrent || positionMs > 0);
+                      if (!shouldShow) return const SizedBox.shrink();
+
+                      final value = (positionMs / durationMs).clamp(0.0, 1.0);
+                      return SizedBox(
+                        height: 4,
+                        child: LinearProgressIndicator(
+                          value: value,
+                          backgroundColor: Colors.white24,
+                          color: Colors.redAccent,
+                        ),
+                      );
+                    },
                   ),
+                ),
               ],
             ),
           ),
@@ -835,7 +867,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
     // 2. Interaction Wrapper
     Widget interactiveCard = Card(
       clipBehavior: Clip.antiAlias,
-      color: isSelected ? Colors.blueAccent.withOpacity(0.2) : const Color(0xFF2C2C2C),
+      color: isSelected ? Colors.blueAccent.withValues(alpha: 0.2) : const Color(0xFF2C2C2C),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
         side: isSelected ? const BorderSide(color: Colors.blueAccent, width: 2) : BorderSide.none,
@@ -855,28 +887,52 @@ class _CollectionScreenState extends State<CollectionScreen> {
             final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
             final playlistManager = Provider.of<PlaylistManager>(context, listen: false);
             
+            final file = File(item.path);
+            if (!await file.exists()) {
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context).clearSnackBars();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text("媒体文件不存在，可能已被移动或删除"),
+                  backgroundColor: Colors.red,
+                ),
+              );
+              return;
+            }
+
             // 加载播放列表（同文件夹的所有媒体）
             playlistManager.loadFolderPlaylist(widget.collectionId, item.id);
             
             // 开始播放
             await playbackService.play(item);
-            
-            // 进入播放页面
-            if (mounted) {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (context) {
-                    if (Platform.isWindows) {
-                      return VideoPlayerScreen(
-                        videoItem: item,
-                        existingController: playbackService.controller,
-                      );
-                    }
-                    return PortraitVideoScreen(videoItem: item);
-                  },
+
+            if (!context.mounted) return;
+            if (playbackService.state == PlaybackState.error || playbackService.controller == null) {
+              ScaffoldMessenger.of(context).clearSnackBars();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text("播放失败：无法加载该媒体"),
+                  backgroundColor: Colors.red,
                 ),
               );
+              return;
             }
+            
+            // 进入播放页面
+            if (!context.mounted) return;
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (context) {
+                  if (Platform.isWindows) {
+                    return VideoPlayerScreen(
+                      videoItem: item,
+                      existingController: playbackService.controller,
+                    );
+                  }
+                  return PortraitVideoScreen(videoItem: item);
+                },
+              ),
+            );
           }
         },
         onLongPress: _isSelectionMode ? null : () {
@@ -912,8 +968,9 @@ class _CollectionScreenState extends State<CollectionScreen> {
           child: interactiveCard,
         ),
         child: DragTarget<int>(
-          onWillAccept: (data) => data != null && data != index,
-          onAccept: (oldIndex) {
+          onWillAcceptWithDetails: (details) => details.data != index,
+          onAcceptWithDetails: (details) {
+            final oldIndex = details.data;
             final library = Provider.of<LibraryService>(context, listen: false);
             final draggedItem = contents[oldIndex];
             final draggedId = (draggedItem as dynamic).id;
@@ -1050,7 +1107,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     data: SliderTheme.of(context).copyWith(
                       activeTrackColor: Colors.blueAccent,
                       thumbColor: Colors.blueAccent,
-                      overlayColor: Colors.blueAccent.withOpacity(0.2),
+                      overlayColor: Colors.blueAccent.withValues(alpha: 0.2),
                       trackHeight: 4,
                     ),
                     child: Slider(
@@ -1083,7 +1140,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     data: SliderTheme.of(context).copyWith(
                       activeTrackColor: Colors.blueAccent,
                       thumbColor: Colors.blueAccent,
-                      overlayColor: Colors.blueAccent.withOpacity(0.2),
+                      overlayColor: Colors.blueAccent.withValues(alpha: 0.2),
                       trackHeight: 4,
                     ),
                     child: Slider(
@@ -1112,7 +1169,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     data: SliderTheme.of(context).copyWith(
                       activeTrackColor: Colors.blueAccent,
                       thumbColor: Colors.blueAccent,
-                      overlayColor: Colors.blueAccent.withOpacity(0.2),
+                      overlayColor: Colors.blueAccent.withValues(alpha: 0.2),
                       trackHeight: 4,
                     ),
                     child: Slider(

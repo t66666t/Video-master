@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_item.dart';
@@ -17,10 +16,10 @@ import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 class BilibiliDownloadScreen extends StatefulWidget {
   final String? initialInput;
   final String? targetFolderId;
-  const BilibiliDownloadScreen({Key? key, this.initialInput, this.targetFolderId}) : super(key: key);
+  const BilibiliDownloadScreen({super.key, this.initialInput, this.targetFolderId});
 
   @override
-  _BilibiliDownloadScreenState createState() => _BilibiliDownloadScreenState();
+  State<BilibiliDownloadScreen> createState() => _BilibiliDownloadScreenState();
 }
 
 class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
@@ -260,6 +259,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     try {
       final content = await service.apiService.fetchSubtitleContent(sub.url);
       final srt = SubtitleUtil.convertJsonToSrt(content);
+      if (!mounted) return;
       Navigator.pop(context); // Dismiss loading
       
       if (mounted) {
@@ -281,6 +281,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
         );
       }
     } catch (e) {
+      if (!mounted) return;
       Navigator.pop(context);
       ScaffoldMessenger.of(context).clearSnackBars();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("预览失败: $e")));
@@ -296,6 +297,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
      
      final file = File(ep.outputPath!);
      if (!await file.exists()) {
+        if (!mounted) return;
         ScaffoldMessenger.of(context).clearSnackBars();
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("视频文件不存在，可能已被删除或移动")));
         return;
@@ -525,7 +527,9 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                task.isSelected = newVal;
                for (var v in task.videos) {
                   v.isSelected = newVal;
-                  for (var e in v.episodes) e.isSelected = newVal;
+                  for (var e in v.episodes) {
+                    e.isSelected = newVal;
+                  }
                }
                service.saveTasks();
             },
@@ -555,7 +559,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                         width: 80,
                         height: 50,
                         fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(width: 80, height: 50, color: Colors.grey),
+                        errorBuilder: (context, error, stackTrace) =>
+                            Container(width: 80, height: 50, color: Colors.grey),
                       ),
                    ),
                    const SizedBox(width: 12),
@@ -788,7 +793,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                             width: 50,
                             height: 32,
                             fit: BoxFit.cover,
-                            errorBuilder: (_, __, ___) => Container(width: 50, height: 32, color: Colors.grey),
+                            errorBuilder: (context, error, stackTrace) =>
+                                Container(width: 50, height: 32, color: Colors.grey),
                           ),
                        ),
                        const SizedBox(width: 10),
@@ -844,7 +850,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
       child: Container(
         padding: EdgeInsets.fromLTRB(leftPadding, 8, 16, 8),
         decoration: BoxDecoration(
-           border: Border(bottom: BorderSide(color: Colors.white.withOpacity(0.05))),
+           border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
         ),
         child: Column(
           children: [
@@ -1067,7 +1073,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                      dropdownColor: const Color(0xFF333333),
                      items: [
                        const DropdownMenuItem<BilibiliSubtitle?>(value: null, child: Text("无")),
-                       ...ep.availableSubtitles.map((s) => DropdownMenuItem(value: s, child: Text(s.lanDoc, overflow: TextOverflow.ellipsis))).toList(),
+                       ...ep.availableSubtitles.map(
+                         (s) => DropdownMenuItem(
+                           value: s,
+                           child: Text(s.lanDoc, overflow: TextOverflow.ellipsis),
+                         ),
+                       ),
                      ],
                      onChanged: (val) {
                         ep.selectedSubtitle = val;
