@@ -71,6 +71,7 @@ dependencies:
   wakelock_plus: ^1.4.0
   photo_manager: ^3.8.3
   wechat_assets_picker: ^10.1.0
+  open_filex: ^4.4.0
 
 dev_dependencies:
   flutter_test:

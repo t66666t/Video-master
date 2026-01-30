@@ -294,13 +294,55 @@ class TranscriptionManager extends ChangeNotifier {
   
   // 保存 SRT 文件
   Future<String> _saveSrtFile(String videoPath, String srtContent) async {
-    final videoFile = File(videoPath);
-    final dir = videoFile.parent.path;
-    final name = p.basenameWithoutExtension(videoPath);
-    // 使用 .ai.srt 区分
-    final srtPath = p.join(dir, "$name.ai.srt");
-    
-    await File(srtPath).writeAsString(srtContent);
-    return srtPath;
+    try {
+      if (srtContent.trim().isEmpty) {
+        throw Exception("生成的字幕内容为空");
+      }
+
+      // 优先保存到应用私有目录，避免 Android 11+ 权限问题
+      final appDocDir = await getApplicationDocumentsDirectory();
+      final subDir = Directory(p.join(appDocDir.path, 'subtitles'));
+      if (!await subDir.exists()) {
+        await subDir.create(recursive: true);
+      }
+      
+      final name = p.basenameWithoutExtension(videoPath);
+      final srtPath = p.join(subDir.path, "$name.ai.srt");
+      
+      await File(srtPath).writeAsString(srtContent);
+      debugPrint("AI字幕已保存到私有目录: $srtPath");
+
+      // 自动导出到公共下载目录 (仅 Android)
+      if (Platform.isAndroid) {
+        try {
+          final downloadDir = Directory('/storage/emulated/0/Download');
+          if (await downloadDir.exists()) {
+             final publicPath = p.join(downloadDir.path, "$name.ai.srt");
+             // 如果文件已存在，添加时间戳避免覆盖或混淆? 或者直接覆盖方便用户?
+             // 这里选择直接覆盖，或者简单的重命名策略
+             await File(srtPath).copy(publicPath);
+             debugPrint("AI字幕已自动导出到公共目录: $publicPath");
+          }
+        } catch (e) {
+          debugPrint("自动导出到公共目录失败: $e");
+        }
+      }
+
+      return srtPath;
+    } catch (e) {
+      debugPrint("保存字幕到私有目录失败: $e");
+      // 如果私有目录也失败，尝试保存到视频目录（作为备选，虽然可能也会失败）
+      try {
+        final videoFile = File(videoPath);
+        final dir = videoFile.parent.path;
+        final name = p.basenameWithoutExtension(videoPath);
+        final srtPath = p.join(dir, "$name.ai.srt");
+        await File(srtPath).writeAsString(srtContent);
+        debugPrint("AI字幕已保存到视频目录: $srtPath");
+        return srtPath;
+      } catch (e2) {
+        throw Exception("保存字幕文件失败: $e");
+      }
+    }
   }
 }

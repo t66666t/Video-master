@@ -357,25 +357,30 @@ class BatchImportService extends ChangeNotifier {
     
     // 1. Remove Video
     final videoItem = state.videoItems[index];
+    bool isImported = false;
+    
     if (videoItem.path != null) {
-      final bool alreadyImported = state.importedVideoIds.containsKey(videoItem.path!);
+      isImported = state.importedVideoIds.containsKey(videoItem.path!);
       
       // Remove imported marker
-      if (alreadyImported) {
+      if (isImported) {
          state.importedVideoIds.remove(videoItem.path!);
+         // Do not delete file if imported, as Library owns it
+      } else {
+         // Delete file if internal and not imported
+         await _deleteFileIfInternal(videoItem.path!);
       }
-      
-      // Delete file if internal
-      // User requested to clear "batch import cache" even if merged,
-      // because LibraryService now makes its own persistent copy for merged items.
-      await _deleteFileIfInternal(videoItem.path!);
     }
     
     // 2. Remove Subtitle
     if (index < state.subtitleItems.length) {
        final subItem = state.subtitleItems[index];
        if (subItem.path != null) {
-         await _deleteFileIfInternal(subItem.path!);
+         // If the video in this row was imported, the subtitle is likely part of it (merged).
+         // So we protect it too.
+         if (!isImported) {
+           await _deleteFileIfInternal(subItem.path!);
+         }
        }
        state.subtitleItems.removeAt(index);
     }
@@ -395,10 +400,6 @@ class BatchImportService extends ChangeNotifier {
     if (item.path != null) {
       if (state.importedVideoIds.containsKey(item.path!)) {
          state.importedVideoIds.remove(item.path!);
-         // If it was imported, we assume Library owns it now, so don't delete file?
-         // Or does user want to delete even if imported? 
-         // User: "没有合并...删掉了...希望他删除的时候会连着他的视频内存一起删除"
-         // This implies only unmerged ones.
       } else {
          // Not imported -> Delete file
          await _deleteFileIfInternal(item.path!);
@@ -417,7 +418,18 @@ class BatchImportService extends ChangeNotifier {
     
     final item = state.subtitleItems[index];
     if (item.path != null) {
-      await _deleteFileIfInternal(item.path!);
+      // Check if associated video is imported
+      bool isAssociatedVideoImported = false;
+      if (index < state.videoItems.length) {
+        final videoPath = state.videoItems[index].path;
+        if (videoPath != null && state.importedVideoIds.containsKey(videoPath)) {
+          isAssociatedVideoImported = true;
+        }
+      }
+
+      if (!isAssociatedVideoImported) {
+        await _deleteFileIfInternal(item.path!);
+      }
     }
 
     state.subtitleItems.removeAt(index);
@@ -445,6 +457,19 @@ class BatchImportService extends ChangeNotifier {
       if (p.isWithin(tempDir.path, path)) {
         await file.delete();
         debugPrint("Deleted temp batch file: $path");
+
+        // Check if parent dir is an unzip dir and empty
+        final parentDir = file.parent;
+        if (p.basename(parentDir.path).startsWith('unzip_')) {
+          try {
+            if (await parentDir.list().isEmpty) {
+              await parentDir.delete();
+              debugPrint("Deleted empty unzip dir: ${parentDir.path}");
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
         return;
       }
       
@@ -466,5 +491,49 @@ class BatchImportService extends ChangeNotifier {
     state.importedVideoIds.remove(videoPath);
     await _saveState();
     notifyListeners();
+  }
+
+  void updateItemPath(String? folderId, String oldPath, String newPath) {
+    final state = _getState(folderId);
+    bool changed = false;
+
+    // Update Video Items
+    for (var item in state.videoItems) {
+      if (item.path == oldPath) {
+        item.path = newPath;
+        changed = true;
+      }
+    }
+
+    // Update Subtitle Items
+    for (var item in state.subtitleItems) {
+      if (item.path == oldPath) {
+        item.path = newPath;
+        changed = true;
+      }
+    }
+
+    // Update Durations
+    if (state.videoDurations.containsKey(oldPath)) {
+      final duration = state.videoDurations.remove(oldPath);
+      if (duration != null) {
+        state.videoDurations[newPath] = duration;
+        changed = true;
+      }
+    }
+
+    // Update Imported IDs
+    if (state.importedVideoIds.containsKey(oldPath)) {
+       final id = state.importedVideoIds.remove(oldPath);
+       if (id != null) {
+         state.importedVideoIds[newPath] = id;
+         changed = true;
+       }
+    }
+    
+    if (changed) {
+      _saveState();
+      notifyListeners();
+    }
   }
 }

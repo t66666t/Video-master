@@ -27,6 +27,7 @@ import 'video_player_screen.dart'; // Landscape screen
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import '../services/embedded_subtitle_service.dart';
+import '../utils/app_toast.dart';
 
 enum PortraitPanel { subtitles, settings, subtitleStyle, ai, subtitleManager }
 
@@ -40,6 +41,7 @@ class PortraitVideoScreen extends StatefulWidget {
 }
 class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsBindingObserver {
   final GlobalKey<SelectableRegionState> _selectionKey = GlobalKey<SelectableRegionState>();
+  final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey = GlobalKey<SubtitleSidebarState>();
   final FocusNode _selectionFocusNode = FocusNode();
   final FocusNode _videoFocusNode = FocusNode(); // Dedicated focus node for video controls
   late VideoPlayerController _controller;
@@ -239,10 +241,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         _transcriptionManager!.currentVideoPath == _currentItem.path &&
         _transcriptionManager!.lastGeneratedSrtPath != null) {
         
+        if (_transcriptionManager!.isResultConsumed) {
+          return;
+        }
+
         final path = _transcriptionManager!.lastGeneratedSrtPath!;
         // Avoid repeated loading if already loaded as primary
         if (_currentSubtitlePaths.isNotEmpty && _currentSubtitlePaths[0] == path) return;
         
+        _transcriptionManager!.markResultConsumed();
+
         // Auto load
         _loadSubtitles([path]);
         
@@ -252,14 +260,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
               .updateVideoSubtitles(_currentItem.id, path, settings.autoCacheSubtitles);
         
         // Show notification
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("AI 字幕转录完成并已自动加载"),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+        AppToast.show("AI 字幕转录完成并已自动加载", type: AppToastType.success);
     }
   }
 
@@ -272,6 +273,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           manager.lastGeneratedSrtPath != null) {
         
         final srtPath = manager.lastGeneratedSrtPath!;
+        final shouldToast = !manager.isResultConsumed;
         
         if (File(srtPath).existsSync()) {
           debugPrint("检测到AI字幕已完成，自动加载: $srtPath");
@@ -283,15 +285,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           
           _loadSubtitles(pathsToLoad);
           
-          if (mounted) {
-            ScaffoldMessenger.of(context).clearSnackBars();
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text("AI 字幕已自动加载"),
-                backgroundColor: Colors.green,
-                behavior: SnackBarBehavior.floating,
-              ),
-            );
+          if (mounted && shouldToast) {
+            AppToast.show("AI 字幕已自动加载", type: AppToastType.success);
+            manager.markResultConsumed();
           }
         }
       }
@@ -335,31 +331,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     String path = _currentItem.path;
     
     // Check embedded
+    bool loadingShown = false;
     try {
-      final messenger = ScaffoldMessenger.of(context);
       final settings = Provider.of<SettingsService>(context, listen: false);
       final library = Provider.of<LibraryService>(context, listen: false);
       _isLoadingEmbeddedSubtitle = true;
       if (showLoadingIndicator && mounted) {
-        messenger.clearSnackBars();
-        messenger.showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                ),
-                SizedBox(width: 12),
-                Text("正在检测内嵌字幕..."),
-              ],
-            ),
-            duration: Duration(seconds: 10),
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: Color(0xFF2C2C2C),
-          ),
-        );
+        loadingShown = true;
+        AppToast.showLoading("正在检测内嵌字幕...");
       }
       final service = Provider.of<EmbeddedSubtitleService>(context, listen: false);
       final tracks = await service.getEmbeddedSubtitles(path);
@@ -383,6 +362,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           if (_subtitles.isNotEmpty) return;
           
           await _loadSubtitles([extractedPath]);
+          if (mounted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _subtitleSidebarKey.currentState?.jumpToFirstSubtitleTop();
+            });
+          }
 
           if (_currentItem.subtitlePath == null) {
             try {
@@ -405,26 +389,23 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           }
           
           if (!mounted) return;
-          messenger.clearSnackBars();
-          messenger.showSnackBar(
-            SnackBar(
-              content: Text("已加载内嵌字幕: ${track.title}"),
-              duration: const Duration(seconds: 3),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: const Color(0xFF2C2C2C),
-            ),
-          );
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("已加载内嵌字幕: ${track.title}", type: AppToastType.success);
         }
       } else {
         if (mounted) {
-          messenger.clearSnackBars();
+          if (loadingShown) AppToast.dismiss();
           if (showToastWhenNone) {
-            messenger.showSnackBar(const SnackBar(content: Text("未找到内嵌字幕")));
+            AppToast.show("未找到内嵌字幕");
           }
         }
       }
     } catch (e) {
       debugPrint("Auto load embedded subtitle failed: $e");
+      if (loadingShown) AppToast.dismiss();
+      if (mounted) {
+        AppToast.show("内嵌字幕检测失败", type: AppToastType.error);
+      }
     } finally {
       _isLoadingEmbeddedSubtitle = false;
     }
@@ -535,7 +516,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     // Initialize controller immediately to prevent LateInitializationError in UI
     _controller = VideoPlayerController.file(file);
     _isControllerAssigned = true;
-    final messenger = ScaffoldMessenger.of(context);
     final libraryService = Provider.of<LibraryService>(context, listen: false);
     final settingsService = Provider.of<SettingsService>(context, listen: false);
     final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
@@ -543,14 +523,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     if (!await file.exists()) {
       developer.log('Video file not found: ${currentItem.path}');
       if (mounted) {
-        messenger.clearSnackBars();
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text("视频文件不存在: ${currentItem.path}"),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 5),
-          ),
-        );
+        AppToast.show("视频文件不存在: ${currentItem.path}", type: AppToastType.error);
       }
       return;
     }
@@ -617,12 +590,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     } catch (e) {
       developer.log('Error initializing player', error: e);
       if (mounted) {
-        messenger.showSnackBar(
-          SnackBar(
-            content: Text("无法加载视频: $e"),
-            backgroundColor: Colors.red,
-          ),
-        );
+        AppToast.show("无法加载视频", type: AppToastType.error);
       }
     }
   }
@@ -843,10 +811,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         await _loadSubtitles(pathsToLoad);
         
         if (mounted) {
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("已加载字幕: ${file.name}")),
-          );
+          AppToast.show("已加载字幕: ${file.name}", type: AppToastType.success);
         }
       }
     } catch (e) {
@@ -1903,7 +1868,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         );
       case PortraitPanel.subtitles:
         return SubtitleSidebar(
-          key: const ValueKey("SubtitleSidebar"),
+          key: _subtitleSidebarKey,
           subtitles: _subtitles,
           secondarySubtitles: _secondarySubtitles,
           controller: _controller, 

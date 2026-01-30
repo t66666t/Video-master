@@ -683,6 +683,19 @@ class BilibiliDownloadService extends ChangeNotifier {
     bool success = false;
     bool slotReleased = false;
 
+    // Record original choices to restore after refresh
+    // Subtitle logic: Index + Name as requested by user
+    int? oldSubtitleIndex;
+    String? oldSubtitleName;
+    bool hadSubtitle = ep.selectedSubtitle != null;
+    
+    if (hadSubtitle) {
+       oldSubtitleName = ep.selectedSubtitle!.lanDoc;
+       oldSubtitleIndex = ep.availableSubtitles.indexOf(ep.selectedSubtitle!);
+    }
+
+    final oldQualityId = ep.selectedVideoQuality?.id;
+
     while (retryCount <= 3 && !success) {
       ep.status = DownloadStatus.downloading;
       ep.progress = 0.0;
@@ -692,9 +705,67 @@ class BilibiliDownloadService extends ChangeNotifier {
 
       try {
         final streamInfo = await apiService.fetchPlayUrl(ep.bvid, ep.page.cid);
+
+        // --- Refresh Info & Restore Choices ---
+        // Find AID
+        String? aid = ep.page.aid;
+        if (aid == null) {
+           try {
+             final task = tasks.firstWhere((t) => t.videos.any((v) => v.episodes.contains(ep)));
+             final video = task.videos.firstWhere((v) => v.episodes.contains(ep));
+             aid = video.videoInfo.aid;
+           } catch (_) {}
+        }
+
+        // Fetch Subtitles
+        final subtitles = await apiService.fetchSubtitles(
+          ep.bvid, 
+          ep.page.cid, 
+          aid: aid
+        );
+
+        // Update Episode Info
+        ep.availableVideoQualities = streamInfo.videoStreams;
+        ep.availableSubtitles = subtitles;
+
+        // Restore Subtitle Logic
+        if (hadSubtitle) {
+            BilibiliSubtitle? match;
+            
+            // 1. Try Index + Name Match (Priority)
+            if (oldSubtitleIndex != null && oldSubtitleIndex >= 0 && oldSubtitleIndex < subtitles.length) {
+                if (subtitles[oldSubtitleIndex].lanDoc == oldSubtitleName) {
+                    match = subtitles[oldSubtitleIndex];
+                }
+            }
+            
+            // 2. Try Name Match (Fallback)
+            if (match == null && oldSubtitleName != null) {
+                try {
+                   match = subtitles.firstWhere((s) => s.lanDoc == oldSubtitleName);
+                } catch (_) {
+                   // Not found
+                }
+            }
+            
+            // 3. Fallback to default preference
+            ep.selectedSubtitle = match ?? _selectBestSubtitle(subtitles);
+        } else {
+            ep.selectedSubtitle = null; 
+        }
+
+        // Restore Quality (Update reference to new object)
+        if (oldQualityId != null) {
+           try {
+             ep.selectedVideoQuality = streamInfo.videoStreams.firstWhere((q) => q.id == oldQualityId);
+           } catch (_) {
+             // If old quality gone, fallback logic will handle it below
+           }
+        }
+        // --- END Refresh & Restore ---
         
         StreamItem? videoStream;
-        if (streamInfo.videoStreams.any((s) => s.id == ep.selectedVideoQuality!.id)) {
+        if (ep.selectedVideoQuality != null && streamInfo.videoStreams.any((s) => s.id == ep.selectedVideoQuality!.id)) {
            videoStream = streamInfo.videoStreams.firstWhere((s) => s.id == ep.selectedVideoQuality!.id);
         } else {
            videoStream = streamInfo.videoStreams.firstWhere(

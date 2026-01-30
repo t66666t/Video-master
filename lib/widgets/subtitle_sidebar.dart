@@ -401,6 +401,13 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
     if (_isArticleMode) {
        final chunkIndex = index ~/ _articleChunkSize;
+       if (_shouldSkipScrollAnimation(
+         targetIndex: chunkIndex,
+         isArticleMode: true,
+         alignment: 0.15,
+       )) {
+         return;
+       }
        
        _articleItemScrollController.scrollTo(
           index: chunkIndex,
@@ -409,12 +416,98 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           alignment: 0.15, // Align near top to ensure visibility
        );
     } else {
+      if (_shouldSkipScrollAnimation(
+        targetIndex: index,
+        isArticleMode: false,
+        alignment: 0.30,
+      )) {
+        return;
+      }
       _itemScrollController.scrollTo(
         index: index,
         duration: isAuto ? const Duration(milliseconds: 200) : const Duration(milliseconds: 300),
         curve: Curves.easeInOut,
         alignment: 0.30, // 30% from top
       );
+    }
+  }
+
+  bool _shouldSkipScrollAnimation({
+    required int targetIndex,
+    required bool isArticleMode,
+    required double alignment,
+  }) {
+    final positions = isArticleMode
+        ? _articleItemPositionsListener.itemPositions.value
+        : _itemPositionsListener.itemPositions.value;
+    if (positions.isEmpty) return false;
+
+    final int itemCount = isArticleMode
+        ? (widget.subtitles.length / _articleChunkSize).ceil()
+        : widget.subtitles.length;
+    final int lastIndex = itemCount - 1;
+
+    int minIndex = 1 << 30;
+    int maxIndex = -1;
+    double minLeading = double.infinity;
+    double maxTrailing = -double.infinity;
+    double? targetLeading;
+
+    for (final pos in positions) {
+      if (pos.index < minIndex) {
+        minIndex = pos.index;
+        minLeading = pos.itemLeadingEdge;
+      }
+      if (pos.index > maxIndex) {
+        maxIndex = pos.index;
+        maxTrailing = pos.itemTrailingEdge;
+      }
+      if (pos.index == targetIndex) {
+        targetLeading = pos.itemLeadingEdge;
+      }
+    }
+
+    if (targetLeading == null) return false;
+
+    const double epsilon = 0.01;
+    final bool atTop = minIndex == 0 && minLeading >= -epsilon;
+    final bool atBottom = maxIndex == lastIndex && maxTrailing <= 1.0 + epsilon;
+
+    if (atTop && targetLeading <= alignment + epsilon) return true;
+    if (atBottom && targetLeading >= alignment - epsilon) return true;
+    return false;
+  }
+
+  void jumpToFirstSubtitleTop() {
+    if (widget.subtitles.isEmpty) return;
+    _activeIndexNotifier.value = 0;
+    _jumpToIndexTopInternal(targetIndex: 0, attempt: 0);
+  }
+
+  void _jumpToIndexTopInternal({required int targetIndex, required int attempt}) {
+    if (!mounted) return;
+    const int maxAttempts = 6;
+    if (_isArticleMode) {
+      if (!_articleItemScrollController.isAttached) {
+        if (attempt < maxAttempts) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _jumpToIndexTopInternal(targetIndex: targetIndex, attempt: attempt + 1);
+          });
+        }
+        return;
+      }
+      final int chunkIndex = targetIndex ~/ _articleChunkSize;
+      _articleItemScrollController.jumpTo(index: chunkIndex, alignment: 0.0);
+    } else {
+      if (!_itemScrollController.isAttached) {
+        if (attempt < maxAttempts) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _jumpToIndexTopInternal(targetIndex: targetIndex, attempt: attempt + 1);
+          });
+        }
+        return;
+      }
+      _itemScrollController.jumpTo(index: targetIndex, alignment: 0.0);
     }
   }
 
@@ -848,6 +941,35 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     return child;
   }
 
+  bool _shouldTopAlignList({
+    required double maxHeight,
+    required bool isSmallScreen,
+    required double innerV,
+    required double itemGap,
+  }) {
+    if (widget.subtitles.isEmpty) return true;
+    final int lineCount = _lineFilterMode == 0 && _isBilingualMode ? 2 : 1;
+    final double fontSize = (isSmallScreen ? 12 : 13) * _fontSizeScale;
+    final double textHeight = fontSize * 1.6 * lineCount;
+    final double estimatedItemHeight = textHeight + innerV * 2 + itemGap + (isSmallScreen ? 6 : 8);
+    final double estimatedTotalHeight = estimatedItemHeight * widget.subtitles.length + itemGap * 2;
+    return estimatedTotalHeight <= maxHeight;
+  }
+
+  bool _shouldTopAlignArticle({
+    required double maxHeight,
+    required bool isSmallScreen,
+    required int chunkCount,
+  }) {
+    if (chunkCount <= 1) return true;
+    final int lineCount = _lineFilterMode == 0 && _isBilingualMode ? 2 : 1;
+    final double fontSize = (isSmallScreen ? 13 : 15) * _fontSizeScale;
+    final double textHeight = fontSize * 1.6 * lineCount;
+    final double estimatedChunkHeight = textHeight * _articleChunkSize * 0.75 + (isSmallScreen ? 20 : 32);
+    final double estimatedTotalHeight = estimatedChunkHeight * chunkCount + (isSmallScreen ? 24 : 40);
+    return estimatedTotalHeight <= maxHeight;
+  }
+
   // 列表模式视图
   Widget _buildListView(int currentIndex) {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
@@ -859,77 +981,87 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final double itemGap = (isSmallScreen ? 2 : 4) * scale; // 列表项间距
     final double timeGap = (isSmallScreen ? 6 : 8) * scale; // 时间戳和文本的间距
 
-    return ScrollablePositionedList.builder(
-        itemScrollController: _itemScrollController,
-        itemPositionsListener: _itemPositionsListener,
-        initialScrollIndex: currentIndex >= 0 ? currentIndex : 0,
-        initialAlignment: 0.30,
-        itemCount: widget.subtitles.length,
-        itemBuilder: (context, index) {
-          final item = widget.subtitles[index];
-          final isCurrent = index == currentIndex;
-          
-          return Padding(
-            padding: EdgeInsets.symmetric(
-              horizontal: isSmallScreen ? 2 : 6, // 极窄的外边距
-            ),
-            child: Padding(
-              padding: EdgeInsets.only(bottom: itemGap), // 列表项之间的间距
-              child: InkWell(
-                onTapDown: (_) {
-                  widget.onClearSelection?.call();
-                  widget.onItemTap?.call(item.startTime);
-                  // 确保在下一帧请求焦点，避免被 InkWell 重新抢占
-                  Future.microtask(() => widget.focusNode?.requestFocus());
-                },
-                canRequestFocus: false, // 防止 InkWell 获取焦点
-                borderRadius: BorderRadius.circular(4),
-                child: Container(
-                  padding: EdgeInsets.symmetric(horizontal: innerH, vertical: innerV),
-                  decoration: BoxDecoration(
-                    color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.15) : Colors.transparent,
-                    borderRadius: BorderRadius.circular(4),
-                    border: Border.all(
-                      color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.3) : Colors.transparent,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final bool shouldTopAlign = _shouldTopAlignList(
+          maxHeight: constraints.maxHeight,
+          isSmallScreen: isSmallScreen,
+          innerV: innerV,
+          itemGap: itemGap,
+        );
+        final list = ScrollablePositionedList.builder(
+          itemScrollController: _itemScrollController,
+          itemPositionsListener: _itemPositionsListener,
+          initialScrollIndex: currentIndex >= 0 ? currentIndex : 0,
+          initialAlignment: 0.30,
+          itemCount: widget.subtitles.length,
+          shrinkWrap: shouldTopAlign,
+          physics: shouldTopAlign ? const NeverScrollableScrollPhysics() : null,
+          itemBuilder: (context, index) {
+            final item = widget.subtitles[index];
+            final isCurrent = index == currentIndex;
+            
+            return Padding(
+              padding: EdgeInsets.symmetric(
+                horizontal: isSmallScreen ? 2 : 6,
+              ),
+              child: Padding(
+                padding: EdgeInsets.only(bottom: itemGap),
+                child: InkWell(
+                  onTapDown: (_) {
+                    widget.onClearSelection?.call();
+                    widget.onItemTap?.call(item.startTime);
+                    Future.microtask(() => widget.focusNode?.requestFocus());
+                  },
+                  canRequestFocus: false,
+                  borderRadius: BorderRadius.circular(4),
+                  child: Container(
+                    padding: EdgeInsets.symmetric(horizontal: innerH, vertical: innerV),
+                    decoration: BoxDecoration(
+                      color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.15) : Colors.transparent,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: isCurrent ? Colors.blueAccent.withValues(alpha: 0.3) : Colors.transparent,
+                      ),
                     ),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      // 时间戳
-                      Padding(
-                        padding: EdgeInsets.only(top: 2 * scale),
-                        child: Text(
-                          _formatDuration(item.startTime),
-                          style: TextStyle(
-                            color: isCurrent ? Colors.blueAccent : Colors.white30,
-                            fontSize: (isSmallScreen ? 10 : 11) * _fontSizeScale,
-                            fontFamily: 'monospace',
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: EdgeInsets.only(top: 2 * scale),
+                          child: Text(
+                            _formatDuration(item.startTime),
+                            style: TextStyle(
+                              color: isCurrent ? Colors.blueAccent : Colors.white30,
+                              fontSize: (isSmallScreen ? 10 : 11) * _fontSizeScale,
+                              fontFamily: 'monospace',
+                            ),
                           ),
                         ),
-                      ),
-                      SizedBox(width: timeGap),
-                      // 字幕内容
-                      Expanded(
-                        child: Text(
-                          (item.text.isEmpty && item.imageLoader != null) 
-                              ? "[图片字幕]" 
-                              : _getFilteredText(item.text, index),
-                          style: TextStyle(
-                            color: isCurrent ? Colors.white : Colors.white70,
-                            fontSize: (isSmallScreen ? 12 : 13) * _fontSizeScale,
-                            height: 1.3,
-                            fontWeight: isCurrent ? FontWeight.w500 : FontWeight.normal,
+                        SizedBox(width: timeGap),
+                        Expanded(
+                          child: Text(
+                            (item.text.isEmpty && item.imageLoader != null) 
+                                ? "[图片字幕]" 
+                                : _getFilteredText(item.text, index),
+                            style: TextStyle(
+                              color: isCurrent ? Colors.white : Colors.white70,
+                              fontSize: (isSmallScreen ? 12 : 13) * _fontSizeScale,
+                              height: 1.3,
+                              fontWeight: isCurrent ? FontWeight.w500 : FontWeight.normal,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-          );
-        },
+            );
+          },
+        );
+        return shouldTopAlign ? Align(alignment: Alignment.topCenter, child: list) : list;
+      },
     );
   }
 
@@ -939,34 +1071,45 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final int chunkCount = (widget.subtitles.length / _articleChunkSize).ceil();
     final int initialChunkIndex = (activeIndex >= 0 ? (activeIndex ~/ _articleChunkSize) : 0);
 
-    return ScrollablePositionedList.builder(
-      itemScrollController: _articleItemScrollController,
-      itemPositionsListener: _articleItemPositionsListener,
-      initialScrollIndex: initialChunkIndex < chunkCount ? initialChunkIndex : 0,
-      initialAlignment: 0.15,
-      itemCount: chunkCount,
-      padding: EdgeInsets.all(isSmallScreen ? 12 : 20),
-      itemBuilder: (context, chunkIndex) {
-        final int startIndex = chunkIndex * _articleChunkSize;
-        final int endIndex = (startIndex + _articleChunkSize) > widget.subtitles.length 
-            ? widget.subtitles.length 
-            : startIndex + _articleChunkSize;
-        
-        return SubtitleArticleChunk(
-          subtitles: widget.subtitles,
-          startIndex: startIndex,
-          endIndex: endIndex,
-          activeIndex: activeIndex,
-          fontSizeScale: _fontSizeScale,
-          onItemTap: widget.onItemTap,
-          onClearSelection: widget.onClearSelection,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final bool shouldTopAlign = _shouldTopAlignArticle(
+          maxHeight: constraints.maxHeight,
           isSmallScreen: isSmallScreen,
-          lineFilterMode: _lineFilterMode,
-          // Pass cache and mode for article chunk
-          secondaryTextCache: _secondaryTextCache,
-          isBilingualMode: _isBilingualMode,
-          focusNode: widget.focusNode,
+          chunkCount: chunkCount,
         );
+        final list = ScrollablePositionedList.builder(
+          itemScrollController: _articleItemScrollController,
+          itemPositionsListener: _articleItemPositionsListener,
+          initialScrollIndex: initialChunkIndex < chunkCount ? initialChunkIndex : 0,
+          initialAlignment: 0.15,
+          itemCount: chunkCount,
+          padding: EdgeInsets.all(isSmallScreen ? 12 : 20),
+          shrinkWrap: shouldTopAlign,
+          physics: shouldTopAlign ? const NeverScrollableScrollPhysics() : null,
+          itemBuilder: (context, chunkIndex) {
+            final int startIndex = chunkIndex * _articleChunkSize;
+            final int endIndex = (startIndex + _articleChunkSize) > widget.subtitles.length 
+                ? widget.subtitles.length 
+                : startIndex + _articleChunkSize;
+            
+            return SubtitleArticleChunk(
+              subtitles: widget.subtitles,
+              startIndex: startIndex,
+              endIndex: endIndex,
+              activeIndex: activeIndex,
+              fontSizeScale: _fontSizeScale,
+              onItemTap: widget.onItemTap,
+              onClearSelection: widget.onClearSelection,
+              isSmallScreen: isSmallScreen,
+              lineFilterMode: _lineFilterMode,
+              secondaryTextCache: _secondaryTextCache,
+              isBilingualMode: _isBilingualMode,
+              focusNode: widget.focusNode,
+            );
+          },
+        );
+        return shouldTopAlign ? Align(alignment: Alignment.topCenter, child: list) : list;
       },
     );
   }

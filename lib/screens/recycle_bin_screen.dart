@@ -3,12 +3,57 @@ import 'package:provider/provider.dart';
 import '../services/library_service.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
+import '../utils/app_toast.dart';
 
 class RecycleBinScreen extends StatefulWidget {
   const RecycleBinScreen({super.key});
 
   @override
   State<RecycleBinScreen> createState() => _RecycleBinScreenState();
+}
+
+class SizeDisplay extends StatefulWidget {
+  final dynamic item;
+  final LibraryService library;
+
+  const SizeDisplay({super.key, required this.item, required this.library});
+
+  @override
+  State<SizeDisplay> createState() => _SizeDisplayState();
+}
+
+class _SizeDisplayState extends State<SizeDisplay> {
+  late Future<int> _sizeFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _sizeFuture = widget.library.calculateItemSize(widget.item);
+  }
+  
+  @override
+  void didUpdateWidget(SizeDisplay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.item != widget.item) {
+       _sizeFuture = widget.library.calculateItemSize(widget.item);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<int>(
+      future: _sizeFuture,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) return const SizedBox.shrink(); 
+        final size = snapshot.data!;
+        if (size == 0) return const SizedBox.shrink();
+        return Text(
+          " • 可释放: ${LibraryService.formatSize(size)}",
+          style: const TextStyle(color: Colors.grey, fontSize: 12),
+        );
+      },
+    );
+  }
 }
 
 class _RecycleBinScreenState extends State<RecycleBinScreen> {
@@ -119,21 +164,25 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                             )
                           : Icon(isFolder ? Icons.folder : Icons.movie, color: isFolder ? Colors.amber : Colors.blue),
                         title: Text(name, style: const TextStyle(color: Colors.white)),
-                        subtitle: Text(
-                          subtitleText,
-                          style: const TextStyle(color: Colors.white54, fontSize: 12),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                        subtitle: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                subtitleText,
+                                style: const TextStyle(color: Colors.white54, fontSize: 12),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            SizeDisplay(item: item, library: library),
+                          ],
                         ),
                         trailing: !_isSelectionMode 
                           ? IconButton(
                               icon: const Icon(Icons.restore, color: Colors.green),
                               onPressed: () {
                                 library.restoreFromRecycleBin([id]);
-                                ScaffoldMessenger.of(context).clearSnackBars();
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text("已还原")),
-                                );
+                                AppToast.show("已还原", type: AppToastType.success);
                               },
                               tooltip: "还原",
                             )
@@ -178,9 +227,7 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                           _selectedIds.clear();
                           _isSelectionMode = false;
                         });
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text("已还原选中项")),
-                        );
+                        AppToast.show("已还原选中项", type: AppToastType.success);
                       },
                     ),
                     TextButton.icon(
@@ -287,9 +334,20 @@ class RecycledFolderDetailScreen extends StatelessWidget {
                                 name, 
                                 style: TextStyle(color: Colors.white.withValues(alpha: 0.7))
                               ),
-                              subtitle: isFolder 
-                                  ? Text("${item.childrenIds.length} 个项目", style: const TextStyle(color: Colors.white38, fontSize: 12))
-                                  : null,
+                              subtitle: Row(
+                                children: [
+                                  if (isFolder)
+                                    Expanded(
+                                      child: Text(
+                                        "${item.childrenIds.length} 个项目",
+                                        style: const TextStyle(color: Colors.white38, fontSize: 12),
+                                      ),
+                                    )
+                                  else
+                                    const Spacer(),
+                                  SizeDisplay(item: item, library: library),
+                                ],
+                              ),
                               onTap: isFolder 
                                   ? () {
                                       Navigator.of(context).push(

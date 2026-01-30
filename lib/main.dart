@@ -17,6 +17,7 @@ import 'services/bilibili/bilibili_download_service.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/progress_tracker.dart';
+import 'utils/app_toast.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -209,6 +210,8 @@ class MyApp extends StatelessWidget {
         child: MaterialApp(
           title: 'Custom Video Player',
           debugShowCheckedModeBanner: false,
+          navigatorKey: AppToast.navigatorKey,
+          navigatorObservers: [AppToast.observer],
           theme: ThemeData(
             brightness: Brightness.dark,
             primarySwatch: Colors.blue,
@@ -309,12 +312,8 @@ Future<void> _restorePlaybackState({
     final position = Duration(milliseconds: positionMs);
     
     // 播放媒体，但立即暂停（不自动播放）
-    await mediaPlaybackService.play(videoItem, startPosition: position);
-    
-    // 如果上次不是播放状态，暂停播放
-    if (!snapshot.wasPlaying) {
-      await mediaPlaybackService.pause();
-    }
+    // 强制 autoPlay: false，确保启动时不自动播放，无论上次退出时状态如何
+    await mediaPlaybackService.play(videoItem, startPosition: position, autoPlay: false);
     
     debugPrint('成功恢复播放状态: ${videoItem.title} at ${position.inSeconds}s');
   } catch (e) {

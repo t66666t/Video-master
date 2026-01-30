@@ -15,6 +15,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:linked_scroll_controller/linked_scroll_controller.dart';
 import '../models/video_item.dart';
 import '../models/video_item.dart' as vi;
+import '../utils/app_toast.dart';
 
 class BatchImportScreen extends StatefulWidget {
   final String? folderId;
@@ -78,9 +79,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       if (validPaths.length < paths.length) {
         final skippedCount = paths.length - validPaths.length;
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("已跳过 $skippedCount 个不支持的文件")),
-          );
+          AppToast.show("已跳过 $skippedCount 个不支持的文件");
         }
       }
       
@@ -143,13 +142,13 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     } catch (e) {
       debugPrint("Error extracting zip: $e");
       if (mounted) {
-         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("解压失败: ${p.basename(zipPath)}")));
+         AppToast.show("解压失败: ${p.basename(zipPath)}", type: AppToastType.error);
       }
     }
     return extractedPaths;
   }
 
-  void _handleMerge(String videoPath, String? subtitlePath) {
+  Future<void> _handleMerge(String videoPath, String? subtitlePath) async {
     final library = Provider.of<LibraryService>(context, listen: false);
     final batch = Provider.of<BatchImportService>(context, listen: false);
 
@@ -165,13 +164,21 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       type: _detectMediaType(videoPath),
     );
 
-    library.addSingleVideo(item);
-    batch.markImported(widget.folderId, videoPath, id);
+    await library.addSingleVideo(item);
     
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text("已合成并导入")),
-    );
+    // Update Batch Service with new paths (LibraryService modified item.path/item.subtitlePath)
+    if (item.path != videoPath) {
+       batch.updateItemPath(widget.folderId, videoPath, item.path);
+    }
+    if (subtitlePath != null && item.subtitlePath != subtitlePath) {
+       batch.updateItemPath(widget.folderId, subtitlePath, item.subtitlePath!);
+    }
+
+    batch.markImported(widget.folderId, item.path, id);
+    
+    if (mounted) {
+       AppToast.show("已合成并导入", type: AppToastType.success);
+    }
   }
 
   vi.MediaType _detectMediaType(String path) {
@@ -186,18 +193,20 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     return vi.MediaType.video;
   }
 
-  void _handleUndo(String videoPath) {
+  Future<void> _handleUndo(String videoPath) async {
     final library = Provider.of<LibraryService>(context, listen: false);
     final batch = Provider.of<BatchImportService>(context, listen: false);
 
     final importedId = batch.getImportedId(widget.folderId, videoPath);
     if (importedId != null) {
-      library.removeSingleVideo(importedId);
+      // Keep the file because it's now in permanent storage and we want to allow re-import.
+      // If we delete it, the user loses the file (since original temp was deleted on import).
+      await library.removeSingleVideo(importedId, keepFile: true);
       batch.unmarkImported(widget.folderId, videoPath);
       
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("已撤回导入")),
-      );
+      if (mounted) {
+         AppToast.show("已撤回导入", type: AppToastType.success);
+      }
     }
   }
 

@@ -22,6 +22,7 @@ import '../widgets/video_action_buttons.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
 import 'dart:convert';
+import '../utils/app_toast.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -464,28 +465,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 
                 return MiniPlaybackCard(
                   isVisible: isVisible,
-                  onTap: () {
+                  onTap: () async {
                     // 点击卡片进入全屏播放页面
                     final currentItem = playbackService.currentItem;
                     if (currentItem == null) return;
-                    if (!File(currentItem.path).existsSync()) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text("媒体文件不存在，可能已被移动或删除"),
-                          backgroundColor: Colors.red,
-                        ),
-                      );
-                      return;
-                    }
-                    if (playbackService.controller == null) {
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text("播放器尚未准备好，请稍后重试"),
-                          backgroundColor: Colors.red,
-                        ),
-                      );
+                    final exists = await File(currentItem.path).exists();
+                    if (!context.mounted) return;
+                    if (!exists) {
+                      AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
                       return;
                     }
                     Navigator.of(context).push(
@@ -530,10 +517,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         _selectedIds.clear();
                         _isSelectionMode = false;
                       });
-                      ScaffoldMessenger.of(context).clearSnackBars();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text("已移入回收站")),
-                      );
+                      AppToast.show("已移入回收站", type: AppToastType.success);
                     },
                   ),
                   if (_selectedIds.length == 1)
@@ -709,11 +693,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               }
 
               library.moveItemsToCollection(itemsToMove, targetId);
-              
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text("已移动到文件夹")),
-              );
+              AppToast.show("已移动到文件夹", type: AppToastType.success);
             }
           },
           onReorder: (oldIndex, newIndex) {
@@ -910,34 +890,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             final file = File(item.path);
             if (!await file.exists()) {
               if (!context.mounted) return;
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text("媒体文件不存在，可能已被移动或删除"),
-                  backgroundColor: Colors.red,
-                ),
-              );
+              AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
               return;
             }
             
             // 加载播放列表（同文件夹的所有媒体）
             playlistManager.loadFolderPlaylist(item.parentId, item.id);
-            
-            // 开始播放
-            await playbackService.play(item);
 
-            if (!context.mounted) return;
-            if (playbackService.state == PlaybackState.error || playbackService.controller == null) {
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text("播放失败：无法加载该媒体"),
-                  backgroundColor: Colors.red,
-                ),
-              );
-              return;
-            }
-            
             // 进入播放页面
             if (!mounted) return;
             navigator.push(

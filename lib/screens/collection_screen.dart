@@ -15,6 +15,7 @@ import '../widgets/video_action_buttons.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
 import 'video_player_screen.dart';
+import '../utils/app_toast.dart';
 
 class CollectionScreen extends StatefulWidget {
   final String collectionId;
@@ -212,9 +213,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
             }
             
             library.moveItemsToCollection(itemsToMove, collection.parentId);
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text("已移出 ${itemsToMove.length} 个项目")),
-            );
+            AppToast.show("已移出 ${itemsToMove.length} 个项目", type: AppToastType.success);
          }
       },
       builder: (context, candidateData, rejectedData) {
@@ -442,23 +441,11 @@ class _CollectionScreenState extends State<CollectionScreen> {
                         final currentItem = playbackService.currentItem;
                         if (currentItem == null) return;
                         if (!File(currentItem.path).existsSync()) {
-                          ScaffoldMessenger.of(context).clearSnackBars();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text("媒体文件不存在，可能已被移动或删除"),
-                              backgroundColor: Colors.red,
-                            ),
-                          );
+                          AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
                           return;
                         }
                         if (playbackService.controller == null) {
-                          ScaffoldMessenger.of(context).clearSnackBars();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text("播放器尚未准备好，请稍后重试"),
-                              backgroundColor: Colors.red,
-                            ),
-                          );
+                          AppToast.show("播放器尚未准备好，请稍后重试", type: AppToastType.error);
                           return;
                         }
                         Navigator.of(context).push(
@@ -502,10 +489,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                             _selectedIds.clear();
                             _isSelectionMode = false;
                           });
-                          ScaffoldMessenger.of(context).clearSnackBars();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text("已移入回收站")),
-                          );
+                          AppToast.show("已移入回收站", type: AppToastType.success);
                         },
                       ),
                       if (_selectedIds.length == 1)
@@ -680,10 +664,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
               }
 
               library.moveItemsToCollection(itemsToMove, targetId);
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text("已移动到文件夹")),
-              );
+              AppToast.show("已移动到文件夹", type: AppToastType.success);
             }
           },
           onReorder: (oldIndex, newIndex) {
@@ -890,13 +871,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
             final file = File(item.path);
             if (!await file.exists()) {
               if (!context.mounted) return;
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text("媒体文件不存在，可能已被移动或删除"),
-                  backgroundColor: Colors.red,
-                ),
-              );
+              AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
               return;
             }
 
@@ -908,13 +883,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
             if (!context.mounted) return;
             if (playbackService.state == PlaybackState.error || playbackService.controller == null) {
-              ScaffoldMessenger.of(context).clearSnackBars();
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text("播放失败：无法加载该媒体"),
-                  backgroundColor: Colors.red,
-                ),
-              );
+              AppToast.show("播放失败：无法加载该媒体", type: AppToastType.error);
               return;
             }
             

@@ -1,10 +1,12 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:developer' as developer;
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
@@ -1038,6 +1040,11 @@ class LibraryService extends ChangeNotifier {
       return null;
     }
     
+    // Windows Specific Implementation
+    if (Platform.isWindows) {
+      return await _generateThumbnailWindows(videoPath);
+    }
+    
     try {
       final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
@@ -1056,6 +1063,64 @@ class LibraryService extends ChangeNotifier {
       developer.log('Thumbnail error', error: e);
       return null;
     }
+  }
+
+  Future<String?> _generateThumbnailWindows(String videoPath) async {
+     try {
+       // Locate FFmpeg
+       final exeDir = p.dirname(Platform.resolvedExecutable);
+       final ffmpegPath = p.join(exeDir, 'ffmpeg.exe');
+       
+       if (!await File(ffmpegPath).exists()) {
+         developer.log("FFmpeg not found at $ffmpegPath");
+         return null;
+       }
+       
+       final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
+       if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+       
+       // Generate deterministic filename based on video path
+       final hash = md5.convert(utf8.encode(videoPath)).toString();
+       final outPath = p.join(thumbDir.path, "$hash.jpg");
+       
+       // 1. Try to extract embedded cover art
+       // -map 0:v selects all video streams
+       // -map -0:V excludes "real" video streams (leaving attached pictures)
+       try {
+         await Process.run(ffmpegPath, [
+           '-y', 
+           '-i', videoPath, 
+           '-map', '0:v', 
+           '-map', '-0:V', 
+           '-c', 'copy', 
+           outPath
+         ]).timeout(const Duration(seconds: 5)); // Add timeout to prevent hanging
+         
+         if (await File(outPath).exists() && await File(outPath).length() > 0) {
+           return outPath;
+         }
+       } catch (e) {
+         // Continue to fallback
+       }
+       
+       // 2. Fallback: Extract first frame
+       await Process.run(ffmpegPath, [
+         '-y', 
+         '-i', videoPath, 
+         '-ss', '0', 
+         '-vframes', '1', 
+         '-vf', 'scale=-1:200', // Resize to height 200px to optimize speed and size
+         '-q:v', '2', // High quality JPEG
+         outPath
+       ]).timeout(const Duration(seconds: 15));
+       
+       if (await File(outPath).exists() && await File(outPath).length() > 0) {
+         return outPath;
+       }
+     } catch (e) {
+       developer.log('Windows Thumbnail error', error: e);
+     }
+     return null;
   }
 
   Future<void> updateVideoProgress(String id, int positionMs) async {
@@ -1250,8 +1315,24 @@ class LibraryService extends ChangeNotifier {
         final newPath = p.join(targetDir.path, fileName);
         
         await file.copy(newPath);
-        // We keep the original file for now (BatchImportService might want to delete it later)
-        // or if it's in temp, it'll be cleaned up by OS.
+        
+        // Delete original if it was temporary
+        try {
+          await file.delete();
+          debugPrint("Deleted temp file after move: $currentPath");
+          
+          // Check for empty unzip parent dir
+          final parentDir = file.parent;
+          if (p.basename(parentDir.path).startsWith('unzip_')) {
+             if (await parentDir.list().isEmpty) {
+               await parentDir.delete();
+               debugPrint("Deleted empty unzip dir: ${parentDir.path}");
+             }
+          }
+        } catch (e) {
+          debugPrint("Failed to delete temp file: $e");
+        }
+
         return newPath;
       }
     } catch (e) {
@@ -1261,10 +1342,10 @@ class LibraryService extends ChangeNotifier {
   }
 
 
-  Future<void> removeSingleVideo(String id) async {
+  Future<void> removeSingleVideo(String id, {bool keepFile = false}) async {
     if (_videos.containsKey(id)) {
       final vid = _videos[id];
-      if (vid != null) await _deleteVideoFiles(vid);
+      if (vid != null && !keepFile) await _deleteVideoFiles(vid);
       _deleteVideo(id); // Helper handles parent removal
       await _saveLibrary();
       notifyListeners();
@@ -1279,5 +1360,84 @@ class LibraryService extends ChangeNotifier {
     }
     await _saveLibrary();
     notifyListeners();
+  }
+
+  // --- Size Calculation Helpers ---
+
+  Future<int> calculateItemSize(dynamic item) async {
+    if (item is VideoItem) {
+      return _calculateVideoItemSize(item);
+    } else if (item is VideoCollection) {
+      return _calculateCollectionSize(item);
+    }
+    return 0;
+  }
+
+  Future<int> _calculateVideoItemSize(VideoItem item) async {
+    int size = 0;
+    
+    // Check Video File
+    if (_isInternalPath(item.path)) {
+      size += await _getFileSize(item.path);
+    }
+    
+    // Check Subtitles
+    if (item.subtitlePath != null && _isInternalPath(item.subtitlePath!)) {
+      size += await _getFileSize(item.subtitlePath!);
+    }
+    if (item.secondarySubtitlePath != null && _isInternalPath(item.secondarySubtitlePath!)) {
+      size += await _getFileSize(item.secondarySubtitlePath!);
+    }
+    if (item.additionalSubtitles != null) {
+      for (var path in item.additionalSubtitles!.values) {
+        if (_isInternalPath(path)) {
+          size += await _getFileSize(path);
+        }
+      }
+    }
+    
+    // Check Thumbnail
+    if (item.thumbnailPath != null && _isInternalPath(item.thumbnailPath!)) {
+      size += await _getFileSize(item.thumbnailPath!);
+    }
+    
+    return size;
+  }
+
+  Future<int> _calculateCollectionSize(VideoCollection col) async {
+    int size = 0;
+    // Recursively calculate children
+    final children = getContents(col.id); 
+    
+    // Run in parallel for speed
+    final sizes = await Future.wait(children.map((child) => calculateItemSize(child)));
+    for (var s in sizes) {
+      size += s;
+    }
+    return size;
+  }
+
+  bool _isInternalPath(String path) {
+    if (!_initialized) return false;
+    return p.isWithin(_appDocDir.path, path);
+  }
+
+  Future<int> _getFileSize(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) {
+        return await file.length();
+      }
+    } catch (e) {
+      // ignore
+    }
+    return 0;
+  }
+
+  static String formatSize(int bytes) {
+    if (bytes <= 0) return "0 B";
+    const suffixes = ["B", "KB", "MB", "GB", "TB"];
+    var i = (log(bytes) / log(1024)).floor();
+    return '${(bytes / pow(1024, i)).toStringAsFixed(2)} ${suffixes[i]}';
   }
 }

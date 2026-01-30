@@ -10,6 +10,7 @@ import 'package:video_player_app/screens/video_player_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
+import 'package:video_player_app/utils/app_toast.dart';
 
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 
@@ -63,8 +64,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     final hasCookie = await service.apiService.hasCookie();
     if (!hasCookie) {
       if (mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("解析前请先扫码登录 Bilibili")));
+        AppToast.show("解析前请先扫码登录 Bilibili", type: AppToastType.error);
         _showQrCodeLoginDialog(service);
       }
       return;
@@ -217,8 +217,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                  onPressed: () {
                     service.updateSettings(tempMax, tempQuality, tempSubLang, tempAi, tempAutoImport, tempAutoDelete, tempSeqExport);
                     Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).clearSnackBars();
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("设置已保存")));
+                    AppToast.show("设置已保存", type: AppToastType.success);
                  }, 
                  child: const Text("保存")
                ),
@@ -232,21 +231,18 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   Future<void> _importToLibrary(BilibiliDownloadService service, {BilibiliDownloadEpisode? episode}) async {
     final library = Provider.of<LibraryService>(context, listen: false);
     
-    // Clear previous snacks immediately
-    ScaffoldMessenger.of(context).clearSnackBars();
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("开始导入...")));
+    AppToast.showLoading("开始导入...");
     
     final count = await service.importToLibrary(library, episode: episode, targetFolderId: widget.targetFolderId);
     
     if (!mounted) return;
     
-    // Clear "Starting..." snack and show result immediately
-    ScaffoldMessenger.of(context).clearSnackBars();
+    AppToast.dismiss();
     
     if (count > 0) {
-       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("已导入 $count 个视频")));
+       AppToast.show("已导入 $count 个视频", type: AppToastType.success);
     } else {
-       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("导入失败或无已完成任务")));
+       AppToast.show("导入失败或无已完成任务", type: AppToastType.error);
     }
   }
 
@@ -283,23 +279,20 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     } catch (e) {
       if (!mounted) return;
       Navigator.pop(context);
-      ScaffoldMessenger.of(context).clearSnackBars();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("预览失败: $e")));
+      AppToast.show("预览失败", type: AppToastType.error);
     }
   }
 
   void _previewVideo(BilibiliDownloadEpisode ep) async {
      if (ep.outputPath == null) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("文件路径为空，无法播放")));
+        AppToast.show("文件路径为空，无法播放", type: AppToastType.error);
         return;
      }
      
      final file = File(ep.outputPath!);
      if (!await file.exists()) {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("视频文件不存在，可能已被删除或移动")));
+        AppToast.show("视频文件不存在，可能已被删除或移动", type: AppToastType.error);
         return;
      }
      

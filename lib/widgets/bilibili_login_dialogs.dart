@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
+import 'package:video_player_app/utils/app_toast.dart';
 
 Future<void> showBilibiliLoginDialog(BuildContext context) async {
   final service = Provider.of<BilibiliDownloadService>(context, listen: false);
@@ -68,8 +69,7 @@ Future<void> showBilibiliLoginDialog(BuildContext context) async {
             if (sessData.isNotEmpty) {
               await service.apiService.setCookie(sessData);
               if (context.mounted) {
-                ScaffoldMessenger.of(context).clearSnackBars();
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Cookie 已更新")));
+                AppToast.show("Cookie 已更新", type: AppToastType.success);
                 Navigator.pop(context);
               }
             }
@@ -159,8 +159,7 @@ class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
       if (result['success'] == true) {
         timer.cancel();
         Navigator.pop(context); // Close dialog
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("登录成功！")));
+        AppToast.show("登录成功！", type: AppToastType.success);
       } else if (result['code'] == 86038) { // Expired
         timer.cancel();
         setState(() {

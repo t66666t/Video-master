@@ -4,7 +4,11 @@ import 'package:path/path.dart' as p;
 import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:open_filex/open_filex.dart';
 import '../services/embedded_subtitle_service.dart';
+import '../utils/app_toast.dart';
+
+import 'package:shared_preferences/shared_preferences.dart';
 
 class SubtitleManagementSheet extends StatefulWidget {
   final String videoPath;
@@ -38,6 +42,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   bool _isLoading = true;
   int? _extractingTrackIndex; 
   List<String> _selectedPaths = []; // Track selected items
+  String? _customDownloadPath;
 
   final Map<int, String> _extractedTrackPaths = {}; // Map track index to extracted path
 
@@ -46,6 +51,60 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     super.initState();
     _selectedPaths = List.from(widget.initialSelectedPaths);
     _loadSubtitles();
+    _loadCustomDownloadPath();
+  }
+
+  Future<void> _loadCustomDownloadPath() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final path = prefs.getString('subtitle_download_path');
+      if (mounted) {
+        setState(() {
+          _customDownloadPath = path;
+        });
+      }
+    } catch (e) {
+      debugPrint("Error loading custom download path: $e");
+    }
+  }
+
+  Future<void> _setCustomDownloadPath() async {
+    try {
+      final String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
+      if (selectedDirectory != null) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('subtitle_download_path', selectedDirectory);
+        if (mounted) {
+          setState(() {
+            _customDownloadPath = selectedDirectory;
+          });
+          AppToast.show("默认下载路径已更新", type: AppToastType.success);
+        }
+      }
+    } catch (e) {
+      debugPrint("Error setting custom download path: $e");
+    }
+  }
+
+  Future<void> _openDownloadDirectory() async {
+    try {
+      final dir = await _resolveDownloadTargetDir();
+      final path = dir.path;
+      if (Platform.isWindows) {
+        await Process.run('explorer', [path]);
+      } else if (Platform.isMacOS) {
+        await Process.run('open', [path]);
+      } else if (Platform.isLinux) {
+        await Process.run('xdg-open', [path]);
+      } else {
+        // Android fallback (open file manager not easily supported via Intent without plugin)
+        // Try OpenFilex if it's a directory? OpenFilex usually opens files.
+        // For now, just show toast on mobile if not supported
+         AppToast.show("已保存至: $path", type: AppToastType.info);
+      }
+    } catch (e) {
+      AppToast.show("无法打开文件夹", type: AppToastType.error);
+    }
   }
 
   @override
@@ -104,11 +163,14 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         }).toList();
       }
 
-      // 2. Load Extracted Subtitles from AppDocDir
+      // 2. Load Extracted Subtitles and AI Subtitles from AppDocDir
       final appDocDir = await getApplicationDocumentsDirectory();
       final subDir = Directory(p.join(appDocDir.path, 'subtitles'));
       if (await subDir.exists()) {
-        final extractedFiles = subDir.listSync().whereType<File>().where((file) {
+        final docFiles = subDir.listSync().whereType<File>();
+        
+        // Handle Extracted Streams
+        final extractedFiles = docFiles.where((file) {
           final name = p.basename(file.path);
           if (!name.startsWith(extractedPrefix)) return false;
           final ext = p.extension(file.path).toLowerCase();
@@ -123,6 +185,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           final index = int.tryParse(match.group(1) ?? '');
           if (index == null) continue;
           _extractedTrackPaths[index] = file.path;
+        }
+
+        // Handle AI Subtitles
+        final aiFiles = docFiles.where((file) {
+          final name = p.basename(file.path);
+          // Match videoName.ai.srt
+          return name == "$videoName.ai.srt";
+        });
+        
+        for (final file in aiFiles) {
+          if (!_subtitleFiles.any((f) => f.path == file.path)) {
+             _subtitleFiles.add(file);
+          }
         }
       }
       
@@ -190,26 +265,20 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
              // Store mapping
              _extractedTrackPaths[track.index] = path;
              
-             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text("内嵌字幕提取成功")),
-            );
+             AppToast.show("内嵌字幕提取成功", type: AppToastType.success);
 
             _handleSelection(path);
           }
         } else {
           if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text("提取字幕失败，可能格式不支持")),
-            );
+            AppToast.show("提取字幕失败，可能格式不支持", type: AppToastType.error);
           }
         }
       }
     } catch (e) {
       debugPrint("Error extracting: $e");
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-           SnackBar(content: Text("提取出错: $e")),
-        );
+        AppToast.show("提取出错", type: AppToastType.error);
       }
     } finally {
       if (mounted) setState(() => _extractingTrackIndex = null);
@@ -245,11 +314,136 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         widget.onSubtitleChanged(); // Notify parent
       } catch (e) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("删除失败: $e")),
-          );
+          AppToast.show("删除失败", type: AppToastType.error);
         }
       }
+    }
+  }
+
+  Future<Directory> _resolveDownloadTargetDir() async {
+    // 1. 优先使用用户自定义路径
+    if (_customDownloadPath != null) {
+      final customDir = Directory(_customDownloadPath!);
+      if (await customDir.exists()) {
+        return customDir;
+      }
+    }
+
+    if (Platform.isAndroid) {
+      // 优先使用公共下载目录，方便用户通过 MT 管理器等访问
+      final downloadDir = Directory('/storage/emulated/0/Download');
+      if (await downloadDir.exists()) {
+        return downloadDir;
+      }
+      final dir = await getExternalStorageDirectory();
+      if (dir != null) return dir;
+    }
+    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+      final downloads = await getDownloadsDirectory();
+      if (downloads != null) return downloads;
+    }
+    return getApplicationDocumentsDirectory();
+  }
+
+  String? _resolveMimeType(String path) {
+    final ext = p.extension(path).toLowerCase();
+    if (ext.isEmpty) return null;
+    if ([
+      '.srt',
+      '.vtt',
+      '.ass',
+      '.ssa',
+      '.lrc',
+      '.scc',
+      '.sub',
+      '.idx',
+      '.sup',
+    ].contains(ext)) {
+      return 'text/plain';
+    }
+    return null;
+  }
+
+  Future<void> _downloadSubtitleFile(String path) async {
+    try {
+      final sourceFile = File(path);
+      if (!await sourceFile.exists()) {
+        if (mounted) {
+          AppToast.show("字幕文件不存在", type: AppToastType.error);
+        }
+        return;
+      }
+
+      Directory targetDir = await _resolveDownloadTargetDir();
+      if (!await targetDir.exists()) {
+        await targetDir.create(recursive: true);
+      }
+
+      final sourceDir = p.normalize(p.dirname(path));
+      final targetDirPath = p.normalize(targetDir.path);
+      String targetPath = path;
+
+      if (sourceDir != targetDirPath) {
+        final fileName = p.basename(path);
+        String destPath = p.join(targetDir.path, fileName);
+        if (await File(destPath).exists()) {
+          final base = p.basenameWithoutExtension(fileName);
+          final ext = p.extension(fileName);
+          destPath = p.join(targetDir.path, "$base.downloaded.${DateTime.now().millisecondsSinceEpoch}$ext");
+        }
+        await sourceFile.copy(destPath);
+        targetPath = destPath;
+      }
+
+      final result = await OpenFilex.open(targetPath, type: _resolveMimeType(targetPath));
+      if (mounted) {
+        if (result.type == ResultType.done) {
+          AppToast.show("字幕已下载并打开", type: AppToastType.success);
+        } else {
+          AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        AppToast.show("下载字幕失败", type: AppToastType.error);
+      }
+    }
+  }
+
+  Future<void> _downloadEmbeddedTrack(EmbeddedSubtitleTrack track) async {
+    if (_extractingTrackIndex != null) return;
+    if (_extractedTrackPaths.containsKey(track.index)) {
+      await _downloadSubtitleFile(_extractedTrackPaths[track.index]!);
+      return;
+    }
+
+    setState(() => _extractingTrackIndex = track.index);
+
+    try {
+      final appDocDir = await getApplicationDocumentsDirectory();
+      final subDir = Directory(p.join(appDocDir.path, 'subtitles'));
+      if (!await subDir.exists()) {
+        await subDir.create(recursive: true);
+      }
+
+      if (!mounted) return;
+      final service = Provider.of<EmbeddedSubtitleService>(context, listen: false);
+      final path = await service.extractSubtitle(widget.videoPath, track.index, subDir.path, codecName: track.codecName);
+
+      if (path != null) {
+        _extractedTrackPaths[track.index] = path;
+        await _downloadSubtitleFile(path);
+      } else {
+        if (mounted) {
+          AppToast.show("提取字幕失败，可能格式不支持", type: AppToastType.error);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        AppToast.show("提取出错", type: AppToastType.error);
+      }
+    } finally {
+      if (mounted) setState(() => _extractingTrackIndex = null);
     }
   }
 
@@ -333,6 +527,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                 "字幕管理",
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
               ),
+              const Spacer(),
               IconButton(
                 icon: const Icon(Icons.close, color: Colors.white70),
                 onPressed: () {
@@ -347,6 +542,66 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
               ),
             ],
           ),
+          
+          if (Platform.isWindows) ...[
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.05),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white10),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.download_rounded, color: Colors.white54, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _customDownloadPath ?? "默认下载位置: 用户/下载",
+                      style: TextStyle(
+                        color: _customDownloadPath != null ? Colors.white : Colors.white38,
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: _setCustomDownloadPath,
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      backgroundColor: Colors.white10,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                    ),
+                    child: const Text("浏览", style: TextStyle(fontSize: 12)),
+                  ),
+                  const SizedBox(width: 8),
+                  Tooltip(
+                    message: "打开下载目录",
+                    child: InkWell(
+                      onTap: _openDownloadDirectory,
+                      borderRadius: BorderRadius.circular(4),
+                      child: Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.white10,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Icon(Icons.folder, color: Colors.amber, size: 16),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
           const SizedBox(height: 8),
           
           Expanded(
@@ -409,7 +664,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                 ),
                                 selected: _selectedPaths.contains(path),
                                 selectedTileColor: Colors.white10,
-                                trailing: null,
+                              trailing: IconButton(
+                                icon: const Icon(Icons.download_outlined, color: Colors.white70, size: 18),
+                                onPressed: exists ? () => _downloadSubtitleFile(path) : null,
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints(),
+                              ),
                                 onTap: exists ? () => _handleSelection(path) : null,
                               ),
                            );
@@ -458,7 +718,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                 ),
-                                trailing: _buildSelectionBadge(path),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(Icons.download_outlined, color: Colors.white70, size: 18),
+                                      onPressed: exists ? () => _downloadSubtitleFile(path) : null,
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    _buildSelectionBadge(path),
+                                  ],
+                                ),
                                 onTap: exists ? () => _handleSelection(path) : null,
                               ),
                             );
@@ -487,9 +759,20 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                 "${track.language} • ${track.codecName}",
                                 style: const TextStyle(color: Colors.white30, fontSize: 11),
                               ),
-                              trailing: _extractedTrackPaths.containsKey(track.index) && _selectedPaths.contains(_extractedTrackPaths[track.index])
-                                ? _buildSelectionBadge(_extractedTrackPaths[track.index]!)
-                                : const Icon(Icons.download, color: Colors.white70, size: 18),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    icon: const Icon(Icons.download_outlined, color: Colors.white70, size: 18),
+                                    onPressed: _extractingTrackIndex == track.index ? null : () => _downloadEmbeddedTrack(track),
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  if (_extractedTrackPaths.containsKey(track.index))
+                                    _buildSelectionBadge(_extractedTrackPaths[track.index]!),
+                                ],
+                              ),
                               onTap: () => _handleEmbeddedTrackSelection(track),
                             ),
                           );
@@ -551,11 +834,23 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                 ),
                                 selected: _selectedPaths.contains(file.path),
                                 selectedTileColor: Colors.white10,
-                                trailing: IconButton(
-                                  icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
-                                  onPressed: () => _deleteSubtitle(file),
-                                  padding: EdgeInsets.zero,
-                                  constraints: const BoxConstraints(),
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(Icons.download_outlined, color: Colors.white70, size: 18),
+                                      onPressed: () => _downloadSubtitleFile(file.path),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(),
+                                    ),
+                                    const SizedBox(width: 4),
+                                    IconButton(
+                                      icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 18),
+                                      onPressed: () => _deleteSubtitle(file),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(),
+                                    ),
+                                  ],
                                 ),
                                 onTap: () => _handleSelection(file.path),
                               ),

@@ -37,6 +37,21 @@ import '../widgets/subtitle_position_sidebar.dart';
 import '../widgets/subtitle_management_sheet.dart';
 import '../widgets/ai_transcription_panel.dart';
 import '../services/transcription_manager.dart';
+import '../utils/app_toast.dart';
+
+List<Map<String, Object?>> _parseTextSubtitlesToSerializable(String content) {
+  final parsed = SubtitleParser.parse(content);
+  final result = <Map<String, Object?>>[];
+  for (final item in parsed) {
+    result.add(<String, Object?>{
+      'i': item.index,
+      's': item.startTime.inMilliseconds,
+      'e': item.endTime.inMilliseconds,
+      't': item.text,
+    });
+  }
+  return result;
+}
 
 enum SidebarType { none, subtitles, settings, subtitleStyle, subtitlePosition, subtitleManager, aiTranscription }
 
@@ -109,6 +124,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   final List<int> _subtitleStartMs = <int>[];
   final List<int> _secondarySubtitleStartMs = <int>[];
   Timer? _subtitleSeekTimer;
+  bool _isParsingSubtitles = false;
+  int _subtitleParseRequestId = 0;
+  final Map<String, List<SubtitleItem>> _subtitleCache = <String, List<SubtitleItem>>{};
+  bool _userRequestedSubtitles = false;
   
   // Subtitle Positioning Mode
   bool _isSubtitleDragMode = false;
@@ -178,6 +197,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     final settings = _settingsService;
     if (settings == null) return;
 
+    final bool showSubtitlesBecameTrue = (_lastShowSubtitles == false || _lastShowSubtitles == null) && settings.showSubtitles;
+
     final bool changed = _lastShowSubtitles != settings.showSubtitles ||
         _lastSubtitleOffset != settings.subtitleOffset ||
         _lastSplitSubtitleByLine != settings.splitSubtitleByLine ||
@@ -195,6 +216,36 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     if (_initialized) {
       _updateSubtitle();
     }
+
+    if (showSubtitlesBecameTrue) {
+      _maybeLoadSubtitlesForCurrentItem(force: true);
+    }
+  }
+
+  bool _shouldLoadSubtitlesNow(SettingsService settings) {
+    if (settings.showSubtitles) return true;
+    if (_userRequestedSubtitles) return true;
+    return false;
+  }
+
+  void _maybeLoadSubtitlesForCurrentItem({bool force = false}) {
+    if (!mounted) return;
+    final currentItem = _currentItem;
+    if (currentItem == null) return;
+    final settings = _settingsService ?? Provider.of<SettingsService>(context, listen: false);
+    if (!force && !_shouldLoadSubtitlesNow(settings)) return;
+    if (_isParsingSubtitles) return;
+    if (_currentSubtitlePaths.isNotEmpty) return;
+
+    if (currentItem.subtitlePath != null) {
+      final List<String> paths = <String>[currentItem.subtitlePath!];
+      if (currentItem.secondarySubtitlePath != null) {
+        paths.add(currentItem.secondarySubtitlePath!);
+      }
+      _loadSubtitles(paths, autoEnableSubtitles: false);
+      return;
+    }
+    _maybeAutoLoadEmbeddedSubtitle();
   }
 
   void _triggerSubtitleRefreshBurst() {
@@ -249,6 +300,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         _currentSubtitleIndex = -1;
         _currentSecondarySubtitleIndex = -1;
         _autoEmbeddedAttemptedForItemId = null;
+        _subtitleCache.clear();
+        _isParsingSubtitles = false;
+        _subtitleParseRequestId++;
+        _userRequestedSubtitles = false;
         // Do not reset _isControllerOwner here. Let _initVideo handle it.
         // Otherwise we might accidentally dispose the service controller if we exit before init completes.
       });
@@ -473,14 +528,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         
         // 不需要在这里保存，TranscriptionManager 已经保存了
         
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("AI 字幕转录完成并已自动加载"),
-            backgroundColor: Colors.green,
-            behavior: SnackBarBehavior.floating,
-          ),
-        );
+        AppToast.show("AI 字幕转录完成并已自动加载", type: AppToastType.success);
     }
   }
 
@@ -509,15 +557,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           
           _loadSubtitles(pathsToLoad);
           
-          if (mounted) {
-            ScaffoldMessenger.of(context).clearSnackBars();
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text("AI 字幕已自动加载"),
-                backgroundColor: Colors.green,
-                behavior: SnackBarBehavior.floating,
-              ),
-            );
+          if (!manager.isResultConsumed) {
+            manager.markResultConsumed();
           }
         }
       }
@@ -545,6 +586,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     if (path == null) return;
     
     // Check embedded
+    bool loadingShown = false;
     try {
       _isLoadingEmbeddedSubtitle = true;
       final SettingsService settings = Provider.of<SettingsService>(context, listen: false);
@@ -552,25 +594,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       
       // Show loading indicator if requested
       if (showLoadingIndicator && mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Row(
-              children: [
-                SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                ),
-                SizedBox(width: 12),
-                Text("正在检测内嵌字幕..."),
-              ],
-            ),
-            duration: Duration(seconds: 10),
-            behavior: SnackBarBehavior.floating,
-            backgroundColor: Color(0xFF2C2C2C),
-          ),
-        );
+        loadingShown = true;
+        AppToast.showLoading("正在检测内嵌字幕...");
       }
       
       final service = Provider.of<EmbeddedSubtitleService>(context, listen: false);
@@ -596,6 +621,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           if (_subtitles.isNotEmpty) return;
 
           await _loadSubtitles([extractedPath]);
+          if (mounted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _subtitleSidebarKey.currentState?.jumpToFirstSubtitleTop();
+            });
+          }
 
           if (_currentItem != null) {
             try {
@@ -612,48 +642,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           
           if (!mounted) return;
 
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Row(
-                children: [
-                  const Icon(Icons.check_circle, color: Colors.green, size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text("已加载内嵌字幕: ${track.title}")),
-                ],
-              ),
-              duration: const Duration(seconds: 3),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: const Color(0xFF2C2C2C),
-            ),
-          );
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("已加载内嵌字幕: ${track.title}", type: AppToastType.success);
         } else if (mounted && extractedPath == null) {
           // Extraction failed
-          ScaffoldMessenger.of(context).clearSnackBars();
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Row(
-                children: [
-                  Icon(Icons.error_outline, color: Colors.orange, size: 20),
-                  SizedBox(width: 8),
-                  Text("内嵌字幕提取失败"),
-                ],
-              ),
-              duration: Duration(seconds: 2),
-              behavior: SnackBarBehavior.floating,
-              backgroundColor: Color(0xFF2C2C2C),
-            ),
-          );
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("内嵌字幕提取失败", type: AppToastType.error);
         }
       } else if (mounted && tracks.isEmpty) {
         // No embedded subtitles found
-        ScaffoldMessenger.of(context).clearSnackBars();
+        if (loadingShown) AppToast.dismiss();
       }
     } catch (e) {
       debugPrint("Auto load embedded subtitle failed: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).clearSnackBars();
-      }
+      if (loadingShown) AppToast.dismiss();
+      if (mounted) AppToast.show("内嵌字幕检测失败", type: AppToastType.error);
     } finally {
       _isLoadingEmbeddedSubtitle = false;
     }
@@ -731,16 +734,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       // 首先检查是否有刚完成的AI字幕（即使 isResultConsumed 为 true）
       _checkAndLoadAiSubtitle(currentItem);
       
-      // Load subtitles if item has path
-      if (currentItem?.subtitlePath != null) {
-        final List<String> paths = [currentItem!.subtitlePath!];
-        if (currentItem.secondarySubtitlePath != null) {
-          paths.add(currentItem.secondarySubtitlePath!);
-        }
-        _loadSubtitles(paths, autoEnableSubtitles: false);
-      } else {
-        _maybeAutoLoadEmbeddedSubtitle();
-      }
+      _maybeLoadSubtitlesForCurrentItem();
     } else {
       // 尝试从 MediaPlaybackService 获取 controller (适用于视频切换或未传递 controller 的情况)
       bool usedService = false;
@@ -828,15 +822,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
              _triggerSubtitleRefreshBurst();
              _checkAndLoadAiSubtitle(currentItem);
              
-             if (currentItem.subtitlePath != null) {
-                final List<String> paths = [currentItem.subtitlePath!];
-                if (currentItem.secondarySubtitlePath != null) {
-                   paths.add(currentItem.secondarySubtitlePath!);
-                }
-                _loadSubtitles(paths, autoEnableSubtitles: false);
-             } else {
-                _maybeAutoLoadEmbeddedSubtitle();
-             }
+             _maybeLoadSubtitlesForCurrentItem();
           }
         } catch (e) {
           debugPrint("Check MediaPlaybackService failed: $e");
@@ -934,16 +920,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           // 首先检查是否有刚完成的AI字幕（即使 isResultConsumed 为 true）
           _checkAndLoadAiSubtitle(currentItem);
   
-          // Load subtitles if item has path
-          if (currentItem?.subtitlePath != null) {
-            final List<String> paths = [currentItem!.subtitlePath!];
-            if (currentItem.secondarySubtitlePath != null) {
-              paths.add(currentItem.secondarySubtitlePath!);
-            }
-            _loadSubtitles(paths, autoEnableSubtitles: false);
-          } else {
-            _maybeAutoLoadEmbeddedSubtitle();
-          }
+          _maybeLoadSubtitlesForCurrentItem();
         }).catchError((error) {
           debugPrint("Error initializing video: $error");
           debugPrint("Error stack trace: ${StackTrace.current}");
@@ -1113,7 +1090,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             await File(originalBackup).delete();
             
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("修复成功，正在重新加载...")));
+              AppToast.show("修复成功，正在重新加载...", type: AppToastType.success);
               setState(() => _isRepairing = false);
               // Re-init video
               _controller.dispose();
@@ -1123,7 +1100,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             debugPrint("File op failed: $e");
             if (mounted) {
                setState(() => _isRepairing = false);
-               ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("文件替换失败: $e")));
+               AppToast.show("文件替换失败", type: AppToastType.error);
             }
           }
         } else {
@@ -1376,9 +1353,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         await _loadSubtitles(pathsToLoad);
         
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("已加载字幕: ${file.name}")),
-          );
+          AppToast.show("已加载字幕: ${file.name}", type: AppToastType.success);
         }
       }
     } catch (e) {
@@ -1391,11 +1366,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       _previousSidebarType = SidebarType.subtitles;
       _activeSidebar = SidebarType.subtitleManager;
     });
+    _userRequestedSubtitles = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _maybeLoadSubtitlesForCurrentItem(force: true);
+    });
   }
   
   Future<void> _loadSubtitles(List<String> paths, {bool autoEnableSubtitles = true}) async {
     final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
     final settingsService = Provider.of<SettingsService>(context, listen: false);
+
+    final int requestId = ++_subtitleParseRequestId;
+    final String? itemIdAtStart = _currentItem?.id;
 
     if (paths.isEmpty) {
       setState(() {
@@ -1414,45 +1396,73 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       // 同步到 MediaPlaybackService
       playbackService.setSubtitleState(paths: const [], primary: const [], secondary: const []);
       _triggerSubtitleRefreshBurst();
+      if (_isParsingSubtitles) {
+        setState(() {
+          _isParsingSubtitles = false;
+        });
+      }
       
       return;
     }
-    
-    // Load Primary
-    final primaryList = await _parseSubtitleFile(paths[0]);
-    
-    List<SubtitleItem> secondaryList = [];
-    if (paths.length > 1) {
-       secondaryList = await _parseSubtitleFile(paths[1]);
+
+    if (_isParsingSubtitles) return;
+    if (mounted) {
+      setState(() {
+        _isParsingSubtitles = true;
+      });
+    } else {
+      _isParsingSubtitles = true;
     }
     
-    if (primaryList.isNotEmpty || secondaryList.isNotEmpty) {
-       if (!mounted) return;
+    // Load Primary
+    try {
+      final primaryList = await _parseSubtitleFile(paths[0]);
+    
+      List<SubtitleItem> secondaryList = [];
+      if (paths.length > 1) {
+         secondaryList = await _parseSubtitleFile(paths[1]);
+      }
+    
+      if (!mounted) return;
+      if (requestId != _subtitleParseRequestId) return;
+      if (itemIdAtStart != null && _currentItem?.id != itemIdAtStart) return;
 
-       setState(() {
-          _subtitles = primaryList;
-          _secondarySubtitles = secondaryList;
-          _currentSubtitlePaths = List.from(paths);
-          _lastSubtitleIndex = 0;
-          _lastSecondarySubtitleIndex = 0;
-          _currentSubtitleText = "";
-          _currentSecondaryText = null;
-          _currentSubtitleImage = null;
-          _currentSubtitleItem = null;
-          _currentSubtitleIndex = -1;
-          _currentSecondarySubtitleIndex = -1;
-       });
-       _rebuildSubtitleIndex();
-       
-       playbackService.setSubtitleState(
-         paths: _currentSubtitlePaths,
-         primary: primaryList,
-         secondary: secondaryList,
-       );
-       if (autoEnableSubtitles) {
-         settingsService.updateSetting('showSubtitles', true);
-       }
-       _triggerSubtitleRefreshBurst();
+      if (primaryList.isNotEmpty || secondaryList.isNotEmpty) {
+         setState(() {
+            _subtitles = primaryList;
+            _secondarySubtitles = secondaryList;
+            _currentSubtitlePaths = List.from(paths);
+            _lastSubtitleIndex = 0;
+            _lastSecondarySubtitleIndex = 0;
+            _currentSubtitleText = "";
+            _currentSecondaryText = null;
+            _currentSubtitleImage = null;
+            _currentSubtitleItem = null;
+            _currentSubtitleIndex = -1;
+            _currentSecondarySubtitleIndex = -1;
+         });
+         _rebuildSubtitleIndex();
+         
+         playbackService.setSubtitleState(
+           paths: _currentSubtitlePaths,
+           primary: primaryList,
+           secondary: secondaryList,
+         );
+         if (autoEnableSubtitles) {
+           settingsService.updateSetting('showSubtitles', true);
+         }
+         _triggerSubtitleRefreshBurst();
+      }
+    } finally {
+      if (!mounted) {
+        _isParsingSubtitles = false;
+      } else if (requestId == _subtitleParseRequestId) {
+        setState(() {
+          _isParsingSubtitles = false;
+        });
+      } else {
+        _isParsingSubtitles = false;
+      }
     }
   }
 
@@ -1541,6 +1551,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   }
 
   Future<List<SubtitleItem>> _parseSubtitleFile(String path) async {
+    final cached = _subtitleCache[path];
+    if (cached != null) return cached;
+
     try {
       final file = File(path);
       if (!await file.exists()) return [];
@@ -1584,13 +1597,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         }
         
         if (content.isNotEmpty) {
-          parsed = SubtitleParser.parse(content);
+          final serialized = await compute(_parseTextSubtitlesToSerializable, content);
+          parsed = serialized
+              .map(
+                (m) => SubtitleItem(
+                  index: (m['i'] as int?) ?? 0,
+                  startTime: Duration(milliseconds: (m['s'] as int?) ?? 0),
+                  endTime: Duration(milliseconds: (m['e'] as int?) ?? 0),
+                  text: (m['t'] as String?) ?? "",
+                ),
+              )
+              .toList();
         }
       }
       
       if (parsed.isNotEmpty) {
         parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
       }
+      _subtitleCache[path] = parsed;
       return parsed;
     } catch (e) {
       developer.log('Load sub error', error: e);
@@ -1927,6 +1951,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                      } else {
                                        _isSubtitleSidebarVisible = true;
                                        _activeSidebar = SidebarType.subtitles;
+                                     }
+                                   });
+                                   WidgetsBinding.instance.addPostFrameCallback((_) {
+                                     if (!mounted) return;
+                                     if (_isSubtitleSidebarVisible && _activeSidebar == SidebarType.subtitles) {
+                                       _userRequestedSubtitles = true;
+                                       _maybeLoadSubtitlesForCurrentItem(force: true);
                                      }
                                    });
                                 },
@@ -2296,9 +2327,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
               await _loadSubtitles([srtPath]);
               
               if (mounted) {
-                 ScaffoldMessenger.of(context).showSnackBar(
-                   const SnackBar(content: Text("AI 字幕已加载")),
-                 );
+                 AppToast.show("AI 字幕已加载", type: AppToastType.success);
               }
               setState(() => _activeSidebar = SidebarType.subtitles);
            },
