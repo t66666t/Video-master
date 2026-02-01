@@ -2,6 +2,109 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../models/subtitle_style.dart';
 
+class SubtitleOverlayEntry {
+  final int? index;
+  final String text;
+  final String? secondaryText;
+  final Uint8List? image;
+
+  const SubtitleOverlayEntry({
+    this.index,
+    required this.text,
+    this.secondaryText,
+    this.image,
+  });
+
+  bool get hasContent {
+    if (image != null) return true;
+    if (text.isNotEmpty) return true;
+    if (secondaryText != null && secondaryText!.isNotEmpty) return true;
+    return false;
+  }
+}
+
+class SubtitleOverlayGroup extends StatelessWidget {
+  final List<SubtitleOverlayEntry> entries;
+  final SubtitleStyle style;
+  final Alignment alignment;
+  final VoidCallback? onLongPress;
+  final bool isDragging;
+  final bool isGestureOnly;
+  final bool isVisualOnly;
+  final double itemGap;
+  final bool animateAlignment;
+  final Duration alignmentDuration;
+  final Curve alignmentCurve;
+
+  const SubtitleOverlayGroup({
+    super.key,
+    required this.entries,
+    required this.style,
+    required this.alignment,
+    this.onLongPress,
+    this.isDragging = false,
+    this.isGestureOnly = false,
+    this.isVisualOnly = false,
+    this.itemGap = 6.0,
+    this.animateAlignment = false,
+    this.alignmentDuration = const Duration(milliseconds: 300),
+    this.alignmentCurve = Curves.easeOutCubic,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleEntries = entries.where((e) => e.hasContent).toList();
+    if (visibleEntries.isEmpty && !isDragging) return const SizedBox.shrink();
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final Widget content = SingleChildScrollView(
+          reverse: alignment.y >= 0,
+          physics: const NeverScrollableScrollPhysics(),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (int i = 0; i < visibleEntries.length; i++) ...[
+                SubtitleOverlay(
+                  text: visibleEntries[i].text,
+                  secondaryText: visibleEntries[i].secondaryText,
+                  image: visibleEntries[i].image,
+                  style: style,
+                  onLongPress: onLongPress,
+                  isDragging: isDragging,
+                  isGestureOnly: isGestureOnly,
+                  isVisualOnly: isVisualOnly,
+                ),
+                if (i != visibleEntries.length - 1) SizedBox(height: itemGap),
+              ],
+            ],
+          ),
+        );
+
+        final Widget alignedChild = animateAlignment
+            ? AnimatedAlign(
+                alignment: alignment,
+                duration: alignmentDuration,
+                curve: alignmentCurve,
+                child: content,
+              )
+            : Align(
+                alignment: alignment,
+                child: content,
+              );
+
+        return SizedBox(
+          width: constraints.maxWidth,
+          height: constraints.maxHeight,
+          child: ClipRect(
+            child: alignedChild,
+          ),
+        );
+      },
+    );
+  }
+}
+
 class SubtitleOverlay extends StatelessWidget {
   final String text; // Primary text (or all text if single file + no split)
   final String? secondaryText; // Explicit secondary text

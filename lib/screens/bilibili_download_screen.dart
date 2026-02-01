@@ -27,6 +27,40 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   final TextEditingController _inputController = TextEditingController();
   
   // Dialog helpers need access to API service, which is now in BilibiliDownloadService
+
+  Widget _buildCheckboxWithSmallThumbnail({
+    required bool value,
+    required ValueChanged<bool?> onChanged,
+    required String thumbnailUrl,
+    double thumbnailWidth = 44,
+    double thumbnailHeight = 28,
+  }) {
+    return SizedBox(
+      width: 56,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Checkbox(
+            value: value,
+            activeColor: Colors.pinkAccent,
+            onChanged: onChanged,
+          ),
+          if (thumbnailUrl.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: Image.network(
+                thumbnailUrl,
+                width: thumbnailWidth,
+                height: thumbnailHeight,
+                fit: BoxFit.cover,
+                errorBuilder: (context, error, stackTrace) =>
+                    Container(width: thumbnailWidth, height: thumbnailHeight, color: Colors.grey),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
   
   @override
   void initState() {
@@ -768,29 +802,20 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   child: Row(
                     children: [
-                       Checkbox(
-                          value: video.isSelected,
-                          activeColor: Colors.pinkAccent,
-                          onChanged: (val) {
-                            video.isSelected = val ?? false;
-                            for (var ep in video.episodes) {
-                              ep.isSelected = video.isSelected;
-                            }
-                            service.saveTasks();
-                          },
+                       _buildCheckboxWithSmallThumbnail(
+                         value: video.isSelected,
+                         onChanged: (val) {
+                           video.isSelected = val ?? false;
+                           for (var ep in video.episodes) {
+                             ep.isSelected = video.isSelected;
+                           }
+                           service.saveTasks();
+                         },
+                         thumbnailUrl: video.videoInfo.pic,
+                         thumbnailWidth: 44,
+                         thumbnailHeight: 28,
                        ),
-                       ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: Image.network(
-                            video.videoInfo.pic,
-                            width: 50,
-                            height: 32,
-                            fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) =>
-                                Container(width: 50, height: 32, color: Colors.grey),
-                          ),
-                       ),
-                       const SizedBox(width: 10),
+                       const SizedBox(width: 8),
                        Expanded(
                           child: Text(
                             video.videoInfo.title,
@@ -850,18 +875,31 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
              Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                   Checkbox(
-                      value: ep.isSelected,
-                      activeColor: Colors.pinkAccent,
-                      onChanged: (val) {
-                        ep.isSelected = val ?? false;
-                        video.isSelected = video.episodes.every((e) => e.isSelected);
-                        if (!task.isCollection) {
+                   if (task.isCollection && video.episodes.length == 1)
+                     _buildCheckboxWithSmallThumbnail(
+                       value: ep.isSelected,
+                       onChanged: (val) {
+                         ep.isSelected = val ?? false;
+                         video.isSelected = video.episodes.every((e) => e.isSelected);
+                         service.saveTasks();
+                       },
+                       thumbnailUrl: video.videoInfo.pic,
+                       thumbnailWidth: 40,
+                       thumbnailHeight: 26,
+                     )
+                   else
+                     Checkbox(
+                       value: ep.isSelected,
+                       activeColor: Colors.pinkAccent,
+                       onChanged: (val) {
+                         ep.isSelected = val ?? false;
+                         video.isSelected = video.episodes.every((e) => e.isSelected);
+                         if (!task.isCollection) {
                            task.isSelected = video.isSelected;
-                        }
-                        service.saveTasks();
-                      },
-                   ),
+                         }
+                         service.saveTasks();
+                       },
+                     ),
                    Expanded(
                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,

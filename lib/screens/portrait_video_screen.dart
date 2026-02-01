@@ -58,8 +58,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   String? _currentSecondaryText;
   int _currentSubtitleIndex = -1;
   int _currentSecondarySubtitleIndex = -1;
-  int _lastSubtitleIndex = 0;
-  int _lastSecondarySubtitleIndex = 0;
+  List<int> _currentSubtitleIndices = [];
+  List<int> _currentSecondarySubtitleIndices = [];
+  List<SubtitleOverlayEntry> _currentSubtitleEntries = [];
   final List<int> _subtitleStartMs = <int>[];
   final List<int> _secondarySubtitleStartMs = <int>[];
   Timer? _subtitleSeekTimer;
@@ -75,6 +76,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
 
   bool _isOrientationSetup = false;
   bool _forceExit = false;
+  bool _iosBackSwipeActive = false;
+  double _iosBackSwipeDistance = 0.0;
+  static const double _iosBackSwipeEdgeWidth = 20.0;
+  static const double _iosBackSwipeTriggerDistance = 60.0;
   TranscriptionManager? _transcriptionManager;
   
   // Audio state
@@ -140,31 +145,72 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _updateSubtitle();
     }
   }
+
+  void _applyItemSubtitlePreference(VideoItem item, {bool force = false}) {
+    final settings = _settingsService ?? Provider.of<SettingsService>(context, listen: false);
+    final bool target = item.showFloatingSubtitles;
+    if (force || settings.showSubtitles != target) {
+      settings.updateSetting('showSubtitles', target);
+    }
+  }
+
+  void _setFloatingSubtitles(bool value) {
+    final settings = _settingsService ?? Provider.of<SettingsService>(context, listen: false);
+    settings.updateSetting('showSubtitles', value);
+    final currentItem = _currentItem;
+    currentItem.showFloatingSubtitles = value;
+    try {
+      Provider.of<LibraryService>(context, listen: false)
+          .updateVideoSubtitleVisibility(currentItem.id, value);
+    } catch (_) {}
+  }
   
   void _onPlaybackServiceChange() {
     if (!mounted) return;
     final service = Provider.of<MediaPlaybackService>(context, listen: false);
+    
+    // 检查当前路由是否在最顶层（即竖屏页是否可见）
+    // 如果不在最顶层（被横屏页覆盖），则不处理控制器变更，只更新字幕等状态
+    final bool isOnTop = ModalRoute.of(context)?.isCurrent ?? false;
+    
     if (service.currentItem != null && service.currentItem!.id != _currentItem.id) {
-      // 切换视频
-      setState(() {
-        _currentItem = service.currentItem!;
-        _initialized = false;
-        _isControllerAssigned = false;
-        _subtitles = [];
-        _secondarySubtitles = [];
-        _currentSubtitlePaths = [];
-        _currentSubtitleText = "";
-        _currentSecondaryText = null;
-        _currentSubtitleIndex = -1;
-        _currentSecondarySubtitleIndex = -1;
-        _autoEmbeddedAttemptedForItemId = null;
-      });
-      _initPlayer();
+      // 视频发生变化
+      if (isOnTop) {
+        // 竖屏页在最顶层，正常处理视频切换
+        setState(() {
+          _currentItem = service.currentItem!;
+          _initialized = false;
+          _isControllerAssigned = false;
+          _subtitles = [];
+          _secondarySubtitles = [];
+          _currentSubtitlePaths = [];
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
+          _autoEmbeddedAttemptedForItemId = null;
+        });
+        _applyItemSubtitlePreference(service.currentItem!, force: true);
+        _initPlayer();
+      } else {
+        // 竖屏页在后台（被横屏页覆盖），只更新当前项信息，不处理控制器
+        // 这样当返回竖屏页时，会重新同步状态
+        setState(() {
+          _currentItem = service.currentItem!;
+          _initialized = false;
+          _isControllerAssigned = false;
+        });
+        // 不调用 _initPlayer，让页面重新可见时再处理
+      }
     } else if (!_initialized && service.currentItem?.id == _currentItem.id && 
                service.state != PlaybackState.loading && service.controller != null) {
       // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
       _initPlayer();
     } else if (service.currentItem?.id == _currentItem.id) {
+      // 同步字幕状态（无论是否在顶层都同步，确保字幕设置一致）
       final bool pathsChanged = !_stringListEquals(service.subtitlePaths, _currentSubtitlePaths);
       final bool primaryChanged = service.subtitles.length != _subtitles.length;
       final bool secondaryChanged = service.secondarySubtitles.length != _secondarySubtitles.length;
@@ -173,12 +219,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           _subtitles = service.subtitles;
           _secondarySubtitles = service.secondarySubtitles;
           _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
-          _lastSubtitleIndex = 0;
-          _lastSecondarySubtitleIndex = 0;
           _currentSubtitleText = "";
           _currentSecondaryText = null;
           _currentSubtitleIndex = -1;
           _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
         });
         _rebuildSubtitleIndex();
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -420,6 +467,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     } catch (e) {
       debugPrint("Error refreshing item: $e");
     }
+    _applyItemSubtitlePreference(currentItem, force: true);
     
     // Check if this is audio
     _isAudio = currentItem.type == MediaType.audio;
@@ -614,12 +662,15 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     final settings = Provider.of<SettingsService>(context, listen: false);
     
     if (!settings.showSubtitles) {
-      if (_currentSubtitleText.isNotEmpty || _currentSecondaryText != null || _currentSubtitleIndex != -1 || _currentSecondarySubtitleIndex != -1) {
+      if (_currentSubtitleText.isNotEmpty || _currentSecondaryText != null || _currentSubtitleIndex != -1 || _currentSecondarySubtitleIndex != -1 || _currentSubtitleEntries.isNotEmpty) {
         setState(() {
           _currentSubtitleText = "";
           _currentSecondaryText = null;
           _currentSubtitleIndex = -1;
           _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
         });
       }
       return;
@@ -630,73 +681,92 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     final int posMs = adjustedPosition.inMilliseconds;
     final continuousSubtitleEnabled = _isAudio ? settings.audioContinuousSubtitle : settings.videoContinuousSubtitle;
     
-    // --- Primary Subtitle ---
-    SubtitleItem? currentItem;
-    int primaryIndex = -1;
-    if (_subtitles.isNotEmpty) {
-      if (_subtitleStartMs.length != _subtitles.length) {
-        _rebuildSubtitleIndex();
+    if (_subtitleStartMs.length != _subtitles.length || _secondarySubtitleStartMs.length != _secondarySubtitles.length) {
+      _rebuildSubtitleIndex();
+    }
+
+    final List<int> primaryIndices = _subtitles.isEmpty
+        ? <int>[]
+        : _findSubtitleIndicesMs(
+            posMs: posMs,
+            subtitles: _subtitles,
+            startMs: _subtitleStartMs,
+            continuousSubtitleEnabled: continuousSubtitleEnabled,
+          );
+    final List<int> secondaryIndices = _secondarySubtitles.isEmpty
+        ? <int>[]
+        : _findSubtitleIndicesMs(
+            posMs: posMs,
+            subtitles: _secondarySubtitles,
+            startMs: _secondarySubtitleStartMs,
+            continuousSubtitleEnabled: continuousSubtitleEnabled,
+          );
+
+    final List<SubtitleItem> secondaryOverlapItems = secondaryIndices.map((i) => _secondarySubtitles[i]).toList();
+    final List<SubtitleOverlayEntry> entries = <SubtitleOverlayEntry>[];
+
+    if (primaryIndices.isNotEmpty) {
+      for (final int index in primaryIndices) {
+        final SubtitleItem item = _subtitles[index];
+        String text = item.text;
+        String? secondaryText;
+
+        if (_secondarySubtitles.isEmpty && settings.splitSubtitleByLine) {
+          if (text.contains('\n')) {
+            final lines = text.split('\n');
+            text = lines[0];
+            secondaryText = lines.sublist(1).join('\n');
+          }
+        } else if (secondaryOverlapItems.isNotEmpty) {
+          SubtitleItem? best;
+          int bestDelta = 1 << 30;
+          for (final sec in secondaryOverlapItems) {
+            final int delta = (sec.startTime.inMilliseconds - item.startTime.inMilliseconds).abs();
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              best = sec;
+            }
+          }
+          secondaryText = best?.text;
+        }
+
+        entries.add(SubtitleOverlayEntry(
+          index: index,
+          text: text,
+          secondaryText: secondaryText,
+          image: null,
+        ));
       }
-      final int index = _findSubtitleIndexMs(
-        posMs: posMs,
-        subtitles: _subtitles,
-        startMs: _subtitleStartMs,
-        lastIndex: _lastSubtitleIndex,
-        continuousSubtitleEnabled: continuousSubtitleEnabled,
-      );
-      if (index >= 0) {
-        currentItem = _subtitles[index];
-        _lastSubtitleIndex = index;
-        primaryIndex = index;
-      } else {
-        _lastSubtitleIndex = 0;
+    } else if (secondaryIndices.isNotEmpty) {
+      for (final int index in secondaryIndices) {
+        final SubtitleItem item = _secondarySubtitles[index];
+        entries.add(SubtitleOverlayEntry(
+          index: null,
+          text: "",
+          secondaryText: item.text,
+          image: null,
+        ));
       }
     }
 
-    // --- Secondary Subtitle ---
-    SubtitleItem? currentSecondaryItem;
-    int secondaryIndex = -1;
-    if (_secondarySubtitles.isNotEmpty) {
-      if (_secondarySubtitleStartMs.length != _secondarySubtitles.length) {
-        _rebuildSubtitleIndex();
-      }
-      final int index = _findSubtitleIndexMs(
-        posMs: posMs,
-        subtitles: _secondarySubtitles,
-        startMs: _secondarySubtitleStartMs,
-        lastIndex: _lastSecondarySubtitleIndex,
-        continuousSubtitleEnabled: continuousSubtitleEnabled,
-      );
-      if (index >= 0) {
-        currentSecondaryItem = _secondarySubtitles[index];
-        _lastSecondarySubtitleIndex = index;
-        secondaryIndex = index;
-      } else {
-        _lastSecondarySubtitleIndex = 0;
-      }
-    }
-    
-    String newText = currentItem?.text ?? "";
-    String? newSecondaryText = currentSecondaryItem?.text;
-    
-    // If no explicit secondary file is loaded, apply the "Split by Line" logic
-    if (_secondarySubtitles.isEmpty && settings.splitSubtitleByLine) {
-       if (newText.contains('\n')) {
-          final lines = newText.split('\n');
-          newText = lines[0];
-          newSecondaryText = lines.sublist(1).join('\n');
-       }
-    }
-    
-    final bool primaryChanged = primaryIndex != _currentSubtitleIndex;
-    final bool secondaryChanged = secondaryIndex != _currentSecondarySubtitleIndex;
-    if (!primaryChanged && !secondaryChanged) return;
+    final int anchorPrimaryIndex = primaryIndices.isNotEmpty ? primaryIndices.first : -1;
+    final int anchorSecondaryIndex = secondaryIndices.isNotEmpty ? secondaryIndices.first : -1;
+    final SubtitleOverlayEntry? anchorEntry = entries.isNotEmpty ? entries.first : null;
+    final bool indicesChanged = !_areIntListsEqual(primaryIndices, _currentSubtitleIndices) ||
+        !_areIntListsEqual(secondaryIndices, _currentSecondarySubtitleIndices);
+    final bool entriesChanged = !_areSubtitleEntryListsEqual(entries, _currentSubtitleEntries);
+    final bool anchorChanged = anchorPrimaryIndex != _currentSubtitleIndex || anchorSecondaryIndex != _currentSecondarySubtitleIndex;
+
+    if (!indicesChanged && !entriesChanged && !anchorChanged) return;
 
     setState(() {
-      _currentSubtitleIndex = primaryIndex;
-      _currentSecondarySubtitleIndex = secondaryIndex;
-      _currentSubtitleText = newText;
-      _currentSecondaryText = newSecondaryText;
+      _currentSubtitleIndices = primaryIndices;
+      _currentSecondarySubtitleIndices = secondaryIndices;
+      _currentSubtitleEntries = entries;
+      _currentSubtitleIndex = anchorPrimaryIndex;
+      _currentSecondarySubtitleIndex = anchorSecondaryIndex;
+      _currentSubtitleText = anchorEntry?.text ?? "";
+      _currentSecondaryText = anchorEntry?.secondaryText;
     });
   }
 
@@ -881,12 +951,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _subtitles = primary;
       _secondarySubtitles = secondary;
       _currentSubtitlePaths = List.from(paths);
-      _lastSubtitleIndex = 0;
-      _lastSecondarySubtitleIndex = 0;
       _currentSubtitleText = "";
       _currentSecondaryText = null;
       _currentSubtitleIndex = -1;
       _currentSecondarySubtitleIndex = -1;
+      _currentSubtitleIndices = [];
+      _currentSecondarySubtitleIndices = [];
+      _currentSubtitleEntries = [];
     });
     _rebuildSubtitleIndex();
     
@@ -912,9 +983,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     required bool continuousSubtitleEnabled,
   }) {
     final SubtitleItem item = subtitles[index];
-    if (!continuousSubtitleEnabled) return item.endTime.inMilliseconds;
-    if (index + 1 < subtitles.length) return startMs[index + 1];
-    return item.endTime.inMilliseconds;
+    final int actualEndMs = item.endTime.inMilliseconds;
+    if (!continuousSubtitleEnabled) return actualEndMs;
+    int nextStartMs = actualEndMs;
+    if (index + 1 < subtitles.length) {
+      nextStartMs = startMs[index + 1];
+    }
+    return nextStartMs < actualEndMs ? actualEndMs : nextStartMs;
   }
 
   int _binarySearchLastStartLE(List<int> startMs, int posMs) {
@@ -933,51 +1008,56 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     return ans;
   }
 
-  int _findSubtitleIndexMs({
+
+  List<int> _findSubtitleIndicesMs({
     required int posMs,
     required List<SubtitleItem> subtitles,
     required List<int> startMs,
-    required int lastIndex,
     required bool continuousSubtitleEnabled,
   }) {
-    if (subtitles.isEmpty) return -1;
+    if (subtitles.isEmpty) return <int>[];
+    final int candidate = _binarySearchLastStartLE(startMs, posMs);
+    if (candidate < 0 || candidate >= subtitles.length) return <int>[];
 
-    if (lastIndex >= 0 && lastIndex < subtitles.length) {
-      final int lastStartMs = startMs[lastIndex];
-      final int lastEndMs = _getEffectiveEndMs(
+    final List<int> indices = <int>[];
+    for (int i = candidate; i >= 0; i--) {
+      if (startMs[i] > posMs) continue;
+      final int endMs = _getEffectiveEndMs(
         subtitles: subtitles,
         startMs: startMs,
-        index: lastIndex,
+        index: i,
         continuousSubtitleEnabled: continuousSubtitleEnabled,
       );
-      if (posMs >= lastStartMs && posMs < lastEndMs) {
-        return lastIndex;
-      }
-      final int nextIndex = lastIndex + 1;
-      if (nextIndex < subtitles.length) {
-        final int nextStartMs = startMs[nextIndex];
-        final int nextEndMs = _getEffectiveEndMs(
-          subtitles: subtitles,
-          startMs: startMs,
-          index: nextIndex,
-          continuousSubtitleEnabled: continuousSubtitleEnabled,
-        );
-        if (posMs >= nextStartMs && posMs < nextEndMs) {
-          return nextIndex;
-        }
+      if (posMs < endMs) {
+        indices.add(i);
+      } else {
+        break;
       }
     }
+    if (indices.length <= 1) return indices;
+    indices.sort();
+    return indices;
+  }
 
-    final int candidate = _binarySearchLastStartLE(startMs, posMs);
-    if (candidate < 0 || candidate >= subtitles.length) return -1;
-    final int endMs = _getEffectiveEndMs(
-      subtitles: subtitles,
-      startMs: startMs,
-      index: candidate,
-      continuousSubtitleEnabled: continuousSubtitleEnabled,
-    );
-    if (posMs < endMs) return candidate;
-    return -1;
+  bool _areIntListsEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  bool _areSubtitleEntryListsEqual(List<SubtitleOverlayEntry> a, List<SubtitleOverlayEntry> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      final SubtitleOverlayEntry left = a[i];
+      final SubtitleOverlayEntry right = b[i];
+      if (left.index != right.index) return false;
+      if (left.text != right.text) return false;
+      if (left.secondaryText != right.secondaryText) return false;
+      if (left.image != right.image) return false;
+    }
+    return true;
   }
 
   @override
@@ -1014,6 +1094,54 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
      } catch (e) {
        debugPrint("Exit sync error: $e");
      }
+  }
+
+  Future<void> _handleBackRequest() async {
+    final navigator = Navigator.of(context);
+    if (_forceExit) {
+      SystemChrome.setPreferredOrientations([]);
+      if (mounted) navigator.pop();
+      return;
+    }
+
+    if (_isSubtitleDragMode) {
+      _exitSubtitleDragMode();
+      return;
+    }
+
+    if (_activePanel != PortraitPanel.subtitles) {
+      if (!mounted) return;
+      setState(() {
+        _activePanel = PortraitPanel.subtitles;
+      });
+      return;
+    }
+
+    await _handleExit();
+    if (!mounted) return;
+    SystemChrome.setPreferredOrientations([]);
+    navigator.pop();
+  }
+
+  void _onIosBackSwipeStart(DragStartDetails details) {
+    if (!Platform.isIOS) return;
+    _iosBackSwipeActive = true;
+    _iosBackSwipeDistance = 0.0;
+  }
+
+  void _onIosBackSwipeUpdate(DragUpdateDetails details) {
+    if (!_iosBackSwipeActive) return;
+    _iosBackSwipeDistance += details.delta.dx;
+    if (_iosBackSwipeDistance >= _iosBackSwipeTriggerDistance) {
+      _iosBackSwipeActive = false;
+      _iosBackSwipeDistance = 0.0;
+      _handleBackRequest();
+    }
+  }
+
+  void _onIosBackSwipeEnd(DragEndDetails details) {
+    _iosBackSwipeActive = false;
+    _iosBackSwipeDistance = 0.0;
   }
 
   @override
@@ -1063,11 +1191,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     // Use opaque: false to make transition smoother if needed
     _saveProgress(); // Save before switch just in case
     
+    // 标记控制器已传递给横屏页，竖屏页不再拥有它
+    _isControllerOwner = false;
+    
     await Navigator.of(context).push(
       PageRouteBuilder(
         pageBuilder: (context, animation, secondaryAnimation) => VideoPlayerScreen(
           videoFile: null, // Legacy param, ignored
-          existingController: _controller, // Pass controller
+          existingController: _controller, // Pass控制器
           videoItem: _currentItem, // Pass item for context
           skipAutoPauseOnExit: true,
         ),
@@ -1083,11 +1214,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     
     if (!mounted) return;
     
+    // 从横屏返回后，需要重新同步控制器状态
+    // 因为横屏页可能已经切换了视频，导致控制器被替换
+    _isControllerAssigned = false;
+    _initialized = false;
+    
     // Restore orientation logic based on device type
     _updateOrientations();
     
-    // When returning, we need to refresh state if settings changed
-    // And force reload subtitle in case it was changed in landscape
+    // 重新初始化播放器以同步 Service 的状态
+    _initPlayer();
+    
+    // 同步字幕状态
     try {
       final library = Provider.of<LibraryService>(context, listen: false);
       final updated = library.getVideo(_currentItem.id);
@@ -1112,6 +1250,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         _currentSubtitlePaths = [];
         _currentSubtitleText = "";
         _currentSecondaryText = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _currentSubtitleIndices = [];
+        _currentSecondarySubtitleIndices = [];
+        _currentSubtitleEntries = [];
       });
       playbackService.clearSubtitleState();
     }
@@ -1148,9 +1291,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           height: 36, // Extremely short height
           child: Row(
             children: [
-              // Time
+              // Time - show drag position when dragging, otherwise show current position
               Text(
-                "${_formatDuration(position)} / ${_formatDuration(duration)}",
+                _isDraggingProgress
+                    ? "${_formatDuration(Duration(milliseconds: _dragProgressValue.toInt()))} / ${_formatDuration(duration)}"
+                    : "${_formatDuration(position)} / ${_formatDuration(duration)}",
                 style: const TextStyle(color: Colors.white, fontSize: 10),
               ),
               
@@ -1239,7 +1384,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                   color: settings.showSubtitles ? Colors.blueAccent : Colors.white70,
                   size: 18,
                 ),
-                onPressed: () => settings.updateSetting('showSubtitles', !settings.showSubtitles),
+                onPressed: () => _setFloatingSubtitles(!settings.showSubtitles),
                 tooltip: "字幕开关",
                 padding: const EdgeInsets.all(4),
                 constraints: const BoxConstraints(),
@@ -1408,32 +1553,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           canPop: false,
           onPopInvokedWithResult: (didPop, result) {
             if (didPop) return;
-            final navigator = Navigator.of(context);
-            () async {
-              if (_forceExit) {
-                SystemChrome.setPreferredOrientations([]);
-                if (mounted) navigator.pop();
-                return;
-              }
-
-              if (_isSubtitleDragMode) {
-                _exitSubtitleDragMode();
-                return;
-              }
-
-              if (_activePanel != PortraitPanel.subtitles) {
-                if (!mounted) return;
-                setState(() {
-                  _activePanel = PortraitPanel.subtitles;
-                });
-                return;
-              }
-
-              await _handleExit();
-              if (!mounted) return;
-              SystemChrome.setPreferredOrientations([]);
-              navigator.pop();
-            }();
+            _handleBackRequest();
           },
           child: Scaffold(
             backgroundColor: Colors.black,
@@ -1551,10 +1671,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                     subtitles: _subtitles,
                                     longPressSpeed: settings.longPressSpeed,
                                     showSubtitles: settings.showSubtitles,
-                                    onToggleSubtitles: () => settings.updateSetting('showSubtitles', !settings.showSubtitles),
+                                    onToggleSubtitles: () => _setFloatingSubtitles(!settings.showSubtitles),
                                     onMoveSubtitles: _enterSubtitleDragMode,
-                                    subtitleText: _currentSubtitleText,
-                                    secondarySubtitleText: _currentSecondaryText,
+                                    subtitleEntries: _currentSubtitleEntries,
                                     subtitleStyle: settings.subtitleStyle,
                                     subtitleAlignment: settings.subtitleAlignment,
                                     onEnterSubtitleDragMode: _enterSubtitleDragMode,
@@ -1726,6 +1845,19 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                           ),
                         ),
                       ),
+                    if (Platform.isIOS)
+                      Positioned(
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                        width: _iosBackSwipeEdgeWidth,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onHorizontalDragStart: _onIosBackSwipeStart,
+                          onHorizontalDragUpdate: _onIosBackSwipeUpdate,
+                          onHorizontalDragEnd: _onIosBackSwipeEnd,
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -1820,17 +1952,15 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
           onDoubleTapSubtitleSeekChanged: (val) => settings.updateSetting('enableDoubleTapSubtitleSeek', val),
           subtitleDelay: settings.subtitleDelay,
-          isHardwareDecoding: settings.isHardwareDecoding,
           longPressSpeed: settings.longPressSpeed,
           autoCacheSubtitles: settings.autoCacheSubtitles,
           onSpeedChanged: (val) => settings.updateSetting('playbackSpeed', val),
-          onSubtitleToggle: (val) => settings.updateSetting('showSubtitles', val),
+          onSubtitleToggle: (val) => _setFloatingSubtitles(val),
           onMirrorHChanged: (val) => settings.updateSetting('isMirroredH', val),
           onMirrorVChanged: (val) => settings.updateSetting('isMirroredV', val),
           onSeekSecondsChanged: (val) => settings.updateSetting('doubleTapSeekSeconds', val),
           onSubtitleDelayChanged: (val) => settings.setSubtitleDelay(val), 
           onSubtitleDelayChangeEnd: (val) => settings.saveSubtitleDelay(val),
-          onHardwareDecodingChanged: (val) => settings.updateSetting('isHardwareDecoding', val),
           onLongPressSpeedChanged: (val) => settings.updateSetting('longPressSpeed', val),
           onAutoCacheSubtitlesChanged: (val) => settings.updateSetting('autoCacheSubtitles', val),
           splitSubtitleByLine: settings.splitSubtitleByLine,
@@ -1847,6 +1977,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           onAutoPauseOnExitChanged: (val) => settings.updateSetting('autoPauseOnExit', val),
           autoPlayNextVideo: settings.autoPlayNextVideo,
           onAutoPlayNextVideoChanged: (val) => settings.updateSetting('autoPlayNextVideo', val),
+          enableSeekPreview: settings.enableSeekPreview,
+          onEnableSeekPreviewChanged: (val) => settings.updateSetting('enableSeekPreview', val),
           onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
           onLoadSubtitle: _pickSubtitle,
           onOpenSubtitleSettings: _openSubtitleStyleSettings,
@@ -1855,6 +1987,25 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         return SubtitleSettingsSheet(
           key: const ValueKey("SubtitleSettingsSheet"),
           style: _isAudio ? settings.audioSubtitleStylePortrait : settings.subtitleStylePortrait,
+          isLandscape: false,
+          isAudio: _isAudio,
+          // 文字样式改变时同步到横竖屏
+          onTextStyleChanged: (newTextStyle) {
+            if (_isAudio) {
+              settings.saveAudioSubtitleTextStyle(newTextStyle);
+            } else {
+              settings.saveSubtitleTextStyle(newTextStyle);
+            }
+          },
+          // 布局样式改变时只影响竖屏
+          onLayoutStyleChanged: (newLayoutStyle) {
+            if (_isAudio) {
+              settings.saveAudioSubtitleLayoutPortrait(newLayoutStyle);
+            } else {
+              settings.saveSubtitleLayoutPortrait(newLayoutStyle);
+            }
+          },
+          // 向后兼容的回调
           onStyleChanged: (newStyle) {
             if (_isAudio) {
               settings.saveAudioSubtitleStylePortrait(newStyle);
@@ -1864,7 +2015,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           },
           onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
           onBack: () => setState(() => _activePanel = PortraitPanel.subtitles), // Or settings if navigated from there
-          isAudio: _isAudio,
         );
       case PortraitPanel.subtitles:
         return SubtitleSidebar(

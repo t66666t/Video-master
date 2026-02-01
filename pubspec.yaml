@@ -74,6 +74,7 @@ dependencies:
   open_filex: ^4.4.0
 
 dev_dependencies:
+  flutter_launcher_icons: "^0.14.2"
   flutter_test:
     sdk: flutter
 
@@ -152,6 +153,44 @@ flutter:
         - asset: assets/fonts/ComicRelief-Regular.ttf
         - asset: assets/fonts/ComicRelief-Bold.ttf
           weight: 700
+    - family: Roboto
+      fonts:
+        - asset: assets/fonts/Roboto_Condensed-Thin.ttf
+          weight: 100
+        - asset: assets/fonts/Roboto_Condensed-ExtraLight.ttf
+          weight: 200
+        - asset: assets/fonts/Roboto_Condensed-Light.ttf
+          weight: 300
+        - asset: assets/fonts/Roboto_Condensed-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Roboto_Condensed-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Roboto_Condensed-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Roboto_Condensed-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Roboto_Condensed-ExtraBold.ttf
+          weight: 800
+        - asset: assets/fonts/Roboto_Condensed-Black.ttf
+          weight: 900
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/icon/fluent-player.png"
+  min_sdk_android: 21
+  web:
+    generate: true
+    image_path: "assets/icon/fluent-player.png"
+    background_color: "#000000"
+    theme_color: "#000000"
+  windows:
+    generate: true
+    image_path: "assets/icon/fluent-player.png"
+    icon_size: 48
+  macos:
+    generate: true
+    image_path: "assets/icon/fluent-player.png"

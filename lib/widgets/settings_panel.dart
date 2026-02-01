@@ -22,9 +22,6 @@ class SettingsPanel extends StatefulWidget {
   final ValueChanged<double> onSubtitleDelayChanged; // For visual update
   final ValueChanged<double>? onSubtitleDelayChangeEnd; // For saving
 
-  final bool isHardwareDecoding;
-  final ValueChanged<bool> onHardwareDecodingChanged;
-
   final double longPressSpeed;
   final ValueChanged<double> onLongPressSpeedChanged;
   
@@ -44,6 +41,9 @@ class SettingsPanel extends StatefulWidget {
   final bool autoPlayNextVideo;
   final ValueChanged<bool> onAutoPlayNextVideoChanged;
 
+  final bool enableSeekPreview;
+  final ValueChanged<bool> onEnableSeekPreviewChanged;
+
   const SettingsPanel({
     super.key,
     required this.playbackSpeed,
@@ -62,8 +62,6 @@ class SettingsPanel extends StatefulWidget {
     required this.subtitleDelay,
     required this.onSubtitleDelayChanged,
     this.onSubtitleDelayChangeEnd,
-    required this.isHardwareDecoding,
-    required this.onHardwareDecodingChanged,
     required this.longPressSpeed,
     required this.onLongPressSpeedChanged,
     required this.autoCacheSubtitles,
@@ -76,6 +74,8 @@ class SettingsPanel extends StatefulWidget {
     required this.onAutoPauseOnExitChanged,
     required this.autoPlayNextVideo,
     required this.onAutoPlayNextVideoChanged,
+    required this.enableSeekPreview,
+    required this.onEnableSeekPreviewChanged,
     this.onLoadSubtitle,
     this.onOpenSubtitleSettings,
   });
@@ -250,6 +250,16 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         visualDensity: VisualDensity.compact,
                       ),
+                      SwitchListTile(
+                        title: const Text("进度条拖动预览", style: TextStyle(color: Colors.white70, fontSize: 13)),
+                        subtitle: const Text("拖动进度条时显示缩略图", style: TextStyle(color: Colors.white30, fontSize: 10)),
+                        value: widget.enableSeekPreview,
+                        onChanged: widget.onEnableSeekPreviewChanged,
+                        activeThumbColor: Colors.blueAccent,
+                        dense: true,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                        visualDensity: VisualDensity.compact,
+                      ),
                     ],
                   ),
                 ),
@@ -365,46 +375,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 
                 SizedBox(height: spacingValue),
 
-                // 5. 解码方式
-                _buildSectionTitle("解码方式", Icons.memory),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _buildMirrorButton(
-                        icon: Icons.memory,
-                        label: "硬件解码 (默认)",
-                        isActive: widget.isHardwareDecoding,
-                        onTap: () {
-                           // Hardware decoding is default, logic handled by OS/player.
-                           // Just update state for UI consistency, though it doesn't force player re-init currently.
-                           widget.onHardwareDecodingChanged(true);
-                        },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildMirrorButton(
-                        icon: Icons.computer,
-                        label: "软件解码",
-                        isActive: !widget.isHardwareDecoding,
-                        onTap: () {
-                           // Software decoding isn't explicitly exposed by video_player package in initialization.
-                           // This toggle is mainly a placeholder or for future custom implementations.
-                           widget.onHardwareDecodingChanged(false);
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-                Padding(
-                   padding: const EdgeInsets.only(top: 8, left: 4),
-                   child: Text(
-                      "注: 播放器默认自动选择最佳解码方式。如遇播放问题，请尝试转码。",
-                      style: TextStyle(color: Colors.white.withValues(alpha: 0.3), fontSize: 10),
-                   ),
-                ),
-                
-                SizedBox(height: spacingValue),
+              
                 
                 // 5.5 双击跳转字幕
                 SwitchListTile(

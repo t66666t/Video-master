@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 import 'package:video_player_app/screens/simple_video_preview_screen.dart';
 import 'package:video_player_app/screens/subtitle_preview_screen.dart';
 import 'package:video_player_app/services/batch_import_service.dart';
@@ -49,6 +50,52 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
   }
 
   Future<void> _pickVideos() async {
+    // 显示导入方式选择对话框
+    final importType = await _showImportTypeDialog();
+    if (importType == null) return;
+
+    if (importType == 'gallery') {
+      await _pickFromGallery();
+    } else {
+      await _pickFromFileManager();
+    }
+  }
+
+  Future<String?> _showImportTypeDialog() async {
+    return showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF2C2C2C),
+        title: const Text("选择导入方式", style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library, color: Colors.blueAccent),
+              title: const Text("从相册导入", style: TextStyle(color: Colors.white)),
+              subtitle: const Text("选择手机相册中的媒体文件", style: TextStyle(color: Colors.white70, fontSize: 12)),
+              onTap: () => Navigator.pop(context, 'gallery'),
+            ),
+            const Divider(color: Colors.white24),
+            ListTile(
+              leading: const Icon(Icons.folder_open, color: Colors.orangeAccent),
+              title: const Text("从文件管理器导入", style: TextStyle(color: Colors.white)),
+              subtitle: const Text("浏览文件系统选择媒体文件", style: TextStyle(color: Colors.white70, fontSize: 12)),
+              onTap: () => Navigator.pop(context, 'file_manager'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("取消", style: TextStyle(color: Colors.white70)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickFromFileManager() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
@@ -85,6 +132,56 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       
       if (validPaths.isNotEmpty && mounted) {
         context.read<BatchImportService>().addVideos(widget.folderId, validPaths);
+      }
+    }
+  }
+
+  Future<void> _pickFromGallery() async {
+    try {
+      final permission = await PhotoManager.requestPermissionExtend();
+      if (!permission.isAuth && !permission.isLimited) {
+        if (mounted) {
+          AppToast.show("未获得相册权限，请在系统设置中开启", type: AppToastType.error);
+        }
+        return;
+      }
+
+      if (!mounted) return;
+      final List<AssetEntity>? assets = await AssetPicker.pickAssets(
+        context,
+        pickerConfig: const AssetPickerConfig(
+          requestType: RequestType.video,
+          maxAssets: 999,
+        ),
+      );
+
+      if (assets == null || assets.isEmpty) return;
+
+      if (mounted) {
+        AppToast.show("正在处理媒体文件...");
+      }
+
+      final List<String> paths = [];
+      for (final asset in assets) {
+        final File? file = await asset.file;
+        if (file == null) continue;
+        paths.add(file.path);
+      }
+
+      if (paths.isEmpty) {
+        if (mounted) {
+          AppToast.show("未找到可用的媒体文件", type: AppToastType.error);
+        }
+        return;
+      }
+
+      if (paths.isNotEmpty && mounted) {
+        context.read<BatchImportService>().addVideos(widget.folderId, paths);
+      }
+    } catch (e) {
+      debugPrint("Gallery import error: $e");
+      if (mounted) {
+        AppToast.show("相册导入失败: $e", type: AppToastType.error);
       }
     }
   }
@@ -164,7 +261,12 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       type: _detectMediaType(videoPath),
     );
 
-    await library.addSingleVideo(item);
+    // 使用原始文件路径，不创建缓存副本
+    final resultId = await library.addSingleVideo(item, useOriginalPath: true);
+    
+    // 如果返回的ID与当前创建的ID不同，说明是重复视频
+    final isDuplicate = resultId != null && resultId != id;
+    final actualId = resultId ?? id;
     
     // Update Batch Service with new paths (LibraryService modified item.path/item.subtitlePath)
     if (item.path != videoPath) {
@@ -174,10 +276,14 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
        batch.updateItemPath(widget.folderId, subtitlePath, item.subtitlePath!);
     }
 
-    batch.markImported(widget.folderId, item.path, id);
+    batch.markImported(widget.folderId, item.path, actualId);
     
     if (mounted) {
-       AppToast.show("已合成并导入", type: AppToastType.success);
+      if (isDuplicate) {
+        AppToast.show("该视频已存在，已关联到现有卡片", type: AppToastType.info);
+      } else {
+        AppToast.show("已合成并导入", type: AppToastType.success);
+      }
     }
   }
 

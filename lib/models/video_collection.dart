@@ -2,6 +2,7 @@ class VideoCollection {
   final String id;
   String name;
   final int createTime;
+  String? thumbnailPath;
   
   // New: File System Structure
   List<String> childrenIds; // Can contain VideoItem IDs or VideoCollection IDs
@@ -16,6 +17,7 @@ class VideoCollection {
     required this.id,
     required this.name,
     required this.createTime,
+    this.thumbnailPath,
     List<String>? childrenIds,
     this.parentId,
     this.isRecycled = false,
@@ -27,6 +29,7 @@ class VideoCollection {
       'id': id,
       'name': name,
       'createTime': createTime,
+      'thumbnailPath': thumbnailPath,
       'childrenIds': childrenIds,
       'parentId': parentId,
       'isRecycled': isRecycled,
@@ -47,6 +50,7 @@ class VideoCollection {
       id: json['id'] as String,
       name: json['name'] as String,
       createTime: json['createTime'] as int,
+      thumbnailPath: json['thumbnailPath'] as String?,
       childrenIds: loadedChildren,
       parentId: json['parentId'] as String?,
       isRecycled: json['isRecycled'] as bool? ?? false,

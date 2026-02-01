@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
@@ -15,6 +16,8 @@ import '../screens/bilibili_download_screen.dart';
 class VideoActionButtons extends StatelessWidget {
   final String? collectionId;
   final bool isHorizontal; // For empty state usage if needed, though mostly for FAB
+
+  static const MethodChannel _fileManagerChannel = MethodChannel('com.example.video_player_app/file_manager');
 
   const VideoActionButtons({
     super.key,
@@ -56,7 +59,6 @@ class VideoActionButtons extends StatelessWidget {
     );
     if (autoHideDuration != null) {
       Future.delayed(autoHideDuration, () {
-        if (!context.mounted) return;
         messenger.hideCurrentMaterialBanner();
       });
     }
@@ -321,7 +323,13 @@ class VideoActionButtons extends StatelessWidget {
           "已开始后台导入 ${paths.length} 个媒体文件",
           autoHideDuration: const Duration(seconds: 2),
         );
-        library.importVideosBackground(paths, collectionId, shouldCopy: false, originalTitles: originalTitles);
+        library.importVideosBackground(
+          paths,
+          collectionId,
+          shouldCopy: false,
+          originalTitles: originalTitles,
+          allowDuplicatePath: true,
+        );
       }
     } catch (e) {
       if (context.mounted) {
@@ -338,10 +346,160 @@ class VideoActionButtons extends StatelessWidget {
   static Future<void> _pickFromFileManager(BuildContext context, String? collectionId) async {
     try {
       if (Platform.isAndroid) {
-        if (await Permission.videos.request().isGranted) {
-        } else if (await Permission.storage.request().isGranted) {
-        } else if (await Permission.manageExternalStorage.request().isGranted) {
+        final hasPermission = await Permission.videos.request().isGranted ||
+            await Permission.storage.request().isGranted ||
+            await Permission.manageExternalStorage.request().isGranted;
+        if (!hasPermission) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未获得存储权限，请在系统设置中开启",
+              backgroundColor: const Color(0xFFB00020),
+              actionText: "去设置",
+              onActionPressed: () {
+                openAppSettings();
+              },
+            );
+          }
+          return;
         }
+
+        final result = await _fileManagerChannel.invokeMethod<List<dynamic>>(
+          "pickFiles",
+          {
+            "mimeTypes": ["video/*", "audio/*"],
+            "allowMultiple": true,
+          },
+        );
+        final pickedPaths = result?.whereType<String>().toList() ?? [];
+        if (pickedPaths.isEmpty) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未选择任何媒体",
+              autoHideDuration: const Duration(seconds: 2),
+            );
+          }
+          return;
+        }
+
+        final validExtensions = {
+          '.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.wmv', '.3gp', '.m4v', '.ts',
+          '.rmvb', '.mpg', '.mpeg', '.f4v', '.m2ts', '.mts', '.vob', '.ogv', '.divx',
+          '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.wma', '.opus', '.m4b', '.aiff'
+        };
+        final paths = pickedPaths.where((path) => validExtensions.contains(p.extension(path).toLowerCase())).toList();
+        if (paths.isEmpty) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未找到可用的媒体文件",
+              backgroundColor: const Color(0xFFB00020),
+              autoHideDuration: const Duration(seconds: 2),
+            );
+          }
+          return;
+        }
+
+        final originalTitles = paths.map((path) => p.basename(path)).toList();
+        if (context.mounted) {
+          final library = Provider.of<LibraryService>(context, listen: false);
+          _showTopBanner(
+            context,
+            "已开始后台导入 ${paths.length} 个媒体文件",
+            autoHideDuration: const Duration(seconds: 2),
+          );
+          library.importVideosBackground(
+            paths,
+            collectionId,
+            shouldCopy: false,
+            originalTitles: originalTitles,
+            allowDuplicatePath: true,
+            useOriginalPath: true,
+          );
+        }
+        return;
+      }
+
+      if (Platform.isIOS) {
+        final permission = await PhotoManager.requestPermissionExtend();
+        if (!permission.isAuth && !permission.isLimited) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未获得相册权限，请在系统设置中开启",
+              backgroundColor: const Color(0xFFB00020),
+              actionText: "去设置",
+              onActionPressed: () {
+                openAppSettings();
+              },
+            );
+          }
+          return;
+        }
+
+        if (!context.mounted) return;
+        final List<AssetEntity>? assets = await AssetPicker.pickAssets(
+          context,
+          pickerConfig: const AssetPickerConfig(
+            requestType: RequestType.all,
+            maxAssets: 999,
+          ),
+        );
+
+        if (assets == null || assets.isEmpty) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未选择任何媒体",
+              autoHideDuration: const Duration(seconds: 2),
+            );
+          }
+          return;
+        }
+
+        if (context.mounted) {
+          _showTopBanner(context, "正在处理媒体文件...");
+        }
+
+        final List<String> paths = [];
+        final List<String> originalTitles = [];
+
+        for (final asset in assets) {
+          final File? file = await asset.file;
+          if (file == null) continue;
+          paths.add(file.path);
+          originalTitles.add(asset.title ?? p.basename(file.path));
+        }
+
+        if (paths.isEmpty) {
+          if (context.mounted) {
+            _showTopBanner(
+              context,
+              "未找到可用的媒体文件",
+              backgroundColor: const Color(0xFFB00020),
+              autoHideDuration: const Duration(seconds: 2),
+            );
+          }
+          return;
+        }
+
+        if (context.mounted) {
+          final library = Provider.of<LibraryService>(context, listen: false);
+          _showTopBanner(
+            context,
+            "已开始后台导入 ${paths.length} 个媒体文件",
+            autoHideDuration: const Duration(seconds: 2),
+          );
+          library.importVideosBackground(
+            paths,
+            collectionId,
+            shouldCopy: false,
+            originalTitles: originalTitles,
+            allowDuplicatePath: true,
+          );
+        }
+        return;
       }
 
       if (!context.mounted) return;
@@ -372,7 +530,13 @@ class VideoActionButtons extends StatelessWidget {
           );
         }
 
-        library.importVideosBackground(paths, collectionId);
+        library.importVideosBackground(
+          paths,
+          collectionId,
+          allowCacheRescue: false,
+          allowDuplicatePath: true,
+          useOriginalPath: true,
+        );
       }
     } catch (e) {
       if (context.mounted) {

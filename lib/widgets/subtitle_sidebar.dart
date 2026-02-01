@@ -59,7 +59,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   
   // 自动滚动相关
   final ValueNotifier<int> _activeIndexNotifier = ValueNotifier<int>(-1);
-  int _lastFoundIndex = -1;
+  final ValueNotifier<List<int>> _activeIndicesNotifier = ValueNotifier<List<int>>(<int>[]);
   final List<int> _subtitleStartMs = <int>[];
   int _lastIndexComputeAtMs = 0;
   int _lastIndexComputePosMs = -1;
@@ -164,6 +164,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   void dispose() {
     widget.controller.removeListener(_updateIndex);
     _activeIndexNotifier.dispose();
+    _activeIndicesNotifier.dispose();
     _autoScrollTimer?.cancel();
     super.dispose();
   }
@@ -172,7 +173,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _subtitleStartMs
       ..clear()
       ..addAll(widget.subtitles.map((e) => e.startTime.inMilliseconds));
-    _lastFoundIndex = -1;
     _lastIndexComputePosMs = -1;
   }
 
@@ -192,7 +192,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _lastIndexComputePosMs = posMs;
     _lastIndexComputeAtMs = nowMs;
 
-    final int index = _findCurrentIndexMs(posMs);
+    const bool continuousSubtitleEnabled = true;
+    final List<int> activeIndices = _findActiveIndicesMs(
+      posMs,
+      continuousSubtitleEnabled: continuousSubtitleEnabled,
+    );
+    final int index = activeIndices.isNotEmpty ? activeIndices.first : -1;
+    if (!_isSameIndices(activeIndices, _activeIndicesNotifier.value)) {
+      _activeIndicesNotifier.value = activeIndices;
+    }
     
     if (index != _activeIndexNotifier.value) {
       _activeIndexNotifier.value = index;
@@ -204,20 +212,24 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   int _getEffectiveEndTimeMs(int index, bool continuousSubtitleEnabled) {
     final item = widget.subtitles[index];
+    final int actualEndMs = item.endTime.inMilliseconds;
     if (!continuousSubtitleEnabled) {
-      return item.endTime.inMilliseconds;
+      return actualEndMs;
     }
+    int nextStartMs = actualEndMs;
     if (index + 1 < widget.subtitles.length) {
       if (_subtitleStartMs.length == widget.subtitles.length) {
-        return _subtitleStartMs[index + 1];
+        nextStartMs = _subtitleStartMs[index + 1];
+      } else {
+        nextStartMs = widget.subtitles[index + 1].startTime.inMilliseconds;
       }
-      return widget.subtitles[index + 1].startTime.inMilliseconds;
+    } else {
+      final controllerValue = widget.controller.value;
+      if (controllerValue.isInitialized && controllerValue.duration > item.endTime) {
+        nextStartMs = controllerValue.duration.inMilliseconds;
+      }
     }
-    final controllerValue = widget.controller.value;
-    if (controllerValue.isInitialized && controllerValue.duration > item.endTime) {
-      return controllerValue.duration.inMilliseconds;
-    }
-    return item.endTime.inMilliseconds;
+    return nextStartMs < actualEndMs ? actualEndMs : nextStartMs;
   }
 
   int _binarySearchLastStartLE(int posMs) {
@@ -236,43 +248,37 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     return ans;
   }
 
-  int _findCurrentIndexMs(int posMs, {bool useCache = true}) {
-    final continuousSubtitleEnabled = true;
-    
-    // Optimization: Check if close to last found index first
-    if (useCache && _lastFoundIndex >= 0 && _lastFoundIndex < widget.subtitles.length) {
-      if (_subtitleStartMs.length != widget.subtitles.length) {
-        _rebuildSubtitleIndex();
-      }
-      final int startMs = _subtitleStartMs[_lastFoundIndex];
-      final int endMs = _getEffectiveEndTimeMs(_lastFoundIndex, continuousSubtitleEnabled);
-      if (posMs >= startMs && posMs < endMs) {
-        return _lastFoundIndex;
-      }
-      // Check next one (sequential playback)
-      if (_lastFoundIndex + 1 < widget.subtitles.length) {
-        final int nextStartMs = _subtitleStartMs[_lastFoundIndex + 1];
-        final int nextEndMs = _getEffectiveEndTimeMs(_lastFoundIndex + 1, continuousSubtitleEnabled);
-        if (posMs >= nextStartMs && posMs < nextEndMs) {
-          _lastFoundIndex++;
-          return _lastFoundIndex;
-        }
-      }
-    }
-    
+  List<int> _findActiveIndicesMs(
+    int posMs, {
+    required bool continuousSubtitleEnabled,
+  }) {
+    if (widget.subtitles.isEmpty) return <int>[];
     if (_subtitleStartMs.length != widget.subtitles.length) {
       _rebuildSubtitleIndex();
     }
-
     final int candidate = _binarySearchLastStartLE(posMs);
-    if (candidate < 0 || candidate >= widget.subtitles.length) return -1;
-
-    final int endMs = _getEffectiveEndTimeMs(candidate, continuousSubtitleEnabled);
-    if (posMs < endMs) {
-      _lastFoundIndex = candidate;
-      return candidate;
+    if (candidate < 0 || candidate >= widget.subtitles.length) return <int>[];
+    final List<int> indices = <int>[];
+    for (int i = candidate; i >= 0; i--) {
+      if (_subtitleStartMs[i] > posMs) continue;
+      final int endMs = _getEffectiveEndTimeMs(i, continuousSubtitleEnabled);
+      if (posMs < endMs) {
+        indices.add(i);
+      } else {
+        break;
+      }
     }
-    return -1;
+    if (indices.length <= 1) return indices;
+    indices.sort();
+    return indices;
+  }
+
+  bool _isSameIndices(List<int> next, List<int> prev) {
+    if (next.length != prev.length) return false;
+    for (int i = 0; i < next.length; i++) {
+      if (next[i] != prev[i]) return false;
+    }
+    return true;
   }
 
   void _scheduleAutoScroll(int posMs) {
@@ -297,8 +303,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final int posMs = widget.controller.value.position.inMilliseconds;
     // Always recalculate index to ensure accuracy during mode switch
     // This fixes the issue where the cached index might be stale or slightly off
-    final int index = _findCurrentIndexMs(posMs, useCache: false);
-    
+    const bool continuousSubtitleEnabled = true;
+    final List<int> activeIndices = _findActiveIndicesMs(
+      posMs,
+      continuousSubtitleEnabled: continuousSubtitleEnabled,
+    );
+    final int index = activeIndices.isNotEmpty ? activeIndices.first : -1;
+    if (!_isSameIndices(activeIndices, _activeIndicesNotifier.value)) {
+      _activeIndicesNotifier.value = activeIndices;
+    }
     if (index >= 0 && index < widget.subtitles.length) {
       _activeIndexNotifier.value = index;
     }
@@ -838,12 +851,14 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           Expanded(
             child: widget.subtitles.isEmpty
                 ? const Center(child: Text("暂无字幕", style: TextStyle(color: Colors.white54)))
-                : ValueListenableBuilder<int>(
-                    valueListenable: _activeIndexNotifier,
-                    builder: (context, activeIndex, child) {
+                : ValueListenableBuilder<List<int>>(
+                    valueListenable: _activeIndicesNotifier,
+                    builder: (context, activeIndices, child) {
+                      final int activeIndex = activeIndices.isNotEmpty ? activeIndices.first : -1;
+                      final Set<int> activeSet = activeIndices.toSet();
                       return _isArticleMode 
-                          ? _buildArticleView(activeIndex) 
-                          : _buildListView(activeIndex);
+                          ? _buildArticleView(activeIndex, activeSet) 
+                          : _buildListView(activeIndex, activeSet);
                     },
                   ),
           ),
@@ -971,7 +986,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   // 列表模式视图
-  Widget _buildListView(int currentIndex) {
+  Widget _buildListView(int currentIndex, Set<int> activeIndices) {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
     
     // 动态计算间距，随字体大小缩放，使小字体模式更紧凑
@@ -999,7 +1014,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           physics: shouldTopAlign ? const NeverScrollableScrollPhysics() : null,
           itemBuilder: (context, index) {
             final item = widget.subtitles[index];
-            final isCurrent = index == currentIndex;
+            final isCurrent = activeIndices.contains(index);
             
             return Padding(
               padding: EdgeInsets.symmetric(
@@ -1066,7 +1081,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   // 文章模式视图
-  Widget _buildArticleView(int activeIndex) {
+  Widget _buildArticleView(int activeIndex, Set<int> activeIndices) {
     final isSmallScreen = MediaQuery.of(context).size.width < 600;
     final int chunkCount = (widget.subtitles.length / _articleChunkSize).ceil();
     final int initialChunkIndex = (activeIndex >= 0 ? (activeIndex ~/ _articleChunkSize) : 0);
@@ -1097,7 +1112,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
               subtitles: widget.subtitles,
               startIndex: startIndex,
               endIndex: endIndex,
-              activeIndex: activeIndex,
+              activeIndices: activeIndices,
               fontSizeScale: _fontSizeScale,
               onItemTap: widget.onItemTap,
               onClearSelection: widget.onClearSelection,
@@ -1126,14 +1141,14 @@ class SubtitleArticleChunk extends StatefulWidget {
   final List<SubtitleItem> subtitles;
   final int startIndex;
   final int endIndex;
-  final int activeIndex;
+  final Set<int> activeIndices;
   final double fontSizeScale;
   final ValueChanged<Duration>? onItemTap;
   final VoidCallback? onClearSelection;
   final bool isSmallScreen;
   final int lineFilterMode;
-  final Map<int, String> secondaryTextCache; // New
-  final bool isBilingualMode; // New
+  final Map<int, String> secondaryTextCache;
+  final bool isBilingualMode;
   final FocusNode? focusNode;
 
   const SubtitleArticleChunk({
@@ -1141,7 +1156,7 @@ class SubtitleArticleChunk extends StatefulWidget {
     required this.subtitles,
     required this.startIndex,
     required this.endIndex,
-    required this.activeIndex,
+    required this.activeIndices,
     required this.fontSizeScale,
     this.onItemTap,
     this.onClearSelection,
@@ -1205,7 +1220,7 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
 
     for (int i = widget.startIndex; i < widget.endIndex; i++) {
       final item = widget.subtitles[i];
-      final isCurrent = i == widget.activeIndex;
+      final isCurrent = widget.activeIndices.contains(i);
       String rawText = _getFilteredText(item.text, i);
       if (rawText.isEmpty && item.imageLoader != null) {
         rawText = "[图片字幕]";

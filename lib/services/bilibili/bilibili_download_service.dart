@@ -13,6 +13,7 @@ import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_state_manager.dart';
 import 'package:video_player_app/services/bilibili/download_manager.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/services/thumbnail_cache_service.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 
@@ -1090,6 +1091,44 @@ class BilibiliDownloadService extends ChangeNotifier {
     return newCollection.id;
   }
 
+  Future<String?> _downloadCoverToThumbDir(Directory thumbDir, String key, String coverUrl) async {
+    if (coverUrl.isEmpty) return null;
+    try {
+      final ext = coverUrl.split('.').last.split('?').first;
+      final safeExt = (ext.length > 4 || ext.isEmpty) ? 'jpg' : ext;
+      final filePath = "${thumbDir.path}/$key.$safeExt";
+
+      final file = File(filePath);
+      if (await file.exists()) return filePath;
+
+      final resp = await apiService.dio.get(
+        coverUrl,
+        options: Options(responseType: ResponseType.bytes),
+      );
+      await file.writeAsBytes(resp.data);
+      return filePath;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Future<void> _ensureCollectionThumbnail(LibraryService library, Directory thumbDir, String collectionId, String coverUrl) async {
+    final col = library.getCollection(collectionId);
+    if (col == null) return;
+
+    final currentPath = col.thumbnailPath;
+    if (currentPath != null && currentPath.isNotEmpty) {
+      final file = File(currentPath);
+      if (await file.exists()) return;
+    }
+
+    final savedPath = await _downloadCoverToThumbDir(thumbDir, "collection_$collectionId", coverUrl);
+    if (savedPath == null) return;
+
+    ThumbnailCacheService().evictFromCache(collectionId);
+    await library.updateCollectionThumbnail(collectionId, savedPath);
+  }
+
   // --- Import ---
   
   Future<int> importToLibrary(LibraryService library, {BilibiliDownloadEpisode? episode, String? targetFolderId}) async {
@@ -1112,6 +1151,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     if (!await subDir.exists()) await subDir.create(recursive: true);
 
     int count = 0;
+    final ensuredCollectionIds = <String>{};
     
     for (var ep in completedEpisodes) {
       final file = File(ep.outputPath!);
@@ -1132,6 +1172,10 @@ class BilibiliDownloadService extends ChangeNotifier {
       String? rootCollectionId;
       if (task.collectionInfo != null) {
          rootCollectionId = await _getOrCreateCollection(library, task.collectionInfo!.title, targetFolderId);
+         if (!ensuredCollectionIds.contains(rootCollectionId)) {
+           ensuredCollectionIds.add(rootCollectionId);
+           await _ensureCollectionThumbnail(library, thumbDir, rootCollectionId, task.collectionInfo!.cover);
+         }
       } else {
          rootCollectionId = targetFolderId;
       }
@@ -1139,8 +1183,12 @@ class BilibiliDownloadService extends ChangeNotifier {
       // 2. Level 2: Video Folder (if multi-part)
       String? targetParentId = rootCollectionId;
       if (video.videoInfo.pages.length > 1) {
-         // Create a folder for this video inside the root (or root itself)
-         targetParentId = await _getOrCreateCollection(library, video.videoInfo.title, rootCollectionId);
+         final folderId = await _getOrCreateCollection(library, video.videoInfo.title, rootCollectionId);
+         targetParentId = folderId;
+         if (!ensuredCollectionIds.contains(folderId)) {
+           ensuredCollectionIds.add(folderId);
+           await _ensureCollectionThumbnail(library, thumbDir, folderId, video.videoInfo.pic);
+         }
       }
       
       // --- End Hierarchy Logic ---

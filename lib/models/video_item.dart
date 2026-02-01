@@ -18,6 +18,9 @@ class VideoItem {
   Map<String, String>? additionalSubtitles;
   String? codec;
   MediaType type;
+  bool showFloatingSubtitles;
+  List<String>? recycledSelectedSubtitlePaths;
+  Map<String, String>? recycledAdditionalSubtitles;
 
   VideoItem({
     required this.id,
@@ -37,6 +40,9 @@ class VideoItem {
     this.additionalSubtitles,
     this.codec,
     this.type = MediaType.video,
+    this.showFloatingSubtitles = true,
+    this.recycledSelectedSubtitlePaths,
+    this.recycledAdditionalSubtitles,
   });
 
   Map<String, dynamic> toJson() {
@@ -58,6 +64,9 @@ class VideoItem {
       'extraSubtitles': additionalSubtitles,
       'codec': codec,
       'type': type.name,
+      'showFloatingSubtitles': showFloatingSubtitles,
+      'recycledSelectedSubtitlePaths': recycledSelectedSubtitlePaths,
+      'recycledExtraSubtitles': recycledAdditionalSubtitles,
     };
   }
 
@@ -80,6 +89,9 @@ class VideoItem {
       additionalSubtitles: (json['extraSubtitles'] as Map<String, dynamic>?)?.map((k, v) => MapEntry(k, v as String)),
       codec: json['codec'] as String?,
       type: json['type'] != null ? MediaType.values.firstWhere((e) => e.name == json['type'], orElse: () => MediaType.video) : MediaType.video,
+      showFloatingSubtitles: json['showFloatingSubtitles'] as bool? ?? true,
+      recycledSelectedSubtitlePaths: (json['recycledSelectedSubtitlePaths'] as List?)?.map((e) => e.toString()).toList(),
+      recycledAdditionalSubtitles: (json['recycledExtraSubtitles'] as Map<String, dynamic>?)?.map((k, v) => MapEntry(k, v as String)),
     );
   }
 }

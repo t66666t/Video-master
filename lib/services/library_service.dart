@@ -285,12 +285,13 @@ class LibraryService extends ChangeNotifier {
     return results;
   }
 
-  Future<VideoCollection> createCollection(String name, String? parentId) async {
+  Future<VideoCollection> createCollection(String name, String? parentId, {String? thumbnailPath}) async {
     final collection = VideoCollection(
       id: const Uuid().v4(),
       name: name,
       createTime: DateTime.now().millisecondsSinceEpoch,
       parentId: parentId,
+      thumbnailPath: thumbnailPath,
     );
     
     _collections[collection.id] = collection;
@@ -306,12 +307,46 @@ class LibraryService extends ChangeNotifier {
     return collection;
   }
 
+  Future<void> updateCollectionThumbnail(String collectionId, String? thumbnailPath) async {
+    final col = _collections[collectionId];
+    if (col == null) return;
+
+    final previousPath = col.thumbnailPath;
+    if (previousPath != null &&
+        previousPath.isNotEmpty &&
+        thumbnailPath != previousPath &&
+        p.isWithin(_appDocDir.path, previousPath)) {
+      try {
+        final file = File(previousPath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        developer.log('Error deleting previous collection thumbnail', error: e);
+      }
+    }
+
+    col.thumbnailPath = thumbnailPath;
+    ThumbnailCacheService().evictFromCache(collectionId);
+    await _saveLibrary();
+    notifyListeners();
+  }
+
   // Batch import videos
   // filePaths: 视频文件的内部存储路径列表
   // parentId: 目标文件夹ID
   // shouldCopy: 是否复制文件到内部存储（仅用于外部文件）
+  // useOriginalPath: 是否直接使用原始文件路径而不复制到应用内部存储
   // originalTitles: 可选参数，原始文件名列表，用于设置视频标题
-  Future<void> importVideosBackground(List<String> filePaths, String? parentId, {bool shouldCopy = false, List<String>? originalTitles}) async {
+  Future<void> importVideosBackground(
+    List<String> filePaths,
+    String? parentId, {
+    bool shouldCopy = false,
+    bool allowCacheRescue = true,
+    bool allowDuplicatePath = false,
+    bool useOriginalPath = false,
+    List<String>? originalTitles,
+  }) async {
     // Give UI a chance to render the "Started importing" snackbar
     await Future.delayed(const Duration(milliseconds: 200));
 
@@ -358,84 +393,93 @@ class LibraryService extends ChangeNotifier {
             : p.basename(path);
         
         // 0. Cache Rescue (Copy cached files to persistent storage)
-        bool isCached = false;
-        if (tempDir != null && p.isWithin(tempDir.path, path)) {
-          isCached = true;
-        } else if (extCacheDirs != null) {
-          for (var dir in extCacheDirs) {
-            if (p.isWithin(dir.path, path)) {
+        // 如果 useOriginalPath 为 true，则跳过缓存救援和文件复制，直接使用原始路径
+        if (!useOriginalPath) {
+          bool isCached = false;
+          if (allowCacheRescue) {
+            if (tempDir != null && p.isWithin(tempDir.path, path)) {
               isCached = true;
+            } else if (extCacheDirs != null) {
+              for (var dir in extCacheDirs) {
+                if (p.isWithin(dir.path, path)) {
+                  isCached = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if ((allowCacheRescue && isCached) || shouldCopy) {
+             try {
+               final originalFile = File(path);
+               if (await originalFile.exists()) {
+                 final fileName = p.basename(path);
+                 // Use timestamp to prevent name collision
+                 final newPath = p.join(importedDir.path, "${DateTime.now().millisecondsSinceEpoch}_$fileName");
+                 
+                 await originalFile.copy(newPath);
+                 path = newPath; // Use the new permanent path
+                 debugPrint("Copied video to: $path (Cached: $isCached, Forced: $shouldCopy)");
+               }
+             } catch (e) {
+               debugPrint("Error copying file: $e");
+               // If copy fails but we must copy, we might want to skip or try continuing with original?
+               // For now, continue with original path if copy fails, though it might be broken later.
+             }
+          }
+        } else {
+          debugPrint("Using original path (no copy): $path");
+        }
+
+        if (!allowDuplicatePath) {
+          // 1. Duplicate Check
+          // Check if it's already in _videos (by path)
+          String? existingId;
+          for (var v in _videos.values) {
+            if (v.path == path) {
+              existingId = v.id;
               break;
             }
           }
-        }
 
-        if (isCached || shouldCopy) {
-           try {
-             final originalFile = File(path);
-             if (await originalFile.exists()) {
-               final fileName = p.basename(path);
-               // Use timestamp to prevent name collision
-               final newPath = p.join(importedDir.path, "${DateTime.now().millisecondsSinceEpoch}_$fileName");
+          if (existingId != null) {
+            final existingVideo = _videos[existingId]!;
+            if (existingVideo.isRecycled) {
+               // Restore from recycle bin
+               existingVideo.isRecycled = false;
+               existingVideo.recycleTime = null;
                
-               await originalFile.copy(newPath);
-               path = newPath; // Use the new permanent path
-               debugPrint("Copied video to: $path (Cached: $isCached, Forced: $shouldCopy)");
-             }
-           } catch (e) {
-             debugPrint("Error copying file: $e");
-             // If copy fails but we must copy, we might want to skip or try continuing with original?
-             // For now, continue with original path if copy fails, though it might be broken later.
-           }
-        }
-
-        // 1. Duplicate Check
-        // Check if it's already in _videos (by path)
-        String? existingId;
-        for (var v in _videos.values) {
-          if (v.path == path) {
-            existingId = v.id;
-            break;
-          }
-        }
-
-        if (existingId != null) {
-          final existingVideo = _videos[existingId]!;
-          if (existingVideo.isRecycled) {
-             // Restore from recycle bin
-             existingVideo.isRecycled = false;
-             existingVideo.recycleTime = null;
-             
-             // Move to current target folder
-             // 1. Remove from old parent (if any) - implicitly done by not adding to old parent's list? 
-             // No, we need to ensure it's in the NEW parent's list and NOT in the old one if we want to "move" it.
-             // But simpler: just restore it to where it was? 
-             // User expects "Import" to put it in CURRENT folder.
-             
-             // Remove from old parent's children list if different
-             if (existingVideo.parentId != null && _collections.containsKey(existingVideo.parentId)) {
-               _collections[existingVideo.parentId]!.childrenIds.remove(existingId);
-             } else if (existingVideo.parentId == null) {
-               _rootChildrenIds.remove(existingId);
-             }
-
-             // Set new parent
-             existingVideo.parentId = parentId;
-
-             // Add to new parent's children list
-             if (parentId != null && _collections.containsKey(parentId)) {
-               if (!_collections[parentId]!.childrenIds.contains(existingId)) {
-                 _collections[parentId]!.childrenIds.add(existingId);
+               // Move to current target folder
+               // 1. Remove from old parent (if any) - implicitly done by not adding to old parent's list? 
+               // No, we need to ensure it's in the NEW parent's list and NOT in the old one if we want to "move" it.
+               // But simpler: just restore it to where it was? 
+               // User expects "Import" to put it in CURRENT folder.
+               
+               // Remove from old parent's children list if different
+               if (existingVideo.parentId != null && _collections.containsKey(existingVideo.parentId)) {
+                 _collections[existingVideo.parentId]!.childrenIds.remove(existingId);
+               } else if (existingVideo.parentId == null) {
+                 _rootChildrenIds.remove(existingId);
                }
-             } else {
-               if (!_rootChildrenIds.contains(existingId)) {
-                 _rootChildrenIds.add(existingId);
+
+               // Set new parent
+               existingVideo.parentId = parentId;
+
+               // Add to new parent's children list
+               if (parentId != null && _collections.containsKey(parentId)) {
+                 if (!_collections[parentId]!.childrenIds.contains(existingId)) {
+                   _collections[parentId]!.childrenIds.add(existingId);
+                 }
+               } else {
+                 if (!_rootChildrenIds.contains(existingId)) {
+                   _rootChildrenIds.add(existingId);
+                 }
                }
-             }
-             
-             notifyListeners();
+               
+               notifyListeners();
+            }
+            continue;
           }
-          continue;
         }
         
         final id = Uuid().v4();
@@ -539,6 +583,18 @@ class LibraryService extends ChangeNotifier {
         parentId = col.parentId;
       } else if (_videos.containsKey(id)) {
         final vid = _videos[id]!;
+        final selectedPaths = <String>[];
+        if (vid.subtitlePath != null) selectedPaths.add(vid.subtitlePath!);
+        if (vid.secondarySubtitlePath != null) selectedPaths.add(vid.secondarySubtitlePath!);
+        vid.recycledSelectedSubtitlePaths = selectedPaths.isEmpty ? null : selectedPaths;
+        final snapshotPaths = await _collectAssociatedSubtitlePaths(vid);
+        if (snapshotPaths.isNotEmpty) {
+          vid.recycledAdditionalSubtitles = {
+            for (final path in snapshotPaths) p.basename(path): path,
+          };
+        } else {
+          vid.recycledAdditionalSubtitles = null;
+        }
         vid.isRecycled = true;
         vid.recycleTime = now;
         parentId = vid.parentId;
@@ -570,6 +626,16 @@ class LibraryService extends ChangeNotifier {
         final vid = _videos[id]!;
         vid.isRecycled = false;
         vid.recycleTime = null;
+        if (vid.recycledSelectedSubtitlePaths != null) {
+          final paths = vid.recycledSelectedSubtitlePaths!;
+          vid.subtitlePath = paths.isNotEmpty ? paths[0] : null;
+          vid.secondarySubtitlePath = paths.length > 1 ? paths[1] : null;
+          vid.recycledSelectedSubtitlePaths = null;
+        }
+        if (vid.recycledAdditionalSubtitles != null && vid.recycledAdditionalSubtitles!.isNotEmpty) {
+          vid.additionalSubtitles = Map<String, String>.from(vid.recycledAdditionalSubtitles!);
+          vid.recycledAdditionalSubtitles = null;
+        }
         parentId = vid.parentId;
       } else {
         continue;
@@ -634,6 +700,20 @@ class LibraryService extends ChangeNotifier {
   Future<void> _deleteCollectionFilesRecursive(String id) async {
     final col = _collections[id];
     if (col == null) return;
+
+    ThumbnailCacheService().evictFromCache(id);
+    if (col.thumbnailPath != null &&
+        col.thumbnailPath!.isNotEmpty &&
+        p.isWithin(_appDocDir.path, col.thumbnailPath!)) {
+      try {
+        final file = File(col.thumbnailPath!);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        developer.log('Error deleting collection thumbnail', error: e);
+      }
+    }
     
     for (var childId in col.childrenIds) {
       if (_collections.containsKey(childId)) {
@@ -1205,17 +1285,86 @@ class LibraryService extends ChangeNotifier {
         item.isSecondarySubtitleCached = false;
       }
 
+      if (item.isRecycled) {
+        final paths = <String>[];
+        if (item.subtitlePath != null) paths.add(item.subtitlePath!);
+        if (item.secondarySubtitlePath != null) paths.add(item.secondarySubtitlePath!);
+        item.recycledSelectedSubtitlePaths = paths;
+      }
+
       await _saveLibrary();
+    }
+  }
+
+  Future<void> updateVideoSubtitleVisibility(String videoId, bool showFloatingSubtitles) async {
+    final item = _videos[videoId];
+    if (item != null) {
+      item.showFloatingSubtitles = showFloatingSubtitles;
+      item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      await _saveLibrary();
+      notifyListeners();
     }
   }
 
   // --- Single Item Management (Exposed for Batch Import) ---
 
-  Future<void> addSingleVideo(VideoItem item) async {
-    // 1. Handle file persistence for temp/cache files
-    await _ensureFilePersistence(item);
+  Future<String?> addSingleVideo(VideoItem item, {bool useOriginalPath = false}) async {
+    // 1. Duplicate Check - Check if a video with the same path already exists
+    String? existingId;
+    for (var v in _videos.values) {
+      if (v.path == item.path) {
+        existingId = v.id;
+        break;
+      }
+    }
 
-    // 2. For audio files, ensure thumbnailPath is null
+    if (existingId != null) {
+      final existingVideo = _videos[existingId]!;
+      if (existingVideo.isRecycled) {
+        // Restore from recycle bin
+        existingVideo.isRecycled = false;
+        existingVideo.recycleTime = null;
+        
+        // Remove from old parent's children list if different
+        if (existingVideo.parentId != null && _collections.containsKey(existingVideo.parentId)) {
+          _collections[existingVideo.parentId]!.childrenIds.remove(existingId);
+        } else if (existingVideo.parentId == null) {
+          _rootChildrenIds.remove(existingId);
+        }
+
+        // Set new parent
+        existingVideo.parentId = item.parentId;
+
+        // Add to new parent's children list
+        if (item.parentId != null && _collections.containsKey(item.parentId)) {
+          if (!_collections[item.parentId]!.childrenIds.contains(existingId)) {
+            _collections[item.parentId]!.childrenIds.add(existingId);
+          }
+        } else {
+          if (!_rootChildrenIds.contains(existingId)) {
+            _rootChildrenIds.add(existingId);
+          }
+        }
+        
+        await _saveLibrary();
+        notifyListeners();
+        return existingId;
+      } else {
+        // Video already exists and is not recycled, skip adding
+        debugPrint("Video with path ${item.path} already exists, skipping import");
+        return existingId;
+      }
+    }
+
+    // 2. Handle file persistence for temp/cache files
+    // 如果 useOriginalPath 为 true，则跳过文件持久化处理，直接使用原始路径
+    if (!useOriginalPath) {
+      await _ensureFilePersistence(item);
+    } else {
+      debugPrint("Using original path for single video (no copy): ${item.path}");
+    }
+
+    // 3. For audio files, ensure thumbnailPath is null
     if (item.type == MediaType.audio) {
       item.thumbnailPath = null;
     }
@@ -1245,6 +1394,8 @@ class LibraryService extends ChangeNotifier {
          }
        });
     }
+    
+    return item.id;
   }
 
   /// Ensures that video and subtitle files are moved to permanent storage 
@@ -1380,19 +1531,10 @@ class LibraryService extends ChangeNotifier {
     if (_isInternalPath(item.path)) {
       size += await _getFileSize(item.path);
     }
-    
-    // Check Subtitles
-    if (item.subtitlePath != null && _isInternalPath(item.subtitlePath!)) {
-      size += await _getFileSize(item.subtitlePath!);
-    }
-    if (item.secondarySubtitlePath != null && _isInternalPath(item.secondarySubtitlePath!)) {
-      size += await _getFileSize(item.secondarySubtitlePath!);
-    }
-    if (item.additionalSubtitles != null) {
-      for (var path in item.additionalSubtitles!.values) {
-        if (_isInternalPath(path)) {
-          size += await _getFileSize(path);
-        }
+    final subtitlePaths = await _collectAssociatedSubtitlePaths(item);
+    for (final path in subtitlePaths) {
+      if (_isInternalPath(path)) {
+        size += await _getFileSize(path);
       }
     }
     
@@ -1402,6 +1544,55 @@ class LibraryService extends ChangeNotifier {
     }
     
     return size;
+  }
+
+  Future<Set<String>> _collectAssociatedSubtitlePaths(VideoItem item) async {
+    final paths = <String>{};
+    if (item.subtitlePath != null) {
+      paths.add(item.subtitlePath!);
+    }
+    if (item.secondarySubtitlePath != null) {
+      paths.add(item.secondarySubtitlePath!);
+    }
+    if (item.additionalSubtitles != null) {
+      paths.addAll(item.additionalSubtitles!.values);
+    }
+
+    final videoName = p.basenameWithoutExtension(item.path);
+    final extractedPrefix = "$videoName.stream_";
+    try {
+      final videoFile = File(item.path);
+      final dir = videoFile.parent;
+      if (await dir.exists()) {
+        final files = dir.listSync().whereType<File>();
+        for (final file in files) {
+          final name = p.basename(file.path);
+          if (!name.startsWith(videoName)) continue;
+          if (name.startsWith(extractedPrefix)) continue;
+          final ext = p.extension(file.path).toLowerCase();
+          if (['.srt', '.vtt', '.ass', '.ssa', '.sup', '.lrc', '.sub', '.idx', '.scc'].contains(ext)) {
+            paths.add(file.path);
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (_initialized) {
+      try {
+        final subDir = Directory(p.join(_appDocDir.path, 'subtitles'));
+        if (await subDir.exists()) {
+          final docFiles = subDir.listSync().whereType<File>();
+          for (final file in docFiles) {
+            final name = p.basename(file.path);
+            if (name.startsWith(extractedPrefix) || name == "$videoName.ai.srt") {
+              paths.add(file.path);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    return paths;
   }
 
   Future<int> _calculateCollectionSize(VideoCollection col) async {

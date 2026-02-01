@@ -523,6 +523,8 @@ class _CollectionScreenState extends State<CollectionScreen> {
       List<dynamic> contents
   ) {
     final isSelected = _selectedIds.contains(collection.id);
+    final thumbnailPath = collection.thumbnailPath;
+    final hasThumbnail = thumbnailPath != null && thumbnailPath.isNotEmpty;
     
     // 1. Visual Content
     Widget cardVisual = Column(
@@ -533,13 +535,44 @@ class _CollectionScreenState extends State<CollectionScreen> {
           aspectRatio: 4 / 3,
           child: Container(
             color: Colors.black26,
-            child: Center(
-              child: Icon(
-                Icons.folder, 
-                size: 64, 
-                color: Colors.blueAccent.withValues(alpha: 0.8)
-              ),
-            ),
+            child: hasThumbnail
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CachedThumbnailWidget(
+                        videoId: collection.id,
+                        thumbnailPath: thumbnailPath,
+                        cacheWidth: 512,
+                        cacheHeight: 384,
+                        placeholder: const SizedBox.expand(
+                          child: ColoredBox(color: Colors.black26),
+                        ),
+                        errorWidget: Center(
+                          child: Icon(
+                            Icons.folder,
+                            size: 64,
+                            color: Colors.blueAccent.withValues(alpha: 0.8),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        right: 6,
+                        bottom: 6,
+                        child: Icon(
+                          Icons.folder,
+                          size: 28,
+                          color: Colors.blueAccent.withValues(alpha: 0.9),
+                        ),
+                      ),
+                    ],
+                  )
+                : Center(
+                    child: Icon(
+                      Icons.folder,
+                      size: 64,
+                      color: Colors.blueAccent.withValues(alpha: 0.8),
+                    ),
+                  ),
           ),
         ),
         // Info Area

@@ -9,9 +9,11 @@ import 'recycle_bin_screen.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import '../widgets/folder_drop_target.dart';
+import '../widgets/cached_thumbnail_widget.dart';
 import 'package:flutter/services.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../models/bilibili_download_task.dart';
+import '../models/bilibili_models.dart';
 import 'portrait_video_screen.dart';
 import 'video_player_screen.dart';
 
@@ -23,6 +25,23 @@ import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
 import 'dart:convert';
 import '../utils/app_toast.dart';
+import '../utils/bilibili_url_parser.dart';
+
+class _ClipboardDisplayInfo {
+  final String title;
+  final String cover;
+  final String? collectionTitle;
+  final String? collectionCover;
+  final bool showCollectionBadge;
+
+  const _ClipboardDisplayInfo({
+    required this.title,
+    required this.cover,
+    required this.collectionTitle,
+    required this.collectionCover,
+    required this.showCollectionBadge,
+  });
+}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -222,7 +241,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (task != null) {
         _lastProcessedClipboard = content;
         if (mounted) {
-           _showClipboardDialog(content, task);
+           final displayInfo = await _buildClipboardDisplayInfo(content, task);
+           if (!mounted) return;
+           _showClipboardDialog(content, task, displayInfo);
         }
       }
     } catch (e) {
@@ -231,9 +252,78 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _showClipboardDialog(String content, BilibiliDownloadTask task) {
-    final title = task.singleVideoInfo?.title ?? task.collectionInfo?.title ?? "未知标题";
-    final cover = task.singleVideoInfo?.pic ?? task.collectionInfo?.cover ?? "";
+  Future<_ClipboardDisplayInfo> _buildClipboardDisplayInfo(String content, BilibiliDownloadTask task) async {
+    final collectionTitle = task.collectionInfo?.title;
+    final collectionCover = task.collectionInfo?.cover;
+    BilibiliVideoInfo? targetVideo;
+    if (task.singleVideoInfo != null) {
+      targetVideo = task.singleVideoInfo;
+    } else if (task.collectionInfo != null) {
+      final id = await _extractBilibiliIdFromContent(content);
+      if (id != null) {
+        final lowerId = id.toLowerCase();
+        for (final video in task.videos) {
+          final bvid = video.videoInfo.bvid.toLowerCase();
+          final aid = video.videoInfo.aid.toLowerCase();
+          if (bvid == lowerId || aid == lowerId) {
+            targetVideo = video.videoInfo;
+            break;
+          }
+        }
+      }
+      targetVideo ??= task.videos.length == 1 ? task.videos.first.videoInfo : null;
+    }
+    final title = targetVideo?.title ?? task.singleVideoInfo?.title ?? task.collectionInfo?.title ?? "未知标题";
+    final cover = targetVideo?.pic ?? task.singleVideoInfo?.pic ?? task.collectionInfo?.cover ?? "";
+    final showCollectionBadge = task.collectionInfo != null && targetVideo != null;
+    return _ClipboardDisplayInfo(
+      title: title,
+      cover: cover,
+      collectionTitle: collectionTitle,
+      collectionCover: collectionCover,
+      showCollectionBadge: showCollectionBadge,
+    );
+  }
+
+  Future<String?> _extractBilibiliIdFromContent(String content) async {
+    try {
+      String cleanInput = content.trim();
+      final linkMatch = RegExp(r'(https?://[^\s]+)').firstMatch(content);
+      if (linkMatch != null) {
+        cleanInput = linkMatch.group(0)!;
+        cleanInput = cleanInput.replaceAll(RegExp(r'[.,!?;:")]*$'), '');
+      } else {
+        final bvMatch = RegExp(r'(BV[a-zA-Z0-9]{10})', caseSensitive: false).firstMatch(content);
+        if (bvMatch != null) {
+          cleanInput = bvMatch.group(0)!;
+        } else {
+          final ssMatch = RegExp(r'(ss[0-9]+)', caseSensitive: false).firstMatch(content);
+          if (ssMatch != null) {
+            cleanInput = ssMatch.group(0)!;
+          } else {
+            final epMatch = RegExp(r'(ep[0-9]+)', caseSensitive: false).firstMatch(content);
+            if (epMatch != null) {
+              cleanInput = epMatch.group(0)!;
+            }
+          }
+        }
+      }
+      var type = BilibiliUrlParser.determineType(cleanInput);
+      if (type == BilibiliUrlType.shortLink) {
+        final service = Provider.of<BilibiliDownloadService>(context, listen: false);
+        final resolvedUrl = await service.apiService.resolveShortLink(cleanInput);
+        cleanInput = resolvedUrl;
+        type = BilibiliUrlParser.determineType(cleanInput);
+      }
+      return BilibiliUrlParser.extractId(cleanInput, type);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void _showClipboardDialog(String content, BilibiliDownloadTask task, _ClipboardDisplayInfo displayInfo) {
+    final title = displayInfo.title;
+    final cover = displayInfo.cover;
     
     showDialog(
       context: context,
@@ -264,11 +354,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                   const Text("检测到 Bilibili 视频", style: TextStyle(fontSize: 12, color: Colors.blueAccent, fontWeight: FontWeight.bold)),
-                   const SizedBox(height: 8),
-                   Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white), maxLines: 2, overflow: TextOverflow.ellipsis),
-                   const SizedBox(height: 12),
-                   const Text("是否前往下载页导入该视频？", style: TextStyle(fontSize: 13, color: Colors.white70)),
+                  const Text("检测到 Bilibili 视频", style: TextStyle(fontSize: 12, color: Colors.blueAccent, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white), maxLines: 2, overflow: TextOverflow.ellipsis),
+                  if (displayInfo.showCollectionBadge) ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        if ((displayInfo.collectionCover ?? '').isNotEmpty)
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(3),
+                            child: Image.network(
+                              displayInfo.collectionCover!,
+                              width: 22,
+                              height: 16,
+                              fit: BoxFit.cover,
+                              errorBuilder: (context, error, stackTrace) => Container(
+                                width: 22,
+                                height: 16,
+                                color: Colors.grey[800],
+                              ),
+                            ),
+                          )
+                        else
+                          Container(width: 22, height: 16, color: Colors.grey[800]),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            "来自合集：${displayInfo.collectionTitle ?? ''}",
+                            style: const TextStyle(fontSize: 11, color: Colors.white54),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 12),
+                  const Text("是否前往下载页导入该视频？", style: TextStyle(fontSize: 13, color: Colors.white70)),
                 ],
               ),
             )
@@ -552,6 +675,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       List<dynamic> contents
   ) {
     final isSelected = _selectedIds.contains(collection.id);
+    final thumbnailPath = collection.thumbnailPath;
+    final hasThumbnail = thumbnailPath != null && thumbnailPath.isNotEmpty;
     
     // 1. The Visual Content of the Card
     Widget cardVisual = Column(
@@ -562,13 +687,44 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           aspectRatio: 4 / 3,
           child: Container(
             color: Colors.black26,
-            child: Center(
-              child: Icon(
-                Icons.folder, 
-                size: 64, 
-                color: Colors.blueAccent.withValues(alpha: 0.8)
-              ),
-            ),
+            child: hasThumbnail
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CachedThumbnailWidget(
+                        videoId: collection.id,
+                        thumbnailPath: thumbnailPath,
+                        cacheWidth: 512,
+                        cacheHeight: 384,
+                        placeholder: const SizedBox.expand(
+                          child: ColoredBox(color: Colors.black26),
+                        ),
+                        errorWidget: Center(
+                          child: Icon(
+                            Icons.folder,
+                            size: 64,
+                            color: Colors.blueAccent.withValues(alpha: 0.8),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        right: 6,
+                        bottom: 6,
+                        child: Icon(
+                          Icons.folder,
+                          size: 28,
+                          color: Colors.blueAccent.withValues(alpha: 0.9),
+                        ),
+                      ),
+                    ],
+                  )
+                : Center(
+                    child: Icon(
+                      Icons.folder,
+                      size: 64,
+                      color: Colors.blueAccent.withValues(alpha: 0.8),
+                    ),
+                  ),
           ),
         ),
         // Info Area

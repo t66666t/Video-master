@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:io';
+import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -7,8 +10,24 @@ import '../models/video_item.dart';
 import '../models/subtitle_model.dart';
 import 'playlist_manager.dart';
 import 'progress_tracker.dart';
-
 import '../services/settings_service.dart';
+import '../utils/pgs_parser.dart';
+import '../utils/subtitle_converter.dart';
+import '../utils/subtitle_parser.dart';
+
+List<Map<String, Object?>> _parseTextSubtitlesToSerializable(String content) {
+  final parsed = SubtitleParser.parse(content);
+  final result = <Map<String, Object?>>[];
+  for (final item in parsed) {
+    result.add(<String, Object?>{
+      'i': item.index,
+      's': item.startTime.inMilliseconds,
+      'e': item.endTime.inMilliseconds,
+      't': item.text,
+    });
+  }
+  return result;
+}
 
 /// 播放状态枚举
 enum PlaybackState {
@@ -47,6 +66,8 @@ class MediaPlaybackService extends ChangeNotifier {
   SubtitleItem? _currentSubtitle;
   int _lastSubtitleIndex = 0;
   final List<int> _subtitleStartMs = <int>[];
+  final Map<String, List<SubtitleItem>> _subtitleCache = {};
+  int _subtitleLoadRequestId = 0;
   
   // 进度追踪定时器
   Timer? _progressTimer;
@@ -121,6 +142,31 @@ class MediaPlaybackService extends ChangeNotifier {
 
   void clearSubtitleState() {
     setSubtitleState(paths: const [], primary: const [], secondary: const []);
+  }
+
+  Future<void> _refreshSubtitlesForCurrentItem(VideoItem item) async {
+    final int requestId = ++_subtitleLoadRequestId;
+    if (!item.showFloatingSubtitles) {
+      if (_subtitles.isNotEmpty || _secondarySubtitles.isNotEmpty || _subtitlePaths.isNotEmpty) {
+        setSubtitleState(paths: const [], primary: const [], secondary: const []);
+      }
+      return;
+    }
+
+    final List<String> paths = <String>[];
+    if (item.subtitlePath != null) paths.add(item.subtitlePath!);
+    if (item.secondarySubtitlePath != null) paths.add(item.secondarySubtitlePath!);
+    if (paths.isEmpty) {
+      setSubtitleState(paths: const [], primary: const [], secondary: const []);
+      return;
+    }
+
+    final primary = await _parseSubtitleFile(paths[0]);
+    final secondary = paths.length > 1 ? await _parseSubtitleFile(paths[1]) : <SubtitleItem>[];
+    if (requestId != _subtitleLoadRequestId) return;
+    if (_currentItem?.id != item.id) return;
+
+    setSubtitleState(paths: paths, primary: primary, secondary: secondary);
   }
   
   /// 设置外部控制器（用于UI创建的控制器移交给服务管理）
@@ -322,6 +368,8 @@ class MediaPlaybackService extends ChangeNotifier {
       await _savePlaybackStateSnapshot();
       
       notifyListeners();
+      
+      _refreshSubtitlesForCurrentItem(item);
     } catch (e) {
       debugPrint('MediaPlaybackService: 播放失败 $e');
       _state = PlaybackState.error;
@@ -590,6 +638,78 @@ class MediaPlaybackService extends ChangeNotifier {
     if (_lastControllerIsPlaying != controllerIsPlaying) {
       _lastControllerIsPlaying = controllerIsPlaying;
       updatePlaybackStateFromController();
+    }
+  }
+
+  Future<List<SubtitleItem>> _parseSubtitleFile(String path) async {
+    final cached = _subtitleCache[path];
+    if (cached != null) return cached;
+
+    try {
+      final file = File(path);
+      if (!await file.exists()) return [];
+
+      final length = await file.length();
+      if (length > 10 * 1024 * 1024) {
+        debugPrint("Subtitle file too large ($length bytes), skipping: $path");
+        return [];
+      }
+
+      final ext = path.toLowerCase();
+      List<SubtitleItem> parsed = [];
+
+      if (ext.endsWith('.sup')) {
+        parsed = await PgsParser.parse(path);
+      } else if (ext.endsWith('.idx')) {
+        final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.sup');
+        if (converted != null) parsed = await PgsParser.parse(converted);
+      } else if (ext.endsWith('.scc')) {
+        final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.srt');
+        if (converted != null) return _parseSubtitleFile(converted);
+      } else if (ext.endsWith('.sub')) {
+        if (await SubtitleConverter.isMicroDvdSub(path)) {
+          final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.srt');
+          if (converted != null) return _parseSubtitleFile(converted);
+        } else {
+          final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.sup');
+          if (converted != null) parsed = await PgsParser.parse(converted);
+        }
+      } else {
+        List<int> bytes = await file.readAsBytes();
+        String content = "";
+        try {
+          content = utf8.decode(bytes);
+        } catch (e) {
+          try {
+            content = gbk.decode(bytes);
+          } catch (e2) {
+            developer.log('Failed to decode', error: e2);
+          }
+        }
+
+        if (content.isNotEmpty) {
+          final serialized = await compute(_parseTextSubtitlesToSerializable, content);
+          parsed = serialized
+              .map(
+                (m) => SubtitleItem(
+                  index: (m['i'] as int?) ?? 0,
+                  startTime: Duration(milliseconds: (m['s'] as int?) ?? 0),
+                  endTime: Duration(milliseconds: (m['e'] as int?) ?? 0),
+                  text: (m['t'] as String?) ?? "",
+                ),
+              )
+              .toList();
+        }
+      }
+
+      if (parsed.isNotEmpty) {
+        parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+      }
+      _subtitleCache[path] = parsed;
+      return parsed;
+    } catch (e) {
+      developer.log('Load sub error', error: e);
+      return [];
     }
   }
   

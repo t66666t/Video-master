@@ -1,9 +1,49 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../services/media_playback_service.dart';
+import '../services/playlist_manager.dart';
 import '../services/library_service.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import '../utils/app_toast.dart';
+import 'portrait_video_screen.dart';
+import 'video_player_screen.dart';
+
+Future<void> _openRecycleBinVideo(BuildContext context, VideoItem item) async {
+  final file = File(item.path);
+  if (!await file.exists()) {
+    if (!context.mounted) return;
+    AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
+    return;
+  }
+  if (!context.mounted) return;
+
+  final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+  final playlistManager = Provider.of<PlaylistManager>(context, listen: false);
+  playlistManager.setPlaylist([item], startIndex: 0);
+  await playbackService.play(item);
+
+  if (!context.mounted) return;
+  if (playbackService.state == PlaybackState.error || playbackService.controller == null) {
+    AppToast.show("播放失败：无法加载该媒体", type: AppToastType.error);
+    return;
+  }
+
+  Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (context) {
+        if (Platform.isWindows) {
+          return VideoPlayerScreen(
+            videoItem: item,
+            existingController: playbackService.controller,
+          );
+        }
+        return PortraitVideoScreen(videoItem: item);
+      },
+    ),
+  );
+}
 
 class RecycleBinScreen extends StatefulWidget {
   const RecycleBinScreen({super.key});
@@ -167,11 +207,14 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                         subtitle: Row(
                           children: [
                             Expanded(
-                              child: Text(
-                                subtitleText,
-                                style: const TextStyle(color: Colors.white54, fontSize: 12),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                child: Text(
+                                  subtitleText,
+                                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.visible,
+                                ),
                               ),
                             ),
                             SizeDisplay(item: item, library: library),
@@ -198,6 +241,8 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                             });
                           } else if (isFolder) {
                              _navigateToFolderDetail(context, folder);
+                          } else {
+                            _openRecycleBinVideo(context, item as VideoItem);
                           }
                         },
                         onLongPress: () {
@@ -348,15 +393,17 @@ class RecycledFolderDetailScreen extends StatelessWidget {
                                   SizeDisplay(item: item, library: library),
                                 ],
                               ),
-                              onTap: isFolder 
-                                  ? () {
-                                      Navigator.of(context).push(
-                                        MaterialPageRoute(
-                                          builder: (context) => RecycledFolderDetailScreen(collection: item),
-                                        ),
-                                      );
-                                    }
-                                  : null, // Disable tapping videos
+                              onTap: () {
+                                if (isFolder) {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (context) => RecycledFolderDetailScreen(collection: item),
+                                    ),
+                                  );
+                                } else {
+                                  _openRecycleBinVideo(context, item as VideoItem);
+                                }
+                              },
                             ),
                           );
                         },
