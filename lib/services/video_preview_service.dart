@@ -82,15 +82,13 @@ class VideoPreviewService {
         result = _cache[key];
       } else {
         result = await _extractFrameAccurate(videoPath, timeMs, anchorTimeMs);
-        if (result == null) {
-          result = await VideoThumbnail.thumbnailData(
+        result ??= await VideoThumbnail.thumbnailData(
             video: videoPath,
             imageFormat: ImageFormat.JPEG,
             maxWidth: 200,
             timeMs: timeMs,
             quality: 50,
           );
-        }
         if (result != null) {
           _addToCache(key, result);
         }

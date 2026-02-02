@@ -71,6 +71,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   // Bottom Control Bar State
   bool _isDraggingProgress = false;
   double _dragProgressValue = 0.0;
+  bool _isProgressDragCanceling = false;
   final bool _showVolumeSlider = false;
   final LayerLink _volumeButtonLayerLink = LayerLink();
 
@@ -1259,6 +1260,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       playbackService.clearSubtitleState();
     }
 
+    // 从横屏返回后，重置字幕边栏滚动位置到顶部
+    // 确保字幕数量不足时从顶部对齐
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _subtitleSidebarKey.currentState?.jumpToFirstSubtitleTop();
+      }
+    });
+
     setState(() {});
   }
 
@@ -1267,6 +1276,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
     String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
     return "${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds";
+  }
+
+  bool _isInCancelArea(Offset globalPosition) {
+    if (!mounted) return false;
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) return false;
+    final localOffset = box.globalToLocal(globalPosition);
+    return localOffset.dy < box.size.height * 0.25;
   }
 
   Widget _buildBottomControlBar() {
@@ -1303,44 +1320,66 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
               
               // Progress Slider
               Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: const Color(0xFF0D47A1),
-                    inactiveTrackColor: Colors.white24,
-                    thumbColor: const Color(0xFF1565C0),
-                    overlayColor: const Color(0x291565C0),
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
-                    trackHeight: 2.0,
-                    overlayShape: const RoundSliderOverlayShape(overlayRadius: 10),
-                  ),
-                  child: Slider(
-                    min: 0.0,
-                    max: sliderMax,
-                    value: _isDraggingProgress 
-                        ? _dragProgressValue 
-                        : sliderValue,
-                    onChanged: (newValue) {
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerMove: (event) {
+                    if (!_isDraggingProgress || _isLocked) return;
+                    final isInCancelArea = _isInCancelArea(event.position);
+                    if (isInCancelArea != _isProgressDragCanceling) {
                       setState(() {
-                        _isDraggingProgress = true;
-                        _dragProgressValue = newValue;
+                        _isProgressDragCanceling = isInCancelArea;
                       });
-                    },
-                    onChangeEnd: (newValue) {
-                      final pos = Duration(milliseconds: newValue.toInt());
-                      try {
-                        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
-                        if (playbackService.controller == _controller) {
-                          playbackService.seekTo(pos);
-                        } else {
-                          _controller.seekTo(pos);
+                    }
+                  },
+                  onPointerCancel: (event) {
+                    if (!_isDraggingProgress) return;
+                    setState(() {
+                      _isDraggingProgress = false;
+                      _isProgressDragCanceling = false;
+                    });
+                  },
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: _isProgressDragCanceling ? Colors.grey : const Color(0xFF0D47A1),
+                      inactiveTrackColor: Colors.white24,
+                      thumbColor: _isProgressDragCanceling ? Colors.grey : const Color(0xFF1565C0),
+                      overlayColor: const Color(0x291565C0),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6.0),
+                      trackHeight: 2.0,
+                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 10),
+                    ),
+                    child: Slider(
+                      min: 0.0,
+                      max: sliderMax,
+                      value: _isDraggingProgress 
+                          ? _dragProgressValue 
+                          : sliderValue,
+                      onChanged: (newValue) {
+                        setState(() {
+                          _isDraggingProgress = true;
+                          _dragProgressValue = newValue;
+                        });
+                      },
+                      onChangeEnd: (newValue) {
+                        if (!_isProgressDragCanceling) {
+                          final pos = Duration(milliseconds: newValue.toInt());
+                          try {
+                            final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+                            if (playbackService.controller == _controller) {
+                              playbackService.seekTo(pos);
+                            } else {
+                              _controller.seekTo(pos);
+                            }
+                          } catch (_) {
+                            _controller.seekTo(pos);
+                          }
                         }
-                      } catch (_) {
-                        _controller.seekTo(pos);
-                      }
-                      setState(() {
-                        _isDraggingProgress = false;
-                      });
-                    },
+                        setState(() {
+                          _isDraggingProgress = false;
+                          _isProgressDragCanceling = false;
+                        });
+                      },
+                    ),
                   ),
                 ),
               ),
@@ -1575,7 +1614,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 500),
                     child: SafeArea(
-                      child: Stack(
+                    child: Stack(
                     children: [
                       Column(
                         children: [
@@ -1617,6 +1656,17 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                     ),
                                   ),
                                 ],
+                                if (_isDraggingProgress && !_isLocked)
+                                  Positioned.fill(
+                                    child: Container(
+                                      color: Colors.black.withValues(alpha: _isProgressDragCanceling ? 0.28 : 0.16),
+                                      alignment: Alignment.center,
+                                      child: Text(
+                                        _isProgressDragCanceling ? "松手取消" : "上滑至此区域取消",
+                                        style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                                      ),
+                                    ),
+                                  ),
                                 // Visible Subtitles
                                 if (_initialized && settings.showSubtitles)
                                   Align(
@@ -1979,6 +2029,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           onAutoPlayNextVideoChanged: (val) => settings.updateSetting('autoPlayNextVideo', val),
           enableSeekPreview: settings.enableSeekPreview,
           onEnableSeekPreviewChanged: (val) => settings.updateSetting('enableSeekPreview', val),
+          isLeftHandedMode: settings.isLeftHandedMode,
+          onLeftHandedModeChanged: (val) => settings.updateSetting('isLeftHandedMode', val),
           onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
           onLoadSubtitle: _pickSubtitle,
           onOpenSubtitleSettings: _openSubtitleStyleSettings,
@@ -1997,7 +2049,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
               settings.saveSubtitleTextStyle(newTextStyle);
             }
           },
-          // 布局样式改变时只影响竖屏
+          // 布局样式改变时同步到横竖屏
           onLayoutStyleChanged: (newLayoutStyle) {
             if (_isAudio) {
               settings.saveAudioSubtitleLayoutPortrait(newLayoutStyle);

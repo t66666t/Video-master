@@ -58,6 +58,14 @@ class SubtitleOverlayGroup extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
+        double scale = 1.0;
+        if (constraints.maxHeight != double.infinity && constraints.maxHeight > 0) {
+          scale = constraints.maxHeight / 720.0;
+        }
+        final childConstraints = BoxConstraints(
+          maxWidth: constraints.maxWidth,
+          maxHeight: constraints.maxHeight,
+        );
         final Widget content = SingleChildScrollView(
           reverse: alignment.y >= 0,
           physics: const NeverScrollableScrollPhysics(),
@@ -65,17 +73,20 @@ class SubtitleOverlayGroup extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               for (int i = 0; i < visibleEntries.length; i++) ...[
-                SubtitleOverlay(
-                  text: visibleEntries[i].text,
-                  secondaryText: visibleEntries[i].secondaryText,
-                  image: visibleEntries[i].image,
-                  style: style,
-                  onLongPress: onLongPress,
-                  isDragging: isDragging,
-                  isGestureOnly: isGestureOnly,
-                  isVisualOnly: isVisualOnly,
+                ConstrainedBox(
+                  constraints: childConstraints,
+                  child: SubtitleOverlay(
+                    text: visibleEntries[i].text,
+                    secondaryText: visibleEntries[i].secondaryText,
+                    image: visibleEntries[i].image,
+                    style: style,
+                    onLongPress: onLongPress,
+                    isDragging: isDragging,
+                    isGestureOnly: isGestureOnly,
+                    isVisualOnly: isVisualOnly,
+                  ),
                 ),
-                if (i != visibleEntries.length - 1) SizedBox(height: itemGap),
+                if (i != visibleEntries.length - 1) SizedBox(height: itemGap * scale),
               ],
             ],
           ),

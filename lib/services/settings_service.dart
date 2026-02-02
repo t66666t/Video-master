@@ -24,14 +24,19 @@ class SettingsService extends ChangeNotifier {
   int doubleTapSeekSeconds = 5;
   bool enableDoubleTapSubtitleSeek = true;
   double userSubtitleSidebarWidth = 320.0;
+  bool isLeftHandedMode = false;
 
   // Subtitle Settings - 新的结构
   // 文字样式 - 横竖屏共享
   SubtitleTextStyle subtitleTextStyle = const SubtitleTextStyle();
 
-  // 布局样式 - 横竖屏独立
+  // 布局样式 - 横竖屏共享
   SubtitleLayoutStyle subtitleLayoutLandscape = const SubtitleLayoutStyle();
   SubtitleLayoutStyle subtitleLayoutPortrait = const SubtitleLayoutStyle();
+
+  // 幽灵模式布局样式 - 与普通字幕完全独立（仅共享文字样式）
+  SubtitleLayoutStyle subtitleLayoutGhostLandscape = const SubtitleLayoutStyle();
+  SubtitleLayoutStyle subtitleLayoutGhostPortrait = const SubtitleLayoutStyle();
 
   // 音频字幕 - 同样结构
   SubtitleTextStyle audioSubtitleTextStyle = const SubtitleTextStyle();
@@ -46,6 +51,16 @@ class SettingsService extends ChangeNotifier {
   SubtitleStyle get subtitleStylePortrait => SubtitleStyle(
     textStyle: subtitleTextStyle,
     layoutStyle: subtitleLayoutPortrait,
+  );
+
+  // 便捷访问器 - 视频幽灵字幕完整样式（仅布局独立）
+  SubtitleStyle get subtitleStyleGhostLandscape => SubtitleStyle(
+    textStyle: subtitleTextStyle,
+    layoutStyle: subtitleLayoutGhostLandscape,
+  );
+  SubtitleStyle get subtitleStyleGhostPortrait => SubtitleStyle(
+    textStyle: subtitleTextStyle,
+    layoutStyle: subtitleLayoutGhostPortrait,
   );
 
   // 便捷访问器 - 音频字幕完整样式
@@ -101,8 +116,6 @@ class SettingsService extends ChangeNotifier {
   // New: Subtitle Ghost Mode
   bool isGhostModeEnabled = false;
   Alignment ghostModeAlignment = const Alignment(0.0, 0.9);
-  double ghostSubtitleFontSize = 39.0;
-  double ghostSubtitleLetterSpacing = 0.0;
 
   // New: Split Subtitle by Line
   bool splitSubtitleByLine = true;
@@ -166,6 +179,7 @@ class SettingsService extends ChangeNotifier {
     doubleTapSeekSeconds = _prefs.getInt('doubleTapSeekSeconds') ?? 5;
     enableDoubleTapSubtitleSeek = _prefs.getBool('enableDoubleTapSubtitleSeek') ?? true;
     userSubtitleSidebarWidth = _prefs.getDouble('userSubtitleSidebarWidth') ?? 320.0;
+    isLeftHandedMode = _prefs.getBool('isLeftHandedMode') ?? false;
     autoCacheSubtitles = _prefs.getBool('autoCacheSubtitles') ?? true;
     autoScrollSubtitles = _prefs.getBool('autoScrollSubtitles') ?? true;
     autoLoadEmbeddedSubtitles = _prefs.getBool('autoLoadEmbeddedSubtitles') ?? false;
@@ -357,17 +371,73 @@ class SettingsService extends ChangeNotifier {
       }
     }
 
-    // 加载幽灵字幕设置
-    if (_prefs.containsKey('ghostSubtitleFontSize')) {
-      ghostSubtitleFontSize = _prefs.getDouble('ghostSubtitleFontSize') ?? subtitleLayoutLandscape.fontSize;
-    } else {
-      ghostSubtitleFontSize = subtitleLayoutLandscape.fontSize;
+    // 加载幽灵模式布局样式（与普通布局完全独立）
+    final ghostLayoutLandJson = _prefs.getString('subtitleLayoutGhostLandscape');
+    final ghostLayoutPortJson = _prefs.getString('subtitleLayoutGhostPortrait');
+    if (ghostLayoutLandJson != null) {
+      try {
+        subtitleLayoutGhostLandscape = SubtitleLayoutStyle.fromJson(json.decode(ghostLayoutLandJson));
+      } catch (e) {
+        developer.log('Error loading ghost landscape layout style', error: e);
+      }
+    }
+    if (ghostLayoutPortJson != null) {
+      try {
+        subtitleLayoutGhostPortrait = SubtitleLayoutStyle.fromJson(json.decode(ghostLayoutPortJson));
+      } catch (e) {
+        developer.log('Error loading ghost portrait layout style', error: e);
+      }
     }
 
-    if (_prefs.containsKey('ghostSubtitleLetterSpacing')) {
-      ghostSubtitleLetterSpacing = _prefs.getDouble('ghostSubtitleLetterSpacing') ?? 0.0;
+    // 旧版迁移：只有 ghostSubtitleFontSize / ghostSubtitleLetterSpacing（新版本改为完整布局样式）
+    final bool hasGhostLayout = ghostLayoutLandJson != null || ghostLayoutPortJson != null;
+    if (!hasGhostLayout && (_prefs.containsKey('ghostSubtitleFontSize') || _prefs.containsKey('ghostSubtitleLetterSpacing'))) {
+      final oldFontSize = _prefs.getDouble('ghostSubtitleFontSize') ?? subtitleLayoutLandscape.fontSize;
+      final oldLetterSpacing = _prefs.getDouble('ghostSubtitleLetterSpacing') ?? 0.0;
+      final base = subtitleLayoutLandscape;
+      final baseSecondary = base.secondaryFontSize ?? base.fontSize;
+      final fontScale = base.fontSize == 0 ? 1.0 : (oldFontSize / base.fontSize);
+      final migrated = base.copyWith(
+        fontSize: oldFontSize,
+        secondaryFontSize: baseSecondary * fontScale,
+        letterSpacing: oldLetterSpacing,
+      );
+      subtitleLayoutGhostLandscape = migrated;
+      subtitleLayoutGhostPortrait = migrated;
+      await _prefs.setString('subtitleLayoutGhostLandscape', json.encode(migrated.toJson()));
+      await _prefs.setString('subtitleLayoutGhostPortrait', json.encode(migrated.toJson()));
     } else {
-      ghostSubtitleLetterSpacing = 0.0;
+      // 无旧版数据时，默认继承普通布局（之后用户可独立调整）
+      if (ghostLayoutLandJson == null) subtitleLayoutGhostLandscape = subtitleLayoutLandscape;
+      if (ghostLayoutPortJson == null) subtitleLayoutGhostPortrait = subtitleLayoutGhostLandscape;
+    }
+
+    await _syncSubtitleLayouts();
+  }
+
+  bool _layoutStyleEquals(SubtitleLayoutStyle a, SubtitleLayoutStyle b) {
+    return a.fontSize == b.fontSize &&
+        a.secondaryFontSize == b.secondaryFontSize &&
+        a.lineSpacing == b.lineSpacing &&
+        a.letterSpacing == b.letterSpacing;
+  }
+
+  Future<void> _syncSubtitleLayouts() async {
+    if (!_layoutStyleEquals(subtitleLayoutLandscape, subtitleLayoutPortrait)) {
+      subtitleLayoutPortrait = subtitleLayoutLandscape;
+      await _prefs.setString('subtitleLayoutPortrait', json.encode(subtitleLayoutPortrait.toJson()));
+      await _prefs.setString('subtitleStylePortrait', json.encode(subtitleStylePortrait.toJson()));
+    }
+
+    if (!_layoutStyleEquals(subtitleLayoutGhostLandscape, subtitleLayoutGhostPortrait)) {
+      subtitleLayoutGhostPortrait = subtitleLayoutGhostLandscape;
+      await _prefs.setString('subtitleLayoutGhostPortrait', json.encode(subtitleLayoutGhostPortrait.toJson()));
+    }
+
+    if (!_layoutStyleEquals(audioSubtitleLayoutLandscape, audioSubtitleLayoutPortrait)) {
+      audioSubtitleLayoutPortrait = audioSubtitleLayoutLandscape;
+      await _prefs.setString('audioSubtitleLayoutPortrait', json.encode(audioSubtitleLayoutPortrait.toJson()));
+      await _prefs.setString('audioSubtitleStylePortrait', json.encode(audioSubtitleStylePortrait.toJson()));
     }
   }
 
@@ -392,6 +462,7 @@ class SettingsService extends ChangeNotifier {
       case 'doubleTapSeekSeconds': doubleTapSeekSeconds = value as int; break;
       case 'enableDoubleTapSubtitleSeek': enableDoubleTapSubtitleSeek = value as bool; break;
       case 'userSubtitleSidebarWidth': userSubtitleSidebarWidth = value as double; break;
+      case 'isLeftHandedMode': isLeftHandedMode = value as bool; break;
       case 'autoCacheSubtitles': autoCacheSubtitles = value as bool; break;
       case 'autoScrollSubtitles': autoScrollSubtitles = value as bool; break;
       case 'autoLoadEmbeddedSubtitles': autoLoadEmbeddedSubtitles = value as bool; break;
@@ -414,8 +485,6 @@ class SettingsService extends ChangeNotifier {
       case 'subtitleViewMode': subtitleViewMode = value as int; break;
       case 'lastSelectedModelType': lastSelectedModelType = value as String; break;
       case 'isGhostModeEnabled': isGhostModeEnabled = value as bool; break;
-      case 'ghostSubtitleFontSize': ghostSubtitleFontSize = value as double; break;
-      case 'ghostSubtitleLetterSpacing': ghostSubtitleLetterSpacing = value as double; break;
       case 'subtitleOffset':
          subtitleOffset = Duration(milliseconds: value as int);
          break;
@@ -449,38 +518,64 @@ class SettingsService extends ChangeNotifier {
   /// 保存横屏布局样式
   Future<void> saveSubtitleLayoutLandscape(SubtitleLayoutStyle style) async {
     subtitleLayoutLandscape = style;
+    subtitleLayoutPortrait = style;
     notifyListeners();
     await _prefs.setString('subtitleLayoutLandscape', json.encode(style.toJson()));
-    // 同时更新旧格式以保持兼容
+    await _prefs.setString('subtitleLayoutPortrait', json.encode(style.toJson()));
     await _prefs.setString('subtitleStyleLandscape', json.encode(subtitleStyleLandscape.toJson()));
+    await _prefs.setString('subtitleStylePortrait', json.encode(subtitleStylePortrait.toJson()));
     await _prefs.setString('subtitleStyle', json.encode(subtitleStyleLandscape.toJson()));
   }
 
   /// 保存竖屏布局样式
   Future<void> saveSubtitleLayoutPortrait(SubtitleLayoutStyle style) async {
     subtitleLayoutPortrait = style;
+    subtitleLayoutLandscape = style;
     notifyListeners();
     await _prefs.setString('subtitleLayoutPortrait', json.encode(style.toJson()));
-    // 同时更新旧格式以保持兼容
+    await _prefs.setString('subtitleLayoutLandscape', json.encode(style.toJson()));
     await _prefs.setString('subtitleStylePortrait', json.encode(subtitleStylePortrait.toJson()));
+    await _prefs.setString('subtitleStyleLandscape', json.encode(subtitleStyleLandscape.toJson()));
+    await _prefs.setString('subtitleStyle', json.encode(subtitleStyleLandscape.toJson()));
+  }
+
+  /// 保存幽灵模式布局样式（横竖屏同步，但与普通布局完全独立）
+  Future<void> saveSubtitleLayoutGhostLandscape(SubtitleLayoutStyle style) async {
+    subtitleLayoutGhostLandscape = style;
+    subtitleLayoutGhostPortrait = style;
+    notifyListeners();
+    await _prefs.setString('subtitleLayoutGhostLandscape', json.encode(style.toJson()));
+    await _prefs.setString('subtitleLayoutGhostPortrait', json.encode(style.toJson()));
+  }
+
+  Future<void> saveSubtitleLayoutGhostPortrait(SubtitleLayoutStyle style) async {
+    subtitleLayoutGhostPortrait = style;
+    subtitleLayoutGhostLandscape = style;
+    notifyListeners();
+    await _prefs.setString('subtitleLayoutGhostPortrait', json.encode(style.toJson()));
+    await _prefs.setString('subtitleLayoutGhostLandscape', json.encode(style.toJson()));
   }
 
   /// 保存音频横屏布局样式
   Future<void> saveAudioSubtitleLayoutLandscape(SubtitleLayoutStyle style) async {
     audioSubtitleLayoutLandscape = style;
+    audioSubtitleLayoutPortrait = style;
     notifyListeners();
     await _prefs.setString('audioSubtitleLayoutLandscape', json.encode(style.toJson()));
-    // 同时更新旧格式以保持兼容
+    await _prefs.setString('audioSubtitleLayoutPortrait', json.encode(style.toJson()));
     await _prefs.setString('audioSubtitleStyleLandscape', json.encode(audioSubtitleStyleLandscape.toJson()));
+    await _prefs.setString('audioSubtitleStylePortrait', json.encode(audioSubtitleStylePortrait.toJson()));
   }
 
   /// 保存音频竖屏布局样式
   Future<void> saveAudioSubtitleLayoutPortrait(SubtitleLayoutStyle style) async {
     audioSubtitleLayoutPortrait = style;
+    audioSubtitleLayoutLandscape = style;
     notifyListeners();
     await _prefs.setString('audioSubtitleLayoutPortrait', json.encode(style.toJson()));
-    // 同时更新旧格式以保持兼容
+    await _prefs.setString('audioSubtitleLayoutLandscape', json.encode(style.toJson()));
     await _prefs.setString('audioSubtitleStylePortrait', json.encode(audioSubtitleStylePortrait.toJson()));
+    await _prefs.setString('audioSubtitleStyleLandscape', json.encode(audioSubtitleStyleLandscape.toJson()));
   }
 
   // ========== 向后兼容的旧方法 ==========
@@ -493,37 +588,52 @@ class SettingsService extends ChangeNotifier {
   Future<void> saveSubtitleStyleLandscape(SubtitleStyle style) async {
     subtitleTextStyle = style.textStyle;
     subtitleLayoutLandscape = style.layoutStyle;
+    subtitleLayoutPortrait = style.layoutStyle;
     notifyListeners();
     await _prefs.setString('subtitleTextStyle', json.encode(style.textStyle.toJson()));
     await _prefs.setString('subtitleLayoutLandscape', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('subtitleLayoutPortrait', json.encode(style.layoutStyle.toJson()));
     await _prefs.setString('subtitleStyleLandscape', json.encode(style.toJson()));
+    await _prefs.setString('subtitleStylePortrait', json.encode(subtitleStylePortrait.toJson()));
     await _prefs.setString('subtitleStyle', json.encode(style.toJson()));
   }
 
   Future<void> saveSubtitleStylePortrait(SubtitleStyle style) async {
-    // 注意：这里只更新布局样式，文字样式保持共享
+    subtitleTextStyle = style.textStyle;
     subtitleLayoutPortrait = style.layoutStyle;
+    subtitleLayoutLandscape = style.layoutStyle;
     notifyListeners();
     await _prefs.setString('subtitleLayoutPortrait', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('subtitleLayoutLandscape', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('subtitleTextStyle', json.encode(style.textStyle.toJson()));
     await _prefs.setString('subtitleStylePortrait', json.encode(subtitleStylePortrait.toJson()));
+    await _prefs.setString('subtitleStyleLandscape', json.encode(subtitleStyleLandscape.toJson()));
+    await _prefs.setString('subtitleStyle', json.encode(subtitleStyleLandscape.toJson()));
   }
 
   // Audio Subtitle Style Savers
   Future<void> saveAudioSubtitleStyleLandscape(SubtitleStyle style) async {
     audioSubtitleTextStyle = style.textStyle;
     audioSubtitleLayoutLandscape = style.layoutStyle;
+    audioSubtitleLayoutPortrait = style.layoutStyle;
     notifyListeners();
     await _prefs.setString('audioSubtitleTextStyle', json.encode(style.textStyle.toJson()));
     await _prefs.setString('audioSubtitleLayoutLandscape', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('audioSubtitleLayoutPortrait', json.encode(style.layoutStyle.toJson()));
     await _prefs.setString('audioSubtitleStyleLandscape', json.encode(style.toJson()));
+    await _prefs.setString('audioSubtitleStylePortrait', json.encode(audioSubtitleStylePortrait.toJson()));
   }
 
   Future<void> saveAudioSubtitleStylePortrait(SubtitleStyle style) async {
-    // 注意：这里只更新布局样式，文字样式保持共享
+    audioSubtitleTextStyle = style.textStyle;
     audioSubtitleLayoutPortrait = style.layoutStyle;
+    audioSubtitleLayoutLandscape = style.layoutStyle;
     notifyListeners();
     await _prefs.setString('audioSubtitleLayoutPortrait', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('audioSubtitleLayoutLandscape', json.encode(style.layoutStyle.toJson()));
+    await _prefs.setString('audioSubtitleTextStyle', json.encode(style.textStyle.toJson()));
     await _prefs.setString('audioSubtitleStylePortrait', json.encode(audioSubtitleStylePortrait.toJson()));
+    await _prefs.setString('audioSubtitleStyleLandscape', json.encode(audioSubtitleStyleLandscape.toJson()));
   }
 
   Future<void> saveSubtitleAlignment(Alignment align) async {

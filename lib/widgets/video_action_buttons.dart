@@ -12,6 +12,7 @@ import '../services/settings_service.dart';
 import '../services/batch_import_service.dart';
 import '../screens/batch_import_screen.dart';
 import '../screens/bilibili_download_screen.dart';
+import '../utils/app_toast.dart';
 
 class VideoActionButtons extends StatelessWidget {
   final String? collectionId;
@@ -28,39 +29,31 @@ class VideoActionButtons extends StatelessWidget {
   static void _showTopBanner(
     BuildContext context,
     String message, {
-    Color backgroundColor = const Color(0xFF2C2C2C),
-    Duration? autoHideDuration,
+    Color? backgroundColor,
     String? actionText,
     VoidCallback? onActionPressed,
+    Duration autoHideDuration = const Duration(milliseconds: 2000),
   }) {
-    if (!context.mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.clearSnackBars();
-    messenger.hideCurrentMaterialBanner();
-    messenger.showMaterialBanner(
-      MaterialBanner(
-        content: Text(message, style: const TextStyle(color: Colors.white)),
-        backgroundColor: backgroundColor,
-        actions: [
-          if (actionText != null && onActionPressed != null)
-            TextButton(
-              onPressed: () {
-                messenger.hideCurrentMaterialBanner();
-                onActionPressed();
-              },
-              child: Text(actionText, style: const TextStyle(color: Colors.white)),
-            ),
-          TextButton(
-            onPressed: () => messenger.hideCurrentMaterialBanner(),
-            child: const Text("关闭", style: TextStyle(color: Colors.white)),
+    if (actionText != null && onActionPressed != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: backgroundColor ?? const Color(0xFF333333),
+          duration: autoHideDuration,
+          action: SnackBarAction(
+            label: actionText,
+            textColor: Colors.white,
+            onPressed: onActionPressed,
           ),
-        ],
-      ),
-    );
-    if (autoHideDuration != null) {
-      Future.delayed(autoHideDuration, () {
-        messenger.hideCurrentMaterialBanner();
-      });
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else {
+      AppToastType type = AppToastType.info;
+      if (backgroundColor != null && backgroundColor.toARGB32() == 0xFFB00020) {
+        type = AppToastType.error;
+      }
+      AppToast.show(message, type: type, duration: autoHideDuration);
     }
   }
 
@@ -273,26 +266,20 @@ class VideoActionButtons extends StatelessWidget {
       if (!context.mounted) return;
       final List<AssetEntity>? assets = await AssetPicker.pickAssets(
         context,
-        pickerConfig: const AssetPickerConfig(
-          requestType: RequestType.video,
+        pickerConfig: AssetPickerConfig(
+          requestType: RequestType.video | RequestType.audio,
           maxAssets: 999,
         ),
       );
 
       if (assets == null || assets.isEmpty) {
         if (context.mounted) {
-          _showTopBanner(
-            context,
-            "未选择任何媒体",
-            autoHideDuration: const Duration(seconds: 2),
-          );
+          _showTopBanner(context, "未选择任何媒体");
         }
         return;
       }
 
-      if (context.mounted) {
-        _showTopBanner(context, "正在处理媒体文件...");
-      }
+      AppToast.showLoading("正在处理媒体文件...");
 
       final List<String> paths = [];
       final List<String> originalTitles = [];
@@ -304,13 +291,14 @@ class VideoActionButtons extends StatelessWidget {
         originalTitles.add(asset.title ?? p.basename(file.path));
       }
 
+      AppToast.dismiss();
+
       if (paths.isEmpty) {
         if (context.mounted) {
           _showTopBanner(
             context,
             "未找到可用的视频文件",
             backgroundColor: const Color(0xFFB00020),
-            autoHideDuration: const Duration(seconds: 2),
           );
         }
         return;
@@ -321,7 +309,6 @@ class VideoActionButtons extends StatelessWidget {
         _showTopBanner(
           context,
           "已开始后台导入 ${paths.length} 个媒体文件",
-          autoHideDuration: const Duration(seconds: 2),
         );
         library.importVideosBackground(
           paths,
@@ -332,6 +319,7 @@ class VideoActionButtons extends StatelessWidget {
         );
       }
     } catch (e) {
+      AppToast.dismiss();
       if (context.mounted) {
         _showTopBanner(
           context,
@@ -374,11 +362,7 @@ class VideoActionButtons extends StatelessWidget {
         final pickedPaths = result?.whereType<String>().toList() ?? [];
         if (pickedPaths.isEmpty) {
           if (context.mounted) {
-            _showTopBanner(
-              context,
-              "未选择任何媒体",
-              autoHideDuration: const Duration(seconds: 2),
-            );
+            _showTopBanner(context, "未选择任何媒体");
           }
           return;
         }
@@ -395,7 +379,6 @@ class VideoActionButtons extends StatelessWidget {
               context,
               "未找到可用的媒体文件",
               backgroundColor: const Color(0xFFB00020),
-              autoHideDuration: const Duration(seconds: 2),
             );
           }
           return;
@@ -407,7 +390,6 @@ class VideoActionButtons extends StatelessWidget {
           _showTopBanner(
             context,
             "已开始后台导入 ${paths.length} 个媒体文件",
-            autoHideDuration: const Duration(seconds: 2),
           );
           library.importVideosBackground(
             paths,
@@ -441,26 +423,20 @@ class VideoActionButtons extends StatelessWidget {
         if (!context.mounted) return;
         final List<AssetEntity>? assets = await AssetPicker.pickAssets(
           context,
-          pickerConfig: const AssetPickerConfig(
-            requestType: RequestType.all,
+          pickerConfig: AssetPickerConfig(
+            requestType: RequestType.video | RequestType.audio,
             maxAssets: 999,
           ),
         );
 
         if (assets == null || assets.isEmpty) {
           if (context.mounted) {
-            _showTopBanner(
-              context,
-              "未选择任何媒体",
-              autoHideDuration: const Duration(seconds: 2),
-            );
+            _showTopBanner(context, "未选择任何媒体");
           }
           return;
         }
 
-        if (context.mounted) {
-          _showTopBanner(context, "正在处理媒体文件...");
-        }
+        AppToast.showLoading("正在处理媒体文件...");
 
         final List<String> paths = [];
         final List<String> originalTitles = [];
@@ -472,13 +448,14 @@ class VideoActionButtons extends StatelessWidget {
           originalTitles.add(asset.title ?? p.basename(file.path));
         }
 
+        AppToast.dismiss();
+
         if (paths.isEmpty) {
           if (context.mounted) {
             _showTopBanner(
               context,
               "未找到可用的媒体文件",
               backgroundColor: const Color(0xFFB00020),
-              autoHideDuration: const Duration(seconds: 2),
             );
           }
           return;
@@ -489,7 +466,6 @@ class VideoActionButtons extends StatelessWidget {
           _showTopBanner(
             context,
             "已开始后台导入 ${paths.length} 个媒体文件",
-            autoHideDuration: const Duration(seconds: 2),
           );
           library.importVideosBackground(
             paths,
@@ -521,12 +497,11 @@ class VideoActionButtons extends StatelessWidget {
 
       if (result != null && result.files.isNotEmpty) {
         final paths = result.files.where((f) => f.path != null).map((f) => f.path!).toList();
-        
+
         if (context.mounted) {
           _showTopBanner(
             context,
             "已开始后台导入 ${paths.length} 个媒体文件",
-            autoHideDuration: const Duration(seconds: 2),
           );
         }
 

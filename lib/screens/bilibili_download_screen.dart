@@ -35,6 +35,15 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     double thumbnailWidth = 44,
     double thumbnailHeight = 28,
   }) {
+    String processedUrl = thumbnailUrl;
+    // 优化：针对 Bilibili 图片使用 CDN 缩放参数，并指定 cacheWidth/cacheHeight 以减少内存占用
+    if (thumbnailUrl.isNotEmpty && !thumbnailUrl.contains('@') && 
+       (thumbnailUrl.contains('hdslb.com') || thumbnailUrl.contains('bilivideo.com'))) {
+        final w = (thumbnailWidth * 2).toInt();
+        final h = (thumbnailHeight * 2).toInt();
+        processedUrl = "$thumbnailUrl@${w}w_${h}h_1c.webp";
+    }
+
     return SizedBox(
       width: 56,
       child: Column(
@@ -49,10 +58,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
               child: Image.network(
-                thumbnailUrl,
+                processedUrl,
                 width: thumbnailWidth,
                 height: thumbnailHeight,
                 fit: BoxFit.cover,
+                cacheWidth: (thumbnailWidth * 2).toInt(),
+                cacheHeight: (thumbnailHeight * 2).toInt(),
                 errorBuilder: (context, error, stackTrace) =>
                     Container(width: thumbnailWidth, height: thumbnailHeight, color: Colors.grey),
               ),
@@ -369,174 +380,215 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final service = Provider.of<BilibiliDownloadService>(context, listen: false);
     return GestureDetector(
       onTap: () => FocusScope.of(context).unfocus(), // Dismiss keyboard on tap outside
-      child: Consumer<BilibiliDownloadService>(
-      builder: (context, service, child) {
-        final selectedCount = service.tasks.expand((t) => t.videos).expand((v) => v.episodes).where((e) => e.isSelected).length;
+      child: Builder(
+        builder: (context) {
+          final media = MediaQuery.of(context);
+          final isCompactAppBar = media.orientation == Orientation.portrait && media.size.width < 600;
+          final double appBarIconSize = isCompactAppBar ? 20 : 24;
+          final double appBarButtonSize = isCompactAppBar ? 36 : 40;
+          final EdgeInsets appBarIconPadding = EdgeInsets.zero;
+          final BoxConstraints appBarIconConstraints = BoxConstraints.tightFor(width: appBarButtonSize, height: appBarButtonSize);
 
-        return Scaffold(
-          backgroundColor: const Color(0xFF121212),
-          appBar: AppBar(
-            title: const Text("BBDown 下载"),
-            backgroundColor: const Color(0xFF1E1E1E),
-            actions: [
-              IconButton(
-                icon: const Icon(Icons.select_all),
-                tooltip: "全选",
-                onPressed: service.selectAll,
+          return Scaffold(
+            backgroundColor: const Color(0xFF121212),
+            appBar: AppBar(
+              titleSpacing: isCompactAppBar ? 8 : null,
+              title: Text(
+                "BBDown 下载",
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
               ),
-              IconButton(
-                 icon: const Icon(Icons.refresh),
-                 tooltip: "获取所有清晰度/字幕",
-                 onPressed: service.fetchAllInfos,
-              ),
-              IconButton(
-                icon: const Icon(Icons.delete_sweep),
-                tooltip: "清空任务",
-                onPressed: () => _deleteAllTasks(service),
-              ),
-              IconButton(
-                icon: const Icon(Icons.settings),
-                tooltip: "下载设置",
-                onPressed: () => _showDownloadSettings(service),
-              ),
-              IconButton(
-                icon: const Icon(Icons.person),
-                onPressed: () => _showCookieDialog(service),
-                tooltip: "登录/Cookie",
-              ),
-            ],
-          ),
-          body: Column(
-            children: [
-              // Input Area
-              Container(
-                padding: const EdgeInsets.all(12),
-                color: const Color(0xFF1E1E1E),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _inputController,
-                        // focusNode: FocusNode(), // Do not recreate FocusNode every build, it causes issues. 
-                        // Default behavior is fine, just ensure we unfocus elsewhere.
-                        maxLines: 5,
-                        minLines: 3,
-                        expands: false,
-                        keyboardType: TextInputType.multiline,
-                        textInputAction: TextInputAction.newline,
-                        decoration: const InputDecoration(
-                          labelText: "输入 BV号 或 视频链接（链接包含视频标题前缀也可输入） (支持多行)",
-                          border: OutlineInputBorder(),
-                          contentPadding: EdgeInsets.all(12),
-                          hintText: "每行一个链接，自动忽略前缀...",
-                          isDense: true,
-                        ),
-                        style: const TextStyle(color: Colors.white, fontSize: 13),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Column(
-                       mainAxisAlignment: MainAxisAlignment.start,
-                       children: [
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              IconButton(
-                                icon: const Icon(Icons.paste, color: Colors.white70, size: 20),
-                                tooltip: "粘贴",
-                                padding: const EdgeInsets.all(8),
-                                constraints: const BoxConstraints(),
-                                onPressed: () async {
-                                   final data = await Clipboard.getData(Clipboard.kTextPlain);
-                                   if (data?.text != null) {
-                                     String currentText = _inputController.text;
-                                     if (currentText.isNotEmpty && !currentText.endsWith('\n')) {
-                                       currentText += '\n';
-                                     }
-                                     _inputController.text = currentText + data!.text!;
-                                   }
-                                },
-                              ),
-                              const SizedBox(width: 4),
-                              IconButton(
-                                icon: const Icon(Icons.clear, color: Colors.white70, size: 20),
-                                tooltip: "清空",
-                                padding: const EdgeInsets.all(8),
-                                constraints: const BoxConstraints(),
-                                onPressed: () {
-                                   _inputController.clear();
-                                },
-                              ),
-                              const SizedBox(width: 4),
-                              IconButton(
-                                icon: const Icon(Icons.keyboard_return, color: Colors.white70, size: 20),
-                                tooltip: "换行",
-                                padding: const EdgeInsets.all(8),
-                                constraints: const BoxConstraints(),
-                                onPressed: () {
-                                   final text = _inputController.text;
-                                   final selection = _inputController.selection;
-                                   final newText = text.replaceRange(selection.start, selection.end, "\n");
-                                   _inputController.value = TextEditingValue(
-                                     text: newText,
-                                     selection: TextSelection.collapsed(offset: selection.start + 1),
-                                   );
-                                },
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          ElevatedButton(
-                            onPressed: service.isParsing ? null : () => _parseVideo(service),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.pinkAccent,
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                              minimumSize: const Size(64, 36),
-                            ),
-                            child: service.isParsing 
-                              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) 
-                              : const Text("解析"),
-                          ),
-                       ],
-                    ),
-                  ],
+              backgroundColor: const Color(0xFF1E1E1E),
+              actions: [
+                IconButton(
+                  icon: Icon(Icons.select_all, size: appBarIconSize),
+                  tooltip: "全选",
+                  padding: appBarIconPadding,
+                  constraints: appBarIconConstraints,
+                  onPressed: service.selectAll,
                 ),
-              ),
-              if (service.parsingStatus != null)
+                IconButton(
+                  icon: Icon(Icons.delete_sweep, size: appBarIconSize),
+                  tooltip: "清空任务",
+                  padding: appBarIconPadding,
+                  constraints: appBarIconConstraints,
+                  onPressed: () => _deleteAllTasks(service),
+                ),
+                IconButton(
+                  icon: Icon(Icons.settings, size: appBarIconSize),
+                  tooltip: "下载设置",
+                  padding: appBarIconPadding,
+                  constraints: appBarIconConstraints,
+                  onPressed: () => _showDownloadSettings(service),
+                ),
+                IconButton(
+                  icon: Icon(Icons.person, size: appBarIconSize),
+                  onPressed: () => _showCookieDialog(service),
+                  tooltip: "登录/Cookie",
+                  padding: appBarIconPadding,
+                  constraints: appBarIconConstraints,
+                ),
+              ],
+            ),
+            body: Column(
+              children: [
                 Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                  color: Colors.black54,
-                  child: Text(service.parsingStatus!, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                  padding: const EdgeInsets.all(12),
+                  color: const Color(0xFF1E1E1E),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _inputController,
+                          maxLines: 5,
+                          minLines: 3,
+                          expands: false,
+                          keyboardType: TextInputType.multiline,
+                          textInputAction: TextInputAction.newline,
+                          decoration: const InputDecoration(
+                            labelText: "输入 BV号 或 视频链接（链接包含视频标题前缀也可输入） (支持多行)",
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.all(12),
+                            hintText: "每行一个链接，自动忽略前缀...",
+                            isDense: true,
+                          ),
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Column(
+                         mainAxisAlignment: MainAxisAlignment.start,
+                         children: [
+                            Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.paste, color: Colors.white70, size: 20),
+                                  tooltip: "粘贴",
+                                  padding: const EdgeInsets.all(8),
+                                  constraints: const BoxConstraints(),
+                                  onPressed: () async {
+                                     final data = await Clipboard.getData(Clipboard.kTextPlain);
+                                     if (data?.text != null) {
+                                       String currentText = _inputController.text;
+                                       if (currentText.isNotEmpty && !currentText.endsWith('\n')) {
+                                         currentText += '\n';
+                                       }
+                                       _inputController.text = currentText + data!.text!;
+                                     }
+                                  },
+                                ),
+                                const SizedBox(width: 4),
+                                IconButton(
+                                  icon: const Icon(Icons.clear, color: Colors.white70, size: 20),
+                                  tooltip: "清空",
+                                  padding: const EdgeInsets.all(8),
+                                  constraints: const BoxConstraints(),
+                                  onPressed: () {
+                                     _inputController.clear();
+                                  },
+                                ),
+                                const SizedBox(width: 4),
+                                IconButton(
+                                  icon: const Icon(Icons.keyboard_return, color: Colors.white70, size: 20),
+                                  tooltip: "换行",
+                                  padding: const EdgeInsets.all(8),
+                                  constraints: const BoxConstraints(),
+                                  onPressed: () {
+                                     final text = _inputController.text;
+                                     final selection = _inputController.selection;
+                                     final newText = text.replaceRange(selection.start, selection.end, "\n");
+                                     _inputController.value = TextEditingValue(
+                                       text: newText,
+                                       selection: TextSelection.collapsed(offset: selection.start + 1),
+                                     );
+                                  },
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Consumer<BilibiliDownloadService>(
+                              builder: (context, service, _) {
+                                return ElevatedButton(
+                                  onPressed: service.isParsing ? null : () => _parseVideo(service),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.pinkAccent,
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                    minimumSize: const Size(64, 36),
+                                  ),
+                                  child: service.isParsing 
+                                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) 
+                                    : const Text("解析"),
+                                );
+                              },
+                            ),
+                         ],
+                      ),
+                    ],
+                  ),
                 ),
-                
-              // Task List
-              Expanded(
-                child: service.tasks.isEmpty 
-                  ? const Center(child: Text("请输入链接并解析", style: TextStyle(color: Colors.white30)))
-                  : ListView.builder(
-                      padding: const EdgeInsets.all(16),
-                      itemCount: service.tasks.length,
-                      itemBuilder: (context, index) {
-                        return _buildTaskCard(service, service.tasks[index]);
-                      },
-                    ),
-              ),
-            ],
-          ),
-          bottomNavigationBar: selectedCount > 0 ? _buildBottomBar(service) : null,
-        );
-      }
-    ),
+                Consumer<BilibiliDownloadService>(
+                  builder: (context, service, _) {
+                    if (service.parsingStatus == null) {
+                      return const SizedBox.shrink();
+                    }
+                    return Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                      color: Colors.black54,
+                      child: Text(service.parsingStatus!, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                    );
+                  },
+                ),
+                Expanded(
+                  child: Consumer<BilibiliDownloadService>(
+                    builder: (context, service, _) {
+                      if (service.tasks.isEmpty) {
+                        return const Center(child: Text("请输入链接并解析", style: TextStyle(color: Colors.white30)));
+                      }
+                      return ListView.builder(
+                        padding: const EdgeInsets.all(16),
+                        itemCount: service.tasks.length,
+                        cacheExtent: 600,
+                        addAutomaticKeepAlives: false,
+                        addSemanticIndexes: false,
+                        itemBuilder: (context, index) {
+                          return RepaintBoundary(
+                            child: _buildTaskCard(service, service.tasks[index]),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+            bottomNavigationBar: Consumer<BilibiliDownloadService>(
+              builder: (context, service, _) {
+                final selectedCount = service.tasks
+                    .expand((t) => t.videos)
+                    .expand((v) => v.episodes)
+                    .where((e) => e.isSelected)
+                    .length;
+                return selectedCount > 0 ? _buildBottomBar(service) : const SizedBox.shrink();
+              },
+            ),
+          );
+        },
+      ),
     );
   }
 
   Widget _buildTaskCard(BilibiliDownloadService service, BilibiliDownloadTask task) {
-    bool isSingle = !task.isCollection && task.videos.length == 1 && task.videos.first.episodes.length == 1;
+   bool isSingle = !task.isCollection && task.videos.length == 1 && task.videos.first.episodes.length == 1;
+   final media = MediaQuery.of(context);
+   final isCompactTitle = media.orientation == Orientation.portrait && media.size.width < 600;
     
     return Card(
       color: const Color(0xFF2C2C2C),
@@ -581,13 +633,24 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                    ),
                    ClipRRect(
                       borderRadius: BorderRadius.circular(4),
-                      child: Image.network(
-                        task.cover,
-                        width: 80,
-                        height: 50,
-                        fit: BoxFit.cover,
-                        errorBuilder: (context, error, stackTrace) =>
-                            Container(width: 80, height: 50, color: Colors.grey),
+                      child: Builder(
+                        builder: (context) {
+                          String coverUrl = task.cover;
+                          if (coverUrl.isNotEmpty && !coverUrl.contains('@') && 
+                             (coverUrl.contains('hdslb.com') || coverUrl.contains('bilivideo.com'))) {
+                              coverUrl = "$coverUrl@160w_100h_1c.webp";
+                          }
+                          return Image.network(
+                            coverUrl,
+                            width: 80,
+                            height: 50,
+                            fit: BoxFit.cover,
+                            cacheWidth: 160,
+                            cacheHeight: 100,
+                            errorBuilder: (context, error, stackTrace) =>
+                                Container(width: 80, height: 50, color: Colors.grey),
+                          );
+                        }
                       ),
                    ),
                    const SizedBox(width: 12),
@@ -598,11 +661,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                            : null,
                        child: Text(
                          task.title,
-                         style: TextStyle(
-                           color: Colors.white, 
-                           fontWeight: FontWeight.bold,
-                           decoration: (isSingle && task.videos.first.episodes.first.status == DownloadStatus.completed) ? TextDecoration.underline : null,
-                         ),
+                        style: TextStyle(
+                          color: Colors.white, 
+                          fontWeight: FontWeight.bold,
+                          decoration: (isSingle && task.videos.first.episodes.first.status == DownloadStatus.completed) ? TextDecoration.underline : null,
+                          fontSize: isCompactTitle ? 13 : 14,
+                        ),
                          maxLines: 2,
                          overflow: TextOverflow.ellipsis,
                        ),
@@ -639,6 +703,15 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
 
   Widget _buildSingleEpisodeControls(BilibiliDownloadService service, BilibiliDownloadEpisode ep, BilibiliVideoItem video, BilibiliDownloadTask task) {
      bool hasInfo = ep.availableVideoQualities.isNotEmpty;
+     final media = MediaQuery.of(context);
+     final isCompact = media.orientation == Orientation.portrait && media.size.width < 600;
+     final double compactButtonSize = isCompact ? 26 : 28;
+     final double compactIconSize = isCompact ? 19 : 20;
+     final EdgeInsets iconPadding = isCompact ? EdgeInsets.zero : const EdgeInsets.all(4);
+     final BoxConstraints iconConstraints = isCompact
+         ? BoxConstraints.tightFor(width: compactButtonSize, height: compactButtonSize)
+         : const BoxConstraints(minWidth: 28, minHeight: 28);
+     final VisualDensity iconDensity = isCompact ? const VisualDensity(horizontal: -4, vertical: -4) : VisualDensity.standard;
      
      return Container(
        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -648,7 +721,203 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
               children: [
                  Expanded(child: Container()), 
                  if (hasInfo || ep.status == DownloadStatus.completed)
-                   _buildActionRow(service, ep, task)
+                    Flexible(
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          // Quality
+                          Flexible(
+                            flex: 3,
+                            child: Container(
+                              height: 28,
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.05),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<StreamItem>(
+                                  value: ep.selectedVideoQuality,
+                                  isDense: true,
+                                  isExpanded: true,
+                                  style: const TextStyle(fontSize: 11, color: Colors.white),
+                                  dropdownColor: const Color(0xFF333333),
+                                  icon: const Icon(Icons.arrow_drop_down, size: 16, color: Colors.white54),
+                                  selectedItemBuilder: (BuildContext context) {
+                                     return ep.availableVideoQualities.map<Widget>((StreamItem s) {
+                                        String label = s.qualityName?.replaceAll("高清", "") ?? "Q${s.id}";
+                                        String codec = "";
+                                       if (s.codecs.startsWith("avc1")) {
+                                         codec = "AVC";
+                                       } else if (s.codecs.startsWith("hev1") || s.codecs.contains("hevc")) {
+                                         codec = "HEVC";
+                                       } else if (s.codecs.startsWith("av01")) {
+                                         codec = "AV1";
+                                       } else {
+                                         codec = s.codecs.split('.')[0];
+                                       }
+                                        String detailedLabel = "$label ($codec)";
+                                        return Container(
+                                           alignment: Alignment.centerLeft,
+                                           constraints: const BoxConstraints(minWidth: 50),
+                                           child: SingleChildScrollView(
+                                              scrollDirection: Axis.horizontal,
+                                              child: Text(detailedLabel, style: const TextStyle(fontSize: 11, color: Colors.white)),
+                                           ),
+                                        );
+                                     }).toList();
+                                  },
+                                  items: ep.availableVideoQualities.map((s) {
+                                    String label = s.qualityName?.replaceAll("高清", "") ?? "Q${s.id}";
+                                    String codec = "";
+                                   if (s.codecs.startsWith("avc1")) {
+                                     codec = "AVC";
+                                   } else if (s.codecs.startsWith("hev1") || s.codecs.contains("hevc")) {
+                                     codec = "HEVC";
+                                   } else if (s.codecs.startsWith("av01")) {
+                                     codec = "AV1";
+                                   } else {
+                                     codec = s.codecs.split('.')[0];
+                                   }
+                                    String detailedLabel = "$label ($codec)";
+                                    return DropdownMenuItem(
+                                      value: s, 
+                                      child: Text(detailedLabel, overflow: TextOverflow.ellipsis)
+                                    );
+                                  }).toList(),
+                                  onChanged: (val) {
+                                     ep.selectedVideoQuality = val;
+                                     service.saveTasks();
+                                  },
+                                  hint: const Text("清晰度", style: TextStyle(fontSize: 11, color: Colors.white54)),
+                                ),
+                              ),
+                            ),
+                          ),
+                           const SizedBox(width: 4),
+                          // Subtitle
+                          Flexible(
+                            flex: 2,
+                            child: Container(
+                              height: 28,
+                              padding: const EdgeInsets.symmetric(horizontal: 8),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.05),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<BilibiliSubtitle?>(
+                                  value: ep.selectedSubtitle,
+                                  isDense: true,
+                                  isExpanded: true,
+                                  style: const TextStyle(fontSize: 11, color: Colors.white),
+                                  dropdownColor: const Color(0xFF333333),
+                                  icon: const Icon(Icons.arrow_drop_down, size: 16, color: Colors.white54),
+                                  items: [
+                                    const DropdownMenuItem<BilibiliSubtitle?>(value: null, child: Text("无字幕")),
+                                    ...ep.availableSubtitles.map(
+                                      (s) => DropdownMenuItem(
+                                        value: s,
+                                        child: Text(s.lanDoc, overflow: TextOverflow.ellipsis),
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                     ep.selectedSubtitle = val;
+                                     service.saveTasks();
+                                  },
+                                  hint: const Text("字幕", style: TextStyle(fontSize: 11, color: Colors.white54)),
+                                ),
+                              ),
+                            ),
+                          ),
+                           const SizedBox(width: 2),
+                          // Action Button
+                           if (ep.status == DownloadStatus.downloading)
+                              IconButton(
+                                 icon: Icon(Icons.pause, size: compactIconSize, color: Colors.white70),
+                                 tooltip: "暂停",
+                                 padding: iconPadding,
+                                 constraints: iconConstraints,
+                                 visualDensity: iconDensity,
+                                 onPressed: () => service.pauseDownload(ep),
+                              )
+                           else
+                              IconButton(
+                                 icon: Icon(
+                                    ep.status == DownloadStatus.failed ? Icons.replay : 
+                                    ep.status == DownloadStatus.queued ? Icons.hourglass_top : Icons.download,
+                                    size: compactIconSize,
+                                    color: ep.status == DownloadStatus.failed ? Colors.redAccent : Colors.white70
+                                 ),
+                                 tooltip: ep.status == DownloadStatus.queued ? "退出排队" : "加入排队 / 继续",
+                                 padding: iconPadding,
+                                 constraints: iconConstraints,
+                                 visualDensity: iconDensity,
+                                 onPressed: () {
+                                    if (ep.status == DownloadStatus.queued) {
+                                        service.pauseDownload(ep);
+                                    } else if (ep.status == DownloadStatus.failed) {
+                                        service.startSingleDownload(ep); 
+                                    } else {
+                                        service.startSingleDownload(ep);
+                                    }
+                                 },
+                              ),
+                           // More Menu
+                           PopupMenuButton<String>(
+                              icon: Icon(Icons.more_vert, size: compactIconSize, color: Colors.white70),
+                              padding: EdgeInsets.zero,
+                              offset: Offset(0, compactButtonSize),
+                              color: const Color(0xFF333333),
+                              onSelected: (value) {
+                                 switch (value) {
+                                   case 'top':
+                                     service.startSingleDownload(ep, toTop: true);
+                                     break;
+                                   case 'export':
+                                     _importToLibrary(service, episode: ep);
+                                     break;
+                                   case 'delete':
+                                     service.removeEpisode(ep, task);
+                                     break;
+                                   case 'preview_sub':
+                                      if (ep.selectedSubtitle != null) {
+                                         _showSubtitlePreview(service, ep.selectedSubtitle!);
+                                      }
+                                      break;
+                                 }
+                              },
+                              itemBuilder: (context) => [
+                                 if (ep.status == DownloadStatus.pending || ep.status == DownloadStatus.failed || ep.status == DownloadStatus.queued)
+                                   const PopupMenuItem(
+                                     value: 'top',
+                                     height: 36,
+                                     child: Row(children: [Icon(Icons.vertical_align_top, size: 18), SizedBox(width: 12), Text("插队", style: TextStyle(fontSize: 14))]),
+                                   ),
+                                 if (ep.status == DownloadStatus.completed)
+                                   const PopupMenuItem(
+                                     value: 'export',
+                                     height: 36,
+                                     child: Row(children: [Icon(Icons.file_upload, size: 18), SizedBox(width: 12), Text("导出", style: TextStyle(fontSize: 14))]),
+                                   ),
+                                 if (ep.selectedSubtitle != null)
+                                    const PopupMenuItem(
+                                      value: 'preview_sub',
+                                      height: 36,
+                                      child: Row(children: [Icon(Icons.description, size: 18), SizedBox(width: 12), Text("预览字幕", style: TextStyle(fontSize: 14))]),
+                                    ),
+                                 const PopupMenuItem(
+                                   value: 'delete',
+                                   height: 36,
+                                   child: Row(children: [Icon(Icons.delete, size: 18, color: Colors.redAccent), SizedBox(width: 12), Text("删除任务", style: TextStyle(fontSize: 14, color: Colors.redAccent))]),
+                                 ),
+                              ],
+                           ),
+                        ],
+                      ),
+                    )
                  else if (ep.status == DownloadStatus.fetchingInfo)
                    const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                  else 
@@ -840,19 +1109,22 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   Widget _buildEpisodeRow(BilibiliDownloadService service, BilibiliDownloadEpisode ep, BilibiliVideoItem video, BilibiliDownloadTask task) {
     bool hasInfo = ep.availableVideoQualities.isNotEmpty;
     bool isCompleted = ep.status == DownloadStatus.completed;
-    
-    // Indentation: If it's a multi-episode video inside a collection, indent more?
-    // If we flattened the structure, we might not need deep indentation.
-    // If video.episodes.length > 1, we are inside the "Multi-episode" block above, so we might want some indent.
-    // If length == 1, it's flat.
+    final media = MediaQuery.of(context);
+    final isCompact = media.orientation == Orientation.portrait && media.size.width < 600;
+    final double compactButtonSize = isCompact ? 26 : 28;
+    final double compactIconSize = isCompact ? 19 : 20;
+    final EdgeInsets iconPadding = isCompact ? EdgeInsets.zero : const EdgeInsets.all(4);
+    final BoxConstraints iconConstraints = isCompact
+        ? BoxConstraints.tightFor(width: compactButtonSize, height: compactButtonSize)
+        : const BoxConstraints(minWidth: 28, minHeight: 28);
+    final VisualDensity iconDensity = isCompact ? const VisualDensity(horizontal: -4, vertical: -4) : VisualDensity.standard;
     
     double leftPadding = 16.0;
     if (task.isCollection) {
-       // If it's part of a collection
        if (video.episodes.length > 1) {
-          leftPadding = 32.0; // Indent episodes under the video header
+          leftPadding = 32.0; 
        } else {
-          leftPadding = 16.0; // Flat list look
+          leftPadding = 16.0;
        }
     }
 
@@ -866,14 +1138,14 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
          service.saveTasks();
       },
       child: Container(
-        padding: EdgeInsets.fromLTRB(leftPadding, 8, 16, 8),
+        padding: EdgeInsets.fromLTRB(leftPadding, 8, 8, 8), // Reduce right padding
         decoration: BoxDecoration(
            border: Border(bottom: BorderSide(color: Colors.white.withValues(alpha: 0.05))),
         ),
         child: Column(
           children: [
              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
+                crossAxisAlignment: CrossAxisAlignment.center,
                 children: [
                    if (task.isCollection && video.episodes.length == 1)
                      _buildCheckboxWithSmallThumbnail(
@@ -900,52 +1172,274 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                          service.saveTasks();
                        },
                      ),
+                   
                    Expanded(
                      child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          InkWell(
-                             onTap: isCompleted ? () => _previewVideo(ep) : null,
-                             child: Padding(
-                               padding: const EdgeInsets.only(top: 12, bottom: 8),
-                               child: Text(
-                                 video.episodes.length == 1 
-                                    ? (task.isCollection ? video.videoInfo.title : "P${ep.page.page} ${ep.page.part}")
-                                    : "P${ep.page.page} ${ep.page.part}",
-                                 style: TextStyle(
-                                    color: Colors.white70,
-                                    decoration: isCompleted ? TextDecoration.underline : null,
-                                    decorationColor: Colors.white70,
-                                    fontSize: 14,
-                                    height: 1.3,
-                                 ),
-                                 maxLines: 2,
-                                 overflow: TextOverflow.ellipsis,
-                               ),
-                             ),
-                          ),
-                          
-                          // Action Row on the second line
+                          // Title Row with Action Buttons
                           Row(
                             children: [
-                              if (hasInfo || ep.status == DownloadStatus.completed)
-                                Expanded(child: Align(alignment: Alignment.centerLeft, child: _buildActionRow(service, ep, task)))
-                              else if (ep.status == DownloadStatus.fetchingInfo)
-                                const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                              else 
-                                IconButton(
-                                   icon: const Icon(Icons.refresh, color: Colors.white70),
-                                   tooltip: "获取信息",
-                                   onPressed: () => service.fetchEpisodeInfo(ep),
-                                )
+                              Expanded(
+                                child: InkWell(
+                                   onTap: isCompleted ? () => _previewVideo(ep) : null,
+                                   child: Padding(
+                                     padding: const EdgeInsets.symmetric(vertical: 8),
+                                     child: Text(
+                                       video.episodes.length == 1 
+                                          ? (task.isCollection ? video.videoInfo.title : "P${ep.page.page} ${ep.page.part}")
+                                          : "P${ep.page.page} ${ep.page.part}",
+                                       style: TextStyle(
+                                          color: Colors.white70,
+                                          decoration: isCompleted ? TextDecoration.underline : null,
+                                          decorationColor: Colors.white70,
+                                          fontSize: isCompact ? 13 : 14,
+                                          height: 1.3,
+                                       ),
+                                       maxLines: 2,
+                                       overflow: TextOverflow.ellipsis,
+                                     ),
+                                   ),
+                                ),
+                              ),
+                              // Refresh Button (always visible if not fetching)
+                              SizedBox(
+                                width: compactButtonSize,
+                                height: compactButtonSize,
+                                child: ep.status == DownloadStatus.fetchingInfo
+                                  ? const Center(
+                                      child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                                    )
+                                  : IconButton(
+                                     icon: Icon(Icons.refresh, color: Colors.white70, size: compactIconSize),
+                                     tooltip: "刷新信息",
+                                     padding: iconPadding,
+                                     constraints: iconConstraints,
+                                     visualDensity: iconDensity,
+                                     onPressed: () => service.fetchEpisodeInfo(ep),
+                                  ),
+                              ),
+
+                              // Action Buttons (Download/Pause/More) moved here
+                              if (hasInfo || ep.status == DownloadStatus.completed) ...[
+                                 if (ep.status == DownloadStatus.downloading)
+                                    IconButton(
+                                       icon: Icon(Icons.pause, size: compactIconSize, color: Colors.white70),
+                                       tooltip: "暂停",
+                                       padding: iconPadding,
+                                       constraints: iconConstraints,
+                                       visualDensity: iconDensity,
+                                       onPressed: () => service.pauseDownload(ep),
+                                    )
+                                 else
+                                    IconButton(
+                                       icon: Icon(
+                                          ep.status == DownloadStatus.failed ? Icons.replay : 
+                                          ep.status == DownloadStatus.queued ? Icons.hourglass_top : Icons.download,
+                                          size: compactIconSize,
+                                          color: ep.status == DownloadStatus.failed ? Colors.redAccent : Colors.white70
+                                       ),
+                                       tooltip: ep.status == DownloadStatus.queued ? "退出排队" : "加入排队 / 继续",
+                                       padding: iconPadding,
+                                       constraints: iconConstraints,
+                                       visualDensity: iconDensity,
+                                       onPressed: () {
+                                          if (ep.status == DownloadStatus.queued) {
+                                              service.pauseDownload(ep);
+                                          } else if (ep.status == DownloadStatus.failed) {
+                                              service.startSingleDownload(ep); 
+                                          } else {
+                                              service.startSingleDownload(ep);
+                                          }
+                                       },
+                                    ),
+                                 
+                                 // More Menu
+                                 SizedBox(
+                                   width: compactButtonSize,
+                                   height: compactButtonSize,
+                                   child: PopupMenuButton<String>(
+                                      icon: Icon(Icons.more_vert, size: compactIconSize, color: Colors.white70),
+                                      padding: EdgeInsets.zero,
+                                      offset: Offset(0, compactButtonSize),
+                                      color: const Color(0xFF333333),
+                                      onSelected: (value) {
+                                         switch (value) {
+                                           case 'top':
+                                             service.startSingleDownload(ep, toTop: true);
+                                             break;
+                                           case 'export':
+                                             _importToLibrary(service, episode: ep);
+                                             break;
+                                           case 'delete':
+                                             service.removeEpisode(ep, task);
+                                             break;
+                                           case 'preview_sub':
+                                              if (ep.selectedSubtitle != null) {
+                                                 _showSubtitlePreview(service, ep.selectedSubtitle!);
+                                              }
+                                              break;
+                                         }
+                                      },
+                                      itemBuilder: (context) => [
+                                         if (ep.status == DownloadStatus.pending || ep.status == DownloadStatus.failed || ep.status == DownloadStatus.queued)
+                                           const PopupMenuItem(
+                                             value: 'top',
+                                             height: 36,
+                                             child: Row(children: [Icon(Icons.vertical_align_top, size: 18), SizedBox(width: 12), Text("插队", style: TextStyle(fontSize: 14))]),
+                                           ),
+                                         
+                                         if (ep.status == DownloadStatus.completed)
+                                           const PopupMenuItem(
+                                             value: 'export',
+                                             height: 36,
+                                             child: Row(children: [Icon(Icons.file_upload, size: 18), SizedBox(width: 12), Text("导出", style: TextStyle(fontSize: 14))]),
+                                           ),
+                                         
+                                         if (ep.selectedSubtitle != null)
+                                            const PopupMenuItem(
+                                              value: 'preview_sub',
+                                              height: 36,
+                                              child: Row(children: [Icon(Icons.description, size: 18), SizedBox(width: 12), Text("预览字幕", style: TextStyle(fontSize: 14))]),
+                                            ),
+
+                                         const PopupMenuItem(
+                                           value: 'delete',
+                                           height: 36,
+                                           child: Row(children: [Icon(Icons.delete, size: 18, color: Colors.redAccent), SizedBox(width: 12), Text("删除任务", style: TextStyle(fontSize: 14, color: Colors.redAccent))]),
+                                         ),
+                                      ],
+                                   ),
+                                 ),
+                              ]
                             ],
-                          )
+                          ),
+                          
+                          // Settings Row (Quality & Subtitle) - Only show if info available
+                          if (hasInfo || ep.status == DownloadStatus.completed)
+                            Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: Row(
+                                children: [
+                                  // Quality
+                                  Flexible(
+                                    flex: 3,
+                                    child: Container(
+                                      height: 28,
+                                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(alpha: 0.05),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: DropdownButtonHideUnderline(
+                                        child: DropdownButton<StreamItem>(
+                                          value: ep.selectedVideoQuality,
+                                          isDense: true,
+                                          isExpanded: true,
+                                          style: const TextStyle(fontSize: 11, color: Colors.white),
+                                          dropdownColor: const Color(0xFF333333),
+                                          icon: const Icon(Icons.arrow_drop_down, size: 16, color: Colors.white54),
+                                          selectedItemBuilder: (BuildContext context) {
+                                             return ep.availableVideoQualities.map<Widget>((StreamItem s) {
+                                                String label = s.qualityName?.replaceAll("高清", "") ?? "Q${s.id}";
+                                                String codec = "";
+                                               if (s.codecs.startsWith("avc1")) {
+                                                 codec = "AVC";
+                                               } else if (s.codecs.startsWith("hev1") || s.codecs.contains("hevc")) {
+                                                 codec = "HEVC";
+                                               } else if (s.codecs.startsWith("av01")) {
+                                                 codec = "AV1";
+                                               } else {
+                                                 codec = s.codecs.split('.')[0];
+                                               }
+                                                String detailedLabel = "$label ($codec)";
+                                                return Container(
+                                                   alignment: Alignment.centerLeft,
+                                                   constraints: const BoxConstraints(minWidth: 50),
+                                                   child: SingleChildScrollView(
+                                                      scrollDirection: Axis.horizontal,
+                                                      child: Text(detailedLabel, style: const TextStyle(fontSize: 11, color: Colors.white)),
+                                                   ),
+                                                );
+                                             }).toList();
+                                          },
+                                          items: ep.availableVideoQualities.map((s) {
+                                            String label = s.qualityName?.replaceAll("高清", "") ?? "Q${s.id}";
+                                            String codec = "";
+                                           if (s.codecs.startsWith("avc1")) {
+                                             codec = "AVC";
+                                           } else if (s.codecs.startsWith("hev1") || s.codecs.contains("hevc")) {
+                                             codec = "HEVC";
+                                           } else if (s.codecs.startsWith("av01")) {
+                                             codec = "AV1";
+                                           } else {
+                                             codec = s.codecs.split('.')[0];
+                                           }
+                                            String detailedLabel = "$label ($codec)";
+                                            
+                                            return DropdownMenuItem(
+                                              value: s, 
+                                              child: Text(detailedLabel, overflow: TextOverflow.ellipsis)
+                                            );
+                                          }).toList(),
+                                          onChanged: (val) {
+                                             ep.selectedVideoQuality = val;
+                                             service.saveTasks();
+                                          },
+                                          hint: const Text("清晰度", style: TextStyle(fontSize: 11, color: Colors.white54)),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  
+                                  const SizedBox(width: 4),
+                                  
+                                  // Subtitle
+                                  Flexible(
+                                    flex: 2,
+                                    child: Container(
+                                      height: 28,
+                                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withValues(alpha: 0.05),
+                                        borderRadius: BorderRadius.circular(4),
+                                      ),
+                                      child: DropdownButtonHideUnderline(
+                                        child: DropdownButton<BilibiliSubtitle?>(
+                                          value: ep.selectedSubtitle,
+                                          isDense: true,
+                                          isExpanded: true,
+                                          style: const TextStyle(fontSize: 11, color: Colors.white),
+                                          dropdownColor: const Color(0xFF333333),
+                                          icon: const Icon(Icons.arrow_drop_down, size: 16, color: Colors.white54),
+                                          items: [
+                                            const DropdownMenuItem<BilibiliSubtitle?>(value: null, child: Text("无字幕")),
+                                            ...ep.availableSubtitles.map(
+                                              (s) => DropdownMenuItem(
+                                                value: s,
+                                                child: Text(s.lanDoc, overflow: TextOverflow.ellipsis),
+                                              ),
+                                            ),
+                                          ],
+                                          onChanged: (val) {
+                                             ep.selectedSubtitle = val;
+                                             service.saveTasks();
+                                          },
+                                          hint: const Text("字幕", style: TextStyle(fontSize: 11, color: Colors.white54)),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                         ],
                      ),
                    ),
                 ],
              ),
              
+             // Progress Bar Area (unchanged)
              if (ep.status == DownloadStatus.downloading || ep.status == DownloadStatus.merging || ep.status == DownloadStatus.checking || ep.status == DownloadStatus.repairing)
                 Padding(
                    padding: const EdgeInsets.only(left: 48, right: 16, top: 4),
@@ -1042,145 +1536,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     );
   }
 
-  Widget _buildActionRow(BilibiliDownloadService service, BilibiliDownloadEpisode ep, BilibiliDownloadTask task) {
-     return Row(
-       mainAxisSize: MainAxisSize.min,
-       children: [
-          // 1. Quality
-          SizedBox(
-             width: 120, // Increased width to fit codec info
-             child: DropdownButtonHideUnderline(
-               child: DropdownButton<StreamItem>(
-                 value: ep.selectedVideoQuality,
-                 isDense: true,
-                 isExpanded: true,
-                 style: const TextStyle(fontSize: 10, color: Colors.white),
-                 dropdownColor: const Color(0xFF333333),
-                 items: ep.availableVideoQualities.map((s) {
-                   String label = s.qualityName?.replaceAll("高清", "") ?? "Q${s.id}";
-                   
-                   // Parse codec friendly name
-                   String codec = "";
-                   if (s.codecs.startsWith("avc1")) {
-                     codec = "AVC";
-                   } else if (s.codecs.startsWith("hev1") || s.codecs.startsWith("hvc1") || s.codecs.contains("hevc")) {
-                     codec = "HEVC";
-                   } else if (s.codecs.startsWith("av01")) {
-                     codec = "AV1";
-                   } else {
-                     codec = s.codecs.split('.')[0]; // Fallback to prefix
-                   }
-                   
-                   // Construct detailed label: "1080P (HEVC)"
-                   String detailedLabel = "$label ($codec)";
-                   
-                   return DropdownMenuItem(
-                     value: s, 
-                     child: Text(detailedLabel, overflow: TextOverflow.ellipsis)
-                   );
-                 }).toList(),
-                 onChanged: (val) {
-                    ep.selectedVideoQuality = val;
-                    service.saveTasks(); // Persist choice
-                 },
-                 hint: const Text("清晰度", style: TextStyle(fontSize: 10, color: Colors.white54)),
-               ),
-             ),
-          ),
-          
-          const SizedBox(width: 4),
-          // 2. Subtitle
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                 width: 70,
-                 child: DropdownButtonHideUnderline(
-                   child: DropdownButton<BilibiliSubtitle?>(
-                     value: ep.selectedSubtitle,
-                     isDense: true,
-                     isExpanded: true,
-                     style: const TextStyle(fontSize: 10, color: Colors.white),
-                     dropdownColor: const Color(0xFF333333),
-                     items: [
-                       const DropdownMenuItem<BilibiliSubtitle?>(value: null, child: Text("无")),
-                       ...ep.availableSubtitles.map(
-                         (s) => DropdownMenuItem(
-                           value: s,
-                           child: Text(s.lanDoc, overflow: TextOverflow.ellipsis),
-                         ),
-                       ),
-                     ],
-                     onChanged: (val) {
-                        ep.selectedSubtitle = val;
-                        service.saveTasks(); // Persist choice
-                     },
-                     hint: const Text("字幕", style: TextStyle(fontSize: 10, color: Colors.white54)),
-                   ),
-                 ),
-              ),
-              if (ep.selectedSubtitle != null)
-                IconButton(
-                  icon: const Icon(Icons.description_outlined, size: 16, color: Colors.white70),
-                  tooltip: "预览字幕文本",
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-                  onPressed: () => _showSubtitlePreview(service, ep.selectedSubtitle!),
-                ),
-            ],
-          ),
-          // 3. Merge / Download / Queue / Retry / Jump Queue
-          if (ep.status == DownloadStatus.downloading)
-              IconButton(
-                 icon: const Icon(Icons.pause, size: 20, color: Colors.white70),
-                 tooltip: "暂停",
-                 onPressed: () => service.pauseDownload(ep),
-              )
-          else
-             Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                   IconButton(
-                      icon: Icon(
-                         ep.status == DownloadStatus.failed ? Icons.replay : 
-                         ep.status == DownloadStatus.queued ? Icons.hourglass_top : Icons.download,
-                         size: 20,
-                         color: ep.status == DownloadStatus.failed ? Colors.redAccent : Colors.white70
-                      ),
-                      tooltip: ep.status == DownloadStatus.queued ? "退出排队" : "加入排队 / 继续",
-                      onPressed: () {
-                          if (ep.status == DownloadStatus.queued) {
-                             service.pauseDownload(ep);
-                          } else if (ep.status == DownloadStatus.failed) {
-                             service.startSingleDownload(ep); // Append to queue
-                          } else {
-                             service.startSingleDownload(ep);
-                          }
-                      },
-                   ),
-                   if (ep.status == DownloadStatus.pending || ep.status == DownloadStatus.failed || ep.status == DownloadStatus.queued)
-                      IconButton(
-                          icon: const Icon(Icons.vertical_align_top, size: 20, color: Colors.white70),
-                          tooltip: "插队 (优先下载)",
-                          onPressed: () => service.startSingleDownload(ep, toTop: true),
-                      ),
-                ],
-             ),
-          // 4. Export
-          IconButton(
-             icon: Icon(Icons.file_upload, size: 20, color: ep.status == DownloadStatus.completed ? Colors.white70 : Colors.white24),
-             tooltip: "导出",
-             onPressed: ep.status == DownloadStatus.completed ? () => _importToLibrary(service, episode: ep) : null,
-          ),
-          // 5. Delete
-          IconButton(
-             icon: const Icon(Icons.delete, size: 20, color: Colors.redAccent),
-             tooltip: "删除",
-             onPressed: () => service.removeEpisode(ep, task),
-          ),
-       ],
-     );
-  }
+
 
   Widget _buildBottomBar(BilibiliDownloadService service) {
     return BottomAppBar(
@@ -1201,20 +1557,25 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   }
 
   Widget _buildBottomAction(IconData icon, String label, VoidCallback onTap, {bool isDestructive = false}) {
+    final isSmallScreen = MediaQuery.of(context).size.width < 400;
+
     return InkWell(
       onTap: onTap,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+        padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 8.0 : 16.0, vertical: 8.0),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, color: isDestructive ? Colors.redAccent : Colors.white),
+            Icon(icon, color: isDestructive ? Colors.redAccent : Colors.white, size: isSmallScreen ? 20 : 24),
+            const SizedBox(height: 2),
             Text(
               label, 
               style: TextStyle(
                 color: isDestructive ? Colors.redAccent : Colors.white, 
-                fontSize: 10
-              )
+                fontSize: isSmallScreen ? 9 : 10
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),

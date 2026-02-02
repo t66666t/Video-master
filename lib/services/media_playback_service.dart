@@ -80,6 +80,14 @@ class MediaPlaybackService extends ChangeNotifier {
   bool? _lastControllerIsPlaying;
   bool _wakelockApplied = false;
 
+  // 是否启用自动播放下一集（横屏播放页可以禁用）
+  bool _autoPlayNextEnabled = true;
+  bool get autoPlayNextEnabled => _autoPlayNextEnabled;
+  set autoPlayNextEnabled(bool value) {
+    _autoPlayNextEnabled = value;
+    notifyListeners();
+  }
+
   void _applyWakelock(bool enable) {
     try {
       final Future<void> future = enable ? WakelockPlus.enable() : WakelockPlus.disable();
@@ -790,7 +798,13 @@ class MediaPlaybackService extends ChangeNotifier {
   void _onPlaybackCompleted() {
     // 保存进度
     _saveCurrentProgress(immediate: true);
-    
+
+    // 如果禁用了自动播放下一集，则暂停播放
+    if (!_autoPlayNextEnabled) {
+      pause();
+      return;
+    }
+
     // 自动播放下一个
     if (_playlistManager?.hasNext ?? false) {
       final settings = SettingsService();

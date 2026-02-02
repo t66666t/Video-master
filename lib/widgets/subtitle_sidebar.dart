@@ -414,6 +414,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
     if (_isArticleMode) {
        final chunkIndex = index ~/ _articleChunkSize;
+       
        if (_shouldSkipScrollAnimation(
          targetIndex: chunkIndex,
          isArticleMode: true,
@@ -488,6 +489,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
     if (atTop && targetLeading <= alignment + epsilon) return true;
     if (atBottom && targetLeading >= alignment - epsilon) return true;
+    
+    // Skip animation if target is at the very top (index 0) and already at top
+    if (targetIndex == 0 && atTop && targetLeading <= epsilon) return true;
+    
+    // 根治方案：如果所有字幕都在视图中（数量不足以填满屏幕），跳过所有滚动动画
+    // 这样可以确保横屏的滚动状态不会影响竖屏的显示
+    final bool allItemsVisible = minIndex == 0 && maxIndex == lastIndex;
+    if (allItemsVisible) return true;
+    
     return false;
   }
 
@@ -1004,11 +1014,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           innerV: innerV,
           itemGap: itemGap,
         );
+        // 当字幕数量不足时，强制从顶部开始显示，忽略当前索引
+        final int effectiveInitialIndex = shouldTopAlign ? 0 : (currentIndex >= 0 ? currentIndex : 0);
+        final double effectiveInitialAlignment = shouldTopAlign ? 0.0 : 0.30;
+        
         final list = ScrollablePositionedList.builder(
           itemScrollController: _itemScrollController,
           itemPositionsListener: _itemPositionsListener,
-          initialScrollIndex: currentIndex >= 0 ? currentIndex : 0,
-          initialAlignment: 0.30,
+          initialScrollIndex: effectiveInitialIndex,
+          initialAlignment: effectiveInitialAlignment,
           itemCount: widget.subtitles.length,
           shrinkWrap: shouldTopAlign,
           physics: shouldTopAlign ? const NeverScrollableScrollPhysics() : null,
@@ -1093,11 +1107,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           isSmallScreen: isSmallScreen,
           chunkCount: chunkCount,
         );
+        // 当字幕数量不足时，强制从顶部开始显示，忽略当前索引
+        final int effectiveInitialChunkIndex = shouldTopAlign ? 0 : (initialChunkIndex < chunkCount ? initialChunkIndex : 0);
+        final double effectiveInitialAlignment = shouldTopAlign ? 0.0 : 0.15;
+        
         final list = ScrollablePositionedList.builder(
           itemScrollController: _articleItemScrollController,
           itemPositionsListener: _articleItemPositionsListener,
-          initialScrollIndex: initialChunkIndex < chunkCount ? initialChunkIndex : 0,
-          initialAlignment: 0.15,
+          initialScrollIndex: effectiveInitialChunkIndex,
+          initialAlignment: effectiveInitialAlignment,
           itemCount: chunkCount,
           padding: EdgeInsets.all(isSmallScreen ? 12 : 20),
           shrinkWrap: shouldTopAlign,

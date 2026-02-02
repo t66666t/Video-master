@@ -25,6 +25,7 @@ import '../utils/subtitle_parser.dart';
 import '../utils/pgs_parser.dart';
 import '../utils/subtitle_converter.dart';
 import '../models/subtitle_model.dart';
+import '../models/subtitle_style.dart';
 import '../models/video_item.dart';
 import '../services/settings_service.dart';
 import '../services/library_service.dart';
@@ -145,6 +146,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   bool _isSubtitleDragMode = false;
   bool _isGhostDragMode = false;
   bool _isSubtitleSnapped = false;
+  bool _isStyleSidebarDragMode = false;
   
   // Repair state
   bool _isRepairing = false;
@@ -166,6 +168,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   bool? _lastSplitSubtitleByLine;
   bool? _lastVideoContinuousSubtitle;
   bool? _lastAudioContinuousSubtitle;
+  bool? _lastGhostModeEnabled;
 
   @override
   void initState() {
@@ -185,10 +188,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     }
 
     _initVideo();
-    
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        Provider.of<MediaPlaybackService>(context, listen: false).addListener(_onPlaybackServiceChange);
+        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+        playbackService.addListener(_onPlaybackServiceChange);
+        // 横屏播放页禁用自动播放下一集，视频播放完成后暂停
+        playbackService.autoPlayNextEnabled = false;
       }
     });
 
@@ -201,6 +207,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
       _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
       _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+      _lastGhostModeEnabled = settings.isGhostModeEnabled;
       settings.addListener(_onSettingsChanged);
       _onSettingsChanged();
     });
@@ -218,13 +225,27 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         _lastVideoContinuousSubtitle != settings.videoContinuousSubtitle ||
         _lastAudioContinuousSubtitle != settings.audioContinuousSubtitle;
 
-    if (!changed) return;
+    final bool ghostModeChanged = _lastGhostModeEnabled != settings.isGhostModeEnabled;
+
+    if (!changed && !ghostModeChanged) return;
 
     _lastShowSubtitles = settings.showSubtitles;
     _lastSubtitleOffset = settings.subtitleOffset;
     _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
     _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
     _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+    _lastGhostModeEnabled = settings.isGhostModeEnabled;
+
+    if (ghostModeChanged &&
+        (_isSubtitleDragMode || _isGhostDragMode || _isStyleSidebarDragMode || _activeSidebar == SidebarType.subtitlePosition)) {
+      final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+      final shouldGhost = !_isAudio && settings.isGhostModeEnabled && isLandscape;
+      setState(() {
+        _isGhostDragMode = shouldGhost;
+        _isSubtitleDragMode = !shouldGhost;
+        _isSubtitleSnapped = (shouldGhost ? settings.ghostModeAlignment.x : settings.subtitleAlignment.x) == 0.0;
+      });
+    }
 
     if (_initialized) {
       _updateSubtitle();
@@ -459,17 +480,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   void dispose() {
     // Try to sync one last time (fire and forget)
     _handleExit();
-    
+
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
     _settingsService?.removeListener(_onSettingsChanged);
     // Restore orientations to default (allow all)
     SystemChrome.setPreferredOrientations([]);
     _restoreSystemUIMode();
-    
+
     _selectionFocusNode.dispose();
     _subtitleSeekTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    
+
     if (_controllerAssigned) {
       try {
         _controller.removeListener(_videoListener);
@@ -481,6 +502,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           if (playbackService.controller == _controller) {
             playbackService.clearController();
           }
+          // 恢复自动播放下一集的默认设置
+          playbackService.autoPlayNextEnabled = true;
         } catch (e) {
           debugPrint("Error clearing controller from service: $e");
         }
@@ -489,7 +512,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         } catch (_) {}
       }
     }
-    
+
     super.dispose();
   }
 
@@ -1051,7 +1074,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       setState(() {
         _isPlaying = isPlaying;
       });
-      
+
       // 始终同步播放状态到 MediaPlaybackService
       // 确保通知栏和快捷控制卡片显示正确的播放/暂停状态
       try {
@@ -1062,6 +1085,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         debugPrint("同步播放状态失败: $e");
       }
     }
+
+    // 检测视频播放完成，在末尾暂停而不是自动播放下一集
+    if (_controller.value.isInitialized &&
+        !_controller.value.isPlaying &&
+        _controller.value.position >= _controller.value.duration) {
+      // 视频已播放到末尾，暂停播放（不自动播放下一集）
+      try {
+        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+        // 保存播放进度
+        playbackService.updatePlaybackStateFromController();
+      } catch (e) {
+        debugPrint("保存播放进度失败: $e");
+      }
+    }
+
     _updateSubtitle();
   }
   
@@ -1886,20 +1924,45 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     });
   }
 
-  void _toggleFloatingSubtitleSettingsSidebar() {
+  void _enableStyleSidebarDragMode({required bool isGhost}) {
+    final settings = Provider.of<SettingsService>(context, listen: false);
     setState(() {
-      if (_activeSidebar == SidebarType.subtitleStyle) {
+      _isStyleSidebarDragMode = true;
+      _isSubtitleDragMode = !isGhost;
+      _isGhostDragMode = isGhost;
+      _isSubtitleSnapped = (isGhost ? settings.ghostModeAlignment.x : settings.subtitleAlignment.x) == 0.0;
+    });
+  }
+
+  void _toggleFloatingSubtitleSettingsSidebar() {
+    final bool isClosing = _activeSidebar == SidebarType.subtitleStyle;
+    if (isClosing) {
+      setState(() {
+        _isStyleSidebarDragMode = false;
+        _isSubtitleDragMode = false;
+        _isGhostDragMode = false;
+        _isSubtitleSnapped = false;
         if (_previousSidebarType != SidebarType.none) {
           _activeSidebar = _previousSidebarType;
         } else {
           _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
         }
         _previousSidebarType = SidebarType.none;
-        return;
-      }
+      });
+      return;
+    }
+
+    setState(() {
       _previousSidebarType = _activeSidebar;
       _activeSidebar = SidebarType.subtitleStyle;
     });
+
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    final isGhost = !_isAudio && settings.isGhostModeEnabled && isLandscape;
+    if (_initialized && settings.showSubtitles && !_isAudio) {
+      _enableStyleSidebarDragMode(isGhost: isGhost);
+    }
   }
 
   void _updateSubtitlePosition(DragUpdateDetails details, BoxConstraints constraints, {bool isGhost = false}) {
@@ -1939,7 +2002,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
     if (_isRepairing) return;
 
-    if (_isSubtitleDragMode || _isGhostDragMode) {
+    if ((_isSubtitleDragMode || _isGhostDragMode) && !_isStyleSidebarDragMode) {
       _exitSubtitleDragMode();
       return;
     }
@@ -1948,6 +2011,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       if (!mounted) return;
       if (_activeSidebar == SidebarType.subtitleStyle) {
         setState(() {
+          _isStyleSidebarDragMode = false;
+          _isSubtitleDragMode = false;
+          _isGhostDragMode = false;
+          _isSubtitleSnapped = false;
           if (_previousSidebarType != SidebarType.none) {
             _activeSidebar = _previousSidebarType;
           } else {
@@ -1997,6 +2064,61 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     // Consume SettingsService
     return Consumer<SettingsService>(
       builder: (context, settings, child) {
+        final bool isLeftHandedMode = settings.isLeftHandedMode;
+        final Widget sidebarResizer = RawGestureDetector(
+          gestures: <Type, GestureRecognizerFactory>{
+            LongPressGestureRecognizer: GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
+              () => LongPressGestureRecognizer(duration: const Duration(milliseconds: 250)),
+              (instance) {
+                instance.onLongPressStart = (_) => setState(() => _isResizingSidebar = true);
+                instance.onLongPressMoveUpdate = (details) {
+                  final screenWidth = MediaQuery.of(context).size.width;
+                  final rawWidth = isLeftHandedMode
+                      ? details.globalPosition.dx
+                      : (screenWidth - details.globalPosition.dx);
+                  settings.updateSetting('userSubtitleSidebarWidth', rawWidth.clamp(200.0, 600.0));
+                };
+                instance.onLongPressEnd = (_) {
+                  setState(() => _isResizingSidebar = false);
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted) return;
+                    _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
+                  });
+                };
+              },
+            ),
+          },
+          child: Container(
+            width: 12,
+            color: _isResizingSidebar ? Colors.blueAccent : Colors.black12,
+            child: const Center(child: VerticalDivider(color: Colors.white24, width: 4, thickness: 4, indent: 40, endIndent: 40)),
+          ),
+        );
+        final Widget sidebarPanel = AnimatedContainer(
+          duration: _isResizingSidebar ? Duration.zero : const Duration(milliseconds: 250),
+          curve: Curves.easeOutCubic,
+          width: _isSidebarOpen ? _getSidebarWidth(context, settings) : 0,
+          child: _isSidebarOpen
+              ? ClipRect(
+                  child: OverflowBox(
+                    minWidth: _getSidebarWidth(context, settings),
+                    maxWidth: _getSidebarWidth(context, settings),
+                    alignment: isLeftHandedMode ? Alignment.centerRight : Alignment.centerLeft,
+                    child: _buildSidebarContent(settings),
+                  ),
+                )
+              : null,
+        );
+        final List<Widget> sidebarWidgets = [
+          if (_isSidebarOpen && _activeSidebar == SidebarType.subtitles && isLeftHandedMode) ...[
+            sidebarPanel,
+            sidebarResizer,
+          ] else if (_isSidebarOpen && _activeSidebar == SidebarType.subtitles) ...[
+            sidebarResizer,
+            sidebarPanel,
+          ] else
+            sidebarPanel,
+        ];
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, result) {
@@ -2023,13 +2145,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
               children: [
                 Row(
                   children: [
+                if (isLeftHandedMode) ...sidebarWidgets,
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, screenConstraints) {
                       // Ghost Mode Logic
                       final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
-                      final isGhostActive = settings.isGhostModeEnabled && isLandscape && 
+                      final isGhostActive = !_isAudio && settings.isGhostModeEnabled && isLandscape && 
                           ((_activeSidebar == SidebarType.subtitles) || _isGhostDragMode || _activeSidebar == SidebarType.subtitleStyle);
+                      final SubtitleStyle activeSubtitleStyle = _isAudio
+                          ? (isLandscape ? settings.audioSubtitleStyleLandscape : settings.audioSubtitleStylePortrait)
+                          : (isLandscape ? settings.subtitleStyleLandscape : settings.subtitleStylePortrait);
 
                       return Stack(
                         alignment: Alignment.center,
@@ -2119,7 +2245,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                               child: SubtitleOverlayGroup(
                                                 entries: _currentSubtitleEntries,
                                                 alignment: settings.subtitleAlignment,
-                                                style: _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape,
+                                                style: activeSubtitleStyle,
                                                 isDragging: _isSubtitleDragMode,
                                                 isVisualOnly: false,
                                               ),
@@ -2258,7 +2384,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 onToggleSubtitles: () => _setFloatingSubtitles(!settings.showSubtitles),
                                 onMoveSubtitles: _enterSubtitleDragMode,
                                 subtitleEntries: _currentSubtitleEntries,
-                                subtitleStyle: _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape,
+                                subtitleStyle: activeSubtitleStyle,
                                     subtitleAlignment: settings.subtitleAlignment,
                                     onEnterSubtitleDragMode: _enterSubtitleDragMode,
                                     onClearSelection: () => _selectionKey.currentState?.clearSelection(),
@@ -2277,20 +2403,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 return Center(
                                   child: AspectRatio(
                                     aspectRatio: _controller.value.aspectRatio,
-                                    child: Stack(
-                                      fit: StackFit.expand,
-                                      children: [
-                                        GestureDetector(
-                                          onPanUpdate: (details) => _updateSubtitlePosition(details, constraints),
-                                          child: SubtitleOverlayGroup(
-                                            entries: _currentSubtitleEntries,
-                                            alignment: settings.subtitleAlignment,
-                                            style: _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape,
-                                            isDragging: true,
-                                            isGestureOnly: true,
-                                          ),
-                                        ),
-                                      ],
+                                    child: LayoutBuilder(
+                                      builder: (context, videoConstraints) {
+                                        return Stack(
+                                          fit: StackFit.expand,
+                                          children: [
+                                            GestureDetector(
+                                              onPanUpdate: (details) => _updateSubtitlePosition(details, videoConstraints),
+                                              child: SubtitleOverlayGroup(
+                                                entries: _currentSubtitleEntries,
+                                                alignment: settings.subtitleAlignment,
+                                                style: activeSubtitleStyle,
+                                                isDragging: true,
+                                                isGestureOnly: true,
+                                              ),
+                                            ),
+                                          ],
+                                        );
+                                      },
                                     ),
                                   ),
                                 );
@@ -2323,29 +2453,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                              Positioned.fill(
                                child: IgnorePointer(
                                  ignoring: !_isGhostDragMode,
-                                 child: Builder(
-                                   builder: (context) {
-                                     final baseStyle = _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape;
-                                     final fontScale = baseStyle.fontSize == 0 ? 1.0 : settings.ghostSubtitleFontSize / baseStyle.fontSize;
-                                     final ghostStyle = baseStyle.copyWith(
-                                       fontSize: settings.ghostSubtitleFontSize,
-                                       secondaryFontSize: (baseStyle.secondaryFontSize ?? baseStyle.fontSize) * fontScale,
-                                       letterSpacing: settings.ghostSubtitleLetterSpacing,
-                                     );
-                                     return GestureDetector(
-                                       onPanUpdate: _isGhostDragMode 
-                                           ? (details) => _updateSubtitlePosition(details, screenConstraints, isGhost: true)
-                                           : null,
-                                       child: SubtitleOverlayGroup(
-                                         entries: _currentSubtitleEntries,
-                                         alignment: settings.ghostModeAlignment,
-                                         style: ghostStyle,
-                                         isDragging: _isGhostDragMode,
-                                         isVisualOnly: !_isGhostDragMode,
-                                         animateAlignment: true,
-                                       ),
-                                     );
-                                   },
+                                 child: GestureDetector(
+                                   onPanUpdate: _isGhostDragMode 
+                                       ? (details) => _updateSubtitlePosition(details, screenConstraints, isGhost: true)
+                                       : null,
+                                   child: SubtitleOverlayGroup(
+                                     entries: _currentSubtitleEntries,
+                                     alignment: settings.ghostModeAlignment,
+                                     style: settings.subtitleStyleGhostLandscape,
+                                     isDragging: _isGhostDragMode,
+                                     isVisualOnly: !_isGhostDragMode,
+                                     animateAlignment: true,
+                                   ),
                                  ),
                                ),
                              ),
@@ -2354,52 +2473,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                     }
                   ),
                 ),
-                
-                // Sidebar Resizer
-                if (_isSidebarOpen && _activeSidebar == SidebarType.subtitles)
-                  RawGestureDetector(
-                    gestures: <Type, GestureRecognizerFactory>{
-                      LongPressGestureRecognizer: GestureRecognizerFactoryWithHandlers<LongPressGestureRecognizer>(
-                        () => LongPressGestureRecognizer(duration: const Duration(milliseconds: 250)),
-                        (instance) {
-                          instance.onLongPressStart = (_) => setState(() => _isResizingSidebar = true);
-                          instance.onLongPressMoveUpdate = (details) {
-                            final screenWidth = MediaQuery.of(context).size.width;
-                            settings.updateSetting('userSubtitleSidebarWidth', (screenWidth - details.globalPosition.dx).clamp(200.0, 600.0));
-                          };
-                          instance.onLongPressEnd = (_) {
-                            setState(() => _isResizingSidebar = false);
-                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                              if (!mounted) return;
-                              _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
-                            });
-                          };
-                        },
-                      ),
-                    },
-                    child: Container(
-                      width: 12,
-                      color: _isResizingSidebar ? Colors.blueAccent : Colors.black12,
-                      child: const Center(child: VerticalDivider(color: Colors.white24, width: 4, thickness: 4, indent: 40, endIndent: 40)),
-                    ),
-                  ),
-
-                // Sidebar
-                AnimatedContainer(
-                  duration: _isResizingSidebar ? Duration.zero : const Duration(milliseconds: 250),
-                  curve: Curves.easeOutCubic,
-                  width: _isSidebarOpen ? _getSidebarWidth(context, settings) : 0,
-                  child: _isSidebarOpen 
-                    ? ClipRect(
-                        child: OverflowBox(
-                          minWidth: _getSidebarWidth(context, settings),
-                          maxWidth: _getSidebarWidth(context, settings),
-                          alignment: Alignment.centerLeft,
-                          child: _buildSidebarContent(settings),
-                        ),
-                      )
-                    : null,
-                ),
+                if (!isLeftHandedMode) ...sidebarWidgets,
                   ],
                 ),
                 if (Platform.isIOS)
@@ -2443,10 +2517,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           }),
           onClose: () => setState(() => _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none),
           onLoadSubtitle: _pickSubtitle,
-          onOpenSubtitleStyle: () => setState(() {
-            _previousSidebarType = SidebarType.subtitles;
-            _activeSidebar = SidebarType.subtitleStyle;
-          }),
+          onOpenSubtitleStyle: _toggleFloatingSubtitleSettingsSidebar,
           onOpenSubtitleManager: _showSubtitleManager,
           onClearSelection: () => _selectionKey.currentState?.clearSelection(),
           onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
@@ -2457,9 +2528,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         );
 
       case SidebarType.subtitleStyle:
+        final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+        final isGhostEditing = !_isAudio && settings.isGhostModeEnabled && isLandscape;
+        final SubtitleStyle sheetStyle = _isAudio
+            ? (isLandscape ? settings.audioSubtitleStyleLandscape : settings.audioSubtitleStylePortrait)
+            : (isGhostEditing
+                ? settings.subtitleStyleGhostLandscape
+                : (isLandscape ? settings.subtitleStyleLandscape : settings.subtitleStylePortrait));
         return SubtitleSettingsSheet(
-          style: _isAudio ? settings.audioSubtitleStyleLandscape : settings.subtitleStyleLandscape,
-          isLandscape: true,
+          style: sheetStyle,
+          isLandscape: isLandscape,
           isAudio: _isAudio,
           // 文字样式改变时同步到横竖屏
           onTextStyleChanged: (newTextStyle) {
@@ -2469,12 +2547,22 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
               settings.saveSubtitleTextStyle(newTextStyle);
             }
           },
-          // 布局样式改变时只影响横屏
+          // 布局样式改变时同步到横竖屏
           onLayoutStyleChanged: (newLayoutStyle) {
             if (_isAudio) {
-              settings.saveAudioSubtitleLayoutLandscape(newLayoutStyle);
+              if (isLandscape) {
+                settings.saveAudioSubtitleLayoutLandscape(newLayoutStyle);
+              } else {
+                settings.saveAudioSubtitleLayoutPortrait(newLayoutStyle);
+              }
             } else {
-              settings.saveSubtitleLayoutLandscape(newLayoutStyle);
+              if (isGhostEditing) {
+                settings.saveSubtitleLayoutGhostLandscape(newLayoutStyle);
+              } else if (isLandscape) {
+                settings.saveSubtitleLayoutLandscape(newLayoutStyle);
+              } else {
+                settings.saveSubtitleLayoutPortrait(newLayoutStyle);
+              }
             }
           },
           // 向后兼容的回调
@@ -2486,10 +2574,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             }
           },
           onClose: () => setState(() {
+            _isStyleSidebarDragMode = false;
+            _isSubtitleDragMode = false;
+            _isGhostDragMode = false;
+            _isSubtitleSnapped = false;
             _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
             _previousSidebarType = SidebarType.none;
           }),
           onBack: () => setState(() {
+            _isStyleSidebarDragMode = false;
+            _isSubtitleDragMode = false;
+            _isGhostDragMode = false;
+            _isSubtitleSnapped = false;
             _activeSidebar = _previousSidebarType == SidebarType.settings ? SidebarType.settings : SidebarType.subtitles;
             _previousSidebarType = SidebarType.none;
           }),
@@ -2504,10 +2600,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           onLoadSubtitle: () async {
               await _pickSubtitle();
           },
-          onOpenSubtitleSettings: () => setState(() {
-            _previousSidebarType = SidebarType.settings;
-            _activeSidebar = SidebarType.subtitleStyle;
-          }),
+          onOpenSubtitleSettings: _toggleFloatingSubtitleSettingsSidebar,
           onClose: () => setState(() {
             if (_previousSidebarType == SidebarType.subtitles) {
               _activeSidebar = SidebarType.subtitles;
@@ -2562,6 +2655,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           // Seek Preview
           enableSeekPreview: settings.enableSeekPreview,
           onEnableSeekPreviewChanged: (value) => settings.updateSetting('enableSeekPreview', value),
+          isLeftHandedMode: settings.isLeftHandedMode,
+          onLeftHandedModeChanged: (value) => settings.updateSetting('isLeftHandedMode', value),
         );
         
       case SidebarType.subtitlePosition:

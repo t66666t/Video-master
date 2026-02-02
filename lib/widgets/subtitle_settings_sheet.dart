@@ -5,7 +5,7 @@ import '../services/settings_service.dart';
 
 /// 字幕设置面板
 /// 文字样式（字体、颜色、描边、阴影等）会同步到横竖屏
-/// 布局样式（字号、行间距、字间距等）只影响当前方向
+/// 布局样式（字号、行间距、字间距等）同步到横竖屏
 class SubtitleSettingsSheet extends StatelessWidget {
   /// 当前完整样式（包含文字样式和布局样式）
   final SubtitleStyle style;
@@ -66,6 +66,17 @@ class SubtitleSettingsSheet extends StatelessWidget {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmallScreen = screenWidth < 600;
     final paddingValue = isSmallScreen ? 6.0 : 20.0;
+    final headerHPadding = isSmallScreen ? 4.0 : 12.0;
+    final headerVPadding = isSmallScreen ? 2.0 : 6.0;
+    final headerIconSize = isSmallScreen ? 16.0 : 18.0;
+    final headerTitleFontSize = isSmallScreen ? 13.0 : 14.0;
+    final headerButtonSize = isSmallScreen ? 28.0 : 32.0;
+    final headerTopRowHeight = isSmallScreen ? 28.0 : 32.0;
+    final headerBottomRowHeight = isSmallScreen ? 20.0 : 24.0;
+    final headerRowGap = isSmallScreen ? 0.0 : 2.0;
+    final headerHeight = isAudio
+        ? (headerTopRowHeight + headerVPadding * 2)
+        : (headerTopRowHeight + headerBottomRowHeight + headerRowGap + headerVPadding * 2);
 
     // Adaptive sizes
     final double titleFontSize = isSmallScreen ? 11 : 12;
@@ -77,68 +88,89 @@ class SubtitleSettingsSheet extends StatelessWidget {
       child: Column(
         children: [
           // Header
-          Container(
-            padding: EdgeInsets.fromLTRB(paddingValue, paddingValue, 8, paddingValue / 2),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
+          SizedBox(
+            height: headerHeight,
+            child: Theme(
+              data: Theme.of(context).copyWith(
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                visualDensity: VisualDensity.compact,
+              ),
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: headerHPadding, vertical: headerVPadding),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    if (onBack != null)
-                      IconButton(
-                        icon: const Icon(Icons.arrow_back, color: Colors.white70, size: 18),
-                        onPressed: onBack,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints(),
-                        tooltip: "返回",
-                      ),
-                    if (onBack != null) const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        isAudio ? "音频字幕样式" : "视频字幕样式",
-                        style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
+                    SizedBox(
+                      height: headerTopRowHeight,
+                      child: Row(
+                        children: [
+                          if (onBack != null)
+                            IconButton(
+                              icon: Icon(Icons.arrow_back, color: Colors.white70, size: headerIconSize),
+                              onPressed: onBack,
+                              padding: EdgeInsets.zero,
+                              constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                              splashRadius: headerButtonSize / 2,
+                              tooltip: "返回",
+                            ),
+                          if (onBack != null) const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              isAudio ? "音频字幕样式" : "视频字幕样式",
+                              style: TextStyle(color: Colors.white, fontSize: headerTitleFontSize, fontWeight: FontWeight.w600),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          IconButton(
+                            icon: Icon(Icons.close, color: Colors.white70, size: headerIconSize),
+                            onPressed: onClose,
+                            padding: EdgeInsets.zero,
+                            constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                            splashRadius: headerButtonSize / 2,
+                            tooltip: "关闭",
+                          ),
+                        ],
                       ),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.close, color: Colors.white70, size: 18),
-                      onPressed: onClose,
-                      padding: EdgeInsets.zero,
-                      constraints: const BoxConstraints(),
-                      tooltip: "关闭",
-                    ),
+                    if (!isAudio) SizedBox(height: headerRowGap),
+                    if (!isAudio)
+                      Consumer<SettingsService>(
+                        builder: (context, settings, child) {
+                          final titleIndent = onBack != null ? (headerButtonSize + 4.0) : 0.0;
+                          final ghostLabel = isSmallScreen ? "幽灵" : "幽灵模式";
+                          return SizedBox(
+                            height: headerBottomRowHeight,
+                            child: Row(
+                              children: [
+                                if (titleIndent > 0) SizedBox(width: titleIndent),
+                                Text(ghostLabel, style: TextStyle(color: Colors.white70, fontSize: isSmallScreen ? 11 : 12)),
+                                const SizedBox(width: 6),
+                                Transform.scale(
+                                  scale: isSmallScreen ? 0.66 : 0.85,
+                                  alignment: Alignment.centerLeft,
+                                  child: Switch(
+                                    value: settings.isGhostModeEnabled,
+                                    onChanged: (val) => settings.updateSetting('isGhostModeEnabled', val),
+                                    activeThumbColor: Colors.blueAccent,
+                                  ),
+                                ),
+                                IconButton(
+                                  icon: Icon(Icons.help_outline, color: Colors.white70, size: headerIconSize),
+                                  onPressed: () => _showGhostModeHelp(context),
+                                  tooltip: "幽灵模式说明",
+                                  padding: EdgeInsets.zero,
+                                  constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                                  splashRadius: headerButtonSize / 2,
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
                   ],
                 ),
-                if (!isAudio)
-                  Align(
-                    alignment: Alignment.centerRight,
-                    child: Consumer<SettingsService>(
-                      builder: (context, settings, child) {
-                        return Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            if (!isSmallScreen)
-                              const Text("幽灵模式", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                            if (!isSmallScreen) const SizedBox(width: 6),
-                            Switch(
-                              value: settings.isGhostModeEnabled,
-                              onChanged: (val) => settings.updateSetting('isGhostModeEnabled', val),
-                              activeThumbColor: Colors.blueAccent,
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.help_outline, color: Colors.white70, size: 18),
-                              onPressed: () => _showGhostModeHelp(context),
-                              tooltip: "幽灵模式说明",
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(),
-                            ),
-                          ],
-                        );
-                      },
-                    ),
-                  ),
-              ],
+              ),
             ),
           ),
           const Divider(color: Colors.white10, height: 1),
@@ -189,7 +221,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
                 ),
 
                 // 1. Layout Settings (Size & Spacing) - 仅影响当前方向
-                _buildSectionTitle(context, "${isLandscape ? '横屏' : '竖屏'}布局 (仅当前方向)", Icons.format_size, color: Colors.orangeAccent),
+                _buildSectionTitle(context, "布局 (横竖屏同步)", Icons.format_size, color: Colors.orangeAccent),
                 // Main Font Size
                 Row(
                   children: [
@@ -259,51 +291,6 @@ class SubtitleSettingsSheet extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 16),
-
-                if (!isAudio) ...[
-                  _buildSectionTitle(context, "幽灵模式字幕", Icons.visibility),
-                  Consumer<SettingsService>(
-                    builder: (context, settings, child) {
-                      return Column(
-                        children: [
-                          Row(
-                            children: [
-                              Text("字幕大小", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: _buildSlider(
-                                  context,
-                                  value: settings.ghostSubtitleFontSize,
-                                  min: 10,
-                                  max: 100,
-                                  label: settings.ghostSubtitleFontSize.toInt().toString(),
-                                  onChanged: (val) => settings.updateSetting('ghostSubtitleFontSize', val),
-                                ),
-                              ),
-                            ],
-                          ),
-                          Row(
-                            children: [
-                              Text("字间距", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: _buildSlider(
-                                  context,
-                                  value: settings.ghostSubtitleLetterSpacing,
-                                  min: -5,
-                                  max: 20,
-                                  label: settings.ghostSubtitleLetterSpacing.toStringAsFixed(1),
-                                  onChanged: (val) => settings.updateSetting('ghostSubtitleLetterSpacing', val),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                ],
 
                 const Divider(color: Colors.white10, height: 24),
 
@@ -551,8 +538,10 @@ class SubtitleSettingsSheet extends StatelessWidget {
 
   /// 更新文字样式 - 会同步到横竖屏
   void _updateTextStyle(SubtitleTextStyle newTextStyle) {
-    onTextStyleChanged?.call(newTextStyle);
-    // 同时触发完整样式回调以保持兼容
+    if (onTextStyleChanged != null) {
+      onTextStyleChanged!.call(newTextStyle);
+      return;
+    }
     onStyleChanged?.call(SubtitleStyle(
       textStyle: newTextStyle,
       layoutStyle: style.layoutStyle,
@@ -561,8 +550,10 @@ class SubtitleSettingsSheet extends StatelessWidget {
 
   /// 更新布局样式 - 只影响当前方向
   void _updateLayoutStyle(SubtitleLayoutStyle newLayoutStyle) {
-    onLayoutStyleChanged?.call(newLayoutStyle);
-    // 同时触发完整样式回调以保持兼容
+    if (onLayoutStyleChanged != null) {
+      onLayoutStyleChanged!.call(newLayoutStyle);
+      return;
+    }
     onStyleChanged?.call(SubtitleStyle(
       textStyle: style.textStyle,
       layoutStyle: newLayoutStyle,

@@ -149,8 +149,8 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       if (!mounted) return;
       final List<AssetEntity>? assets = await AssetPicker.pickAssets(
         context,
-        pickerConfig: const AssetPickerConfig(
-          requestType: RequestType.video,
+        pickerConfig: AssetPickerConfig(
+          requestType: RequestType.video | RequestType.audio,
           maxAssets: 999,
         ),
       );
@@ -162,10 +162,12 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       }
 
       final List<String> paths = [];
+      final List<String> titles = [];
       for (final asset in assets) {
         final File? file = await asset.file;
         if (file == null) continue;
         paths.add(file.path);
+        titles.add(asset.title ?? p.basename(file.path));
       }
 
       if (paths.isEmpty) {
@@ -176,7 +178,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
       }
 
       if (paths.isNotEmpty && mounted) {
-        context.read<BatchImportService>().addVideos(widget.folderId, paths);
+        context.read<BatchImportService>().addVideos(widget.folderId, paths, titles: titles);
       }
     } catch (e) {
       debugPrint("Gallery import error: $e");
@@ -245,7 +247,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     return extractedPaths;
   }
 
-  Future<void> _handleMerge(String videoPath, String? subtitlePath) async {
+  Future<void> _handleMerge(String videoPath, String? subtitlePath, {String? title}) async {
     final library = Provider.of<LibraryService>(context, listen: false);
     final batch = Provider.of<BatchImportService>(context, listen: false);
 
@@ -253,7 +255,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     final item = VideoItem(
       id: id,
       path: videoPath,
-      title: p.basename(videoPath),
+      title: title ?? p.basename(videoPath),
       durationMs: 0,
       lastUpdated: DateTime.now().millisecondsSinceEpoch,
       parentId: widget.folderId,
@@ -510,7 +512,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
                                         Text(
-                                          p.basename(item.path!),
+                                          item.title ?? p.basename(item.path!),
                                           style: TextStyle(
                                             color: isImported ? Colors.green : Colors.white,
                                             fontSize: fontSize,
@@ -633,7 +635,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                                    if (isImported) {
                                      _handleUndo(videoPath);
                                    } else {
-                                     _handleMerge(videoPath, subItem?.path);
+                                     _handleMerge(videoPath, subItem?.path, title: videoItem?.title);
                                    }
                                 },
                               ),

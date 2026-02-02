@@ -13,7 +13,6 @@ import '../models/subtitle_model.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../services/settings_service.dart';
 import '../services/video_preview_service.dart';
-import 'dart:typed_data';
 
 class VideoControlsOverlay extends StatefulWidget {
   final VideoPlayerController controller;
@@ -103,6 +102,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   Duration _gestureTargetTime = Duration.zero;
   String _gestureDiffText = ""; 
   bool _isGestureCanceling = false;
+  bool _isProgressDragCanceling = false; // New: For slider drag cancellation
 
   // Long Press Speed
   bool _isLongPressingZone = false;
@@ -141,7 +141,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   // Auto-hide controls timer
   Timer? _autoHideTimer;
-  static const Duration _autoHideDelay = Duration(seconds: 10);
+  static const Duration _autoHideDelay = Duration(seconds: 5);
 
   void _updateSeekPreview(double value) {
     final settings = Provider.of<SettingsService>(context, listen: false);
@@ -498,6 +498,16 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     
     // Show feedback (optional, reusing gesture UI or similar)
     // For now just seek
+  }
+
+  // Helper for determining cancel area
+  bool _isInCancelArea(Offset globalPosition) {
+    if (!mounted) return false;
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) return false;
+    final localOffset = box.globalToLocal(globalPosition);
+    // Use absolute top area of the player (25%) for cancel zone
+    return localOffset.dy < box.size.height * 0.25;
   }
 
   // Horizontal Drag for Seeking (Direct Slide)
@@ -934,6 +944,90 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final double topBarPadding = isSmallScreen ? 4 : 8;
         final double bottomBarPadding = isSmallScreen ? 8 : 16;
         final double bottomBarVerticalPadding = isSmallScreen ? 8 : 24;
+        final settings = Provider.of<SettingsService>(context);
+        final bool isLeftHandedMode = settings.isLeftHandedMode;
+        final Alignment timeAlignment = isLeftHandedMode ? Alignment.centerRight : Alignment.centerLeft;
+        final Alignment toolsAlignment = isLeftHandedMode ? Alignment.centerLeft : Alignment.centerRight;
+        final List<Widget> topLeading = [
+          if (!kIsWeb && Platform.isWindows) ...[
+            IconButton(
+              icon: const Icon(Icons.close, color: Colors.white),
+              tooltip: "退出播放",
+              onPressed: () {
+                _startAutoHideTimer();
+                (widget.onExitPressed ?? widget.onBackPressed)();
+              },
+              iconSize: iconSize,
+            ),
+            const SizedBox(width: 8),
+          ],
+          IconButton(
+            icon: const Icon(Icons.arrow_back, color: Colors.white),
+            onPressed: () {
+              _startAutoHideTimer();
+              widget.onBackPressed();
+            },
+            iconSize: iconSize,
+          ),
+        ];
+        final List<Widget> topTrailing = [
+          if (widget.onOpenSettings != null)
+            IconButton(
+              icon: const Icon(Icons.settings, color: Colors.white),
+              onPressed: () {
+                _startAutoHideTimer();
+                widget.onOpenSettings!();
+              },
+              iconSize: iconSize,
+            ),
+          if (widget.onToggleFloatingSubtitleSettings != null)
+            IconButton(
+              icon: const Icon(Icons.style, color: Colors.white),
+              tooltip: "悬浮字幕设置",
+              onPressed: () {
+                _startAutoHideTimer();
+                widget.onToggleFloatingSubtitleSettings!();
+              },
+              iconSize: iconSize,
+            ),
+          IconButton(
+            icon: const Icon(Icons.open_with, color: Colors.white),
+            tooltip: "移动字幕",
+            onPressed: () {
+              _startAutoHideTimer();
+              widget.onMoveSubtitles();
+            },
+            iconSize: iconSize,
+          ),
+          if (widget.onToggleSidebar != null)
+            IconButton(
+              icon: Icon(
+                widget.isSubtitleSidebarVisible ? Icons.menu_open : Icons.menu,
+                color: Colors.white,
+              ),
+              tooltip: widget.isSubtitleSidebarVisible ? "隐藏字幕边栏" : "显示字幕边栏",
+              onPressed: () {
+                _startAutoHideTimer();
+                widget.onToggleSidebar!();
+              },
+              iconSize: iconSize,
+            ),
+          if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux))
+            IconButton(
+              icon: Icon(
+                settings.isFullScreen
+                    ? Icons.fullscreen_exit
+                    : Icons.fullscreen,
+                color: Colors.white,
+              ),
+              tooltip: settings.isFullScreen ? "退出全屏" : "全屏",
+              onPressed: () {
+                _startAutoHideTimer();
+                widget.onToggleFullScreen!();
+              },
+              iconSize: iconSize,
+            ),
+        ];
 
         return Focus(
           focusNode: widget.focusNode ?? _focusNode,
@@ -1137,14 +1231,19 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                       ),
 
                     // Seek Cancel Area Highlight
-                    if (_isGestureSeeking && !_isGestureCanceling && !widget.isLocked)
+                    if ((_isGestureSeeking || _isDraggingProgress) && !widget.isLocked)
                        Positioned(
                          top: 0, left: 0, right: 0,
-                         height: height * 0.2,
+                         height: height * 0.25,
                          child: Container(
-                           color: Colors.white.withValues(alpha: 0.1),
+                           color: (_isGestureCanceling || _isProgressDragCanceling) 
+                               ? Colors.red.withValues(alpha: 0.3) 
+                               : Colors.white.withValues(alpha: 0.1),
                            alignment: Alignment.center,
-                           child: const Text("上滑至此区域取消", style: TextStyle(color: Colors.white70)),
+                           child: Text(
+                             (_isGestureCanceling || _isProgressDragCanceling) ? "松手取消" : "上滑至此区域取消", 
+                             style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)
+                           ),
                          ),
                        ),
                     ],
@@ -1162,7 +1261,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
             // Lock Button
             if (_showControls || widget.isLocked)
               Positioned(
-                left: isSmallScreen ? 12 : 20,
+                left: isLeftHandedMode ? null : (isSmallScreen ? 12 : 20),
+                right: isLeftHandedMode ? (isSmallScreen ? 12 : 20) : null,
                 top: height / 2 - (lockIconSize / 2 + (isSmallScreen ? 8 : 12)), 
                 child: IconButton(
                   onPressed: () {
@@ -1201,84 +1301,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                     ),
                     child: Row(
                       children: [
-                        if (!kIsWeb && Platform.isWindows) ...[
-                          IconButton(
-                            icon: const Icon(Icons.close, color: Colors.white),
-                            tooltip: "退出播放",
-                            onPressed: () {
-                              _startAutoHideTimer();
-                              (widget.onExitPressed ?? widget.onBackPressed)();
-                            },
-                            iconSize: iconSize,
-                          ),
-                          const SizedBox(width: 8),
-                        ],
-                        IconButton(
-                          icon: const Icon(Icons.arrow_back, color: Colors.white),
-                          onPressed: () {
-                            _startAutoHideTimer();
-                            widget.onBackPressed();
-                          },
-                          iconSize: iconSize,
-                        ),
+                        if (isLeftHandedMode) ...topTrailing else ...topLeading,
                         const Spacer(),
-                        if (widget.onOpenSettings != null)
-                          IconButton(
-                            icon: const Icon(Icons.settings, color: Colors.white),
-                            onPressed: () {
-                              _startAutoHideTimer();
-                              widget.onOpenSettings!();
-                            },
-                            iconSize: iconSize,
-                          ),
-                        if (widget.onToggleFloatingSubtitleSettings != null)
-                          IconButton(
-                            icon: const Icon(Icons.style, color: Colors.white),
-                            tooltip: "悬浮字幕设置",
-                            onPressed: () {
-                              _startAutoHideTimer();
-                              widget.onToggleFloatingSubtitleSettings!();
-                            },
-                            iconSize: iconSize,
-                          ),
-                        // Move Subtitle Button
-                        IconButton(
-                          icon: const Icon(Icons.open_with, color: Colors.white),
-                          tooltip: "移动字幕",
-                          onPressed: () {
-                            _startAutoHideTimer();
-                            widget.onMoveSubtitles();
-                          },
-                          iconSize: iconSize,
-                        ),
-                        if (widget.onToggleSidebar != null)
-                          IconButton(
-                            icon: Icon(
-                              widget.isSubtitleSidebarVisible ? Icons.menu_open : Icons.menu,
-                              color: Colors.white,
-                            ),
-                            tooltip: widget.isSubtitleSidebarVisible ? "隐藏字幕边栏" : "显示字幕边栏",
-                            onPressed: () {
-                              _startAutoHideTimer();
-                              widget.onToggleSidebar!();
-                            },
-                            iconSize: iconSize,
-                          ),
-                        if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux))
-                          IconButton(
-                            icon: Icon(
-                              Provider.of<SettingsService>(context).isFullScreen 
-                                  ? Icons.fullscreen_exit 
-                                  : Icons.fullscreen, 
-                              color: Colors.white
-                            ),
-                            tooltip: Provider.of<SettingsService>(context).isFullScreen ? "退出全屏" : "全屏",
-                            onPressed: () {
-                              _startAutoHideTimer();
-                              widget.onToggleFullScreen!();
-                            },
-                            iconSize: iconSize,
-                          ),
+                        if (isLeftHandedMode) ...topLeading else ...topTrailing,
                       ],
                     ),
                   ),
@@ -1385,40 +1410,63 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                             ),
                                           ),
 
-                                        SizedBox(
-                                          height: 40, // Ensure enough height for hit testing
-                                          child: SliderTheme(
-                                            data: SliderTheme.of(context).copyWith(
-                                              activeTrackColor: const Color(0xFF0D47A1),
-                                              inactiveTrackColor: Colors.white24,
-                                              thumbColor: isInitialized ? const Color(0xFF1565C0) : Colors.grey,
-                                              overlayColor: const Color(0x291565C0),
-                                              thumbShape: RoundSliderThumbShape(enabledThumbRadius: isSmallScreen ? 4.0 : 6.0),
-                                              trackHeight: isSmallScreen ? 2.0 : 4.0,
-                                              overlayShape: const RoundSliderOverlayShape(overlayRadius: 10), // Reduced overlay to fit
-                                            ),
-                                            child: Slider(
-                                              min: 0.0,
-                                              max: sliderMax,
-                                              value: sliderValue,
-                                              onChanged: isInitialized ? (newValue) {
-                                                setState(() {
-                                                  _isDraggingProgress = true;
-                                                  _dragProgressValue = newValue;
-                                                });
-                                                _updateSeekPreview(newValue);
-                                                // Reset auto-hide timer while dragging
-                                                _startAutoHideTimer();
-                                              } : null,
-                                              onChangeEnd: (newValue) {
-                                                _seekTo(Duration(milliseconds: newValue.toInt()));
-                                                setState(() {
-                                                  _isDraggingProgress = false;
-                                                  _previewImage = null;
-                                                });
-                                                // Reset auto-hide timer after seeking
-                                                _startAutoHideTimer();
-                                              },
+                                        Listener(
+                                          behavior: HitTestBehavior.translucent,
+                                          onPointerMove: (event) {
+                                            if (!_isDraggingProgress || widget.isLocked) return;
+                                            final isInCancelArea = _isInCancelArea(event.position);
+                                            if (isInCancelArea != _isProgressDragCanceling) {
+                                              setState(() {
+                                                _isProgressDragCanceling = isInCancelArea;
+                                              });
+                                            }
+                                          },
+                                          onPointerCancel: (event) {
+                                            if (!_isDraggingProgress) return;
+                                            setState(() {
+                                              _isDraggingProgress = false;
+                                              _previewImage = null;
+                                              _isProgressDragCanceling = false;
+                                            });
+                                          },
+                                          child: SizedBox(
+                                            height: 40, // Ensure enough height for hit testing
+                                            child: SliderTheme(
+                                              data: SliderTheme.of(context).copyWith(
+                                                activeTrackColor: _isProgressDragCanceling ? Colors.grey : const Color(0xFF0D47A1),
+                                                inactiveTrackColor: Colors.white24,
+                                                thumbColor: isInitialized ? (_isProgressDragCanceling ? Colors.grey : const Color(0xFF1565C0)) : Colors.grey,
+                                                overlayColor: const Color(0x291565C0),
+                                                thumbShape: RoundSliderThumbShape(enabledThumbRadius: isSmallScreen ? 4.0 : 6.0),
+                                                trackHeight: isSmallScreen ? 2.0 : 4.0,
+                                                overlayShape: const RoundSliderOverlayShape(overlayRadius: 10), // Reduced overlay to fit
+                                              ),
+                                              child: Slider(
+                                                min: 0.0,
+                                                max: sliderMax,
+                                                value: sliderValue,
+                                                onChanged: isInitialized ? (newValue) {
+                                                  setState(() {
+                                                    _isDraggingProgress = true;
+                                                    _dragProgressValue = newValue;
+                                                  });
+                                                  _updateSeekPreview(newValue);
+                                                  // Reset auto-hide timer while dragging
+                                                  _startAutoHideTimer();
+                                                } : null,
+                                                onChangeEnd: (newValue) {
+                                                  if (!_isProgressDragCanceling) {
+                                                    _seekTo(Duration(milliseconds: newValue.toInt()));
+                                                  }
+                                                  setState(() {
+                                                    _isDraggingProgress = false;
+                                                    _previewImage = null;
+                                                    _isProgressDragCanceling = false;
+                                                  });
+                                                  // Reset auto-hide timer after seeking
+                                                  _startAutoHideTimer();
+                                                },
+                                              ),
                                             ),
                                           ),
                                         ),
@@ -1434,7 +1482,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                     children: [
                                       // Left: Time
                                       Align(
-                                        alignment: Alignment.centerLeft,
+                                        alignment: timeAlignment,
                                         child: Text(
                                           "${_formatDuration(currentPosition)} / ${_formatDuration(duration)}",
                                           style: TextStyle(color: Colors.white, fontSize: isSmallScreen ? 10 : 12),
@@ -1563,7 +1611,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                       
                                       // Right: Tools (Speed, Subtitles, Volume)
                                       Align(
-                                        alignment: Alignment.centerRight,
+                                        alignment: toolsAlignment,
                                         child: Row(
                                           mainAxisSize: MainAxisSize.min,
                                           children: [

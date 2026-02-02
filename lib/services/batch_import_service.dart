@@ -10,15 +10,17 @@ import 'package:uuid/uuid.dart';
 class BatchItem {
   String id;
   String? path;
+  String? title;
 
-  BatchItem({required this.id, this.path});
+  BatchItem({required this.id, this.path, this.title});
 
-  Map<String, dynamic> toJson() => {'id': id, 'path': path};
+  Map<String, dynamic> toJson() => {'id': id, 'path': path, 'title': title};
 
   factory BatchItem.fromJson(Map<String, dynamic> json) {
     return BatchItem(
       id: json['id'] ?? Uuid().v4(),
       path: json['path'],
+      title: json['title'],
     );
   }
 }
@@ -207,20 +209,23 @@ class BatchImportService extends ChangeNotifier {
 
   // --- Actions ---
 
-  Future<void> addVideos(String? folderId, List<String> paths) async {
+  Future<void> addVideos(String? folderId, List<String> paths, {List<String>? titles}) async {
     final state = _getState(folderId);
     bool listChanged = false;
     
     // Find first empty slot to fill, or append
-    for (var path in paths) {
+    for (int i = 0; i < paths.length; i++) {
+      final path = paths[i];
       // Check if already exists
       if (state.videoItems.any((item) => item.path == path)) continue;
 
+      final title = (titles != null && i < titles.length) ? titles[i] : null;
       int emptyIndex = state.videoItems.indexWhere((item) => item.path == null);
       if (emptyIndex != -1) {
         state.videoItems[emptyIndex].path = path;
+        state.videoItems[emptyIndex].title = title;
       } else {
-        state.videoItems.add(BatchItem(id: const Uuid().v4(), path: path));
+        state.videoItems.add(BatchItem(id: const Uuid().v4(), path: path, title: title));
       }
       
       listChanged = true;

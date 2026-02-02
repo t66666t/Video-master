@@ -44,6 +44,9 @@ class SettingsPanel extends StatefulWidget {
   final bool enableSeekPreview;
   final ValueChanged<bool> onEnableSeekPreviewChanged;
 
+  final bool isLeftHandedMode;
+  final ValueChanged<bool> onLeftHandedModeChanged;
+
   const SettingsPanel({
     super.key,
     required this.playbackSpeed,
@@ -76,6 +79,8 @@ class SettingsPanel extends StatefulWidget {
     required this.onAutoPlayNextVideoChanged,
     required this.enableSeekPreview,
     required this.onEnableSeekPreviewChanged,
+    required this.isLeftHandedMode,
+    required this.onLeftHandedModeChanged,
     this.onLoadSubtitle,
     this.onOpenSubtitleSettings,
   });
@@ -255,6 +260,16 @@ class _SettingsPanelState extends State<SettingsPanel> {
                         subtitle: const Text("拖动进度条时显示缩略图", style: TextStyle(color: Colors.white30, fontSize: 10)),
                         value: widget.enableSeekPreview,
                         onChanged: widget.onEnableSeekPreviewChanged,
+                        activeThumbColor: Colors.blueAccent,
+                        dense: true,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      SwitchListTile(
+                        title: const Text("左手模式", style: TextStyle(color: Colors.white70, fontSize: 13)),
+                        subtitle: const Text("镜像侧栏与控制按钮布局", style: TextStyle(color: Colors.white30, fontSize: 10)),
+                        value: widget.isLeftHandedMode,
+                        onChanged: widget.onLeftHandedModeChanged,
                         activeThumbColor: Colors.blueAccent,
                         dense: true,
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),

@@ -50,34 +50,42 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmallScreen = screenWidth < 600;
-    final paddingValue = isSmallScreen ? 8.0 : 16.0;
+    final paddingValue = isSmallScreen ? 6.0 : 16.0;
 
     // Use a fixed width for the D-Pad container or scale it slightly
-    final dPadSize = isSmallScreen ? 120.0 : 160.0; 
-    final buttonSize = isSmallScreen ? 36.0 : 42.0;
-    final iconSize = isSmallScreen ? 20.0 : 24.0;
+    final dPadSize = isSmallScreen ? 100.0 : 160.0; 
+    final buttonSize = isSmallScreen ? 30.0 : 42.0;
+    final iconSize = isSmallScreen ? 18.0 : 24.0;
 
     return Container(
       color: const Color(0xFF1E1E1E),
       child: Column(
         children: [
-          // Header
+          // Header - Optimized for mobile
           Container(
-            padding: EdgeInsets.all(paddingValue),
+            height: isSmallScreen ? 28 : 48,
+            padding: EdgeInsets.symmetric(horizontal: paddingValue),
             decoration: const BoxDecoration(
               border: Border(bottom: BorderSide(color: Colors.white10)),
             ),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text(
-                  "字幕位置调整",
-                  style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+                Text(
+                  "字幕样式",
+                  style: TextStyle(
+                    color: Colors.white, 
+                    fontSize: isSmallScreen ? 11 : 16, 
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
                 IconButton(
                   icon: const Icon(Icons.check, color: Colors.greenAccent),
                   onPressed: widget.onConfirm,
                   tooltip: "确认保存",
+                  iconSize: isSmallScreen ? 16 : 24,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
                 ),
               ],
             ),
@@ -85,46 +93,67 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
 
           Expanded(
             child: ListView(
-              padding: EdgeInsets.all(paddingValue),
+              padding: EdgeInsets.symmetric(horizontal: paddingValue, vertical: isSmallScreen ? 4 : 8),
               children: [
-                // 0. Ghost Mode Settings
-                const Text("幽灵模式 (Ghost Mode)", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: const [
-                          Text("允许自由移动", style: TextStyle(color: Colors.white, fontSize: 14)),
-                          SizedBox(height: 2),
-                          Text("仅在横屏且侧边栏打开时生效", style: TextStyle(color: Colors.white54, fontSize: 10)),
+                // 0. Ghost Mode Settings - Optimized for mobile
+                Container(
+                  height: isSmallScreen ? 32 : 48,
+                  padding: EdgeInsets.symmetric(horizontal: 0),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.max,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          "幽灵模式", 
+                          style: TextStyle(
+                            color: Colors.white, 
+                            fontSize: isSmallScreen ? 9 : 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Transform.scale(
+                            scale: isSmallScreen ? 0.45 : 1.0,
+                            child: Switch(
+                              value: widget.isGhostModeEnabled,
+                              onChanged: widget.onGhostModeToggle,
+                              activeThumbColor: Colors.blueAccent,
+                              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                          ),
+                          IconButton(
+                            icon: Icon(Icons.tune, size: isSmallScreen ? 12 : 20),
+                            onPressed: widget.isGhostModeEnabled ? widget.onEnterGhostMode : null,
+                            tooltip: "调整",
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+                            style: IconButton.styleFrom(
+                              backgroundColor: widget.isGhostModeActive 
+                                  ? Colors.green.withValues(alpha: 0.2) 
+                                  : Colors.white.withValues(alpha: 0.1),
+                              foregroundColor: widget.isGhostModeActive ? Colors.green : Colors.white,
+                            ),
+                          ),
                         ],
                       ),
-                    ),
-                    Switch(
-                      value: widget.isGhostModeEnabled,
-                      onChanged: widget.onGhostModeToggle,
-                      activeThumbColor: Colors.blueAccent,
-                    ),
-                    const SizedBox(width: 8),
-                    IconButton(
-                      icon: const Icon(Icons.tune),
-                      onPressed: widget.isGhostModeEnabled ? widget.onEnterGhostMode : null,
-                      tooltip: "调整幽灵模式位置",
-                      style: IconButton.styleFrom(
-                        backgroundColor: widget.isGhostModeActive ? Colors.green.withValues(alpha: 0.2) : Colors.white.withValues(alpha: 0.1),
-                        foregroundColor: widget.isGhostModeActive ? Colors.green : Colors.white,
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-                const Divider(color: Colors.white10),
-                const SizedBox(height: 12),
+                Divider(color: Colors.white10, height: isSmallScreen ? 2 : 24),
 
                 // 1. Font Settings (Size & Spacing)
-                const Text("字体布局 (Layout)", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                const SizedBox(height: 8),
+                Text(
+                  "字体布局", 
+                  style: TextStyle(
+                    color: Colors.white70, 
+                    fontSize: isSmallScreen ? 10 : 12,
+                  ),
+                ),
+                SizedBox(height: isSmallScreen ? 4 : 8),
                 Consumer<SettingsService>(
                   builder: (context, settings, child) {
                     return Column(
@@ -238,13 +267,18 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                   }
                 ),
 
-                const SizedBox(height: 20),
-                const Divider(color: Colors.white10),
-                const SizedBox(height: 12),
+                SizedBox(height: isSmallScreen ? 6 : 20),
+                Divider(color: Colors.white10, height: isSmallScreen ? 8 : 24),
 
                 // 2. D-Pad for Fine Tuning
-                const Text("微调 (Fine Tune)", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                const SizedBox(height: 12),
+                Text(
+                  "微调", 
+                  style: TextStyle(
+                    color: Colors.white70, 
+                    fontSize: isSmallScreen ? 10 : 12,
+                  ),
+                ),
+                SizedBox(height: isSmallScreen ? 4 : 12),
                 Center(
                   child: SizedBox(
                     width: dPadSize,
@@ -284,9 +318,8 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                   ),
                 ),
 
-                const SizedBox(height: 24),
-                const Divider(color: Colors.white10),
-                const SizedBox(height: 12),
+                SizedBox(height: isSmallScreen ? 8 : 24),
+                Divider(color: Colors.white10, height: isSmallScreen ? 8 : 24),
 
                 // 3. Actions
                 Row(
@@ -294,11 +327,15 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     Expanded(
                       child: ElevatedButton.icon(
                         onPressed: widget.onSavePreset,
-                        icon: const Icon(Icons.save_as, size: 16),
-                        label: const Text("保存当前位置"),
+                        icon: Icon(Icons.save_as, size: isSmallScreen ? 14 : 16),
+                        label: Text(
+                          "保存",
+                          style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
+                        ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.blueAccent.withValues(alpha: 0.2),
                           foregroundColor: Colors.blueAccent,
+                          padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 6 : 12, vertical: isSmallScreen ? 6 : 12),
                         ),
                       ),
                     ),
@@ -306,22 +343,32 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     Expanded(
                       child: OutlinedButton.icon(
                         onPressed: widget.onReset,
-                        icon: const Icon(Icons.restart_alt, size: 16),
-                        label: const Text("重置"),
+                        icon: Icon(Icons.restart_alt, size: isSmallScreen ? 14 : 16),
+                        label: Text(
+                          "重置",
+                          style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
+                        ),
                         style: OutlinedButton.styleFrom(
                           foregroundColor: Colors.white70,
                           side: const BorderSide(color: Colors.white24),
+                          padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 6 : 12, vertical: isSmallScreen ? 6 : 12),
                         ),
                       ),
                     ),
                   ],
                 ),
 
-                const SizedBox(height: 24),
+                SizedBox(height: isSmallScreen ? 8 : 24),
 
                 // 4. Presets
-                const Text("预设位置 (Presets)", style: TextStyle(color: Colors.white70, fontSize: 12)),
-                const SizedBox(height: 12),
+                Text(
+                  "预设位置", 
+                  style: TextStyle(
+                    color: Colors.white70, 
+                    fontSize: isSmallScreen ? 10 : 12,
+                  ),
+                ),
+                SizedBox(height: isSmallScreen ? 4 : 12),
                 Wrap(
                   spacing: 8,
                   runSpacing: 8,

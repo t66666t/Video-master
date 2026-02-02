@@ -206,7 +206,7 @@ class SubtitleTextStyle {
   }
 }
 
-/// 字幕布局样式 - 横竖屏独立
+/// 字幕布局样式 - 横竖屏共享
 /// 包含字体大小、行间距、字间距等布局属性
 class SubtitleLayoutStyle {
   final double fontSize;

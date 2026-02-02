@@ -8,6 +8,8 @@ import 'package:uuid/uuid.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import 'thumbnail_cache_service.dart';
@@ -1125,6 +1127,12 @@ class LibraryService extends ChangeNotifier {
       return await _generateThumbnailWindows(videoPath);
     }
     
+    // iOS: Use FFmpeg for better compatibility with gallery videos
+    if (Platform.isIOS) {
+      return await _generateThumbnailFFmpeg(videoPath);
+    }
+    
+    // Android and other platforms: Use video_thumbnail plugin
     try {
       final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
@@ -1141,6 +1149,66 @@ class LibraryService extends ChangeNotifier {
       return fileName;
     } catch (e) {
       developer.log('Thumbnail error', error: e);
+      return null;
+    }
+  }
+
+  /// 使用 FFmpeg 生成缩略图（用于 iOS 和其他平台）
+  Future<String?> _generateThumbnailFFmpeg(String videoPath) async {
+    try {
+      final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
+      if (!await thumbDir.exists()) {
+        await thumbDir.create(recursive: true);
+      }
+      
+      // Generate deterministic filename based on video path
+      final hash = md5.convert(utf8.encode(videoPath)).toString();
+      final outPath = p.join(thumbDir.path, "$hash.jpg");
+      
+      // Check if thumbnail already exists
+      final outFile = File(outPath);
+      if (await outFile.exists() && await outFile.length() > 0) {
+        return outPath;
+      }
+      
+      // Use FFmpeg to extract first frame
+      // -y: Overwrite output file
+      // -i: Input file
+      // -ss 00:00:01: Seek to 1 second (avoid black frames at start)
+      // -vframes 1: Extract only 1 frame
+      // -vf scale=-1:200: Resize to height 200px maintaining aspect ratio
+      // -q:v 2: High quality JPEG
+      final session = await FFmpegKit.execute(
+        '-y -i "$videoPath" -ss 00:00:01 -vframes 1 -vf scale=-1:200 -q:v 2 "$outPath"'
+      );
+      
+      final returnCode = await session.getReturnCode();
+      
+      if (ReturnCode.isSuccess(returnCode)) {
+        if (await outFile.exists() && await outFile.length() > 0) {
+          developer.log('FFmpeg thumbnail generated: $outPath');
+          return outPath;
+        }
+      }
+      
+      // If failed, try without seek (some videos might be very short)
+      final session2 = await FFmpegKit.execute(
+        '-y -i "$videoPath" -vframes 1 -vf scale=-1:200 -q:v 2 "$outPath"'
+      );
+      
+      final returnCode2 = await session2.getReturnCode();
+      
+      if (ReturnCode.isSuccess(returnCode2)) {
+        if (await outFile.exists() && await outFile.length() > 0) {
+          developer.log('FFmpeg thumbnail generated (fallback): $outPath');
+          return outPath;
+        }
+      }
+      
+      developer.log('FFmpeg thumbnail generation failed for: $videoPath');
+      return null;
+    } catch (e) {
+      developer.log('FFmpeg thumbnail error', error: e);
       return null;
     }
   }
