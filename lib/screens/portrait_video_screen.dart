@@ -1241,7 +1241,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     
     _isPushingLandscape = true;
     try {
-      await Navigator.of(context).push(
+      final navigator = Navigator.of(context);
+      await SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      await navigator.push(
         PageRouteBuilder(
           pageBuilder: (context, animation, secondaryAnimation) => VideoPlayerScreen(
             videoFile: null, // Legacy param, ignored

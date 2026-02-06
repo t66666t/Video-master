@@ -184,8 +184,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       ]);
     });
     _enterImmersiveMode();
-    
-    _activeSidebar = SidebarType.subtitles;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    _isSubtitleSidebarVisible = settings.isLandscapeSubtitleSidebarVisible;
+    _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
     if (Platform.isAndroid) {
       // 请求通知权限
       Permission.notification.request();
@@ -2120,6 +2121,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     if (_forceExit) {
       if (widget.existingController == null) {
         SystemChrome.setPreferredOrientations([]);
+      } else {
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+        ]);
       }
       if (mounted) navigator.pop();
       return;
@@ -2159,8 +2165,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
     await _handleExit();
     if (!mounted) return;
-    // 移除此处对 setPreferredOrientations 的调用
-    // 让 dispose 方法在页面销毁时（动画结束后）恢复方向，避免先旋转后动画的视觉突变
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
     navigator.pop();
   }
 
@@ -2429,6 +2437,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                                     onPressed: () async {
                                                       _forceExit = true;
                                                       await _handleExit();
+                                                      SystemChrome.setPreferredOrientations([
+                                                        DeviceOrientation.portraitUp,
+                                                        DeviceOrientation.portraitDown,
+                                                      ]);
                                                       if (context.mounted) Navigator.of(context).pop();
                                                     },
                                                   ),
@@ -2436,7 +2448,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                                 ],
                                                 IconButton(
                                                   icon: const Icon(Icons.arrow_back, color: Colors.white),
-                                                  onPressed: () => Navigator.of(context).maybePop(),
+                                                  onPressed: () => _handleBackRequest(),
                                                 ),
                                               ],
                                             ),
@@ -2462,7 +2474,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 controller: _controller,
                                 isLocked: _isLocked,
                                 onTogglePlay: _togglePlay,
-                                onBackPressed: () => Navigator.of(context).maybePop(),
+                                onBackPressed: () => _handleBackRequest(),
                                 onSeekTo: (position) {
                                   try {
                                     final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
@@ -2478,6 +2490,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 onExitPressed: () async {
                                   _forceExit = true;
                                   await _handleExit();
+                                  SystemChrome.setPreferredOrientations([
+                                    DeviceOrientation.portraitUp,
+                                    DeviceOrientation.portraitDown,
+                                  ]);
                                   if (context.mounted) Navigator.of(context).pop();
                                 },
                                 onOpenSettings: () => setState(() {
