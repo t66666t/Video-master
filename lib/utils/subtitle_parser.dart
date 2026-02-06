@@ -1,16 +1,137 @@
+import 'dart:convert';
+import 'package:fast_gbk/fast_gbk.dart';
 import '../models/subtitle_model.dart';
 
 class SubtitleParser {
+  static String decodeBytes(List<int> bytes) {
+    if (bytes.isEmpty) return '';
+
+    if (_hasUtf8Bom(bytes)) {
+      return _normalizeContent(utf8.decode(bytes.sublist(3)));
+    }
+    if (_hasUtf16LeBom(bytes)) {
+      return _normalizeContent(_decodeUtf16(bytes.sublist(2), littleEndian: true));
+    }
+    if (_hasUtf16BeBom(bytes)) {
+      return _normalizeContent(_decodeUtf16(bytes.sublist(2), littleEndian: false));
+    }
+
+    final utf16Guess = _detectUtf16(bytes);
+    if (utf16Guess != null) {
+      return _normalizeContent(_decodeUtf16(bytes, littleEndian: utf16Guess));
+    }
+
+    String? utf8Content;
+    try {
+      utf8Content = utf8.decode(bytes);
+    } catch (_) {}
+
+    if (utf8Content != null && _containsSubtitleMarkers(utf8Content)) {
+      return _normalizeContent(utf8Content);
+    }
+
+    String? gbkContent;
+    try {
+      gbkContent = gbk.decode(bytes);
+    } catch (_) {}
+
+    if (gbkContent != null && _containsSubtitleMarkers(gbkContent)) {
+      return _normalizeContent(gbkContent);
+    }
+
+    final utf16Le = _decodeUtf16(bytes, littleEndian: true);
+    if (_containsSubtitleMarkers(utf16Le)) {
+      return _normalizeContent(utf16Le);
+    }
+
+    final utf16Be = _decodeUtf16(bytes, littleEndian: false);
+    if (_containsSubtitleMarkers(utf16Be)) {
+      return _normalizeContent(utf16Be);
+    }
+
+    if (utf8Content != null) return _normalizeContent(utf8Content);
+    if (gbkContent != null) return _normalizeContent(gbkContent);
+    return '';
+  }
+
+  static String _normalizeContent(String content) {
+    if (content.isEmpty) return content;
+    return content.replaceAll('\uFEFF', '').replaceAll('\u0000', '');
+  }
+
+  static bool _hasUtf8Bom(List<int> bytes) {
+    return bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
+  }
+
+  static bool _hasUtf16LeBom(List<int> bytes) {
+    return bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE;
+  }
+
+  static bool _hasUtf16BeBom(List<int> bytes) {
+    return bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF;
+  }
+
+  static bool? _detectUtf16(List<int> bytes) {
+    final sample = bytes.length > 200 ? 200 : bytes.length;
+    if (sample < 4) return null;
+    int evenZero = 0;
+    int oddZero = 0;
+    for (int i = 0; i < sample; i++) {
+      if (bytes[i] == 0) {
+        if (i.isEven) {
+          evenZero++;
+        } else {
+          oddZero++;
+        }
+      }
+    }
+    final zeroCount = evenZero + oddZero;
+    if (zeroCount < sample / 10) return null;
+    if (oddZero > evenZero * 2) return true;
+    if (evenZero > oddZero * 2) return false;
+    return null;
+  }
+
+  static String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
+    if (bytes.isEmpty) return '';
+    final length = bytes.length.isEven ? bytes.length : bytes.length - 1;
+    final codeUnits = <int>[];
+    for (int i = 0; i < length; i += 2) {
+      final int unit = littleEndian
+          ? (bytes[i] | (bytes[i + 1] << 8))
+          : ((bytes[i] << 8) | bytes[i + 1]);
+      codeUnits.add(unit);
+    }
+    return String.fromCharCodes(codeUnits);
+  }
+
+  static bool _containsSubtitleMarkers(String content) {
+    if (content.isEmpty) return false;
+    if (content.contains('-->')) return true;
+    if (content.contains('[Script Info]') || content.contains('[Events]')) return true;
+    if (content.contains('WEBVTT')) return true;
+    if (content.contains('Dialogue:')) return true;
+    if (RegExp(r'\[\d{2}:\d{2}').hasMatch(content)) return true;
+    return false;
+  }
+
+  static String _stripStyleTokens(String text) {
+    if (text.isEmpty) return text;
+    return text.replaceAll(RegExp(r'\{\\[^}]*\}'), '').trim();
+  }
+
   /// 自动解析字幕内容 (根据内容特征)
   static List<SubtitleItem> parse(String content) {
-    if (content.startsWith('WEBVTT') || content.contains('WEBVTT')) {
-      return parseVtt(content);
-    } else if (content.contains('[Script Info]') || content.contains('[Events]')) {
-      return parseAss(content);
-    } else if (content.contains('-->')) {
-      return parseSrt(content);
-    } else if (RegExp(r'\[\d{2}:\d{2}').hasMatch(content)) {
-      return parseLrc(content);
+    final normalized = _normalizeContent(content);
+    final head = normalized.trimLeft();
+    if (head.startsWith('WEBVTT') || normalized.contains('WEBVTT')) {
+      return parseVtt(normalized);
+    } else if (normalized.contains('[Script Info]') || normalized.contains('[Events]')) {
+      return parseAss(normalized);
+    } else if (normalized.contains('-->')) {
+      return parseSrt(normalized);
+    } else if (RegExp(r'\[\d{2}:\d{2}').hasMatch(normalized)) {
+      return parseLrc(normalized);
     }
     return []; // 未知格式
   }
@@ -18,12 +139,16 @@ class SubtitleParser {
   /// 解析 WebVTT 格式
   static List<SubtitleItem> parseVtt(String vttContent) {
     List<SubtitleItem> subtitles = [];
-    final String content = vttContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final String content =
+        _normalizeContent(vttContent).replaceAll('\r\n', '\n').replaceAll('\r', '\n');
     final List<String> lines = content.split('\n');
     
     int index = 0;
+    final RegExp timeReg = RegExp(
+      r'((\d{1,2}:)?\d{2}:\d{2}\.\d{1,3})\s*-->\s*((\d{1,2}:)?\d{2}:\d{2}\.\d{1,3})',
+    );
     while (index < lines.length) {
-      String line = lines[index].trim();
+      String line = lines[index].replaceAll('\uFEFF', '').trim();
       // Skip header or empty lines
       if (line.isEmpty || line == 'WEBVTT') {
         index++;
@@ -38,22 +163,25 @@ class SubtitleParser {
         timestampLine = line;
       } else if (index + 1 < lines.length && lines[index + 1].contains('-->')) {
         index++; // Skip ID line
-        timestampLine = lines[index].trim();
+        timestampLine = lines[index].replaceAll('\uFEFF', '').trim();
       }
       
       if (timestampLine != null && timestampLine.contains('-->')) {
-        var parts = timestampLine.split('-->');
-        if (parts.length == 2) {
-          Duration start = _parseVttDuration(parts[0].trim());
-          Duration end = _parseVttDuration(parts[1].trim());
+        final match = timeReg.firstMatch(timestampLine);
+        if (match != null) {
+          Duration start = _parseVttDuration(match.group(1)!.trim());
+          Duration end = _parseVttDuration(match.group(3)!.trim());
           
           index++;
           StringBuffer textBuffer = StringBuffer();
           while (index < lines.length) {
             String textLine = lines[index].trim();
             if (textLine.isEmpty) break;
-            if (textBuffer.isNotEmpty) textBuffer.write('\n');
-            textBuffer.write(textLine);
+            final cleaned = _stripStyleTokens(textLine);
+            if (cleaned.isNotEmpty) {
+              if (textBuffer.isNotEmpty) textBuffer.write('\n');
+              textBuffer.write(cleaned);
+            }
             index++;
           }
           
@@ -76,7 +204,8 @@ class SubtitleParser {
   /// 解析 ASS/SSA 格式
   static List<SubtitleItem> parseAss(String assContent) {
     List<SubtitleItem> subtitles = [];
-    final String content = assContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final String content =
+        _normalizeContent(assContent).replaceAll('\r\n', '\n').replaceAll('\r', '\n');
     final List<String> lines = content.split('\n');
     
     bool inEvents = false;
@@ -86,18 +215,18 @@ class SubtitleParser {
     int textIndex = -1;
     
     for (var line in lines) {
-      line = line.trim();
+      line = line.replaceAll('\uFEFF', '').trim();
       if (line.isEmpty) continue;
       
-      if (line.startsWith('[Events]')) {
+      if (line.toLowerCase().startsWith('[events]')) {
         inEvents = true;
         continue;
       }
       
       if (!inEvents) continue;
       
-      if (line.startsWith('Format:')) {
-        final formatStr = line.substring(7).trim();
+      if (line.toLowerCase().startsWith('format:')) {
+        final formatStr = line.substring(line.indexOf(':') + 1).trim();
         format = formatStr.split(',').map((e) => e.trim().toLowerCase()).toList();
         startIndex = format.indexOf('start');
         endIndex = format.indexOf('end');
@@ -105,7 +234,7 @@ class SubtitleParser {
         continue;
       }
       
-      if (line.startsWith('Dialogue:')) {
+      if (line.toLowerCase().startsWith('dialogue:')) {
         if (startIndex == -1 || endIndex == -1 || textIndex == -1) {
           // Fallback if no format line found (assume standard)
           // Standard: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -121,7 +250,7 @@ class SubtitleParser {
         // Dialogue: lines are comma separated, BUT the text part can contain commas.
         // We need to split by comma ONLY up to the text field.
         
-        final rawParts = line.substring(9).trim(); // Remove "Dialogue:"
+        final rawParts = line.substring(line.indexOf(':') + 1).trim();
         // We split by comma, but limit the number of splits to ensure Text is the last chunk?
         // No, Text is usually the last field, but technically could be anywhere defined by Format.
         // Usually Text is last.
@@ -182,12 +311,16 @@ class SubtitleParser {
   /// 解析 SRT 格式
   static List<SubtitleItem> parseSrt(String srtContent) {
     List<SubtitleItem> subtitles = [];
-    final String content = srtContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final String content =
+        _normalizeContent(srtContent).replaceAll('\r\n', '\n').replaceAll('\r', '\n');
     final List<String> lines = content.split('\n');
     
     int index = 0;
+    final RegExp timeReg = RegExp(
+      r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})',
+    );
     while (index < lines.length) {
-      String line = lines[index].trim();
+      String line = lines[index].replaceAll('\uFEFF', '').trim();
       if (line.isEmpty) {
         index++;
         continue;
@@ -201,18 +334,21 @@ class SubtitleParser {
       }
       
       if (line.contains('-->')) {
-        var parts = line.split('-->');
-        if (parts.length == 2) {
-          Duration start = _parseSrtDuration(parts[0].trim());
-          Duration end = _parseSrtDuration(parts[1].trim());
+        final match = timeReg.firstMatch(line);
+        if (match != null) {
+          Duration start = _parseSrtDuration(match.group(1)!.trim());
+          Duration end = _parseSrtDuration(match.group(2)!.trim());
           
           index++;
           StringBuffer textBuffer = StringBuffer();
           while (index < lines.length) {
             String textLine = lines[index].trim();
             if (textLine.isEmpty) break;
-            if (textBuffer.isNotEmpty) textBuffer.write('\n');
-            textBuffer.write(textLine);
+            final cleaned = _stripStyleTokens(textLine);
+            if (cleaned.isNotEmpty) {
+              if (textBuffer.isNotEmpty) textBuffer.write('\n');
+              textBuffer.write(cleaned);
+            }
             index++;
           }
           
@@ -236,7 +372,8 @@ class SubtitleParser {
   /// 格式: [mm:ss.xx]歌词内容
   static List<SubtitleItem> parseLrc(String lrcContent) {
     List<SubtitleItem> subtitles = [];
-    final String content = lrcContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final String content =
+        _normalizeContent(lrcContent).replaceAll('\r\n', '\n').replaceAll('\r', '\n');
     final List<String> lines = content.split('\n');
     
     // 正则匹配时间标签 [mm:ss.xx] 或 [mm:ss]
@@ -310,13 +447,18 @@ class SubtitleParser {
 
   static Duration _parseSrtDuration(String timestamp) {
     try {
-      var parts = timestamp.split(',');
+      final normalized = timestamp.replaceAll(',', '.');
+      var parts = normalized.split('.');
       var timeParts = parts[0].split(':');
       
       int hours = int.parse(timeParts[0]);
       int minutes = int.parse(timeParts[1]);
       int seconds = int.parse(timeParts[2]);
-      int milliseconds = parts.length > 1 ? int.parse(parts[1]) : 0;
+      int milliseconds = 0;
+      if (parts.length > 1) {
+        final msRaw = parts[1].padRight(3, '0');
+        milliseconds = int.parse(msRaw.substring(0, 3));
+      }
       
       return Duration(
         hours: hours,
@@ -347,7 +489,11 @@ class SubtitleParser {
         seconds = int.parse(timeParts[1]);
       }
       
-      int milliseconds = parts.length > 1 ? int.parse(parts[1]) : 0;
+      int milliseconds = 0;
+      if (parts.length > 1) {
+        final msRaw = parts[1].padRight(3, '0');
+        milliseconds = int.parse(msRaw.substring(0, 3));
+      }
       
       return Duration(
         hours: hours,

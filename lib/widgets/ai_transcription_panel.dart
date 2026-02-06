@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
@@ -9,12 +10,14 @@ class AiTranscriptionPanel extends StatefulWidget {
   final Function(String path) onCompleted;
 
   final String? videoId;
+  final VoidCallback? onBack;
 
   const AiTranscriptionPanel({
     super.key,
     required this.videoPath,
     required this.onCompleted,
     this.videoId,
+    this.onBack,
   });
 
   @override
@@ -84,136 +87,149 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
         final bool isBusyWithOther = manager.isProcessing && !isJobForThisVideo;
         final bool isProcessing = manager.isProcessing && isJobForThisVideo;
 
-        return Container(
-          padding: const EdgeInsets.all(16),
-          decoration: const BoxDecoration(
-            color: Color(0xFF1E1E1E),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Header
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text(
-                    "AI 智能字幕 (B接口)",
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
-                  ),
-                  if (isProcessing)
-                    const SizedBox(
-                      width: 20, 
-                      height: 20, 
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent)
+        return Focus(
+          autofocus: true,
+          onKeyEvent: (node, event) {
+            if (event is KeyRepeatEvent) return KeyEventResult.handled;
+            if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+              widget.onBack?.call();
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          },
+          child: Container(
+            padding: const EdgeInsets.all(16),
+            decoration: const BoxDecoration(
+              color: Color(0xFF1E1E1E),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.arrow_back, color: Colors.white),
+                      tooltip: "返回",
+                      onPressed: widget.onBack,
                     ),
-                ],
-              ),
-              const SizedBox(height: 20),
-
-              if (isBusyWithOther) ...[
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.withValues(alpha: 0.2),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
-                  ),
-                  child: Column(
-                    children: [
-                      const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 32),
-                      const SizedBox(height: 8),
-                      const Text(
-                        "后台正在转录另一个视频",
-                        style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold),
+                    const SizedBox(width: 4),
+                    const Expanded(
+                      child: Text(
+                        "AI 智能字幕 (B接口)",
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
                       ),
-                    ],
-                  ),
-                ),
-              ] else if (isProcessing) ...[
-                // Progress View
-                 Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.black26,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Column(
-                    children: [
-                      LinearProgressIndicator(
-                        value: manager.progress,
-                        backgroundColor: Colors.white10,
-                        valueColor: const AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                    ),
+                    if (isProcessing)
+                      const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
                       ),
-                      const SizedBox(height: 16),
-                      Text(
-                        manager.statusMessage,
-                        style: const TextStyle(color: Colors.white),
-                        textAlign: TextAlign.center,
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        "${(manager.progress * 100).toInt()}%",
-                        style: const TextStyle(color: Colors.white54, fontSize: 12),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                const Text(
-                  "转录将在后台进行，您可以关闭此面板继续观看视频。",
-                  style: TextStyle(color: Colors.white38, fontSize: 12),
-                  textAlign: TextAlign.center,
-                ),
-              ] else ...[
-                // Idle / Completed / Error View
-                const Text(
-                  "使用 Bilibili 接口进行云端语音转文字。\n支持中英文识别，速度快，准确率高。",
-                  style: TextStyle(color: Colors.white70),
+                  ],
                 ),
                 const SizedBox(height: 20),
-                
-                if (manager.status == TranscriptionStatus.error && isJobForThisVideo)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 20),
-                    child: Text(
-                      manager.statusMessage,
-                      style: const TextStyle(color: Colors.redAccent),
-                      textAlign: TextAlign.center,
+                if (isBusyWithOther) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.orange.withValues(alpha: 0.5)),
                     ),
-                  ),
-
-                if (manager.status == TranscriptionStatus.completed && isJobForThisVideo)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 20),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: const [
-                        Icon(Icons.check_circle, color: Colors.green),
-                        SizedBox(width: 8),
-                        Text(
-                          "转录完成！",
-                          style: TextStyle(color: Colors.green),
+                    child: Column(
+                      children: [
+                        const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 32),
+                        const SizedBox(height: 8),
+                        const Text(
+                          "后台正在转录另一个视频",
+                          style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold),
                         ),
                       ],
                     ),
                   ),
-
-                ElevatedButton.icon(
-                  onPressed: _startTranscription,
-                  icon: const Icon(Icons.auto_awesome),
-                  label: Text(manager.status == TranscriptionStatus.completed && isJobForThisVideo 
-                      ? "重新转录" 
-                      : "开始智能转录"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blue,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
+                ] else if (isProcessing) ...[
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.black26,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      children: [
+                        LinearProgressIndicator(
+                          value: manager.progress,
+                          backgroundColor: Colors.white10,
+                          valueColor: const AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          manager.statusMessage,
+                          style: const TextStyle(color: Colors.white),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          "${(manager.progress * 100).toInt()}%",
+                          style: const TextStyle(color: Colors.white54, fontSize: 12),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    "转录将在后台进行，您可以关闭此面板继续观看视频。",
+                    style: TextStyle(color: Colors.white38, fontSize: 12),
+                    textAlign: TextAlign.center,
+                  ),
+                ] else ...[
+                  const Text(
+                    "使用 Bilibili 接口进行云端语音转文字。\n支持中英文识别，速度快，准确率高。",
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                  const SizedBox(height: 20),
+                  if (manager.status == TranscriptionStatus.error && isJobForThisVideo)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 20),
+                      child: Text(
+                        manager.statusMessage,
+                        style: const TextStyle(color: Colors.redAccent),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  if (manager.status == TranscriptionStatus.completed && isJobForThisVideo)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 20),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: const [
+                          Icon(Icons.check_circle, color: Colors.green),
+                          SizedBox(width: 8),
+                          Text(
+                            "转录完成！",
+                            style: TextStyle(color: Colors.green),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ElevatedButton.icon(
+                    onPressed: _startTranscription,
+                    icon: const Icon(Icons.auto_awesome),
+                    label: Text(
+                      manager.status == TranscriptionStatus.completed && isJobForThisVideo
+                          ? "重新转录"
+                          : "开始智能转录",
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                    ),
+                  ),
+                ],
               ],
-            ],
+            ),
           ),
         );
       },

@@ -13,16 +13,13 @@ import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:cross_file/cross_file.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:fast_gbk/fast_gbk.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'dart:convert';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../services/embedded_subtitle_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
 import '../utils/subtitle_parser.dart';
-import '../utils/pgs_parser.dart';
 import '../utils/subtitle_converter.dart';
 import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
@@ -160,6 +157,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   bool _isLoadingEmbeddedSubtitle = false;
   String? _autoEmbeddedAttemptedForItemId;
   bool _embeddedSubtitleDetected = false;
+
+  bool _isImageSubtitleCodec(String codecName) {
+    final codec = codecName.toLowerCase();
+    return codec == 'hdmv_pgs_subtitle' ||
+        codec == 'dvd_subtitle' ||
+        codec == 'pgs' ||
+        codec == 'pgs_subtitle' ||
+        codec == 'vobsub' ||
+        codec == 'xsub';
+  }
   
   TranscriptionManager? _transcriptionManager;
   VideoItem? _currentItem;
@@ -474,10 +481,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   
   Future<void> _handleExit() async {
      try {
-       final settings = Provider.of<SettingsService>(context, listen: false);
-       await settings.updateSetting('landscapeSubtitleSidebarVisible', _isSubtitleSidebarVisible);
-       if (!_controllerAssigned) return;
-       final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+      await settings.updateSetting('landscapeSubtitleSidebarVisible', _isSubtitleSidebarVisible);
+      if (!_controllerAssigned) return;
        
        final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
        if (!shouldSkipAutoPause && settings.autoPauseOnExit && _controller.value.isPlaying) {
@@ -721,12 +728,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         // 加载字幕
         if (mounted) {
            debugPrint("Auto loading external subtitle: ${fileToLoad.path}");
+           final settings = Provider.of<SettingsService>(context, listen: false);
+           final library = Provider.of<LibraryService>(context, listen: false);
            await _loadSubtitles([fileToLoad.path]);
            
            // 更新媒体库记录（持久化）
            try {
-             final settings = Provider.of<SettingsService>(context, listen: false);
-             final library = Provider.of<LibraryService>(context, listen: false);
              if (_currentItem != null) {
                 library.updateVideoSubtitles(
                   _currentItem!.id,
@@ -784,8 +791,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         setState(() {
           _embeddedSubtitleDetected = true;
         });
-        // Use the first one
-        final track = tracks.first;
+        final EmbeddedSubtitleTrack track = tracks.firstWhere(
+          (t) => !_isImageSubtitleCodec(t.codecName),
+          orElse: () => tracks.first,
+        );
+        if (_isImageSubtitleCodec(track.codecName)) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+          return;
+        }
         
         // Prepare cache dir
         final appDocDir = await getApplicationDocumentsDirectory();
@@ -824,7 +841,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           if (!mounted) return;
 
           if (loadingShown) AppToast.dismiss();
-          AppToast.show("已加载内嵌字幕: ${track.title}", type: AppToastType.success);
+          final isImage = _isImageSubtitleCodec(track.codecName);
+          AppToast.show(
+            isImage ? "已加载内嵌图像字幕: ${track.title}" : "已加载内嵌字幕: ${track.title}",
+            type: AppToastType.success,
+          );
+          if (isImage) {
+            AppToast.show("图像字幕无法转为文本，将以位图渲染", type: AppToastType.info);
+          }
         } else if (mounted && extractedPath == null) {
           // Extraction failed
           if (loadingShown) AppToast.dismiss();
@@ -1949,7 +1973,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       if (!await file.exists()) return [];
 
       final length = await file.length();
-      if (length > 10 * 1024 * 1024) {
+      if (length > 100 * 1024 * 1024) {
          debugPrint("Subtitle file too large ($length bytes), skipping: $path");
          return [];
       }
@@ -1957,11 +1981,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       final ext = path.toLowerCase();
       List<SubtitleItem> parsed = [];
 
-      if (ext.endsWith('.sup')) {
-         parsed = await PgsParser.parse(path);
-      } else if (ext.endsWith('.idx')) {
-         final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.sup');
-         if (converted != null) parsed = await PgsParser.parse(converted);
+      if (ext.endsWith('.sup') || ext.endsWith('.idx')) {
+        if (mounted) {
+          AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+        }
+        return [];
       } else if (ext.endsWith('.scc')) {
          final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.srt');
          if (converted != null) return _parseSubtitleFile(converted);
@@ -1970,21 +1994,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.srt');
             if (converted != null) return _parseSubtitleFile(converted);
          } else {
-            final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.sup');
-            if (converted != null) parsed = await PgsParser.parse(converted);
+           if (mounted) {
+             AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+           }
+           return [];
          }
       } else {
         List<int> bytes = await file.readAsBytes();
-        String content = "";
-        try {
-          content = utf8.decode(bytes);
-        } catch (e) {
-          try {
-            content = gbk.decode(bytes);
-          } catch (e2) {
-            developer.log('Failed to decode', error: e2);
-          }
-        }
+        String content = SubtitleParser.decodeBytes(bytes);
         
         if (content.isNotEmpty) {
           final serialized = await compute(_parseTextSubtitlesToSerializable, content);
@@ -2883,9 +2900,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
            onSubtitlePreview: (path) async {
               await _loadSubtitles([path]);
            },
-           onOpenAi: () {
-             setState(() => _activeSidebar = SidebarType.aiTranscription);
-           },
+          onOpenAi: () {
+            setState(() {
+              _previousSidebarType = SidebarType.subtitleManager;
+              _activeSidebar = SidebarType.aiTranscription;
+            });
+          },
            onClose: () => setState(() => _activeSidebar = SidebarType.subtitles),
          );
 
@@ -2893,9 +2913,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
          String pathAi = _currentItem?.path ?? widget.videoFile?.path ?? "";
          if (pathAi.isEmpty) return null;
          
-         return AiTranscriptionPanel(
+        return AiTranscriptionPanel(
            videoPath: pathAi,
            videoId: _currentItem?.id,
+           onBack: () => setState(() {
+             if (_previousSidebarType != SidebarType.none) {
+               _activeSidebar = _previousSidebarType;
+             } else {
+               _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+             }
+             _previousSidebarType = SidebarType.none;
+           }),
            onCompleted: (srtPath) async {
               // 只负责UI刷新，数据持久化已由 TranscriptionManager 处理
               await _loadSubtitles([srtPath]);
@@ -2903,7 +2931,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
               if (mounted) {
                  AppToast.show("AI 字幕已加载", type: AppToastType.success);
               }
-              setState(() => _activeSidebar = SidebarType.subtitles);
+              setState(() {
+                _activeSidebar = SidebarType.subtitles;
+                _previousSidebarType = SidebarType.none;
+              });
            },
          );
 

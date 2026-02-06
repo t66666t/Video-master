@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:convert';
 import 'dart:developer' as developer;
-import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
@@ -18,6 +16,7 @@ import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_settings_sheet.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/subtitle_overlay.dart';
+import '../utils/subtitle_converter.dart';
 import '../utils/subtitle_parser.dart';
 import '../widgets/settings_panel.dart';
 import '../widgets/ai_transcription_panel.dart';
@@ -61,6 +60,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   List<int> _currentSubtitleIndices = [];
   List<int> _currentSecondarySubtitleIndices = [];
   List<SubtitleOverlayEntry> _currentSubtitleEntries = [];
+  final Map<int, Uint8List?> _currentSubtitleImages = <int, Uint8List?>{};
+  int _subtitleImageRequestId = 0;
   final List<int> _subtitleStartMs = <int>[];
   final List<int> _secondarySubtitleStartMs = <int>[];
   Timer? _subtitleSeekTimer;
@@ -97,6 +98,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   String? _autoEmbeddedAttemptedForItemId;
   bool _isLoadingEmbeddedSubtitle = false;
   bool _embeddedSubtitleDetected = false;
+
+  bool _isImageSubtitleCodec(String codecName) {
+    final codec = codecName.toLowerCase();
+    return codec == 'hdmv_pgs_subtitle' ||
+        codec == 'dvd_subtitle' ||
+        codec == 'pgs' ||
+        codec == 'pgs_subtitle' ||
+        codec == 'vobsub' ||
+        codec == 'xsub';
+  }
 
   @override
   void initState() {
@@ -194,6 +205,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           _currentSubtitleIndices = [];
           _currentSecondarySubtitleIndices = [];
           _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
           _autoEmbeddedAttemptedForItemId = null;
           _embeddedSubtitleDetected = false;
         });
@@ -230,6 +242,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           _currentSubtitleIndices = [];
           _currentSecondarySubtitleIndices = [];
           _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
         });
         _rebuildSubtitleIndex();
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -424,8 +437,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         setState(() {
           _embeddedSubtitleDetected = true;
         });
-        // Use the first one
-        final track = tracks.first;
+        final EmbeddedSubtitleTrack track = tracks.firstWhere(
+          (t) => !_isImageSubtitleCodec(t.codecName),
+          orElse: () => tracks.first,
+        );
+        if (_isImageSubtitleCodec(track.codecName)) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+          return;
+        }
         
         // Prepare cache dir
         final appDocDir = await getApplicationDocumentsDirectory();
@@ -470,7 +493,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           
           if (!mounted) return;
           if (loadingShown) AppToast.dismiss();
-          AppToast.show("已加载内嵌字幕: ${track.title}", type: AppToastType.success);
+          final isImage = _isImageSubtitleCodec(track.codecName);
+          AppToast.show(
+            isImage ? "已加载内嵌图像字幕: ${track.title}" : "已加载内嵌字幕: ${track.title}",
+            type: AppToastType.success,
+          );
+          if (isImage) {
+            AppToast.show("图像字幕无法转为文本，将以位图渲染", type: AppToastType.info);
+          }
         }
       } else {
         if (mounted) {
@@ -714,6 +744,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           _currentSubtitleIndices = [];
           _currentSecondarySubtitleIndices = [];
           _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
         });
       }
       return;
@@ -751,16 +782,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     if (primaryIndices.isNotEmpty) {
       for (final int index in primaryIndices) {
         final SubtitleItem item = _subtitles[index];
-        String text = item.text;
+        final Uint8List? image = _currentSubtitleImages[index];
+        final bool hasImage = item.imageLoader != null;
+        String text = hasImage ? "" : item.text;
         String? secondaryText;
 
-        if (_secondarySubtitles.isEmpty && settings.splitSubtitleByLine) {
+        if (!hasImage && _secondarySubtitles.isEmpty && settings.splitSubtitleByLine) {
           if (text.contains('\n')) {
             final lines = text.split('\n');
             text = lines[0];
             secondaryText = lines.sublist(1).join('\n');
           }
-        } else if (secondaryOverlapItems.isNotEmpty) {
+        } else if (!hasImage && secondaryOverlapItems.isNotEmpty) {
           SubtitleItem? best;
           int bestDelta = 1 << 30;
           for (final sec in secondaryOverlapItems) {
@@ -776,8 +809,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         entries.add(SubtitleOverlayEntry(
           index: index,
           text: text,
-          secondaryText: secondaryText,
-          image: null,
+          secondaryText: hasImage ? null : secondaryText,
+          image: image,
         ));
       }
     } else if (secondaryIndices.isNotEmpty) {
@@ -811,6 +844,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _currentSubtitleText = anchorEntry?.text ?? "";
       _currentSecondaryText = anchorEntry?.secondaryText;
     });
+
+    if (primaryIndices.isNotEmpty) {
+      _loadSubtitleImages(primaryIndices);
+    }
   }
 
   void _seekToSubtitleFast(Duration target) {
@@ -954,27 +991,39 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     Future<List<SubtitleItem>> parseFile(String path) async {
       try {
         final file = File(path);
-        if (await file.exists()) {
-           final length = await file.length();
-           if (length > 10 * 1024 * 1024) return [];
-  
-          List<int> bytes = await file.readAsBytes();
-          String content = "";
-          try {
-            content = utf8.decode(bytes);
-          } catch (e) {
-            try {
-              content = gbk.decode(bytes);
-            } catch (e2) {
-              debugPrint("Failed to decode: $e2");
-            }
+        if (!await file.exists()) return [];
+
+        final length = await file.length();
+        if (length > 100 * 1024 * 1024) {
+           debugPrint("Subtitle file too large ($length bytes), skipping: $path");
+           return [];
+        }
+
+        final ext = path.toLowerCase();
+        if (ext.endsWith('.sup') || ext.endsWith('.idx')) {
+           if (mounted) {
+             AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+           }
+           return [];
+        } else if (ext.endsWith('.sub')) {
+          if (await SubtitleConverter.isMicroDvdSub(path)) {
+            final converted = await SubtitleConverter.convert(inputPath: path, targetExtension: '.srt');
+            if (converted != null) return await parseFile(converted);
+            return [];
           }
-          
-          if (content.isNotEmpty) {
-            final parsed = SubtitleParser.parse(content);
-            parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
-            return parsed;
+          if (mounted) {
+            AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
           }
+          return [];
+        }
+
+        final bytes = await file.readAsBytes();
+        final content = SubtitleParser.decodeBytes(bytes);
+        
+        if (content.isNotEmpty) {
+          final parsed = SubtitleParser.parse(content);
+          parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+          return parsed;
         }
       } catch (e) {
         debugPrint("Error loading subtitle: $e");
@@ -1001,6 +1050,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       _currentSubtitleIndices = [];
       _currentSecondarySubtitleIndices = [];
       _currentSubtitleEntries = [];
+      _currentSubtitleImages.clear();
     });
     _rebuildSubtitleIndex();
     
@@ -1101,6 +1151,50 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       if (left.image != right.image) return false;
     }
     return true;
+  }
+
+  void _pruneSubtitleImages(Set<int> keepIndices) {
+    if (_currentSubtitleImages.isEmpty) return;
+    final keysToRemove = _currentSubtitleImages.keys.where((k) => !keepIndices.contains(k)).toList();
+    for (final key in keysToRemove) {
+      _currentSubtitleImages.remove(key);
+    }
+  }
+
+  void _loadSubtitleImages(List<int> indices) {
+    final Set<int> indexSet = indices.toSet();
+    _pruneSubtitleImages(indexSet);
+    if (indexSet.isEmpty) return;
+
+    final int requestId = ++_subtitleImageRequestId;
+    for (final int index in indexSet) {
+      final SubtitleItem item = _subtitles[index];
+      final imageLoader = item.imageLoader;
+      if (imageLoader == null) continue;
+      if (_currentSubtitleImages.containsKey(index)) continue;
+
+      imageLoader().then((image) {
+        if (!mounted) return;
+        if (requestId != _subtitleImageRequestId) return;
+        if (!indexSet.contains(index)) return;
+
+        setState(() {
+          _currentSubtitleImages[index] = image;
+          _currentSubtitleEntries = _currentSubtitleEntries
+              .map(
+                (entry) => entry.index == index
+                    ? SubtitleOverlayEntry(
+                        index: entry.index,
+                        text: entry.text,
+                        secondaryText: entry.secondaryText,
+                        image: image,
+                      )
+                    : entry,
+              )
+              .toList();
+        });
+      });
+    }
   }
 
   @override
@@ -1309,6 +1403,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         _currentSubtitleIndices = [];
         _currentSecondarySubtitleIndices = [];
         _currentSubtitleEntries = [];
+        _currentSubtitleImages.clear();
       });
       playbackService.clearSubtitleState();
     }
@@ -1730,11 +1825,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                   ),
                                 // Visible Subtitles
                                 if (_initialized && settings.showSubtitles)
-                                  Align(
-                                    alignment: settings.subtitleAlignment,
-                                    child: SubtitleOverlay(
-                                      text: _currentSubtitleText,
-                                      secondaryText: _currentSecondaryText,
+                                  Positioned.fill(
+                                    child: SubtitleOverlayGroup(
+                                      entries: _currentSubtitleEntries,
+                                      alignment: settings.subtitleAlignment,
                                       style: _isAudio ? settings.audioSubtitleStylePortrait : settings.subtitleStylePortrait,
                                       isDragging: _isSubtitleDragMode,
                                       isVisualOnly: false,
@@ -1813,9 +1907,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                         alignment: settings.subtitleAlignment,
                                         child: GestureDetector(
                                           onPanUpdate: (details) => _updateSubtitlePosition(details, constraints),
-                                          child: SubtitleOverlay(
-                                            text: _currentSubtitleText,
-                                            secondaryText: _currentSecondaryText,
+                                          child: SubtitleOverlayGroup(
+                                            entries: _currentSubtitleEntries,
+                                            alignment: settings.subtitleAlignment,
                                             style: _isAudio ? settings.audioSubtitleStylePortrait : settings.subtitleStylePortrait,
                                             isDragging: true,
                                             isGestureOnly: true,
@@ -1889,7 +1983,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                             fit: StackFit.expand,
                             children: <Widget>[
                               ...previousChildren,
-                              if (currentChild != null) currentChild,
+                              ...? (currentChild == null ? null : <Widget>[currentChild]),
                             ],
                           );
                         },
@@ -1992,6 +2086,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       case PortraitPanel.ai:
         return AiTranscriptionPanel(
           videoPath: _currentItem.path,
+          onBack: () => setState(() => _activePanel = PortraitPanel.subtitles),
           onCompleted: (path) async {
             final settingsService = Provider.of<SettingsService>(context, listen: false);
             final libraryService = Provider.of<LibraryService>(context, listen: false);

@@ -1,7 +1,16 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import '../models/subtitle_model.dart';
+
+class PgsRenderParams {
+  final PgsPcs pcs;
+  final PgsPds pds;
+  final PgsOds ods;
+
+  PgsRenderParams(this.pcs, this.pds, this.ods);
+}
 
 class PgsParser {
   static Future<List<SubtitleItem>> parse(String path) async {
@@ -14,10 +23,11 @@ class PgsParser {
 
     List<SubtitleItem> subtitles = [];
     
-    // Temporary storage for current display set
-    PgsPds? currentPds;
-    PgsOds? currentOds;
     PgsPcs? currentPcs;
+    PgsPds? lastPds;
+    final Map<int, PgsPds> paletteById = <int, PgsPds>{};
+    final Map<int, PgsOds> objectById = <int, PgsOds>{};
+    final Map<int, _PgsOdsAccumulator> odsAccumulators = <int, _PgsOdsAccumulator>{};
     
     // We need to keep track of the active palette and objects across segments if needed
     // But typically in a simple parser we process Display Sets.
@@ -56,10 +66,34 @@ class PgsParser {
       // Process Segment
       switch (type) {
         case 0x14: // PDS - Palette Definition Segment
-          currentPds = PgsPds.parse(segmentByteData);
+          final pds = PgsPds.parse(segmentByteData);
+          paletteById[pds.id] = pds;
+          lastPds = pds;
           break;
         case 0x15: // ODS - Object Definition Segment
-          currentOds = PgsOds.parse(segmentByteData);
+          final segment = _parseOdsSegment(segmentByteData);
+          if (segment != null) {
+            if ((segment.sequenceFlag & 0x80) != 0) {
+              odsAccumulators[segment.id] = _PgsOdsAccumulator(
+                id: segment.id,
+                version: segment.version,
+                width: segment.width ?? 0,
+                height: segment.height ?? 0,
+                dataLength: segment.dataLength,
+              );
+            }
+            final accumulator = odsAccumulators[segment.id];
+            if (accumulator != null) {
+              accumulator.add(segment.data);
+              if ((segment.sequenceFlag & 0x40) != 0) {
+                final ods = accumulator.build();
+                if (ods != null) {
+                  objectById[segment.id] = ods;
+                }
+                odsAccumulators.remove(segment.id);
+              }
+            }
+          }
           break;
         case 0x16: // PCS - Presentation Composition Segment
           currentPcs = PgsPcs.parse(segmentByteData, pts);
@@ -87,49 +121,35 @@ class PgsParser {
             
             // Only if we have an object to show
             if (currentPcs.objects.isNotEmpty) {
-               // We need a valid ODS and PDS. 
-               // In a robust parser, we'd store them in a cache (id -> object).
-               // For simplicity, we assume one object per set or use the last seen.
-               final capturedPds = currentPds;
-               final capturedOds = currentOds;
-               final capturedPcs = currentPcs;
-               
-               if (capturedPds != null && capturedOds != null) {
-                 final startTime = Duration(milliseconds: (capturedPcs.pts / 90).round());
-                 // End time is usually defined by the next PCS or explicit cleanup.
-                 // We will set a default duration or update it later.
-                 // PGS doesn't always have explicit duration in one segment.
-                 // Often the next PCS clears the screen.
-                 
-                 // If the PCS has 0 objects, it clears the screen.
-                 
-                 // Let's create an item.
-                 subtitles.add(SubtitleItem(
-                   index: subtitles.length + 1,
-                   startTime: startTime,
-                   endTime: startTime + const Duration(seconds: 2), // Default, fixup later
-                   imageLoader: () async {
-                     return _renderSubtitle(capturedPcs, capturedPds, capturedOds);
-                   },
-                 ));
-               }
+              final capturedPcs = currentPcs;
+              final obj = capturedPcs.objects.first;
+              final capturedOds = objectById[obj.objectId];
+              final capturedPds = paletteById[capturedPcs.paletteId] ?? lastPds;
+              if (capturedPds != null && capturedOds != null) {
+                final startTime = Duration(milliseconds: (capturedPcs.pts / 90).round());
+                subtitles.add(SubtitleItem(
+                  index: subtitles.length + 1,
+                  startTime: startTime,
+                  endTime: startTime + const Duration(seconds: 2),
+                  imageLoader: () async {
+                    return compute(_renderSubtitleCompute, PgsRenderParams(capturedPcs, capturedPds, capturedOds));
+                  },
+                ));
+              }
             } else {
               // PCS with 0 objects -> Clear screen.
               // We can use this to set the endTime of the previous subtitle.
                final clearTime = Duration(milliseconds: (currentPcs.pts / 90).round());
                if (subtitles.isNotEmpty) {
                  final last = subtitles.last;
-                 if (last.endTime > clearTime) { // If default was too long
-                    // We can't modify the object in the list easily if it's final fields, 
-                    // but SubtitleItem fields are final.
-                    // We'll replace it.
-                    subtitles[subtitles.length - 1] = SubtitleItem(
-                      index: last.index,
-                      startTime: last.startTime,
-                      endTime: clearTime,
-                      text: last.text,
-                      imageLoader: last.imageLoader,
-                    );
+                 if (last.endTime == last.startTime + const Duration(seconds: 2)) {
+                   subtitles[subtitles.length - 1] = SubtitleItem(
+                     index: last.index,
+                     startTime: last.startTime,
+                     endTime: clearTime,
+                     text: last.text,
+                     imageLoader: last.imageLoader,
+                   );
                  }
                }
             }
@@ -145,7 +165,8 @@ class PgsParser {
       offset = nextSegmentOffset;
     }
     
-    // Fixup overlapping or default durations
+    // Sort and fix durations
+    subtitles.sort((a, b) => a.startTime.compareTo(b.startTime));
     for (int i = 0; i < subtitles.length - 1; i++) {
       if (subtitles[i].endTime > subtitles[i+1].startTime) {
         subtitles[i] = SubtitleItem(
@@ -161,6 +182,38 @@ class PgsParser {
     return subtitles;
   }
 
+  static Future<Uint8List?> _renderSubtitleCompute(PgsRenderParams params) async {
+    return _renderSubtitle(params.pcs, params.pds, params.ods);
+  }
+
+  static _PgsOdsSegment? _parseOdsSegment(ByteData data) {
+    if (data.lengthInBytes < 7) return null;
+    final id = data.getUint16(0);
+    final version = data.getUint8(2);
+    final sequenceFlag = data.getUint8(3);
+    final dataLength = (data.getUint8(4) << 16) | (data.getUint8(5) << 8) | data.getUint8(6);
+    int offset = 7;
+    int? width;
+    int? height;
+    if ((sequenceFlag & 0x80) != 0) {
+      if (data.lengthInBytes < 11) return null;
+      width = data.getUint16(7);
+      height = data.getUint16(9);
+      offset = 11;
+    }
+    if (offset > data.lengthInBytes) return null;
+    final part = data.buffer.asUint8List(data.offsetInBytes + offset, data.lengthInBytes - offset);
+    return _PgsOdsSegment(
+      id: id,
+      version: version,
+      sequenceFlag: sequenceFlag,
+      dataLength: dataLength,
+      width: width,
+      height: height,
+      data: part,
+    );
+  }
+
   static Future<Uint8List?> _renderSubtitle(PgsPcs pcs, PgsPds pds, PgsOds ods) async {
     // 1. Decode RLE to indices
     final width = ods.width;
@@ -172,9 +225,26 @@ class PgsParser {
       return null;
     }
 
-    // 2. Map indices to colors (ARGB)
-    // 3. Create BMP
-    return _createBmp(indices, width, height, pds.palette);
+    final frameWidth = pcs.width > 0 ? pcs.width : width;
+    final frameHeight = pcs.height > 0 ? pcs.height : height;
+    final canvas = Uint8List(frameWidth * frameHeight);
+    final PgsCompositionObject? obj = pcs.objects.isNotEmpty ? pcs.objects.first : null;
+    final offsetX = obj?.x ?? 0;
+    final offsetY = obj?.y ?? 0;
+    for (int y = 0; y < height; y++) {
+      final int destY = y + offsetY;
+      if (destY < 0 || destY >= frameHeight) continue;
+      final int srcRow = y * width;
+      for (int x = 0; x < width; x++) {
+        final int destX = x + offsetX;
+        if (destX < 0 || destX >= frameWidth) continue;
+        final int index = indices[srcRow + x];
+        if (index == 0) continue;
+        canvas[destY * frameWidth + destX] = index;
+      }
+    }
+
+    return _createBmp(canvas, frameWidth, frameHeight, pds.palette);
   }
   
   static Uint8List _decodeRle(Uint8List rle, int width, int height) {
@@ -283,6 +353,61 @@ class PgsParser {
   }
 }
 
+class _PgsOdsSegment {
+  final int id;
+  final int version;
+  final int sequenceFlag;
+  final int dataLength;
+  final int? width;
+  final int? height;
+  final Uint8List data;
+
+  _PgsOdsSegment({
+    required this.id,
+    required this.version,
+    required this.sequenceFlag,
+    required this.dataLength,
+    required this.width,
+    required this.height,
+    required this.data,
+  });
+}
+
+class _PgsOdsAccumulator {
+  final int id;
+  final int version;
+  final int width;
+  final int height;
+  final int dataLength;
+  final BytesBuilder _builder = BytesBuilder(copy: false);
+
+  _PgsOdsAccumulator({
+    required this.id,
+    required this.version,
+    required this.width,
+    required this.height,
+    required this.dataLength,
+  });
+
+  void add(Uint8List data) {
+    _builder.add(data);
+  }
+
+  PgsOds? build() {
+    if (width <= 0 || height <= 0) return null;
+    final bytes = _builder.takeBytes();
+    final int size = dataLength > 0 && dataLength <= bytes.length ? dataLength : bytes.length;
+    if (size <= 0) return null;
+    return PgsOds(
+      id: id,
+      version: version,
+      width: width,
+      height: height,
+      rleData: Uint8List.fromList(bytes.sublist(0, size)),
+    );
+  }
+}
+
 class PgsPcs {
   final int pts;
   final int width;
@@ -290,6 +415,7 @@ class PgsPcs {
   final int frameRate;
   final int compositionNumber;
   final CompositionState state;
+  final int paletteId;
   final List<PgsCompositionObject> objects;
 
   PgsPcs({
@@ -299,6 +425,7 @@ class PgsPcs {
     required this.frameRate,
     required this.compositionNumber,
     required this.state,
+    required this.paletteId,
     required this.objects,
   });
 
@@ -318,6 +445,7 @@ class PgsPcs {
     final compositionNumber = data.getUint16(5);
     final stateRaw = data.getUint8(7);
     final state = CompositionState.values.firstWhere((e) => e.index == (stateRaw >> 6), orElse: () => CompositionState.normal);
+    final paletteId = data.getUint8(9);
     
     final count = data.getUint8(10);
     final objects = <PgsCompositionObject>[];
@@ -348,6 +476,7 @@ class PgsPcs {
       frameRate: frameRate,
       compositionNumber: compositionNumber,
       state: state,
+      paletteId: paletteId,
       objects: objects,
     );
   }

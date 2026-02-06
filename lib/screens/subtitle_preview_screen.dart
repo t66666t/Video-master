@@ -1,7 +1,5 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:fast_gbk/fast_gbk.dart';
-import 'dart:convert';
 import '../utils/subtitle_parser.dart';
 import '../models/subtitle_model.dart';
 
@@ -33,15 +31,9 @@ class _SubtitlePreviewScreenState extends State<SubtitlePreviewScreen> {
       }
 
       List<int> bytes = await file.readAsBytes();
-      String content = "";
-      try {
-        content = utf8.decode(bytes);
-      } catch (e) {
-        try {
-          content = gbk.decode(bytes);
-        } catch (e2) {
-          throw Exception("Decoding failed");
-        }
+      String content = SubtitleParser.decodeBytes(bytes);
+      if (content.isEmpty) {
+        throw Exception("Decoding failed");
       }
 
       final parsed = SubtitleParser.parse(content);

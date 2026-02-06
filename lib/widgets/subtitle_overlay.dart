@@ -179,32 +179,33 @@ class SubtitleOverlay extends StatelessWidget {
           scale: isDragging ? 1.05 : 1.0,
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOutBack,
-          child: RepaintBoundary( // Cache rendering
-            child: Container(
-              padding: EdgeInsets.symmetric(horizontal: 12 * scale, vertical: 6 * scale),
-              decoration: BoxDecoration(
-                color: (image != null && !isDragging) 
-                    ? Colors.transparent // No background for images unless dragging
-                    : effectiveStyle.backgroundColor.withValues(alpha: effectiveStyle.backgroundOpacity),
-                borderRadius: BorderRadius.circular(8 * scale),
-                border: isDragging ? Border.all(color: Colors.greenAccent, width: 2 * scale) : null,
-              ),
-              child: image != null 
-                  ? Image.memory(
+          child: RepaintBoundary(
+            child: image != null
+                ? SizedBox(
+                    width: constraints.maxWidth,
+                    height: constraints.maxHeight,
+                    child: Image.memory(
                       image!,
                       gaplessPlayback: true,
-                    )
-                  : (effectiveStyle.hasBorder 
-                      ? Stack(
-                          children: [
-                            // Border (Stroke)
-                            _buildContent(displayText, effectiveStyle, isStroke: true),
-                            // Main Text
-                            _buildContent(displayText, effectiveStyle, isStroke: false),
-                          ],
-                        )
-                      : _buildContent(displayText, effectiveStyle, isStroke: false)),
-            ),
+                      fit: BoxFit.contain,
+                    ),
+                  )
+                : Container(
+                    padding: EdgeInsets.symmetric(horizontal: 12 * scale, vertical: 6 * scale),
+                    decoration: BoxDecoration(
+                      color: effectiveStyle.backgroundColor.withValues(alpha: effectiveStyle.backgroundOpacity),
+                      borderRadius: BorderRadius.circular(8 * scale),
+                      border: isDragging ? Border.all(color: Colors.greenAccent, width: 2 * scale) : null,
+                    ),
+                    child: effectiveStyle.hasBorder
+                        ? Stack(
+                            children: [
+                              _buildContent(displayText, effectiveStyle, isStroke: true),
+                              _buildContent(displayText, effectiveStyle, isStroke: false),
+                            ],
+                          )
+                        : _buildContent(displayText, effectiveStyle, isStroke: false),
+                  ),
           ),
         );
         

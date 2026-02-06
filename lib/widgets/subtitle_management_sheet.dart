@@ -47,6 +47,16 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
   final Map<int, String> _extractedTrackPaths = {}; // Map track index to extracted path
 
+  bool _isImageSubtitleCodec(String codecName) {
+    final codec = codecName.toLowerCase();
+    return codec == 'hdmv_pgs_subtitle' ||
+        codec == 'dvd_subtitle' ||
+        codec == 'pgs' ||
+        codec == 'pgs_subtitle' ||
+        codec == 'vobsub' ||
+        codec == 'xsub';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -279,6 +289,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
              _extractedTrackPaths[track.index] = path;
              
              AppToast.show("内嵌字幕提取成功", type: AppToastType.success);
+             if (_isImageSubtitleCodec(track.codecName)) {
+               AppToast.show("图像字幕无法转为文本，将以位图显示", type: AppToastType.info);
+             }
 
             _handleSelection(path);
           }
@@ -767,6 +780,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                           }),
                         ],
                         ..._embeddedTracks.map((track) {
+                           final isImage = _isImageSubtitleCodec(track.codecName);
                            return Container(
                             margin: const EdgeInsets.only(bottom: 4),
                             decoration: BoxDecoration(
@@ -786,7 +800,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                 style: const TextStyle(color: Colors.white, fontSize: 13),
                               ),
                               subtitle: Text(
-                                "${track.language} • ${track.codecName}",
+                                "${track.language} • ${track.codecName}${isImage ? " • 图像字幕" : ""}",
                                 style: const TextStyle(color: Colors.white30, fontSize: 11),
                               ),
                               trailing: Row(

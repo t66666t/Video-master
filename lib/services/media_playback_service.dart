@@ -1,8 +1,6 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
-import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -821,16 +819,7 @@ class MediaPlaybackService extends ChangeNotifier {
         }
       } else {
         List<int> bytes = await file.readAsBytes();
-        String content = "";
-        try {
-          content = utf8.decode(bytes);
-        } catch (e) {
-          try {
-            content = gbk.decode(bytes);
-          } catch (e2) {
-            developer.log('Failed to decode', error: e2);
-          }
-        }
+        String content = SubtitleParser.decodeBytes(bytes);
 
         if (content.isNotEmpty) {
           final serialized = await compute(_parseTextSubtitlesToSerializable, content);
