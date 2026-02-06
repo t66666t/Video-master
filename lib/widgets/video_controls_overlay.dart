@@ -11,6 +11,7 @@ import 'package:volume_controller/volume_controller.dart';
 import '../models/subtitle_style.dart';
 import '../models/subtitle_model.dart';
 import '../widgets/subtitle_overlay.dart';
+import '../services/media_playback_service.dart';
 import '../services/settings_service.dart';
 import '../services/video_preview_service.dart';
 
@@ -188,7 +189,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
        }
      });
      // Start auto-hide timer since controls are initially visible
-     _startAutoHideTimer();
+    _startAutoHideTimer();
    }
 
    @override
@@ -298,14 +299,37 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       } else if (key == LogicalKeyboardKey.arrowRight) {
         _isRightArrowPressed = false;
         _handleKeyRelease(() {
-          // Right Arrow Tap -> Fast Forward
-          _seekRelative(widget.doubleTapSeekSeconds);
+          if (Platform.isWindows) {
+            final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+            final settings = Provider.of<SettingsService>(context, listen: false);
+            playbackService.handleExternalDoubleTapSeek(
+              isLeft: false,
+              doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
+              enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
+              subtitleOffset: settings.subtitleOffset,
+            );
+          } else {
+            _seekRelative(widget.doubleTapSeekSeconds);
+          }
         });
       } else if (key == LogicalKeyboardKey.arrowLeft) {
         _isLeftArrowPressed = false;
         // Left Arrow Tap -> Rewind
         // Left Long press doesn't have a timer start, so it will always be treated as tap here
-        _seekRelative(-widget.doubleTapSeekSeconds);
+        _handleKeyRelease(() {
+          if (Platform.isWindows) {
+            final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+            final settings = Provider.of<SettingsService>(context, listen: false);
+            playbackService.handleExternalDoubleTapSeek(
+              isLeft: true,
+              doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
+              enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
+              subtitleOffset: settings.subtitleOffset,
+            );
+          } else {
+            _seekRelative(-widget.doubleTapSeekSeconds);
+          }
+        });
       }
       return KeyEventResult.handled;
     }

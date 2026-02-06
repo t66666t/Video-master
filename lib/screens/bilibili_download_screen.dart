@@ -25,6 +25,9 @@ class BilibiliDownloadScreen extends StatefulWidget {
 
 class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   final TextEditingController _inputController = TextEditingController();
+  int? _previousImageCacheMaxSize;
+  int? _previousImageCacheMaxBytes;
+  final FocusNode _shortcutFocusNode = FocusNode(debugLabel: 'BilibiliDownloadShortcutFocus');
   
   // Dialog helpers need access to API service, which is now in BilibiliDownloadService
 
@@ -35,15 +38,6 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     double thumbnailWidth = 44,
     double thumbnailHeight = 28,
   }) {
-    String processedUrl = thumbnailUrl;
-    // 优化：针对 Bilibili 图片使用 CDN 缩放参数，并指定 cacheWidth/cacheHeight 以减少内存占用
-    if (thumbnailUrl.isNotEmpty && !thumbnailUrl.contains('@') && 
-       (thumbnailUrl.contains('hdslb.com') || thumbnailUrl.contains('bilivideo.com'))) {
-        final w = (thumbnailWidth * 2).toInt();
-        final h = (thumbnailHeight * 2).toInt();
-        processedUrl = "$thumbnailUrl@${w}w_${h}h_1c.webp";
-    }
-
     return SizedBox(
       width: 56,
       child: Column(
@@ -57,25 +51,72 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
           if (thumbnailUrl.isNotEmpty)
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
-              child: Image.network(
-                processedUrl,
+              child: _buildNetworkThumbnail(
+                url: thumbnailUrl,
                 width: thumbnailWidth,
                 height: thumbnailHeight,
-                fit: BoxFit.cover,
-                cacheWidth: (thumbnailWidth * 2).toInt(),
-                cacheHeight: (thumbnailHeight * 2).toInt(),
-                errorBuilder: (context, error, stackTrace) =>
-                    Container(width: thumbnailWidth, height: thumbnailHeight, color: Colors.grey),
               ),
             ),
         ],
       ),
     );
   }
+
+  Widget _buildNetworkThumbnail({
+    required String url,
+    required double width,
+    required double height,
+  }) {
+    if (url.isEmpty) {
+      return Container(width: width, height: height, color: Colors.grey);
+    }
+    final media = MediaQuery.of(context);
+    final dpr = media.devicePixelRatio;
+    final scale = dpr <= 1.0 ? 1.0 : (dpr >= 1.25 ? 1.25 : dpr);
+    int cacheWidth = (width * scale).round();
+    int cacheHeight = (height * scale).round();
+    String processedUrl = url;
+    if (!url.contains('@') && (url.contains('hdslb.com') || url.contains('bilivideo.com'))) {
+      processedUrl = "$url@${cacheWidth}w_${cacheHeight}h_1c.webp";
+    }
+    final provider = ResizeImage(
+      NetworkImage(processedUrl),
+      width: cacheWidth,
+      height: cacheHeight,
+      allowUpscaling: false,
+    );
+    return Image(
+      image: provider,
+      width: width,
+      height: height,
+      fit: BoxFit.cover,
+      filterQuality: FilterQuality.low,
+      gaplessPlayback: true,
+      loadingBuilder: (context, child, loadingProgress) {
+        if (loadingProgress == null) return child;
+        return Container(width: width, height: height, color: Colors.grey);
+      },
+      errorBuilder: (context, error, stackTrace) {
+        return Container(width: width, height: height, color: Colors.grey);
+      },
+    );
+  }
   
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final cache = PaintingBinding.instance.imageCache;
+      _previousImageCacheMaxSize = cache.maximumSize;
+      _previousImageCacheMaxBytes = cache.maximumSizeBytes;
+      cache.maximumSize = 120;
+      cache.maximumSizeBytes = 20 * 1024 * 1024;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (Platform.isWindows && mounted) {
+        _shortcutFocusNode.requestFocus();
+      }
+    });
     if (widget.initialInput != null) {
       _inputController.text = widget.initialInput!;
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -92,6 +133,30 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
          service.libraryService = Provider.of<LibraryService>(context, listen: false);
       });
     }
+  }
+
+  KeyEventResult _handleEscKeyEvent(KeyEvent event) {
+    if (!Platform.isWindows) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+      Navigator.of(context).maybePop();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  void dispose() {
+    final cache = PaintingBinding.instance.imageCache;
+    if (_previousImageCacheMaxSize != null) {
+      cache.maximumSize = _previousImageCacheMaxSize!;
+    }
+    if (_previousImageCacheMaxBytes != null) {
+      cache.maximumSizeBytes = _previousImageCacheMaxBytes!;
+    }
+    _shortcutFocusNode.dispose();
+    _inputController.dispose();
+    super.dispose();
   }
 
   Future<void> _showCookieDialog(BilibiliDownloadService service) async {
@@ -381,29 +446,40 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
   @override
   Widget build(BuildContext context) {
     final service = Provider.of<BilibiliDownloadService>(context, listen: false);
-    return GestureDetector(
-      onTap: () => FocusScope.of(context).unfocus(), // Dismiss keyboard on tap outside
-      child: Builder(
-        builder: (context) {
-          final media = MediaQuery.of(context);
+    return Focus(
+      focusNode: _shortcutFocusNode,
+      autofocus: Platform.isWindows,
+      onKeyEvent: (node, event) => _handleEscKeyEvent(event),
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+            _shortcutFocusNode.requestFocus();
+          }
+        },
+        child: GestureDetector(
+          onTap: () => FocusScope.of(context).unfocus(),
+          child: Builder(
+            builder: (context) {
+              final media = MediaQuery.of(context);
           final isCompactAppBar = media.orientation == Orientation.portrait && media.size.width < 600;
           final double appBarIconSize = isCompactAppBar ? 20 : 24;
           final double appBarButtonSize = isCompactAppBar ? 36 : 40;
           final EdgeInsets appBarIconPadding = EdgeInsets.zero;
           final BoxConstraints appBarIconConstraints = BoxConstraints.tightFor(width: appBarButtonSize, height: appBarButtonSize);
 
-          return Scaffold(
-            backgroundColor: const Color(0xFF121212),
-            appBar: AppBar(
-              titleSpacing: isCompactAppBar ? 8 : null,
-              title: Text(
-                "BBDown 下载",
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
-              ),
-              backgroundColor: const Color(0xFF1E1E1E),
-              actions: [
+              return Scaffold(
+                backgroundColor: const Color(0xFF121212),
+                appBar: AppBar(
+                  titleSpacing: isCompactAppBar ? 8 : null,
+                  title: Text(
+                    "BBDown 下载",
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
+                  ),
+                  backgroundColor: const Color(0xFF1E1E1E),
+                  actions: [
                 IconButton(
                   icon: Icon(Icons.select_all, size: appBarIconSize),
                   tooltip: "全选",
@@ -434,8 +510,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                 ),
               ],
             ),
-            body: Column(
-              children: [
+                body: Column(
+                  children: [
                 Container(
                   padding: const EdgeInsets.all(12),
                   color: const Color(0xFF1E1E1E),
@@ -567,20 +643,22 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                     },
                   ),
                 ),
-              ],
-            ),
-            bottomNavigationBar: Consumer<BilibiliDownloadService>(
-              builder: (context, service, _) {
-                final selectedCount = service.tasks
-                    .expand((t) => t.videos)
-                    .expand((v) => v.episodes)
-                    .where((e) => e.isSelected)
-                    .length;
-                return selectedCount > 0 ? _buildBottomBar(service) : const SizedBox.shrink();
-              },
-            ),
-          );
-        },
+                  ],
+                ),
+                bottomNavigationBar: Consumer<BilibiliDownloadService>(
+                  builder: (context, service, _) {
+                    final selectedCount = service.tasks
+                        .expand((t) => t.videos)
+                        .expand((v) => v.episodes)
+                        .where((e) => e.isSelected)
+                        .length;
+                    return selectedCount > 0 ? _buildBottomBar(service) : const SizedBox.shrink();
+                  },
+                ),
+              );
+            },
+          ),
+        ),
       ),
     );
   }
@@ -633,24 +711,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                    ),
                    ClipRRect(
                       borderRadius: BorderRadius.circular(4),
-                      child: Builder(
-                        builder: (context) {
-                          String coverUrl = task.cover;
-                          if (coverUrl.isNotEmpty && !coverUrl.contains('@') && 
-                             (coverUrl.contains('hdslb.com') || coverUrl.contains('bilivideo.com'))) {
-                              coverUrl = "$coverUrl@160w_100h_1c.webp";
-                          }
-                          return Image.network(
-                            coverUrl,
-                            width: 80,
-                            height: 50,
-                            fit: BoxFit.cover,
-                            cacheWidth: 160,
-                            cacheHeight: 100,
-                            errorBuilder: (context, error, stackTrace) =>
-                                Container(width: 80, height: 50, color: Colors.grey),
-                          );
-                        }
+                      child: _buildNetworkThumbnail(
+                        url: task.cover,
+                        width: 80,
+                        height: 50,
                       ),
                    ),
                    const SizedBox(width: 12),
@@ -717,15 +781,14 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
        child: Column(
          children: [
-            Row(
-              children: [
-                 Expanded(child: Container()), 
-                 if (hasInfo || ep.status == DownloadStatus.completed)
-                    Flexible(
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        mainAxisAlignment: MainAxisAlignment.end,
-                        children: [
+           Row(
+             children: [
+                if (hasInfo || ep.status == DownloadStatus.completed)
+                   Expanded(
+                     child: Row(
+                       mainAxisSize: MainAxisSize.max,
+                       mainAxisAlignment: MainAxisAlignment.start,
+                       children: [
                           // Quality
                           Flexible(
                             flex: 3,

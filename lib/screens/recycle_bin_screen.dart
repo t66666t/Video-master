@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
@@ -99,6 +100,7 @@ class _SizeDisplayState extends State<SizeDisplay> {
 class _RecycleBinScreenState extends State<RecycleBinScreen> {
   final Set<String> _selectedIds = {};
   bool _isSelectionMode = false;
+  final FocusNode _shortcutFocusNode = FocusNode(debugLabel: 'RecycleBinShortcutFocus');
 
   void _navigateToFolderDetail(BuildContext context, VideoCollection collection) {
     Navigator.of(context).push(
@@ -109,12 +111,56 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Consumer<LibraryService>(
-      builder: (context, library, child) {
-        final bin = library.getRecycleBinContents();
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (Platform.isWindows && mounted) {
+        _shortcutFocusNode.requestFocus();
+      }
+    });
+  }
 
-        return Scaffold(
+  @override
+  void dispose() {
+    _shortcutFocusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleEscKeyEvent(KeyEvent event) {
+    if (!Platform.isWindows) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+      if (_isSelectionMode) {
+        setState(() {
+          _isSelectionMode = false;
+          _selectedIds.clear();
+        });
+      } else {
+        Navigator.of(context).maybePop();
+      }
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: _shortcutFocusNode,
+      autofocus: Platform.isWindows,
+      onKeyEvent: (node, event) => _handleEscKeyEvent(event),
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+            _shortcutFocusNode.requestFocus();
+          }
+        },
+        child: Consumer<LibraryService>(
+          builder: (context, library, child) {
+            final bin = library.getRecycleBinContents();
+
+            return Scaffold(
           appBar: AppBar(
             title: _isSelectionMode 
               ? Text("已选择 ${_selectedIds.length} 项") 
@@ -311,108 +357,164 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
                 ),
               )
             : null,
-        );
-      },
+            );
+          },
+        ),
+      ),
     );
   }
 }
 
-class RecycledFolderDetailScreen extends StatelessWidget {
+class RecycledFolderDetailScreen extends StatefulWidget {
   final VideoCollection collection;
 
   const RecycledFolderDetailScreen({super.key, required this.collection});
 
   @override
+  State<RecycledFolderDetailScreen> createState() => _RecycledFolderDetailScreenState();
+}
+
+class _RecycledFolderDetailScreenState extends State<RecycledFolderDetailScreen> {
+  final FocusNode _shortcutFocusNode = FocusNode(debugLabel: 'RecycleBinDetailShortcutFocus');
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (Platform.isWindows && mounted) {
+        _shortcutFocusNode.requestFocus();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _shortcutFocusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleEscKeyEvent(KeyEvent event) {
+    if (!Platform.isWindows) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+      Navigator.of(context).maybePop();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return Consumer<LibraryService>(
-      builder: (context, library, child) {
-        // Use standard getContents because items inside are NOT marked as recycled
-        final contents = library.getContents(collection.id);
+    return Focus(
+      focusNode: _shortcutFocusNode,
+      autofocus: Platform.isWindows,
+      onKeyEvent: (node, event) => _handleEscKeyEvent(event),
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+            _shortcutFocusNode.requestFocus();
+          }
+        },
+        child: Consumer<LibraryService>(
+          builder: (context, library, child) {
+            final contents = library.getContents(widget.collection.id);
 
-        return Scaffold(
-          appBar: AppBar(
-            title: Text(collection.name),
-            backgroundColor: const Color(0xFF1E1E1E),
-          ),
-          body: Column(
-            children: [
-              // Info Banner
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(12),
-                color: Colors.orange.withValues(alpha: 0.1),
-                child: Row(
-                  children: [
-                    const Icon(Icons.info_outline, color: Colors.orange, size: 20),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        "您正在查看已删除文件夹的内容。\n若要操作这些项目，请先还原该文件夹。",
-                        style: TextStyle(color: Colors.orange[300], fontSize: 13),
-                      ),
+            return Scaffold(
+              appBar: AppBar(
+                title: Text(widget.collection.name),
+                backgroundColor: const Color(0xFF1E1E1E),
+              ),
+              body: Column(
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    color: Colors.orange.withValues(alpha: 0.1),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.info_outline, color: Colors.orange, size: 20),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            "您正在查看已删除文件夹的内容。\n若要操作这些项目，请先还原该文件夹。",
+                            style: TextStyle(color: Colors.orange[300], fontSize: 13),
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: contents.isEmpty
-                    ? const Center(
-                        child: Text("文件夹为空", style: TextStyle(color: Colors.white54)),
-                      )
-                    : ListView.builder(
-                        padding: const EdgeInsets.all(16),
-                        itemCount: contents.length,
-                        itemBuilder: (context, index) {
-                          final item = contents[index];
-                          final String name = item is VideoCollection ? item.name : (item as VideoItem).title;
-                          final bool isFolder = item is VideoCollection;
+                  ),
+                  Expanded(
+                    child: contents.isEmpty
+                        ? const Center(
+                            child: Text("文件夹为空", style: TextStyle(color: Colors.white54)),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.all(16),
+                            itemCount: contents.length,
+                            itemBuilder: (context, index) {
+                              final item = contents[index];
+                              final String name = item is VideoCollection ? item.name : (item as VideoItem).title;
+                              final bool isFolder = item is VideoCollection;
 
-                          return Card(
-                            color: const Color(0xFF2C2C2C).withValues(alpha: 0.5), // Dimmed
-                            margin: const EdgeInsets.only(bottom: 8),
-                            child: ListTile(
-                              leading: Icon(
-                                isFolder ? Icons.folder : Icons.movie, 
-                                color: (isFolder ? Colors.amber : Colors.blue).withValues(alpha: 0.5)
-                              ),
-                              title: Text(
-                                name, 
-                                style: TextStyle(color: Colors.white.withValues(alpha: 0.7))
-                              ),
-                              subtitle: Row(
-                                children: [
-                                  if (isFolder)
-                                    Expanded(
-                                      child: Text(
-                                        "${item.childrenIds.length} 个项目",
-                                        style: const TextStyle(color: Colors.white38, fontSize: 12),
-                                      ),
-                                    )
-                                  else
-                                    const Spacer(),
-                                  SizeDisplay(item: item, library: library),
-                                ],
-                              ),
-                              onTap: () {
-                                if (isFolder) {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (context) => RecycledFolderDetailScreen(collection: item),
-                                    ),
-                                  );
-                                } else {
-                                  _openRecycleBinVideo(context, item as VideoItem);
-                                }
-                              },
-                            ),
-                          );
-                        },
-                      ),
+                              return Card(
+                                color: const Color(0xFF2C2C2C).withValues(alpha: 0.5),
+                                margin: const EdgeInsets.only(bottom: 8),
+                                child: ListTile(
+                                  leading: Icon(
+                                    isFolder ? Icons.folder : Icons.movie,
+                                    color: (isFolder ? Colors.amber : Colors.blue).withValues(alpha: 0.5),
+                                  ),
+                                  title: Text(
+                                    name,
+                                    style: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
+                                  ),
+                                  subtitle: Row(
+                                    children: [
+                                      if (isFolder)
+                                        Expanded(
+                                          child: Text(
+                                            "${item.childrenIds.length} 个项目",
+                                            style: const TextStyle(color: Colors.white38, fontSize: 12),
+                                          ),
+                                        )
+                                      else
+                                        Expanded(
+                                          child: SingleChildScrollView(
+                                            scrollDirection: Axis.horizontal,
+                                            child: Text(
+                                              (item as VideoItem).path,
+                                              style: const TextStyle(color: Colors.white38, fontSize: 12),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.visible,
+                                            ),
+                                          ),
+                                        ),
+                                      SizeDisplay(item: item, library: library),
+                                    ],
+                                  ),
+                                  onTap: () {
+                                    if (isFolder) {
+                                      Navigator.of(context).push(
+                                        MaterialPageRoute(
+                                          builder: (context) => RecycledFolderDetailScreen(collection: item),
+                                        ),
+                                      );
+                                    } else {
+                                      _openRecycleBinVideo(context, item as VideoItem);
+                                    }
+                                  },
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
               ),
-            ],
-          ),
-        );
-      },
+            );
+          },
+        ),
+      ),
     );
   }
 }

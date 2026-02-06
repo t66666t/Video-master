@@ -24,7 +24,7 @@ class BilibiliDownloadService extends ChangeNotifier {
   // State
   List<BilibiliDownloadTask> tasks = [];
   int maxConcurrentDownloads = 1;
-  int preferredQuality = 80;
+  int preferredQuality = 116;
   String preferredSubtitleLang = "zh";
   bool preferAiSubtitles = false;
   bool autoImportToLibrary = true;
@@ -50,7 +50,7 @@ class BilibiliDownloadService extends ChangeNotifier {
   Future<void> _loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
     maxConcurrentDownloads = prefs.getInt('bilibili_max_concurrent') ?? 1;
-    preferredQuality = prefs.getInt('bilibili_preferred_quality') ?? 80;
+    preferredQuality = prefs.getInt('bilibili_preferred_quality') ?? 116;
     preferredSubtitleLang = prefs.getString('bilibili_preferred_subtitle_lang') ?? "zh";
     preferAiSubtitles = prefs.getBool('bilibili_prefer_ai_subtitles') ?? false;
     autoImportToLibrary = prefs.getBool('bilibili_auto_import') ?? true;
@@ -900,8 +900,53 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   // --- Management ---
 
+  void _evictThumbnailUrl(String url) {
+    if (url.isEmpty) return;
+    final imageCache = PaintingBinding.instance.imageCache;
+    imageCache.evict(NetworkImage(url));
+    if (!url.contains('@') && (url.contains('hdslb.com') || url.contains('bilivideo.com'))) {
+      final sizes = <List<int>>[
+        [80, 50],
+        [44, 28],
+        [40, 26],
+      ];
+      final scales = <double>[1.0, 1.25];
+      for (final size in sizes) {
+        for (final scale in scales) {
+          final w = (size[0] * scale).round();
+          final h = (size[1] * scale).round();
+          final processedUrl = "$url@${w}w_${h}h_1c.webp";
+          imageCache.evict(NetworkImage(processedUrl));
+        }
+      }
+    }
+  }
+
+  void _evictTaskThumbnails(BilibiliDownloadTask task) {
+    _evictThumbnailUrl(task.cover);
+    for (var video in task.videos) {
+      _evictThumbnailUrl(video.videoInfo.pic);
+    }
+  }
+
   void removeSelected() async {
     final selectedEpisodes = _getSelectedEpisodes();
+    final tasksToEvict = <BilibiliDownloadTask>{};
+    for (var ep in selectedEpisodes) {
+      BilibiliDownloadTask? task;
+      for (var t in tasks) {
+        if (t.videos.any((v) => v.episodes.contains(ep))) {
+          task = t;
+          break;
+        }
+      }
+      if (task != null) {
+        tasksToEvict.add(task);
+      }
+    }
+    for (var task in tasksToEvict) {
+      _evictTaskThumbnails(task);
+    }
     
     // Stop any downloading episodes first
     for (var ep in selectedEpisodes) {
@@ -946,6 +991,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           ep.cancelToken?.cancel("Task deleted");
           ep.status = DownloadStatus.failed;
        }
+       _evictTaskThumbnails(task);
        if (_downloadQueue.contains(ep)) {
           _downloadQueue.remove(ep);
        }
@@ -973,6 +1019,9 @@ class BilibiliDownloadService extends ChangeNotifier {
   }
 
   void deleteAllTasks() async {
+    for (var task in tasks) {
+      _evictTaskThumbnails(task);
+    }
     // 1. Clear Queue and Cancel All Active
     _downloadQueue.clear();
     

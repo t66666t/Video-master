@@ -159,6 +159,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   // Embedded subtitle loading state
   bool _isLoadingEmbeddedSubtitle = false;
   String? _autoEmbeddedAttemptedForItemId;
+  bool _embeddedSubtitleDetected = false;
   
   TranscriptionManager? _transcriptionManager;
   VideoItem? _currentItem;
@@ -210,6 +211,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       _lastGhostModeEnabled = settings.isGhostModeEnabled;
       settings.addListener(_onSettingsChanged);
       _onSettingsChanged();
+    });
+
+    // 自动跟随字幕开启时，进入横屏后自动定位
+    // 等待转场动画完成 (约300ms)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      if (settings.autoScrollSubtitles) {
+        Future.delayed(const Duration(milliseconds: 400), () {
+          if (mounted) {
+            _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
+          }
+        });
+      }
     });
   }
 
@@ -289,7 +304,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     if (currentItem == null) return;
     final settings = _settingsService ?? Provider.of<SettingsService>(context, listen: false);
     if (!force && !_shouldLoadSubtitlesNow(settings)) return;
-    if (_isParsingSubtitles) return;
+    if (_isParsingSubtitles && !force) return;
     if (_currentSubtitlePaths.isNotEmpty) return;
 
     if (currentItem.subtitlePath != null) {
@@ -367,6 +382,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         _autoEmbeddedAttemptedForItemId = null;
         _subtitleCache.clear();
         _isParsingSubtitles = false;
+        _embeddedSubtitleDetected = false;
         _subtitleParseRequestId++;
         _userRequestedSubtitles = false;
         // 重置控制器相关状态，让 _initVideo 重新设置
@@ -483,8 +499,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
     _settingsService?.removeListener(_onSettingsChanged);
-    // Restore orientations to default (allow all)
-    SystemChrome.setPreferredOrientations([]);
+    if (widget.existingController == null) {
+      SystemChrome.setPreferredOrientations([]);
+    }
     _restoreSystemUIMode();
 
     _selectionFocusNode.dispose();
@@ -641,6 +658,88 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     }
   }
 
+  // --- Auto Load External Subtitles (Windows) ---
+  Future<void> _tryLoadFirstExternalSubtitle() async {
+    // 简单的重试机制，因为Windows下文件扫描可能稍有延迟
+    int attempts = 0;
+    const maxAttempts = 3;
+    
+    while (attempts < maxAttempts) {
+       if (!mounted) return;
+       // 如果用户在重试期间已经手动加载了字幕，则停止
+       if (_subtitles.isNotEmpty) return; 
+       
+       bool found = await _scanAndLoadExternalSubtitle();
+       if (found) return;
+       
+       attempts++;
+       if (attempts < maxAttempts) {
+         // 间隔一定时间重试
+         await Future.delayed(const Duration(milliseconds: 1500));
+       }
+    }
+  }
+
+  Future<bool> _scanAndLoadExternalSubtitle() async {
+      final path = _currentItem?.path ?? widget.videoFile?.path;
+      if (path == null) return false;
+      
+      try {
+        final videoFile = File(path);
+        final dir = videoFile.parent;
+        if (!await dir.exists()) return false;
+        
+        final videoName = p.basenameWithoutExtension(path);
+        final extractedPrefix = "$videoName.stream_";
+        
+        // 扫描目录
+        final files = dir.listSync(); 
+        
+        // 筛选字幕文件
+        final subtitleFiles = files.whereType<File>().where((file) {
+          final name = p.basename(file.path);
+          // 必须以视频文件名开头
+          if (!name.startsWith(videoName)) return false;
+          // 排除提取的流文件
+          if (name.startsWith(extractedPrefix)) return false;
+          final ext = p.extension(file.path).toLowerCase();
+          return ['.srt', '.vtt', '.ass', '.ssa', '.sup', '.lrc', '.sub', '.idx', '.scc'].contains(ext);
+        }).toList();
+        
+        if (subtitleFiles.isEmpty) return false;
+        
+        // 按修改时间降序排序（与字幕管理区一致），取最新的一个
+        subtitleFiles.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+        
+        final fileToLoad = subtitleFiles.first;
+        
+        // 加载字幕
+        if (mounted) {
+           debugPrint("Auto loading external subtitle: ${fileToLoad.path}");
+           await _loadSubtitles([fileToLoad.path]);
+           
+           // 更新媒体库记录（持久化）
+           try {
+             final settings = Provider.of<SettingsService>(context, listen: false);
+             final library = Provider.of<LibraryService>(context, listen: false);
+             if (_currentItem != null) {
+                library.updateVideoSubtitles(
+                  _currentItem!.id,
+                  fileToLoad.path,
+                  settings.autoCacheSubtitles,
+                  isSecondaryCached: settings.autoCacheSubtitles
+                );
+             }
+           } catch (_) {}
+           
+           return true;
+        }
+      } catch (e) {
+        debugPrint("Error scanning external subtitles: $e");
+      }
+      return false;
+  }
+
   // --- Auto Load Embedded Subtitles ---
   Future<void> _checkAndLoadEmbeddedSubtitle({bool showLoadingIndicator = true}) async {
     // If we already have subtitles loaded (e.g. from file), don't override
@@ -677,6 +776,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       final tracks = await service.getEmbeddedSubtitles(path);
       
       if (tracks.isNotEmpty && mounted && _subtitles.isEmpty) {
+        setState(() {
+          _embeddedSubtitleDetected = true;
+        });
         // Use the first one
         final track = tracks.first;
         
@@ -725,11 +827,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         }
       } else if (mounted && tracks.isEmpty) {
         // No embedded subtitles found
+        if (_embeddedSubtitleDetected) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+        }
         if (loadingShown) AppToast.dismiss();
+
+        // Windows端：如果没有内嵌字幕，尝试自动加载本地文件夹中的第一个外挂字幕
+        if (Platform.isWindows && _subtitles.isEmpty) {
+          _tryLoadFirstExternalSubtitle();
+        }
       }
     } catch (e) {
       debugPrint("Auto load embedded subtitle failed: $e");
       if (loadingShown) AppToast.dismiss();
+      if (_embeddedSubtitleDetected && mounted) {
+        setState(() {
+          _embeddedSubtitleDetected = false;
+        });
+      }
       if (mounted) AppToast.show("内嵌字幕检测失败", type: AppToastType.error);
     } finally {
       _isLoadingEmbeddedSubtitle = false;
@@ -1383,6 +1500,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         ));
       }
     }
+    
 
     final int anchorPrimaryIndex = primaryIndices.isNotEmpty ? primaryIndices.first : -1;
     final int anchorSecondaryIndex = secondaryIndices.isNotEmpty ? secondaryIndices.first : -1;
@@ -1553,7 +1671,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       return;
     }
 
-    if (_isParsingSubtitles) return;
     if (mounted) {
       setState(() {
         _isParsingSubtitles = true;
@@ -1881,8 +1998,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       
       if (parsed.isNotEmpty) {
         parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+        _subtitleCache[path] = parsed;
+      } else {
+        _subtitleCache.remove(path);
       }
-      _subtitleCache[path] = parsed;
       return parsed;
     } catch (e) {
       developer.log('Load sub error', error: e);
@@ -1995,7 +2114,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   Future<void> _handleBackRequest() async {
     final navigator = Navigator.of(context);
     if (_forceExit) {
-      SystemChrome.setPreferredOrientations([]);
+      if (widget.existingController == null) {
+        SystemChrome.setPreferredOrientations([]);
+      }
       if (mounted) navigator.pop();
       return;
     }
@@ -2034,7 +2155,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
     await _handleExit();
     if (!mounted) return;
-    SystemChrome.setPreferredOrientations([]);
+    // 移除此处对 setPreferredOrientations 的调用
+    // 让 dispose 方法在页面销毁时（动画结束后）恢复方向，避免先旋转后动画的视觉突变
     navigator.pop();
   }
 
@@ -2317,6 +2439,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                   ),
                           ),
 
+                          if (_initialized && _activeSidebar == SidebarType.subtitleStyle)
+                            Positioned.fill(
+                              child: GestureDetector(
+                                behavior: HitTestBehavior.translucent,
+                                onDoubleTap: _isLocked ? null : _togglePlay,
+                              ),
+                            ),
+
                           // 2. Controls Layer
                           if (_initialized && !_isSubtitleDragMode && !_isGhostDragMode)
                             RepaintBoundary(
@@ -2525,6 +2655,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           isPortrait: false,
           focusNode: _videoFocusNode, // Pass focus node
           isVisible: _isSubtitleSidebarVisible && _activeSidebar == SidebarType.subtitles,
+          showEmbeddedLoadingMessage: _embeddedSubtitleDetected &&
+              _isLoadingEmbeddedSubtitle &&
+              _subtitles.isEmpty &&
+              _secondarySubtitles.isEmpty,
         );
 
       case SidebarType.subtitleStyle:

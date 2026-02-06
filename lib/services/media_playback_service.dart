@@ -79,6 +79,9 @@ class MediaPlaybackService extends ChangeNotifier {
   int _seekRequestId = 0;
   bool? _lastControllerIsPlaying;
   bool _wakelockApplied = false;
+  Timer? _externalSeekResetTimer;
+  int _externalSubtitleSeekAccumulator = 0;
+  Duration? _externalInitialSeekPosition;
 
   // 是否启用自动播放下一集（横屏播放页可以禁用）
   bool _autoPlayNextEnabled = true;
@@ -621,6 +624,140 @@ class MediaPlaybackService extends ChangeNotifier {
       
       await play(previousItem, autoPlay: autoPlay);
     }
+  }
+
+  int _binarySearchFirstStartGT(int posMs) {
+    if (_subtitles.isEmpty) return 0;
+    if (_subtitleStartMs.length != _subtitles.length) {
+      _subtitleStartMs
+        ..clear()
+        ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
+    }
+    int low = 0;
+    int high = _subtitleStartMs.length - 1;
+    int ans = _subtitleStartMs.length;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (_subtitleStartMs[mid] > posMs) {
+        ans = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return ans;
+  }
+
+  int _findCurrentSubtitleIndexByPositionMs(int posMs) {
+    if (_subtitles.isEmpty) return -1;
+    if (_subtitleStartMs.length != _subtitles.length) {
+      _subtitleStartMs
+        ..clear()
+        ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
+    }
+    int low = 0;
+    int high = _subtitleStartMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (_subtitleStartMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    if (ans < 0 || ans >= _subtitles.length) return -1;
+    final int endMs = (ans + 1 < _subtitles.length)
+        ? _subtitleStartMs[ans + 1]
+        : _subtitles[ans].endTime.inMilliseconds;
+    if (posMs <= endMs) return ans;
+    return -1;
+  }
+
+  void handleExternalDoubleTapSeek({
+    required bool isLeft,
+    required int doubleTapSeekSeconds,
+    required bool enableDoubleTapSubtitleSeek,
+    required Duration subtitleOffset,
+  }) {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (_state == PlaybackState.idle || _state == PlaybackState.error) return;
+
+    final currentPos = controller.value.position;
+    final duration = controller.value.duration;
+    Duration target = Duration.zero;
+
+    if (enableDoubleTapSubtitleSeek && _subtitles.isNotEmpty) {
+      if (_externalSeekResetTimer?.isActive ?? false) {
+        _externalSeekResetTimer?.cancel();
+      } else {
+        _externalSubtitleSeekAccumulator = 0;
+        _externalInitialSeekPosition = currentPos - subtitleOffset;
+      }
+
+      if (isLeft) {
+        _externalSubtitleSeekAccumulator--;
+      } else {
+        _externalSubtitleSeekAccumulator++;
+      }
+
+      final int initialPosMs = _externalInitialSeekPosition!.inMilliseconds;
+      int nextSubIndex = _binarySearchFirstStartGT(initialPosMs);
+      if (nextSubIndex < 0) nextSubIndex = 0;
+      if (nextSubIndex > _subtitles.length) nextSubIndex = _subtitles.length;
+
+      final int currentSubIndex = _findCurrentSubtitleIndexByPositionMs(initialPosMs);
+      int pivotIndex;
+      bool isAtStartOfSub = false;
+
+      if (currentSubIndex != -1) {
+        pivotIndex = currentSubIndex;
+        if (initialPosMs < _subtitles[currentSubIndex].startTime.inMilliseconds + 500) {
+          isAtStartOfSub = true;
+        }
+      } else {
+        pivotIndex = nextSubIndex - 1;
+      }
+
+      int targetIndex;
+      if (_externalSubtitleSeekAccumulator < 0) {
+        int jumps = _externalSubtitleSeekAccumulator.abs();
+        if (currentSubIndex != -1 && !isAtStartOfSub) {
+          jumps--;
+          targetIndex = currentSubIndex;
+        } else {
+          targetIndex = pivotIndex;
+        }
+        targetIndex -= jumps;
+      } else {
+        targetIndex = pivotIndex + _externalSubtitleSeekAccumulator;
+      }
+
+      if (targetIndex < 0) {
+        target = Duration.zero;
+      } else if (targetIndex >= _subtitles.length) {
+        target = duration;
+      } else {
+        target = _subtitles[targetIndex].startTime + subtitleOffset;
+      }
+
+      _externalSeekResetTimer = Timer(const Duration(milliseconds: 2000), () {
+        _externalSubtitleSeekAccumulator = 0;
+        _externalInitialSeekPosition = null;
+      });
+    } else {
+      if (isLeft) {
+        target = currentPos - Duration(seconds: doubleTapSeekSeconds);
+      } else {
+        target = currentPos + Duration(seconds: doubleTapSeekSeconds);
+      }
+    }
+
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > duration) target = duration;
+    seekTo(target);
   }
   
   /// 控制器更新监听器（用于处理播放状态变化）

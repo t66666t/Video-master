@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
@@ -31,6 +32,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
   late ScrollController _videoController;
   late ScrollController _subtitleController;
   late ScrollController _actionController;
+  final FocusNode _shortcutFocusNode = FocusNode(debugLabel: 'BatchImportShortcutFocus');
 
   @override
   void initState() {
@@ -39,6 +41,11 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     _videoController = _controllers.addAndGet();
     _subtitleController = _controllers.addAndGet();
     _actionController = _controllers.addAndGet();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (Platform.isWindows && mounted) {
+        _shortcutFocusNode.requestFocus();
+      }
+    });
   }
 
   @override
@@ -46,7 +53,18 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     _videoController.dispose();
     _subtitleController.dispose();
     _actionController.dispose();
+    _shortcutFocusNode.dispose();
     super.dispose();
+  }
+
+  KeyEventResult _handleEscKeyEvent(KeyEvent event) {
+    if (!Platform.isWindows) return KeyEventResult.ignored;
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+      Navigator.of(context).maybePop();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   Future<void> _pickVideos() async {
@@ -372,28 +390,39 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
 
     final maxLen = max(videoItems.length, subtitleItems.length);
 
-    return Scaffold(
-      backgroundColor: const Color(0xFF121212),
-      appBar: AppBar(
-        title: const Text("批量导入媒体及对应字幕", style: TextStyle(fontSize: 15)),
-        centerTitle: false,
-        backgroundColor: const Color(0xFF1E1E1E),
-        foregroundColor: Colors.white,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.remove),
-            onPressed: () => batch.setFontSize(max(10.0, fontSize - 2)),
+    return Focus(
+      focusNode: _shortcutFocusNode,
+      autofocus: Platform.isWindows,
+      onKeyEvent: (node, event) => _handleEscKeyEvent(event),
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: (_) {
+          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+            _shortcutFocusNode.requestFocus();
+          }
+        },
+        child: Scaffold(
+          backgroundColor: const Color(0xFF121212),
+          appBar: AppBar(
+            title: const Text("批量导入媒体及对应字幕", style: TextStyle(fontSize: 15)),
+            centerTitle: false,
+            backgroundColor: const Color(0xFF1E1E1E),
+            foregroundColor: Colors.white,
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.remove),
+                onPressed: () => batch.setFontSize(max(10.0, fontSize - 2)),
+              ),
+              Center(child: Text("${fontSize.toInt()}", style: const TextStyle(fontSize: 16))),
+              IconButton(
+                icon: const Icon(Icons.add),
+                onPressed: () => batch.setFontSize(min(30.0, fontSize + 2)),
+              ),
+              const SizedBox(width: 16),
+            ],
           ),
-          Center(child: Text("${fontSize.toInt()}", style: const TextStyle(fontSize: 16))),
-          IconButton(
-            icon: const Icon(Icons.add),
-            onPressed: () => batch.setFontSize(min(30.0, fontSize + 2)),
-          ),
-          const SizedBox(width: 16),
-        ],
-      ),
-      body: Column(
-        children: [
+          body: Column(
+            children: [
           // Top Buttons
           Padding(
             padding: const EdgeInsets.all(8.0),
@@ -654,7 +683,9 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
               ],
             ),
           ),
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }

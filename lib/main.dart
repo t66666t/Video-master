@@ -166,6 +166,41 @@ void main() async {
   );
 }
 
+class RestartWidget extends StatefulWidget {
+  final Widget child;
+
+  const RestartWidget({super.key, required this.child});
+
+  static void restartApp(BuildContext context) {
+    context.findAncestorStateOfType<_RestartWidgetState>()?.restartApp();
+  }
+
+  @override
+  State<RestartWidget> createState() => _RestartWidgetState();
+}
+
+class _RestartWidgetState extends State<RestartWidget> {
+  Key key = UniqueKey();
+
+  void restartApp() {
+    setState(() {
+      key = UniqueKey();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return KeyedSubtree(
+      key: key,
+      child: widget.child,
+    );
+  }
+}
+
+class RefreshAppIntent extends Intent {
+  const RefreshAppIntent();
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -179,39 +214,48 @@ class MyApp extends StatelessWidget {
     final labelFontWeight = isIOS ? FontWeight.w500 : FontWeight.w300;
     final baseTextTheme = ThemeData.dark(useMaterial3: true).textTheme;
 
-    return Shortcuts(
-      shortcuts: <LogicalKeySet, Intent>{
-        LogicalKeySet(LogicalKeyboardKey.f11): const ToggleFullScreenIntent(),
-        LogicalKeySet(LogicalKeyboardKey.escape): const ExitFullScreenIntent(),
-        LogicalKeySet(LogicalKeyboardKey.space): const VideoPlayPauseIntent(),
-      },
-      child: Actions(
-        actions: <Type, Action<Intent>>{
-          ToggleFullScreenIntent: CallbackAction<ToggleFullScreenIntent>(
-            onInvoke: (intent) => Provider.of<SettingsService>(context, listen: false).toggleFullScreen(),
-          ),
-          ExitFullScreenIntent: CallbackAction<ExitFullScreenIntent>(
-            onInvoke: (intent) {
-              final settings = Provider.of<SettingsService>(context, listen: false);
-              if (settings.isFullScreen) {
-                settings.toggleFullScreen();
-              }
-              return null;
-            },
-          ),
-          VideoPlayPauseIntent: CallbackAction<VideoPlayPauseIntent>(
-            onInvoke: (intent) {
-              // This is a fallback. Real logic is in VideoControlsOverlay.
-              // We only need this if focus is completely lost.
-              return null;
-            },
-          ),
+    return RestartWidget(
+      child: Shortcuts(
+        shortcuts: <LogicalKeySet, Intent>{
+          LogicalKeySet(LogicalKeyboardKey.f11): const ToggleFullScreenIntent(),
+          LogicalKeySet(LogicalKeyboardKey.escape): const ExitFullScreenIntent(),
+          LogicalKeySet(LogicalKeyboardKey.space): const VideoPlayPauseIntent(),
+          LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyR): const RefreshAppIntent(),
         },
-        child: MaterialApp(
+        child: Actions(
+          actions: <Type, Action<Intent>>{
+            ToggleFullScreenIntent: CallbackAction<ToggleFullScreenIntent>(
+              onInvoke: (intent) => Provider.of<SettingsService>(context, listen: false).toggleFullScreen(),
+            ),
+            ExitFullScreenIntent: CallbackAction<ExitFullScreenIntent>(
+              onInvoke: (intent) {
+                final settings = Provider.of<SettingsService>(context, listen: false);
+                if (settings.isFullScreen) {
+                  settings.toggleFullScreen();
+                }
+                return null;
+              },
+            ),
+            VideoPlayPauseIntent: CallbackAction<VideoPlayPauseIntent>(
+              onInvoke: (intent) {
+                // This is a fallback. Real logic is in VideoControlsOverlay.
+                // We only need this if focus is completely lost.
+                return null;
+              },
+            ),
+            RefreshAppIntent: CallbackAction<RefreshAppIntent>(
+              onInvoke: (intent) {
+                RestartWidget.restartApp(context);
+                AppToast.show("正在刷新应用...", type: AppToastType.info);
+                return null;
+              },
+            ),
+          },
+          child: MaterialApp(
           title: 'Custom Video Player',
           debugShowCheckedModeBanner: false,
           navigatorKey: AppToast.navigatorKey,
-          navigatorObservers: [AppToast.observer],
+          navigatorObservers: [AppToast.observer, AppToast.routeObserver],
           theme: ThemeData(
             brightness: Brightness.dark,
             primarySwatch: Colors.blue,
@@ -250,6 +294,7 @@ class MyApp extends StatelessWidget {
           ),
           home: const HomeScreen(),
         ),
+      ),
       ),
     );
   }

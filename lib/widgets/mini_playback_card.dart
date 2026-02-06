@@ -469,12 +469,19 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
           
           // 进度文字说明
           Padding(
-            padding: const EdgeInsets.only(left: 12.0, right: 12.0, top: 2.0),
-            child: Text(
-              '${_formatDuration(position)} / ${_formatDuration(duration)}',
-              style: const TextStyle(
-                color: Colors.white54,
-                fontSize: 10.0,
+            padding: const EdgeInsets.only(left: 8.0, right: 8.0),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                '${_formatDuration(position)} / ${_formatDuration(duration)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white54,
+                  fontSize: 9.0,
+                  height: 1.0,
+                ),
               ),
             ),
           ),

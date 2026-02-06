@@ -43,6 +43,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   int? _extractingTrackIndex; 
   List<String> _selectedPaths = []; // Track selected items
   String? _customDownloadPath;
+  String _defaultDownloadPath = "用户/下载";
 
   final Map<int, String> _extractedTrackPaths = {}; // Map track index to extracted path
 
@@ -51,7 +52,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     super.initState();
     _selectedPaths = List.from(widget.initialSelectedPaths);
     _loadSubtitles();
+    _initDefaultPath();
     _loadCustomDownloadPath();
+  }
+
+  void _initDefaultPath() {
+    if (Platform.isWindows) {
+      try {
+        final exeDir = p.dirname(Platform.resolvedExecutable);
+        _defaultDownloadPath = p.join(exeDir, 'Downloads');
+      } catch (e) {
+        // Fallback
+      }
+    }
   }
 
   Future<void> _loadCustomDownloadPath() async {
@@ -338,7 +351,15 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       final dir = await getExternalStorageDirectory();
       if (dir != null) return dir;
     }
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+    if (Platform.isWindows) {
+      final exeDir = p.dirname(Platform.resolvedExecutable);
+      final downloadDir = Directory(p.join(exeDir, 'Downloads'));
+      if (!await downloadDir.exists()) {
+        await downloadDir.create(recursive: true);
+      }
+      return downloadDir;
+    }
+    if (Platform.isLinux || Platform.isMacOS) {
       final downloads = await getDownloadsDirectory();
       if (downloads != null) return downloads;
     }
@@ -395,12 +416,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         targetPath = destPath;
       }
 
-      final result = await OpenFilex.open(targetPath, type: _resolveMimeType(targetPath));
-      if (mounted) {
-        if (result.type == ResultType.done) {
-          AppToast.show("字幕已下载并打开", type: AppToastType.success);
-        } else {
-          AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
+      if (Platform.isWindows) {
+        await Process.run('explorer', ['/select,', targetPath]);
+        if (mounted) {
+          AppToast.show("字幕已保存", type: AppToastType.success);
+        }
+      } else {
+        final result = await OpenFilex.open(targetPath, type: _resolveMimeType(targetPath));
+        if (mounted) {
+          if (result.type == ResultType.done) {
+            AppToast.show("字幕已下载并打开", type: AppToastType.success);
+          } else {
+            AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
+          }
         }
       }
     } catch (e) {
@@ -557,15 +585,17 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                   const Icon(Icons.download_rounded, color: Colors.white54, size: 16),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(
-                      _customDownloadPath ?? "默认下载位置: 用户/下载",
-                      style: TextStyle(
-                        color: _customDownloadPath != null ? Colors.white : Colors.white38,
-                        fontSize: 12,
-                        fontFamily: 'monospace',
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Text(
+                        _customDownloadPath ?? "默认: $_defaultDownloadPath",
+                        style: TextStyle(
+                          color: _customDownloadPath != null ? Colors.white : Colors.white38,
+                          fontSize: 12,
+                          fontFamily: 'monospace',
+                        ),
+                        maxLines: 1,
                       ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                   const SizedBox(width: 8),

@@ -79,7 +79,13 @@ class VideoActionButtons extends StatelessWidget {
           ),
            const SizedBox(width: 16),
           ElevatedButton(
-             onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BilibiliDownloadScreen(targetFolderId: collectionId))),
+             onPressed: () => Navigator.push(
+               context, 
+               MaterialPageRoute(
+                 builder: (_) => BilibiliDownloadScreen(targetFolderId: collectionId),
+                 settings: const RouteSettings(name: '/bilibili_download'),
+               ),
+             ),
              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFB7299), foregroundColor: Colors.white),
              child: const Text("B站下载"),
           ),
@@ -94,78 +100,104 @@ class VideoActionButtons extends StatelessWidget {
         return Column(
           mainAxisAlignment: MainAxisAlignment.end,
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            FloatingActionButton.small(
-              heroTag: "collapse_toggle_${collectionId ?? 'root'}",
-              onPressed: () {
-                settings.updateSetting('isActionButtonsCollapsed', !isCollapsed);
-              },
-              tooltip: isCollapsed ? "展开" : "收起",
-              backgroundColor: const Color(0xFF333333),
-              foregroundColor: Colors.white,
-              child: Icon(isCollapsed ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down),
-            ),
-            AnimatedSize(
-              duration: const Duration(milliseconds: 300),
-              curve: Curves.easeOutCubic,
-              alignment: Alignment.bottomCenter,
-              child: SizedBox(
-                height: isCollapsed ? 0 : null,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const SizedBox(height: 16),
-                    FloatingActionButton(
-                      heroTag: "add_folder_$collectionId",
-                      onPressed: () => showCreateCollectionDialog(context, collectionId),
-                      tooltip: "新建合集",
-                      child: const Icon(Icons.create_new_folder),
-                    ),
-                    const SizedBox(height: 16),
-                    FloatingActionButton(
-                      heroTag: "add_video_$collectionId",
-                      onPressed: () => importVideos(context, collectionId),
-                      tooltip: "导入视频或音频",
-                      child: const Icon(Icons.video_call),
-                    ),
-                    const SizedBox(height: 16),
-                    FloatingActionButton(
-                      heroTag: "bbdown_download_$collectionId",
-                      onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BilibiliDownloadScreen(targetFolderId: collectionId))),
-                      tooltip: "B站视频下载",
-                      backgroundColor: const Color(0xFFFB7299),
-                      child: const Icon(Icons.tv, color: Colors.white),
-                    ),
-                    const SizedBox(height: 16),
-                    Consumer<BatchImportService>(
-                      builder: (context, batch, _) {
-                        final count = batch.getPendingCount(collectionId);
-                        return Stack(
-                          clipBehavior: Clip.none,
-                          alignment: Alignment.topRight,
-                          children: [
-                            FloatingActionButton(
-                              heroTag: "batch_import_$collectionId",
-                              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BatchImportScreen(folderId: collectionId))),
-                              tooltip: "批量导入媒体及对应字幕",
-                              backgroundColor: Colors.deepPurpleAccent,
-                              child: const Icon(Icons.playlist_add, color: Colors.white),
-                            ),
-                            if (count > 0)
-                              Positioned(
-                                right: -4,
-                                top: -4,
-                                child: Container(
-                                  padding: const EdgeInsets.all(6),
-                                  decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle),
-                                  child: Text("$count", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
-                                ),
+            SizedBox(
+              width: 56, // Enforce width to align with standard FAB
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 300),
+                reverseDuration: const Duration(milliseconds: 300),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (Widget child, Animation<double> animation) {
+                  return SizeTransition(
+                    sizeFactor: animation,
+                    axisAlignment: 1.0, // Anchor at bottom
+                    child: FadeTransition(opacity: animation, child: child),
+                  );
+                },
+                // Use default layoutBuilder (Stack with Alignment.center)
+                // Since we constrained width to 56, center alignment is effectively same as left/right
+                child: isCollapsed
+                    ? const SizedBox.shrink(key: ValueKey('collapsed'))
+                    : Column(
+                        key: const ValueKey('expanded'),
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          FloatingActionButton(
+                            heroTag: "add_folder_$collectionId",
+                            onPressed: () => showCreateCollectionDialog(context, collectionId),
+                            tooltip: "新建合集",
+                            child: const Icon(Icons.create_new_folder),
+                          ),
+                          const SizedBox(height: 16),
+                          FloatingActionButton(
+                            heroTag: "add_video_$collectionId",
+                            onPressed: () => importVideos(context, collectionId),
+                            tooltip: "导入视频或音频",
+                            child: const Icon(Icons.video_call),
+                          ),
+                          const SizedBox(height: 16),
+                          FloatingActionButton(
+                            heroTag: "bbdown_download_$collectionId",
+                            onPressed: () => Navigator.push(
+                              context, 
+                              MaterialPageRoute(
+                                builder: (_) => BilibiliDownloadScreen(targetFolderId: collectionId),
+                                settings: const RouteSettings(name: '/bilibili_download'),
                               ),
-                          ],
-                        );
-                      }
-                    ),
-                  ],
+                            ),
+                            tooltip: "B站视频下载",
+                            backgroundColor: const Color(0xFFFB7299),
+                            child: const Icon(Icons.tv, color: Colors.white),
+                          ),
+                          const SizedBox(height: 16),
+                          Consumer<BatchImportService>(
+                            builder: (context, batch, _) {
+                              final count = batch.getPendingCount(collectionId);
+                              return Stack(
+                                clipBehavior: Clip.none,
+                                alignment: Alignment.topRight,
+                                children: [
+                                  FloatingActionButton(
+                                    heroTag: "batch_import_$collectionId",
+                                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BatchImportScreen(folderId: collectionId))),
+                                    tooltip: "批量导入媒体及对应字幕",
+                                    backgroundColor: Colors.deepPurpleAccent,
+                                    child: const Icon(Icons.playlist_add, color: Colors.white),
+                                  ),
+                                  if (count > 0)
+                                    Positioned(
+                                      right: -4,
+                                      top: -4,
+                                      child: Container(
+                                        padding: const EdgeInsets.all(6),
+                                        decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle),
+                                        child: Text("$count", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                                      ),
+                                    ),
+                                ],
+                              );
+                            }
+                          ),
+                          const SizedBox(height: 16),
+                        ],
+                      ),
+              ),
+            ),
+            SizedBox(
+              width: 56,
+              child: Align(
+                alignment: Alignment.center,
+                child: FloatingActionButton.small(
+                  heroTag: "collapse_toggle_${collectionId ?? 'root'}",
+                  onPressed: () {
+                    settings.updateSetting('isActionButtonsCollapsed', !isCollapsed);
+                  },
+                  tooltip: isCollapsed ? "展开" : "收起",
+                  backgroundColor: const Color(0xFF333333),
+                  foregroundColor: Colors.white,
+                  child: Icon(isCollapsed ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down),
                 ),
               ),
             ),
@@ -331,6 +363,44 @@ class VideoActionButtons extends StatelessWidget {
     }
   }
 
+  static Future<void> processImportedFiles(BuildContext context, List<String> paths, String? collectionId) async {
+    final validExtensions = {
+      '.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.wmv', '.3gp', '.m4v', '.ts',
+      '.rmvb', '.mpg', '.mpeg', '.f4v', '.m2ts', '.mts', '.vob', '.ogv', '.divx',
+      '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.wma', '.opus', '.m4b', '.aiff'
+    };
+    
+    final validPaths = paths.where((path) => validExtensions.contains(p.extension(path).toLowerCase())).toList();
+    if (validPaths.isEmpty) {
+      if (context.mounted) {
+        _showTopBanner(
+          context,
+          "未找到可用的媒体文件",
+          backgroundColor: const Color(0xFFB00020),
+        );
+      }
+      return;
+    }
+
+    final originalTitles = validPaths.map((path) => p.basename(path)).toList();
+    if (context.mounted) {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      _showTopBanner(
+        context,
+        "已开始后台导入 ${validPaths.length} 个媒体文件",
+      );
+      library.importVideosBackground(
+        validPaths,
+        collectionId,
+        shouldCopy: false,
+        originalTitles: originalTitles,
+        allowDuplicatePath: true,
+        useOriginalPath: true,
+        allowCacheRescue: false,
+      );
+    }
+  }
+
   static Future<void> _pickFromFileManager(BuildContext context, String? collectionId) async {
     try {
       if (Platform.isAndroid) {
@@ -367,38 +437,8 @@ class VideoActionButtons extends StatelessWidget {
           return;
         }
 
-        final validExtensions = {
-          '.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.wmv', '.3gp', '.m4v', '.ts',
-          '.rmvb', '.mpg', '.mpeg', '.f4v', '.m2ts', '.mts', '.vob', '.ogv', '.divx',
-          '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.wma', '.opus', '.m4b', '.aiff'
-        };
-        final paths = pickedPaths.where((path) => validExtensions.contains(p.extension(path).toLowerCase())).toList();
-        if (paths.isEmpty) {
-          if (context.mounted) {
-            _showTopBanner(
-              context,
-              "未找到可用的媒体文件",
-              backgroundColor: const Color(0xFFB00020),
-            );
-          }
-          return;
-        }
-
-        final originalTitles = paths.map((path) => p.basename(path)).toList();
         if (context.mounted) {
-          final library = Provider.of<LibraryService>(context, listen: false);
-          _showTopBanner(
-            context,
-            "已开始后台导入 ${paths.length} 个媒体文件",
-          );
-          library.importVideosBackground(
-            paths,
-            collectionId,
-            shouldCopy: false,
-            originalTitles: originalTitles,
-            allowDuplicatePath: true,
-            useOriginalPath: true,
-          );
+          await processImportedFiles(context, pickedPaths, collectionId);
         }
         return;
       }
@@ -439,8 +479,19 @@ class VideoActionButtons extends StatelessWidget {
         AppToast.showLoading("正在处理媒体文件...");
 
         final List<String> paths = [];
+        // originalTitles are handled inside processImportedFiles if we use it, 
+        // but here assets are processed differently (async file retrieval). 
+        // So for iOS/Gallery we keep the existing logic or adapt it. 
+        // The user request specifically mentioned Windows drag & drop.
+        // Let's keep iOS logic as is for now to avoid regression, or minimally touch it.
+        // Actually, the iOS part does async `await asset.file`. 
+        // Let's NOT refactor iOS part deeply to avoid breaking it.
+        
+        // ... (Re-pasting existing iOS logic if needed, but I am replacing _pickFromFileManager) ...
+        // Wait, the search block is large. I should carefully replace only the Android and Desktop parts
+        // or keep the structure and just call processImportedFiles.
+        
         final List<String> originalTitles = [];
-
         for (final asset in assets) {
           final File? file = await asset.file;
           if (file == null) continue;
@@ -479,8 +530,7 @@ class VideoActionButtons extends StatelessWidget {
       }
 
       if (!context.mounted) return;
-      final library = Provider.of<LibraryService>(context, listen: false);
-
+      // Desktop file picker
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: [
@@ -497,21 +547,9 @@ class VideoActionButtons extends StatelessWidget {
 
       if (result != null && result.files.isNotEmpty) {
         final paths = result.files.where((f) => f.path != null).map((f) => f.path!).toList();
-
         if (context.mounted) {
-          _showTopBanner(
-            context,
-            "已开始后台导入 ${paths.length} 个媒体文件",
-          );
+           await processImportedFiles(context, paths, collectionId);
         }
-
-        library.importVideosBackground(
-          paths,
-          collectionId,
-          allowCacheRescue: false,
-          allowDuplicatePath: true,
-          useOriginalPath: true,
-        );
       }
     } catch (e) {
       if (context.mounted) {

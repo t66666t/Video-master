@@ -1,9 +1,12 @@
+import 'dart:convert';
 import 'dart:io';
+import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/foundation.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:path/path.dart' as p;
+import 'package:video_player_app/utils/ffmpeg_utils.dart';
 
 class EmbeddedSubtitleTrack {
   final int index;
@@ -23,7 +26,9 @@ class EmbeddedSubtitleService extends ChangeNotifier {
   
   /// 获取视频文件中的内嵌字幕流信息
   Future<List<EmbeddedSubtitleTrack>> getEmbeddedSubtitles(String videoPath) async {
-    if (Platform.isWindows) return [];
+    if (Platform.isWindows) {
+      return _getEmbeddedSubtitlesWindows(videoPath);
+    }
 
     List<EmbeddedSubtitleTrack> tracks = [];
     
@@ -76,6 +81,71 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     return tracks;
   }
 
+  Future<List<EmbeddedSubtitleTrack>> _getEmbeddedSubtitlesWindows(String videoPath) async {
+    try {
+      final ffprobePath = await FFmpegUtils.ffprobePath;
+      final result = await Process.run(
+        ffprobePath,
+        [
+          '-v',
+          'quiet',
+          '-print_format',
+          'json',
+          '-show_streams',
+          '-select_streams',
+          's',
+          '-show_entries',
+          'stream=index,codec_name,tags',
+          videoPath,
+        ],
+        stdoutEncoding: null,
+        stderrEncoding: null,
+      );
+
+      if (result.exitCode != 0) {
+        return [];
+      }
+
+      final output = _decodeProcessOutput(result.stdout);
+      if (output.isEmpty) return [];
+      final Map<String, dynamic> json = jsonDecode(output);
+      final streams = json['streams'];
+      if (streams is! List) return [];
+
+      final List<EmbeddedSubtitleTrack> tracks = [];
+      for (final stream in streams) {
+        if (stream is! Map) continue;
+        final indexValue = stream['index'];
+        final index = indexValue is int ? indexValue : int.tryParse(indexValue?.toString() ?? '');
+        if (index == null) continue;
+        String title = "未知标题";
+        String language = "未知语言";
+        final codec = (stream['codec_name'] ?? 'unknown').toString();
+        final tags = stream['tags'];
+        if (tags is Map) {
+          final titleValue = tags['title'];
+          final languageValue = tags['language'];
+          if (titleValue != null && titleValue.toString().isNotEmpty) {
+            title = titleValue.toString();
+          }
+          if (languageValue != null && languageValue.toString().isNotEmpty) {
+            language = languageValue.toString();
+          }
+        }
+        tracks.add(EmbeddedSubtitleTrack(
+          index: index,
+          title: title,
+          language: language,
+          codecName: codec,
+        ));
+      }
+      return tracks;
+    } catch (e) {
+      debugPrint("Error probing subtitles: $e");
+      return [];
+    }
+  }
+
   /// 提取指定索引的字幕流
   /// 返回提取后的文件路径
   Future<String?> extractSubtitle(String videoPath, int streamIndex, String outputDir, {String? codecName}) async {
@@ -88,14 +158,18 @@ class EmbeddedSubtitleService extends ChangeNotifier {
 
       // 如果未提供 codec，则尝试探测
       if (codec == "unknown") {
-        final probeSession = await FFprobeKit.getMediaInformation(videoPath);
-        final info = probeSession.getMediaInformation();
-        if (info != null) {
-          final streams = info.getStreams();
-          for (var stream in streams) {
-            if (stream.getIndex() == streamIndex) {
-              codec = stream.getCodec() ?? "unknown";
-              break;
+        if (Platform.isWindows) {
+          codec = await _probeSubtitleCodecWindows(videoPath, streamIndex) ?? "unknown";
+        } else {
+          final probeSession = await FFprobeKit.getMediaInformation(videoPath);
+          final info = probeSession.getMediaInformation();
+          if (info != null) {
+            final streams = info.getStreams();
+            for (var stream in streams) {
+              if (stream.getIndex() == streamIndex) {
+                codec = stream.getCodec() ?? "unknown";
+                break;
+              }
             }
           }
         }
@@ -141,19 +215,98 @@ class EmbeddedSubtitleService extends ChangeNotifier {
 
       // Use execute() synchronously to ensure completion before returning.
       // executeAsync caused race conditions if the user clicked multiple times or if UI updated too fast.
-      final syncSession = await FFmpegKit.execute(command);
-      final returnCode = await syncSession.getReturnCode();
-
-      if (ReturnCode.isSuccess(returnCode)) {
-        return outputPath;
-      } else {
-        final logs = await syncSession.getAllLogsAsString();
-        debugPrint("Extraction failed logs: $logs");
+      if (Platform.isWindows) {
+        final ffmpegPath = await FFmpegUtils.ffmpegPath;
+        final List<String> args = [];
+        args.addAll(['-i', videoPath, '-map', '0:$streamIndex']);
+        if (extension == ".sup") {
+          if (codec == "dvd_subtitle") {
+            args.addAll(['-c:s', 'hdmv_pgs_subtitle']);
+          } else {
+            args.addAll(['-c:s', 'copy']);
+          }
+        }
+        args.add(outputPath);
+        final result = await Process.run(ffmpegPath, args, stdoutEncoding: null, stderrEncoding: null);
+        if (result.exitCode == 0) {
+          return outputPath;
+        }
+        final stderrText = _decodeProcessOutput(result.stderr);
+        debugPrint("Extraction failed logs: $stderrText");
         return null;
+      } else {
+        final syncSession = await FFmpegKit.execute(command);
+        final returnCode = await syncSession.getReturnCode();
+
+        if (ReturnCode.isSuccess(returnCode)) {
+          return outputPath;
+        } else {
+          final logs = await syncSession.getAllLogsAsString();
+          debugPrint("Extraction failed logs: $logs");
+          return null;
+        }
       }
     } catch (e) {
       debugPrint("Error extracting subtitle: $e");
       return null;
     }
+  }
+
+  Future<String?> _probeSubtitleCodecWindows(String videoPath, int streamIndex) async {
+    try {
+      final ffprobePath = await FFmpegUtils.ffprobePath;
+      final result = await Process.run(
+        ffprobePath,
+        [
+          '-v',
+          'quiet',
+          '-print_format',
+          'json',
+          '-show_streams',
+          '-select_streams',
+          's',
+          '-show_entries',
+          'stream=index,codec_name',
+          videoPath,
+        ],
+        stdoutEncoding: null,
+        stderrEncoding: null,
+      );
+      if (result.exitCode != 0) return null;
+      final output = _decodeProcessOutput(result.stdout);
+      if (output.isEmpty) return null;
+      final Map<String, dynamic> json = jsonDecode(output);
+      final streams = json['streams'];
+      if (streams is! List) return null;
+      for (final stream in streams) {
+        if (stream is! Map) continue;
+        final indexValue = stream['index'];
+        final index = indexValue is int ? indexValue : int.tryParse(indexValue?.toString() ?? '');
+        if (index == streamIndex) {
+          final codec = stream['codec_name'];
+          return codec?.toString();
+        }
+      }
+    } catch (e) {
+      debugPrint("Error probing subtitle codec: $e");
+    }
+    return null;
+  }
+
+  String _decodeProcessOutput(dynamic output) {
+    if (output == null) return '';
+    if (output is String) return output;
+    if (output is List<int>) {
+      try {
+        return utf8.decode(output);
+      } catch (_) {
+        try {
+          return gbk.decode(output);
+        } catch (_) {
+          return '';
+        }
+      }
+    }
+    return output.toString();
   }
 }

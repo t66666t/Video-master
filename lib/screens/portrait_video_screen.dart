@@ -39,7 +39,7 @@ class PortraitVideoScreen extends StatefulWidget {
   @override
   State<PortraitVideoScreen> createState() => _PortraitVideoScreenState();
 }
-class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsBindingObserver {
+class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsBindingObserver, RouteAware {
   final GlobalKey<SelectableRegionState> _selectionKey = GlobalKey<SelectableRegionState>();
   final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey = GlobalKey<SubtitleSidebarState>();
   final FocusNode _selectionFocusNode = FocusNode();
@@ -75,7 +75,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   final bool _showVolumeSlider = false;
   final LayerLink _volumeButtonLayerLink = LayerLink();
 
-  bool _isOrientationSetup = false;
+  bool _routeObserverSubscribed = false;
   bool _forceExit = false;
   bool _iosBackSwipeActive = false;
   double _iosBackSwipeDistance = 0.0;
@@ -95,6 +95,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   bool? _lastIsPlayingForServiceSync;
   String? _autoEmbeddedAttemptedForItemId;
   bool _isLoadingEmbeddedSubtitle = false;
+  bool _embeddedSubtitleDetected = false;
 
   @override
   void initState() {
@@ -193,6 +194,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           _currentSecondarySubtitleIndices = [];
           _currentSubtitleEntries = [];
           _autoEmbeddedAttemptedForItemId = null;
+          _embeddedSubtitleDetected = false;
         });
         _applyItemSubtitlePreference(service.currentItem!, force: true);
         _initPlayer();
@@ -268,9 +270,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (!_isOrientationSetup) {
-      _updateOrientations();
-      _isOrientationSetup = true;
+    if (!_routeObserverSubscribed) {
+      final route = ModalRoute.of(context);
+      if (route is PageRoute) {
+        AppToast.routeObserver.subscribe(this, route);
+        _routeObserverSubscribed = true;
+      }
     }
     
     // Listen to TranscriptionManager for auto-mounting subtitles
@@ -367,6 +372,28 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     }
   }
 
+  void _scheduleUpdateOrientations() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _updateOrientations();
+    });
+  }
+
+  @override
+  void didPush() {
+    _scheduleUpdateOrientations();
+  }
+
+  @override
+  void didPopNext() {
+    _scheduleUpdateOrientations();
+  }
+
+  @override
+  void didPushNext() {
+    SystemChrome.setPreferredOrientations([]);
+  }
+
   Future<void> _checkAndLoadEmbeddedSubtitle({
     bool showToastWhenNone = true,
     bool showLoadingIndicator = true,
@@ -392,6 +419,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       final tracks = await service.getEmbeddedSubtitles(path);
       
       if (tracks.isNotEmpty && mounted && _subtitles.isEmpty) {
+        setState(() {
+          _embeddedSubtitleDetected = true;
+        });
         // Use the first one
         final track = tracks.first;
         
@@ -442,6 +472,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         }
       } else {
         if (mounted) {
+          if (_embeddedSubtitleDetected) {
+            setState(() {
+              _embeddedSubtitleDetected = false;
+            });
+          }
           if (loadingShown) AppToast.dismiss();
           if (showToastWhenNone) {
             AppToast.show("未找到内嵌字幕");
@@ -452,6 +487,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       debugPrint("Auto load embedded subtitle failed: $e");
       if (loadingShown) AppToast.dismiss();
       if (mounted) {
+        if (_embeddedSubtitleDetected) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+        }
         AppToast.show("内嵌字幕检测失败", type: AppToastType.error);
       }
     } finally {
@@ -1150,6 +1190,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     // Try to sync one last time (fire and forget)
     _handleExit();
 
+    if (_routeObserverSubscribed) {
+      AppToast.routeObserver.unsubscribe(this);
+    }
+
     try {
       Provider.of<MediaPlaybackService>(context, listen: false).removeListener(_onPlaybackServiceChange);
     } catch (_) {}
@@ -1203,13 +1247,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           videoItem: _currentItem, // Pass item for context
           skipAutoPauseOnExit: true,
         ),
+        opaque: true,
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(
-            opacity: animation,
-            child: child,
-          );
+          return child;
         },
-        transitionDuration: const Duration(milliseconds: 300),
+        transitionDuration: Duration.zero,
+        reverseTransitionDuration: Duration.zero,
       ),
     );
     
@@ -1260,15 +1303,21 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
       playbackService.clearSubtitleState();
     }
 
-    // 从横屏返回后，重置字幕边栏滚动位置到顶部
-    // 确保字幕数量不足时从顶部对齐
+    setState(() {});
+
+    // 自动跟随字幕开启时，从横屏返回后自动定位
+    // 等待转场动画完成，避免在动画过程中滚动
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        _subtitleSidebarKey.currentState?.jumpToFirstSubtitleTop();
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      if (settings.autoScrollSubtitles) {
+        Future.delayed(const Duration(milliseconds: 400), () {
+          if (mounted) {
+            _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
+          }
+        });
       }
     });
-
-    setState(() {});
   }
 
   String _formatDuration(Duration duration) {
@@ -2089,6 +2138,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
           isPortrait: true,
           focusNode: _videoFocusNode,
           isVisible: _activePanel == PortraitPanel.subtitles,
+          showEmbeddedLoadingMessage: _embeddedSubtitleDetected &&
+              _isLoadingEmbeddedSubtitle &&
+              _subtitles.isEmpty &&
+              _secondarySubtitles.isEmpty,
         );
     }
   }

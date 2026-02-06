@@ -6,6 +6,7 @@ enum AppToastType { info, success, error }
 class AppToast {
   static final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
   static final NavigatorObserver observer = _ToastNavigatorObserver();
+  static final RouteObserver<PageRoute<dynamic>> routeObserver = RouteObserver<PageRoute<dynamic>>();
 
   static OverlayEntry? _entry;
   static Timer? _dismissTimer;
@@ -45,6 +46,11 @@ class AppToast {
     _entry?.remove();
     _entry = null;
     _isLoading = false;
+  }
+  
+  static bool isCurrentRoute(String routeName) {
+    return observer is _ToastNavigatorObserver && 
+           (observer as _ToastNavigatorObserver).currentRouteName == routeName;
   }
 
   static void _showEntry(_ToastContent content, {Duration? autoDismissAfter}) {
@@ -95,26 +101,32 @@ class AppToast {
 }
 
 class _ToastNavigatorObserver extends NavigatorObserver {
+  String? currentRouteName;
+
   @override
   void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    currentRouteName = route.settings.name;
     AppToast.dismiss();
     super.didPush(route, previousRoute);
   }
 
   @override
   void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    currentRouteName = previousRoute?.settings.name;
     AppToast.dismiss();
     super.didPop(route, previousRoute);
   }
 
   @override
   void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
+    currentRouteName = newRoute?.settings.name;
     AppToast.dismiss();
     super.didReplace(newRoute: newRoute, oldRoute: oldRoute);
   }
 
   @override
   void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    currentRouteName = previousRoute?.settings.name;
     AppToast.dismiss();
     super.didRemove(route, previousRoute);
   }

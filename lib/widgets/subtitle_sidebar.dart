@@ -22,6 +22,7 @@ class SubtitleSidebar extends StatefulWidget {
   final bool isPortrait;
   final FocusNode? focusNode; // New
   final bool isVisible;
+  final bool showEmbeddedLoadingMessage;
 
   const SubtitleSidebar({
     super.key,
@@ -40,6 +41,7 @@ class SubtitleSidebar extends StatefulWidget {
     this.isPortrait = false,
     this.focusNode,
     this.isVisible = true,
+    this.showEmbeddedLoadingMessage = false,
   });
 
   @override
@@ -860,7 +862,50 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           // 2. 内容区
           Expanded(
             child: widget.subtitles.isEmpty
-                ? const Center(child: Text("暂无字幕", style: TextStyle(color: Colors.white54)))
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          widget.showEmbeddedLoadingMessage
+                              ? "已识别到内嵌字幕\n等待加载中"
+                              : "暂无字幕",
+                          style: const TextStyle(color: Colors.white54),
+                          textAlign: TextAlign.center,
+                        ),
+                        if (widget.onOpenSubtitleManager != null) ...[
+                          const SizedBox(height: 16),
+                          InkWell(
+                            onTap: widget.onOpenSubtitleManager,
+                            borderRadius: BorderRadius.circular(4),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                              decoration: BoxDecoration(
+                                border: Border.all(color: Colors.purpleAccent.withValues(alpha: 0.5)),
+                                borderRadius: BorderRadius.circular(4),
+                                color: Colors.purpleAccent.withValues(alpha: 0.1),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: const [
+                                  Icon(Icons.subtitles, size: 18, color: Colors.purpleAccent),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    "查看字幕管理",
+                                    style: TextStyle(
+                                      color: Colors.purpleAccent,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  )
                 : ValueListenableBuilder<List<int>>(
                     valueListenable: _activeIndicesNotifier,
                     builder: (context, activeIndices, child) {

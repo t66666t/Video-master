@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
-import 'dart:ui';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -23,20 +22,57 @@ class SettingsService extends ChangeNotifier {
   double longPressSpeed = 2.0;
   int doubleTapSeekSeconds = 5;
   bool enableDoubleTapSubtitleSeek = true;
-  double userSubtitleSidebarWidth = 320.0;
+  double userSubtitleSidebarWidth = 262.4;
   bool isLeftHandedMode = false;
 
   // Subtitle Settings - 新的结构
   // 文字样式 - 横竖屏共享
-  SubtitleTextStyle subtitleTextStyle = const SubtitleTextStyle();
+  SubtitleTextStyle subtitleTextStyle = const SubtitleTextStyle(
+    fontFamilyChinese: 'Swei Gothic CJK SC',
+    fontFamilyEnglish: 'Swei Gothic CJK SC',
+    textColor: Color(0xFFFFFFFF),
+    backgroundColor: Color(0xE0000000),
+    hasBorder: true,
+    borderColor: Color(0xFF000000),
+    borderWidth: 2.5,
+    hasShadow: true,
+    shadowColor: Color(0xFF000000),
+    shadowBlur: 2.8,
+    shadowOffset: Offset(2.6, 2.6),
+    backgroundOpacity: 0.88,
+    fontWeightChinese: FontWeight.w600,
+    fontWeightEnglish: FontWeight.w700,
+    isItalic: false,
+    isUnderline: false,
+  );
 
   // 布局样式 - 横竖屏共享
-  SubtitleLayoutStyle subtitleLayoutLandscape = const SubtitleLayoutStyle();
-  SubtitleLayoutStyle subtitleLayoutPortrait = const SubtitleLayoutStyle();
+  SubtitleLayoutStyle subtitleLayoutLandscape = const SubtitleLayoutStyle(
+    fontSize: 39.7,
+    secondaryFontSize: 22.6,
+    lineSpacing: -0.1,
+    letterSpacing: 0.0,
+  );
+  SubtitleLayoutStyle subtitleLayoutPortrait = const SubtitleLayoutStyle(
+    fontSize: 39.7,
+    secondaryFontSize: 22.6,
+    lineSpacing: -0.1,
+    letterSpacing: 0.0,
+  );
 
   // 幽灵模式布局样式 - 与普通字幕完全独立（仅共享文字样式）
-  SubtitleLayoutStyle subtitleLayoutGhostLandscape = const SubtitleLayoutStyle();
-  SubtitleLayoutStyle subtitleLayoutGhostPortrait = const SubtitleLayoutStyle();
+  SubtitleLayoutStyle subtitleLayoutGhostLandscape = const SubtitleLayoutStyle(
+    fontSize: 28.0,
+    secondaryFontSize: 17.2,
+    lineSpacing: -0.1,
+    letterSpacing: 0.0,
+  );
+  SubtitleLayoutStyle subtitleLayoutGhostPortrait = const SubtitleLayoutStyle(
+    fontSize: 28.0,
+    secondaryFontSize: 17.2,
+    lineSpacing: -0.1,
+    letterSpacing: 0.0,
+  );
 
   // 音频字幕 - 同样结构
   SubtitleTextStyle audioSubtitleTextStyle = const SubtitleTextStyle();
@@ -76,7 +112,7 @@ class SettingsService extends ChangeNotifier {
   // Backward compatibility getter/setter (maps to landscape for now)
   SubtitleStyle get subtitleStyle => subtitleStyleLandscape;
 
-  Alignment subtitleAlignment = const Alignment(0.0, 0.9);
+  Alignment subtitleAlignment = const Alignment(0.0, 0.8947589131115533);
   List<Map<String, double>> subtitlePresets = [];
   Duration subtitleOffset = Duration.zero;
 
@@ -84,22 +120,22 @@ class SettingsService extends ChangeNotifier {
   bool autoCacheSubtitles = true;
 
   // New: Auto Scroll Subtitles
-  bool autoScrollSubtitles = false;
+  bool autoScrollSubtitles = true;
 
   // New: Auto Load Embedded Subtitles
   bool autoLoadEmbeddedSubtitles = false;
 
   // New: Grid Size Settings
-  int homeGridCrossAxisCount = 2;
-  int videoCardCrossAxisCount = 2;
+  int homeGridCrossAxisCount = 4;
+  int videoCardCrossAxisCount = 4;
 
   // New: Home Card Style
-  double homeCardTitleFontSize = 14.0;
-  double homeCardAspectRatio = 0.8;
+  double homeCardTitleFontSize = 13.0;
+  double homeCardAspectRatio = 0.625;
 
   // New: Video Card Style
-  double videoCardTitleFontSize = 14.0;
-  double videoCardAspectRatio = 0.8;
+  double videoCardTitleFontSize = 11.0;
+  double videoCardAspectRatio = 0.625;
 
   // New: Subtitle Sidebar Font Scale (Landscape)
   double landscapeSidebarFontSizeScale = 1.0;
@@ -110,12 +146,14 @@ class SettingsService extends ChangeNotifier {
   // New: Subtitle Sidebar View Mode (0: List, 1: Article)
   int subtitleViewMode = 0;
 
+  bool isLandscapeSubtitleSidebarVisible = true;
+
   // New: AI Model Selection
   String lastSelectedModelType = 'base';
 
   // New: Subtitle Ghost Mode
-  bool isGhostModeEnabled = false;
-  Alignment ghostModeAlignment = const Alignment(0.0, 0.9);
+  bool isGhostModeEnabled = true;
+  Alignment ghostModeAlignment = const Alignment(0.0, 0.8856727518593654);
 
   // New: Split Subtitle by Line
   bool splitSubtitleByLine = true;
@@ -139,10 +177,16 @@ class SettingsService extends ChangeNotifier {
   // New: Seek Preview
   bool enableSeekPreview = true;
 
+  // New: Suppress Bilibili Restricted Dialog
+  bool suppressBilibiliRestrictedDialog = false;
+
   Future<void> toggleFullScreen() async {
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       isFullScreen = !isFullScreen;
       await windowManager.setFullScreen(isFullScreen);
+      if (isFullScreen) {
+        await windowManager.focus();
+      }
       notifyListeners();
     }
   }
@@ -164,13 +208,6 @@ class SettingsService extends ChangeNotifier {
     if (_initialized) return;
     _prefs = await SharedPreferences.getInstance();
 
-    // Determine Device Type for Defaults
-    // Threshold: 600 logical pixels width
-    final physicalSize = PlatformDispatcher.instance.views.first.physicalSize;
-    final devicePixelRatio = PlatformDispatcher.instance.views.first.devicePixelRatio;
-    final logicalWidth = physicalSize.width / devicePixelRatio;
-    final bool isTablet = logicalWidth >= 600;
-
     showSubtitles = _prefs.getBool('showSubtitles') ?? true;
     isMirroredH = _prefs.getBool('isMirroredH') ?? false;
     isMirroredV = _prefs.getBool('isMirroredV') ?? false;
@@ -178,7 +215,7 @@ class SettingsService extends ChangeNotifier {
     longPressSpeed = _prefs.getDouble('longPressSpeed') ?? 2.0;
     doubleTapSeekSeconds = _prefs.getInt('doubleTapSeekSeconds') ?? 5;
     enableDoubleTapSubtitleSeek = _prefs.getBool('enableDoubleTapSubtitleSeek') ?? true;
-    userSubtitleSidebarWidth = _prefs.getDouble('userSubtitleSidebarWidth') ?? 320.0;
+    userSubtitleSidebarWidth = _prefs.getDouble('userSubtitleSidebarWidth') ?? 262.4;
     isLeftHandedMode = _prefs.getBool('isLeftHandedMode') ?? false;
     autoCacheSubtitles = _prefs.getBool('autoCacheSubtitles') ?? true;
     autoScrollSubtitles = _prefs.getBool('autoScrollSubtitles') ?? true;
@@ -190,34 +227,36 @@ class SettingsService extends ChangeNotifier {
     autoPlayNextVideo = _prefs.getBool('autoPlayNextVideo') ?? true;
     isActionButtonsCollapsed = _prefs.getBool('isActionButtonsCollapsed') ?? false;
     enableSeekPreview = _prefs.getBool('enableSeekPreview') ?? true;
+    suppressBilibiliRestrictedDialog = _prefs.getBool('suppressBilibiliRestrictedDialog') ?? false;
 
     // Tablet vs Phone Defaults
-    homeGridCrossAxisCount = (_prefs.getInt('homeGridCrossAxisCount') ?? (isTablet ? 6 : 2)).clamp(1, 10);
-    videoCardCrossAxisCount = (_prefs.getInt('videoCardCrossAxisCount') ?? (isTablet ? 6 : 2)).clamp(1, 10);
+    homeGridCrossAxisCount = (_prefs.getInt('homeGridCrossAxisCount') ?? 4).clamp(1, 10);
+    videoCardCrossAxisCount = (_prefs.getInt('videoCardCrossAxisCount') ?? 4).clamp(1, 10);
 
-    homeCardTitleFontSize = _prefs.getDouble('homeCardTitleFontSize') ?? (isTablet ? 13.0 : 14.0);
-    homeCardAspectRatio = _prefs.getDouble('homeCardAspectRatio') ?? (isTablet ? 0.8 : 0.66); // 1.25 height vs 1.50 height
+    homeCardTitleFontSize = _prefs.getDouble('homeCardTitleFontSize') ?? 13.0;
+    homeCardAspectRatio = _prefs.getDouble('homeCardAspectRatio') ?? 0.625;
 
-    videoCardTitleFontSize = _prefs.getDouble('videoCardTitleFontSize') ?? (isTablet ? 13.0 : 14.0);
-    videoCardAspectRatio = _prefs.getDouble('videoCardAspectRatio') ?? (isTablet ? 0.8 : 0.66);
+    videoCardTitleFontSize = _prefs.getDouble('videoCardTitleFontSize') ?? 11.0;
+    videoCardAspectRatio = _prefs.getDouble('videoCardAspectRatio') ?? 0.625;
 
     // Migrate old 'sidebarFontSizeScale' to 'landscapeSidebarFontSizeScale' if present
     // Default 1.1 for Landscape
     landscapeSidebarFontSizeScale = _prefs.getDouble('landscapeSidebarFontSizeScale') ??
-                                   _prefs.getDouble('sidebarFontSizeScale') ?? 1.1;
+                                   _prefs.getDouble('sidebarFontSizeScale') ?? 1.0;
     portraitSidebarFontSizeScale = _prefs.getDouble('portraitSidebarFontSizeScale') ?? 1.0;
     subtitleViewMode = _prefs.getInt('subtitleViewMode') ?? 0;
     lastSelectedModelType = _prefs.getString('lastSelectedModelType') ?? 'base';
+    isLandscapeSubtitleSidebarVisible = _prefs.getBool('landscapeSubtitleSidebarVisible') ?? true;
 
-    isGhostModeEnabled = _prefs.getBool('isGhostModeEnabled') ?? false;
+    isGhostModeEnabled = _prefs.getBool('isGhostModeEnabled') ?? true;
     final ghostAlignX = _prefs.getDouble('ghostModeAlignX') ?? 0.0;
-    final ghostAlignY = _prefs.getDouble('ghostModeAlignY') ?? 0.9;
+    final ghostAlignY = _prefs.getDouble('ghostModeAlignY') ?? 0.8856727518593654;
     ghostModeAlignment = Alignment(ghostAlignX, ghostAlignY);
 
     subtitleOffset = Duration(milliseconds: _prefs.getInt('subtitleOffset') ?? 0);
 
     final alignX = _prefs.getDouble('subtitleAlignX') ?? 0.0;
-    final alignY = _prefs.getDouble('subtitleAlignY') ?? 0.9;
+    final alignY = _prefs.getDouble('subtitleAlignY') ?? 0.8947589131115533;
     subtitleAlignment = Alignment(alignX, alignY);
 
     // 加载字幕样式 - 新的结构
@@ -407,8 +446,6 @@ class SettingsService extends ChangeNotifier {
       await _prefs.setString('subtitleLayoutGhostLandscape', json.encode(migrated.toJson()));
       await _prefs.setString('subtitleLayoutGhostPortrait', json.encode(migrated.toJson()));
     } else {
-      // 无旧版数据时，默认继承普通布局（之后用户可独立调整）
-      if (ghostLayoutLandJson == null) subtitleLayoutGhostLandscape = subtitleLayoutLandscape;
       if (ghostLayoutPortJson == null) subtitleLayoutGhostPortrait = subtitleLayoutGhostLandscape;
     }
 
@@ -473,6 +510,7 @@ class SettingsService extends ChangeNotifier {
       case 'autoPlayNextVideo': autoPlayNextVideo = value as bool; break;
       case 'isActionButtonsCollapsed': isActionButtonsCollapsed = value as bool; break;
       case 'enableSeekPreview': enableSeekPreview = value as bool; break;
+      case 'suppressBilibiliRestrictedDialog': suppressBilibiliRestrictedDialog = value as bool; break;
       case 'homeGridCrossAxisCount': homeGridCrossAxisCount = (value as int).clamp(1, 10); break;
       case 'homeCardTitleFontSize': homeCardTitleFontSize = value as double; break;
       case 'homeCardAspectRatio': homeCardAspectRatio = value as double; break;
@@ -485,6 +523,7 @@ class SettingsService extends ChangeNotifier {
       case 'subtitleViewMode': subtitleViewMode = value as int; break;
       case 'lastSelectedModelType': lastSelectedModelType = value as String; break;
       case 'isGhostModeEnabled': isGhostModeEnabled = value as bool; break;
+      case 'landscapeSubtitleSidebarVisible': isLandscapeSubtitleSidebarVisible = value as bool; break;
       case 'subtitleOffset':
          subtitleOffset = Duration(milliseconds: value as int);
          break;
@@ -654,5 +693,82 @@ class SettingsService extends ChangeNotifier {
     subtitlePresets = presets;
     await _prefs.setString('subtitlePresets', json.encode(presets));
     notifyListeners();
+  }
+
+  Map<String, dynamic> exportSettingsSnapshot() {
+    return {
+      'general': {
+        'isLeftHandedMode': isLeftHandedMode,
+        'isMirroredH': isMirroredH,
+        'isMirroredV': isMirroredV,
+      },
+      'playback': {
+        'playbackSpeed': playbackSpeed,
+        'longPressSpeed': longPressSpeed,
+        'doubleTapSeekSeconds': doubleTapSeekSeconds,
+        'enableDoubleTapSubtitleSeek': enableDoubleTapSubtitleSeek,
+        'autoPauseOnExit': autoPauseOnExit,
+        'autoPlayNextVideo': autoPlayNextVideo,
+        'enableSeekPreview': enableSeekPreview,
+        'isActionButtonsCollapsed': isActionButtonsCollapsed,
+      },
+      'layout': {
+        'userSubtitleSidebarWidth': userSubtitleSidebarWidth,
+        'landscapeSidebarFontSizeScale': landscapeSidebarFontSizeScale,
+        'portraitSidebarFontSizeScale': portraitSidebarFontSizeScale,
+        'subtitleViewMode': subtitleViewMode,
+      },
+      'home': {
+        'homeGridCrossAxisCount': homeGridCrossAxisCount,
+        'homeCardTitleFontSize': homeCardTitleFontSize,
+        'homeCardAspectRatio': homeCardAspectRatio,
+      },
+      'videoCard': {
+        'videoCardCrossAxisCount': videoCardCrossAxisCount,
+        'videoCardTitleFontSize': videoCardTitleFontSize,
+        'videoCardAspectRatio': videoCardAspectRatio,
+      },
+      'subtitles': {
+        'showSubtitles': showSubtitles,
+        'autoCacheSubtitles': autoCacheSubtitles,
+        'autoScrollSubtitles': autoScrollSubtitles,
+        'autoLoadEmbeddedSubtitles': autoLoadEmbeddedSubtitles,
+        'splitSubtitleByLine': splitSubtitleByLine,
+        'videoContinuousSubtitle': videoContinuousSubtitle,
+        'audioContinuousSubtitle': audioContinuousSubtitle,
+        'isGhostModeEnabled': isGhostModeEnabled,
+        'subtitleDelayMs': subtitleOffset.inMilliseconds,
+        'subtitleDelaySeconds': subtitleDelay,
+        'alignment': {
+          'x': subtitleAlignment.x,
+          'y': subtitleAlignment.y,
+        },
+        'ghostAlignment': {
+          'x': ghostModeAlignment.x,
+          'y': ghostModeAlignment.y,
+        },
+        'presets': subtitlePresets,
+        'textStyle': subtitleTextStyle.toJson(),
+        'layoutLandscape': subtitleLayoutLandscape.toJson(),
+        'layoutPortrait': subtitleLayoutPortrait.toJson(),
+        'ghostLayoutLandscape': subtitleLayoutGhostLandscape.toJson(),
+        'ghostLayoutPortrait': subtitleLayoutGhostPortrait.toJson(),
+        'audioTextStyle': audioSubtitleTextStyle.toJson(),
+        'audioLayoutLandscape': audioSubtitleLayoutLandscape.toJson(),
+        'audioLayoutPortrait': audioSubtitleLayoutPortrait.toJson(),
+        'legacy': {
+          'subtitleStyleLandscape': subtitleStyleLandscape.toJson(),
+          'subtitleStylePortrait': subtitleStylePortrait.toJson(),
+          'audioSubtitleStyleLandscape': audioSubtitleStyleLandscape.toJson(),
+          'audioSubtitleStylePortrait': audioSubtitleStylePortrait.toJson(),
+        },
+      },
+      'window': {
+        'isFullScreen': isFullScreen,
+      },
+      'ai': {
+        'lastSelectedModelType': lastSelectedModelType,
+      },
+    };
   }
 }
