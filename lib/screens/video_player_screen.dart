@@ -176,10 +176,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _currentItem = widget.videoItem;
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    });
     _enterImmersiveMode();
     
     _activeSidebar = SidebarType.subtitles;
@@ -470,8 +473,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   
   Future<void> _handleExit() async {
      try {
-       if (!_controllerAssigned) return;
        final settings = Provider.of<SettingsService>(context, listen: false);
+       await settings.updateSetting('landscapeSubtitleSidebarVisible', _isSubtitleSidebarVisible);
+       if (!_controllerAssigned) return;
        final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
        
        final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
@@ -2262,7 +2266,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                 },
                 behavior: HitTestBehavior.translucent,
                 child: SafeArea(
-            child: Stack(
+                  top: true,
+                  bottom: false,
+                  left: false,
+                  right: false,
+                  child: Stack(
               fit: StackFit.expand,
               children: [
                 Row(
@@ -2478,26 +2486,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 }), 
                                 onToggleFloatingSubtitleSettings: _toggleFloatingSubtitleSettingsSidebar,
                                 onToggleSidebar: () {
-                                   setState(() {
-                                     if (_isSubtitleSidebarVisible) {
-                                       if (_activeSidebar == SidebarType.subtitles) {
-                                         _isSubtitleSidebarVisible = false;
-                                         _activeSidebar = SidebarType.none;
-                                       } else {
-                                         _activeSidebar = SidebarType.subtitles;
-                                       }
-                                     } else {
-                                       _isSubtitleSidebarVisible = true;
-                                       _activeSidebar = SidebarType.subtitles;
-                                     }
-                                   });
-                                   WidgetsBinding.instance.addPostFrameCallback((_) {
-                                     if (!mounted) return;
-                                     if (_isSubtitleSidebarVisible && _activeSidebar == SidebarType.subtitles) {
-                                       _userRequestedSubtitles = true;
-                                       _maybeLoadSubtitlesForCurrentItem(force: true);
-                                     }
-                                   });
+                                  final settings = Provider.of<SettingsService>(context, listen: false);
+                                  setState(() {
+                                    if (_isSubtitleSidebarVisible) {
+                                      if (_activeSidebar == SidebarType.subtitles) {
+                                        _isSubtitleSidebarVisible = false;
+                                        _activeSidebar = SidebarType.none;
+                                      } else {
+                                        _activeSidebar = SidebarType.subtitles;
+                                      }
+                                    } else {
+                                      _isSubtitleSidebarVisible = true;
+                                      _activeSidebar = SidebarType.subtitles;
+                                    }
+                                  });
+                                  settings.updateSetting('landscapeSubtitleSidebarVisible', _isSubtitleSidebarVisible);
+                                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                                    if (!mounted) return;
+                                    if (_isSubtitleSidebarVisible && _activeSidebar == SidebarType.subtitles) {
+                                      _userRequestedSubtitles = true;
+                                      _maybeLoadSubtitlesForCurrentItem(force: true);
+                                    }
+                                  });
                                 },
                                 isSubtitleSidebarVisible: _isSubtitleSidebarVisible,
                                 onToggleFullScreen: () => settings.toggleFullScreen(),

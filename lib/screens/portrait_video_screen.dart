@@ -76,6 +76,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   final LayerLink _volumeButtonLayerLink = LayerLink();
 
   bool _routeObserverSubscribed = false;
+  bool _isPushingLandscape = false;
   bool _forceExit = false;
   bool _iosBackSwipeActive = false;
   double _iosBackSwipeDistance = 0.0;
@@ -391,6 +392,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
 
   @override
   void didPushNext() {
+    if (_isPushingLandscape) return;
     SystemChrome.setPreferredOrientations([]);
   }
 
@@ -1140,7 +1142,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   Future<void> _handleBackRequest() async {
     final navigator = Navigator.of(context);
     if (_forceExit) {
-      SystemChrome.setPreferredOrientations([]);
+      _updateOrientations();
       if (mounted) navigator.pop();
       return;
     }
@@ -1160,7 +1162,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
 
     await _handleExit();
     if (!mounted) return;
-    SystemChrome.setPreferredOrientations([]);
+    _updateOrientations();
     navigator.pop();
   }
 
@@ -1203,8 +1205,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     _selectionFocusNode.dispose();
     _subtitleSeekTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
-    // Restore orientations to default (allow all)
-    SystemChrome.setPreferredOrientations([]);
     if (_isControllerAssigned) {
       _controller.removeListener(_videoListener);
       // 只有当我们拥有 controller 时才 dispose
@@ -1239,22 +1239,27 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     // 标记控制器已传递给横屏页，竖屏页不再拥有它
     _isControllerOwner = false;
     
-    await Navigator.of(context).push(
-      PageRouteBuilder(
-        pageBuilder: (context, animation, secondaryAnimation) => VideoPlayerScreen(
-          videoFile: null, // Legacy param, ignored
-          existingController: _controller, // Pass控制器
-          videoItem: _currentItem, // Pass item for context
-          skipAutoPauseOnExit: true,
+    _isPushingLandscape = true;
+    try {
+      await Navigator.of(context).push(
+        PageRouteBuilder(
+          pageBuilder: (context, animation, secondaryAnimation) => VideoPlayerScreen(
+            videoFile: null, // Legacy param, ignored
+            existingController: _controller, // Pass控制器
+            videoItem: _currentItem, // Pass item for context
+            skipAutoPauseOnExit: true,
+          ),
+          opaque: true,
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            return child;
+          },
+          transitionDuration: Duration.zero,
+          reverseTransitionDuration: Duration.zero,
         ),
-        opaque: true,
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return child;
-        },
-        transitionDuration: Duration.zero,
-        reverseTransitionDuration: Duration.zero,
-      ),
-    );
+      );
+    } finally {
+      _isPushingLandscape = false;
+    }
     
     if (!mounted) return;
     
@@ -1663,8 +1668,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 500),
                     child: SafeArea(
-                    child: Stack(
-                    children: [
+                      top: true,
+                      bottom: false,
+                      child: Stack(
+                        children: [
                       Column(
                         children: [
                           // 1. Video Area (Top)
