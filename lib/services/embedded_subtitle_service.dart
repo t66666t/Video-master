@@ -2,9 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/foundation.dart';
-import 'package:ffmpeg_kit_flutter/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter/ffprobe_kit.dart';
-import 'package:ffmpeg_kit_flutter/return_code.dart';
+import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_min_gpl/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
 import 'package:path/path.dart' as p;
 import 'package:video_player_app/utils/ffmpeg_utils.dart';
 

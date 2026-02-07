@@ -1,45 +1,44 @@
-name: MacOS Build
+name: Build macOS App
 
 on:
   push:
-    branches: [ "master", "main" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "master", "main" ]
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-macos:
+    name: Build macOS App
     runs-on: macos-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Flutter
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
 
-      - name: Install dependencies
+      - name: Get Flutter dependencies
         run: flutter pub get
 
-      - name: Enable MacOS desktop
-        run: flutter config --enable-macos-desktop
-
-      - name: Build MacOS App
+      - name: Install CocoaPods (macOS)
         run: |
           cd macos
           pod install --repo-update
           cd ..
-          flutter build macos --release
 
-      - name: Compress App
+      - name: Build macOS App (Release)
+        run: flutter build macos --release
+
+      - name: Package macOS App
         run: |
-          cd build/macos/Build/Products/Release
-          APP_NAME=$(find . -name "*.app" -maxdepth 1 -exec basename {} \;)
-          echo "Found app: $APP_NAME"
-          zip -r "macos-app-release.zip" "$APP_NAME"
+          APP_PATH="build/macos/Build/Products/Release/video_player_app.app"
+          zip -r video_player_app_macos.zip "$APP_PATH"
 
-      - name: Upload Artifact
+      - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-app-release
-          path: build/macos/Build/Products/Release/macos-app-release.zip
+          name: video_player_app_macos
+          path: video_player_app_macos.zip
