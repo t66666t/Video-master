@@ -34,11 +34,11 @@ jobs:
 
       - name: Package macOS App
         run: |
-          APP_PATH="build/macos/Build/Products/Release/video_player_app.app"
-          zip -r video_player_app_macos.zip "$APP_PATH"
+          APP_PATH="build/macos/Build/Products/Release/fluent_player.app"
+          zip -r fluent_player_macos.zip "$APP_PATH"
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: video_player_app_macos
-          path: video_player_app_macos.zip
+          name: fluent_player_macos
+          path: fluent_player_macos.zip
