@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'package:ffmpeg_kit_flutter_min_gpl/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_min_gpl/ffprobe_kit.dart';
-import 'package:ffmpeg_kit_flutter_min_gpl/return_code.dart';
+import 'package:ffmpeg_kit_flutter/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter/return_code.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
@@ -863,8 +863,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
         }
         if (loadingShown) AppToast.dismiss();
 
-        // Windows端：如果没有内嵌字幕，尝试自动加载本地文件夹中的第一个外挂字幕
-        if (Platform.isWindows && _subtitles.isEmpty) {
+        // Windows/Mac端：如果没有内嵌字幕，尝试自动加载本地文件夹中的第一个外挂字幕
+        if ((Platform.isWindows || Platform.isMacOS) && _subtitles.isEmpty) {
           _tryLoadFirstExternalSubtitle();
         }
       }
