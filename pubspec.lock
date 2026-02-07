@@ -244,10 +244,9 @@ packages:
   ffmpeg_kit_flutter_min_gpl:
     dependency: "direct main"
     description:
-      name: ffmpeg_kit_flutter_min_gpl
-      sha256: "3d7d3a7a6413c9bd7ced7b773aca2fece734e4f8f06e9bffe0fa3b850773dab8"
-      url: "https://pub.flutter-io.cn"
-    source: hosted
+      path: "packages/ffmpeg_kit_flutter_min_gpl"
+      relative: true
+    source: path
     version: "6.0.3"
   ffmpeg_kit_flutter_platform_interface:
     dependency: transitive
