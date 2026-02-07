@@ -30,7 +30,6 @@ target 'Runner' do
   use_modular_headers!
 
   flutter_install_all_macos_pods File.dirname(File.realpath(__FILE__))
-  pod 'ffmpeg-kit-macos-min-gpl', :podspec => 'LocalPodspecs/ffmpeg-kit-macos-min-gpl.podspec'
 end
 
 post_install do |installer|

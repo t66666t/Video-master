@@ -23,13 +23,9 @@ jobs:
       - name: Get Flutter dependencies
         run: flutter pub get
 
-      - name: Install CocoaPods
+      - name: Install CocoaPods (macOS)
         run: |
           cd macos
-          # 清理缓存和旧的依赖锁文件，防止版本冲突
-          rm -rf Pods
-          rm -rf Podfile.lock
-          pod cache clean --all
           pod install --repo-update
           cd ..
 

@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.license          = { :type => 'LGPLv3' }
   s.author           = { 'Taner Sener' => 'tanersener@gmail.com' }
   s.platform         = :osx, '10.15'
-  s.source           = { :http => 'https://github.com/arthenica/ffmpeg-kit/releases/download/v6.0/ffmpeg-kit-min-gpl-6.0-macos-xcframework.zip' }
+  s.source           = { :http => 'https://sourceforge.net/projects/ffmpegkit.mirror/files/v6.0/ffmpeg-kit-min-gpl-6.0-macos-xcframework.zip/download' }
   
   s.vendored_frameworks = '**/*.xcframework'
 end
