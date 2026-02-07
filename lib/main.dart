@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -93,7 +94,12 @@ void main() async {
 
   // Initialize Services
   final settings = SettingsService();
-  await settings.init();
+  try {
+    // 允许 SettingsService 初始化失败，避免阻塞启动
+    await settings.init().timeout(const Duration(seconds: 2));
+  } catch (e) {
+    debugPrint('SettingsService init failed or timed out: $e');
+  }
 
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
@@ -114,16 +120,26 @@ void main() async {
   }
   
   final library = LibraryService();
-  await library.init();
+  // Start library initialization but don't await it to prevent blocking app startup
+  // We capture the future to use it for playback restoration later
+  final libraryInitFuture = library.init().catchError((e) {
+    debugPrint('LibraryService init failed: $e');
+  });
   
   final batch = BatchImportService();
-  await batch.init();
+  // Don't await batch import service initialization
+  batch.init().catchError((e) {
+    debugPrint('BatchImportService init failed: $e');
+  });
   
   // Register Services
   final transcriptionManager = TranscriptionManager();
   final embeddedSubtitleService = EmbeddedSubtitleService();
   final bilibiliService = BilibiliDownloadService();
-  await bilibiliService.init();
+  // Don't await bilibili service initialization
+  bilibiliService.init().catchError((e) {
+    debugPrint('BilibiliDownloadService init failed: $e');
+  });
 
   // Initialize media playback services
   final playlistManager = PlaylistManager();
@@ -138,32 +154,39 @@ void main() async {
     progressTracker: progressTracker,
   );
 
-  // 恢复上次的播放状态 - 改为非阻塞方式,避免卡住应用启动
-  // 使用unawaited让它在后台执行
-  _restorePlaybackState(
-    mediaPlaybackService: mediaPlaybackService,
-    progressTracker: progressTracker,
-    playlistManager: playlistManager,
-    library: library,
-  ).catchError((e) {
-    debugPrint('恢复播放状态失败: $e');
+  // 恢复上次的播放状态 - 等待 library 初始化完成后执行
+  // 这样既不会阻塞启动，又能保证有数据可恢复
+  libraryInitFuture.then((_) {
+    _restorePlaybackState(
+      mediaPlaybackService: mediaPlaybackService,
+      progressTracker: progressTracker,
+      playlistManager: playlistManager,
+      library: library,
+    ).catchError((e) {
+      debugPrint('恢复播放状态失败: $e');
+    });
   });
 
-  runApp(
-    MultiProvider(
-      providers: [
-        ChangeNotifierProvider.value(value: settings),
-        ChangeNotifierProvider.value(value: library),
-        ChangeNotifierProvider.value(value: transcriptionManager),
-        ChangeNotifierProvider.value(value: batch),
-        ChangeNotifierProvider.value(value: embeddedSubtitleService),
-        ChangeNotifierProvider.value(value: bilibiliService),
-        ChangeNotifierProvider.value(value: playlistManager),
-        ChangeNotifierProvider.value(value: mediaPlaybackService),
-      ],
-      child: const MyApp(),
-    ),
-  );
+  runZonedGuarded(() {
+    runApp(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider.value(value: settings),
+          ChangeNotifierProvider.value(value: library),
+          ChangeNotifierProvider.value(value: transcriptionManager),
+          ChangeNotifierProvider.value(value: batch),
+          ChangeNotifierProvider.value(value: embeddedSubtitleService),
+          ChangeNotifierProvider.value(value: bilibiliService),
+          ChangeNotifierProvider.value(value: playlistManager),
+          ChangeNotifierProvider.value(value: mediaPlaybackService),
+        ],
+        child: const MyApp(),
+      ),
+    );
+  }, (error, stack) {
+    debugPrint('Uncaught error: $error');
+    debugPrint(stack.toString());
+  });
 }
 
 class RestartWidget extends StatefulWidget {
