@@ -59,8 +59,7 @@ dependencies:
   video_thumbnail: ^0.5.6
   uuid: ^4.5.2
   path_provider: ^2.1.5
-  ffmpeg_kit_flutter_min_gpl:
-    path: packages/ffmpeg_kit_flutter_min_gpl
+  ffmpeg_kit_flutter_new_min_gpl: ^2.1.1
   dio: ^5.9.0
   archive: ^4.0.7
   linked_scroll_controller: ^0.2.0

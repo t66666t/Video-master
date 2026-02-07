@@ -56,9 +56,9 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("release")
-            // 启用代码混淆和资源压缩
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // 关闭代码混淆和资源压缩，防止 Flutter 插件功能失效
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
