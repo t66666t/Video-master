@@ -25,7 +25,11 @@ jobs:
         run: flutter config --enable-macos-desktop
 
       - name: Build MacOS App
-        run: flutter build macos --release
+        run: |
+          cd macos
+          pod install --repo-update
+          cd ..
+          flutter build macos --release
 
       - name: Compress App
         run: |
