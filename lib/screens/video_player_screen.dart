@@ -87,12 +87,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   
   // Local UI State
   bool _isLocked = false;
-  
-  // Long Press Speed State
   bool _isLongPressing = false;
   String _longPressFeedbackText = "";
   double _preLongPressSpeed = 1.0;
-  final GlobalKey _controlsOverlayKey = GlobalKey(); // Key to preserve overlay state/gesture across orientation
   
   // Sidebar
   SidebarType _activeSidebar = SidebarType.none;
@@ -1610,6 +1607,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     }
   }
 
+  void _startLongPressSpeed() {
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    _preLongPressSpeed = _controller.value.playbackSpeed;
+    setState(() {
+      _isLongPressing = true;
+      _longPressFeedbackText = "${settings.longPressSpeed}x 速";
+    });
+    _controller.setPlaybackSpeed(settings.longPressSpeed);
+  }
+
+  void _endLongPressSpeed() {
+    if (!_isLongPressing) return;
+    setState(() {
+      _isLongPressing = false;
+    });
+    _controller.setPlaybackSpeed(_preLongPressSpeed);
+  }
+
   Future<void> _pickSubtitle() async {
     try {
       final settings = Provider.of<SettingsService>(context, listen: false);
@@ -2224,48 +2239,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
     _iosBackSwipeDistance = 0.0;
   }
 
-  void _onLongPressStart() {
-    if (_isLocked) return;
-    if (!_initialized) return;
-    
-    final settings = Provider.of<SettingsService>(context, listen: false);
-    final double targetSpeed = settings.longPressSpeed;
-    
-    // Don't change if already at target speed
-    if (_controller.value.playbackSpeed == targetSpeed) {
-       // Still show feedback but don't save pre-speed if we are already there?
-       // Actually, we should probably just proceed. 
-       // If user was manually at 2.0x and long press is 2.0x, 
-       // we might want to just show the feedback.
-       // But if we save 2.0x as pre-speed, it restores to 2.0x. Correct.
-    }
-    
-    _preLongPressSpeed = _controller.value.playbackSpeed;
-    
-    _controller.setPlaybackSpeed(targetSpeed);
-    
-    if (mounted) {
-      setState(() {
-        _isLongPressing = true;
-        _longPressFeedbackText = "${targetSpeed.toStringAsFixed(1)}x";
-      });
-    }
-  }
-
-  void _onLongPressEnd() {
-    if (!_isLongPressing) return;
-    if (!_initialized) return;
-    
-    // Restore speed
-    _controller.setPlaybackSpeed(_preLongPressSpeed);
-    
-    if (mounted) {
-      setState(() {
-        _isLongPressing = false;
-      });
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     // Consume SettingsService
@@ -2544,14 +2517,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                           if (_initialized && !_isSubtitleDragMode && !_isGhostDragMode)
                             RepaintBoundary(
                               child: VideoControlsOverlay(
-                                key: _controlsOverlayKey,
                                 controller: _controller,
                                 isLocked: _isLocked,
                                 onTogglePlay: _togglePlay,
-                                isLongPressing: _isLongPressing,
-                                longPressFeedbackText: _longPressFeedbackText,
-                                onLongPressStart: _onLongPressStart,
-                                onLongPressEnd: _onLongPressEnd,
                                 onBackPressed: () => _handleBackRequest(),
                                 onSeekTo: (position) {
                                   try {
@@ -2618,6 +2586,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                 showSubtitles: settings.showSubtitles,
                                 onToggleSubtitles: () => _setFloatingSubtitles(!settings.showSubtitles),
                                 onMoveSubtitles: _enterSubtitleDragMode,
+                                isLongPressing: _isLongPressing,
+                                longPressFeedbackText: _longPressFeedbackText,
+                                onLongPressStart: _startLongPressSpeed,
+                                onLongPressEnd: _endLongPressSpeed,
                                 subtitleEntries: _currentSubtitleEntries,
                                 subtitleStyle: activeSubtitleStyle,
                                     subtitleAlignment: settings.subtitleAlignment,

@@ -52,6 +52,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
   
   // Shared State Logic
   bool _isLocked = false;
+  bool _isLongPressing = false;
+  String _longPressFeedbackText = "";
+  double _preLongPressSpeed = 1.0;
   String _currentSubtitleText = "";
   String? _currentSecondaryText;
   int _currentSubtitleIndex = -1;
@@ -889,6 +892,24 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     } else {
       _controller.play();
     }
+  }
+
+  void _startLongPressSpeed() {
+    final settings = _settingsService ?? Provider.of<SettingsService>(context, listen: false);
+    _preLongPressSpeed = _controller.value.playbackSpeed;
+    setState(() {
+      _isLongPressing = true;
+      _longPressFeedbackText = "${settings.longPressSpeed}x 速";
+    });
+    _controller.setPlaybackSpeed(settings.longPressSpeed);
+  }
+
+  void _endLongPressSpeed() {
+    if (!_isLongPressing) return;
+    setState(() {
+      _isLongPressing = false;
+    });
+    _controller.setPlaybackSpeed(_preLongPressSpeed);
   }
 
   void _enterSubtitleDragMode() {
@@ -1884,7 +1905,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                     onClearSelection: () => _selectionKey.currentState?.clearSelection(),
                                     showPlayControls: false,
                                     showBottomBar: false,
-                                    focusNode: _videoFocusNode, isLongPressing: false, longPressFeedbackText: '', onLongPressStart: () {  }, onLongPressEnd: () {  },
+                                    focusNode: _videoFocusNode,
+                                    isLongPressing: _isLongPressing,
+                                    longPressFeedbackText: _longPressFeedbackText,
+                                    onLongPressStart: _startLongPressSpeed,
+                                    onLongPressEnd: _endLongPressSpeed,
                                   ),
                                 // Fullscreen Button (Custom for Portrait)
                                 if (!_isLocked && !_isSubtitleDragMode)
