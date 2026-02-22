@@ -35,6 +35,39 @@ jobs:
 
       - name: Build iOS App (No Codesign)
         run: |
+          # 确保 AppFrameworkInfo.plist 存在，如果不存在则手动创建
+          if [ ! -f ios/Flutter/AppFrameworkInfo.plist ]; then
+            echo "Creating ios/Flutter/AppFrameworkInfo.plist..."
+            cat <<EOF > ios/Flutter/AppFrameworkInfo.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleExecutable</key>
+            <string>App</string>
+            <key>CFBundleIdentifier</key>
+            <string>io.flutter.flutter.app</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>App</string>
+            <key>CFBundlePackageType</key>
+            <string>FMWK</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+            <key>CFBundleSignature</key>
+            <string>????</string>
+            <key>CFBundleVersion</key>
+            <string>1.0</string>
+            <key>MinimumOSVersion</key>
+            <string>12.0</string>
+          </dict>
+          </plist>
+          EOF
+          fi
+          
           # 构建 Release 版本的 App，但不进行签名
           flutter build ios --release --no-codesign
 
