@@ -47,6 +47,7 @@ jobs:
             exit 1
           fi
           cp -r "$APP_PATH" Payload/
+          cp ios/Flutter/AppFrameworkInfo.plist Payload/
           zip -r video_player_app_unsigned.ipa Payload
 
       - name: Upload IPA artifact
