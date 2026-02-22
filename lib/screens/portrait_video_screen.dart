@@ -24,7 +24,6 @@ import '../services/transcription_manager.dart';
 import '../widgets/subtitle_management_sheet.dart';
 import 'video_player_screen.dart'; // Landscape screen
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../utils/app_toast.dart';
 
@@ -423,7 +422,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
     // Check embedded
     bool loadingShown = false;
     try {
-      final settings = Provider.of<SettingsService>(context, listen: false);
       final library = Provider.of<LibraryService>(context, listen: false);
       _isLoadingEmbeddedSubtitle = true;
       if (showLoadingIndicator && mounted) {
@@ -451,8 +449,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         }
         
         // Prepare cache dir
-        final appDocDir = await getApplicationDocumentsDirectory();
-        final subDir = Directory(p.join(appDocDir.path, 'subtitles'));
+        final settings = Provider.of<SettingsService>(context, listen: false);
+        final dataRoot = await settings.resolveLargeDataRootDir();
+        final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
         if (!await subDir.exists()) {
           await subDir.create(recursive: true);
         }
@@ -2107,6 +2106,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
         return SubtitleManagementSheet(
           key: ValueKey(_currentItem.path),
           videoPath: _currentItem.path,
+          showEmbeddedSubtitles: !(_currentItem.isBilibiliExported),
           additionalSubtitles: _currentItem.additionalSubtitles,
           initialSelectedPaths: _currentSubtitlePaths,
           onSubtitleChanged: () {

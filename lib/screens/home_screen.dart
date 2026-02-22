@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import 'package:open_filex/open_filex.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:video_player/video_player.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
@@ -114,6 +115,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int _titleTapCount = 0;
   final FocusNode _shortcutFocusNode = FocusNode();
   bool? _lastIsFullScreen;
+  bool _bilibiliLoginCheckQueued = false;
   
   // ... (existing code)
 
@@ -565,6 +567,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     
     try {
       final service = Provider.of<BilibiliDownloadService>(context, listen: false);
+      bool initReady = true;
+      final initFuture = service.init();
+      await initFuture.timeout(const Duration(milliseconds: 800), onTimeout: () {
+        initReady = false;
+      });
+      if (!initReady) {
+        if (!_bilibiliLoginCheckQueued) {
+          _bilibiliLoginCheckQueued = true;
+          initFuture.then((_) {
+            if (!mounted) return;
+            _bilibiliLoginCheckQueued = false;
+            _checkBilibiliLogin();
+          });
+        }
+        return;
+      }
+      if (!mounted) return;
       final settings = Provider.of<SettingsService>(context, listen: false);
 
       if (settings.suppressBilibiliRestrictedDialog) return;
@@ -984,6 +1003,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 icon: Icon(settings.isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen),
                 tooltip: settings.isFullScreen ? "退出全屏" : "全屏",
                 onPressed: () => settings.toggleFullScreen(),
+              ),
+            if (Platform.isWindows)
+              IconButton(
+                icon: const Icon(Icons.folder_open),
+                tooltip: "大文件目录",
+                onPressed: () => _showLargeDataPathDialog(context),
               ),
             if (_showExportSettingsButton)
               IconButton(
@@ -1571,91 +1596,94 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 );
               }
             },
-            onLongPress: _isSelectionMode ? null : () {
-              setState(() {
-                _isSelectionMode = true;
-                _selectedIds.add(collection.id);
-              });
-            },
             child: cardVisual,
           ),
         );
 
-        // 3. Selection Mode Wrapper (Draggable + Drop Target)
-        if (_isSelectionMode) {
-          return Stack(
-            children: [
-              LongPressDraggable<int>(
-                delay: const Duration(milliseconds: 200),
-                data: index,
-                feedback: SizedBox(
-                  width: 140,
-                  height: 160,
-                  child: Opacity(
-                    opacity: 0.9, 
-                    child: Card(
-                      color: const Color(0xFF333333),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
-                      child: Center(
-                        child: _selectedIds.length > 1 && isSelected
-                            ? Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  const Icon(Icons.folder, size: 50, color: Colors.blueAccent),
-                                  Text(
-                                    "${_selectedIds.length} 个项目",
-                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                                  )
-                                ],
-                              )
-                            : Icon(Icons.folder, size: 60, color: Colors.blueAccent),
-                      ),
-                    )
-                  ),
-                ),
-                childWhenDragging: Opacity(
-                  opacity: 0.3,
-                  child: interactiveCard,
-                ),
-                child: FolderDropTarget(
-                  folderId: collection.id,
-                  index: index,
-                  onMoveToFolder: (draggedIndex, targetId) {
-                    if (draggedIndex >= 0 && draggedIndex < contents.length) {
-                      final draggedItem = contents[draggedIndex];
-                      final draggedId = (draggedItem as dynamic).id;
-                      
-                      List<String> itemsToMove = [];
-                      if (_selectedIds.contains(draggedId)) {
-                         itemsToMove = contents
-                             .where((item) => _selectedIds.contains((item as dynamic).id))
-                             .map((item) => (item as dynamic).id as String)
-                             .toList();
-                      } else {
-                         itemsToMove = [draggedId];
-                      }
-
-                      library.moveItemsToCollection(itemsToMove, targetId);
-                      AppToast.show("已移动到文件夹", type: AppToastType.success);
+        return Stack(
+          children: [
+            LongPressDraggable<int>(
+              delay: const Duration(milliseconds: 160),
+              data: index,
+              onDragStarted: () {
+                if (!_isSelectionMode) {
+                  setState(() {
+                    _isSelectionMode = true;
+                    if (!_selectedIds.contains(collection.id)) {
+                      _selectedIds.add(collection.id);
                     }
-                  },
-                  onReorder: (oldIndex, newIndex) {
-                    final draggedItem = contents[oldIndex];
-                    final draggedId = (draggedItem as dynamic).id;
-
-                    if (_selectedIds.contains(draggedId)) {
-                       final itemsToMove = contents
-                            .where((item) => _selectedIds.contains((item as dynamic).id))
-                            .map((item) => (item as dynamic).id as String)
-                            .toList();
-                       library.reorderMultipleItems(null, itemsToMove, oldIndex, newIndex);
-                    } else {
-                       library.reorderItems(null, oldIndex, newIndex);
-                    }
-                  },
-                  child: interactiveCard,
+                  });
+                }
+              },
+              feedback: SizedBox(
+                width: 140,
+                height: 160,
+                child: Opacity(
+                  opacity: 0.9, 
+                  child: Card(
+                    color: const Color(0xFF333333),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
+                    child: Center(
+                      child: _selectedIds.length > 1 && isSelected
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.folder, size: 50, color: Colors.blueAccent),
+                                Text(
+                                  "${_selectedIds.length} 个项目",
+                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                                )
+                              ],
+                            )
+                          : Icon(Icons.folder, size: 60, color: Colors.blueAccent),
+                    ),
+                  )
                 ),
               ),
+              childWhenDragging: Opacity(
+                opacity: 0.3,
+                child: interactiveCard,
+              ),
+              child: FolderDropTarget(
+                folderId: collection.id,
+                index: index,
+                onMoveToFolder: (draggedIndex, targetId) {
+                  if (draggedIndex >= 0 && draggedIndex < contents.length) {
+                    final draggedItem = contents[draggedIndex];
+                    final draggedId = (draggedItem as dynamic).id;
+                    
+                    List<String> itemsToMove = [];
+                    if (_selectedIds.contains(draggedId)) {
+                       itemsToMove = contents
+                           .where((item) => _selectedIds.contains((item as dynamic).id))
+                           .map((item) => (item as dynamic).id as String)
+                           .toList();
+                    } else {
+                       itemsToMove = [draggedId];
+                    }
+
+                    library.moveItemsToCollection(itemsToMove, targetId);
+                    AppToast.show("已移动到文件夹", type: AppToastType.success);
+                  }
+                },
+                onReorder: (oldIndex, newIndex) {
+                  final draggedItem = contents[oldIndex];
+                  final draggedId = (draggedItem as dynamic).id;
+
+                  if (_selectedIds.contains(draggedId)) {
+                     final itemsToMove = contents
+                          .where((item) => _selectedIds.contains((item as dynamic).id))
+                          .map((item) => (item as dynamic).id as String)
+                          .toList();
+                     library.reorderMultipleItems(null, itemsToMove, oldIndex, newIndex);
+                  } else {
+                     library.reorderItems(null, oldIndex, newIndex);
+                  }
+                },
+                child: interactiveCard,
+              ),
+            ),
+            if (_isSelectionMode)
               Positioned(
                 top: 0,
                 right: 0,
@@ -1673,6 +1701,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(collection.id)) {
                           _selectedIds.add(collection.id);
                           _dragSelectionSnapshot.add(collection.id);
@@ -1697,6 +1729,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(collection.id)) {
                           _selectedIds.add(collection.id);
                           _dragSelectionSnapshot.add(collection.id);
@@ -1728,12 +1764,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ),
-            ],
-          );
-        }
-
-        // 4. Default Mode (Just the card)
-        return interactiveCard;
+          ],
+        );
       }
     );
   }
@@ -1917,85 +1949,88 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 );
               }
             },
-            onLongPress: _isSelectionMode ? null : () {
-              setState(() {
-                _isSelectionMode = true;
-                _selectedIds.add(item.id);
-              });
-            },
             child: cardVisual,
           ),
         );
 
-        // 3. Selection Mode Wrapper (Draggable + Checkmark)
-        if (_isSelectionMode) {
-          return Stack(
-            children: [
-              LongPressDraggable<int>(
-                delay: const Duration(milliseconds: 200),
-                data: index,
-                feedback: SizedBox(
-                  width: 140,
-                  height: 160,
-                  child: Opacity(
-                    opacity: 0.9, 
-                    child: Card(
-                      color: const Color(0xFF333333),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
-                      child: Center(
-                        child: _selectedIds.length > 1 && isSelected
-                            ? Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  const Icon(Icons.movie, size: 50, color: Colors.blueAccent),
-                                  Text(
-                                    "${_selectedIds.length} 个项目",
-                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                                  )
-                                ],
-                              )
-                            : Icon(Icons.movie, size: 60, color: Colors.blueAccent),
-                      ),
-                    )
-                  ),
-                ),
-                childWhenDragging: Opacity(
-                  opacity: 0.3,
-                  child: interactiveCard,
-                ),
-                child: DragTarget<int>(
-                  onWillAcceptWithDetails: (details) => details.data != index,
-                  onAcceptWithDetails: (details) {
-                    final oldIndex = details.data;
-                    final library = Provider.of<LibraryService>(context, listen: false);
-                    final draggedItem = contents[oldIndex];
-                    final draggedId = (draggedItem as dynamic).id;
-
-                    if (_selectedIds.contains(draggedId)) {
-                       final itemsToMove = contents
-                            .where((item) => _selectedIds.contains((item as dynamic).id))
-                            .map((item) => (item as dynamic).id as String)
-                            .toList();
-                       library.reorderMultipleItems(null, itemsToMove, oldIndex, index);
-                    } else {
-                       library.reorderItems(null, oldIndex, index);
+        return Stack(
+          children: [
+            LongPressDraggable<int>(
+              delay: const Duration(milliseconds: 160),
+              data: index,
+              onDragStarted: () {
+                if (!_isSelectionMode) {
+                  setState(() {
+                    _isSelectionMode = true;
+                    if (!_selectedIds.contains(item.id)) {
+                      _selectedIds.add(item.id);
                     }
-                  },
-                  builder: (context, candidateData, rejectedData) {
-                    Widget targetChild = interactiveCard;
-                    if (candidateData.isNotEmpty) {
-                       targetChild = Container(
-                         decoration: BoxDecoration(
-                           border: Border.all(color: Colors.blueAccent, width: 2),
-                           borderRadius: BorderRadius.circular(radius),
-                         ),
-                         child: interactiveCard,
-                       );
-                    }
-                    return targetChild;
-                  },
+                  });
+                }
+              },
+              feedback: SizedBox(
+                width: 140,
+                height: 160,
+                child: Opacity(
+                  opacity: 0.9, 
+                  child: Card(
+                    color: const Color(0xFF333333),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
+                    child: Center(
+                      child: _selectedIds.length > 1 && isSelected
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.movie, size: 50, color: Colors.blueAccent),
+                                Text(
+                                  "${_selectedIds.length} 个项目",
+                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                                )
+                              ],
+                            )
+                          : Icon(Icons.movie, size: 60, color: Colors.blueAccent),
+                    ),
+                  )
                 ),
               ),
+              childWhenDragging: Opacity(
+                opacity: 0.3,
+                child: interactiveCard,
+              ),
+              child: DragTarget<int>(
+                onWillAcceptWithDetails: (details) => details.data != index,
+                onAcceptWithDetails: (details) {
+                  final oldIndex = details.data;
+                  final library = Provider.of<LibraryService>(context, listen: false);
+                  final draggedItem = contents[oldIndex];
+                  final draggedId = (draggedItem as dynamic).id;
+
+                  if (_selectedIds.contains(draggedId)) {
+                     final itemsToMove = contents
+                          .where((item) => _selectedIds.contains((item as dynamic).id))
+                          .map((item) => (item as dynamic).id as String)
+                          .toList();
+                     library.reorderMultipleItems(null, itemsToMove, oldIndex, index);
+                  } else {
+                     library.reorderItems(null, oldIndex, index);
+                  }
+                },
+                builder: (context, candidateData, rejectedData) {
+                  Widget targetChild = interactiveCard;
+                  if (candidateData.isNotEmpty) {
+                     targetChild = Container(
+                       decoration: BoxDecoration(
+                         border: Border.all(color: Colors.blueAccent, width: 2),
+                         borderRadius: BorderRadius.circular(radius),
+                       ),
+                       child: interactiveCard,
+                     );
+                  }
+                  return targetChild;
+                },
+              ),
+            ),
+            if (_isSelectionMode)
               Positioned(
                 top: 0,
                 right: 0,
@@ -2013,6 +2048,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(item.id)) {
                           _selectedIds.add(item.id);
                           _dragSelectionSnapshot.add(item.id);
@@ -2037,6 +2076,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(item.id)) {
                           _selectedIds.add(item.id);
                           _dragSelectionSnapshot.add(item.id);
@@ -2068,12 +2111,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ),
-            ],
-          );
-        }
-        
-        // 4. Default Mode
-        return interactiveCard;
+          ],
+        );
       }
     );
   }
@@ -2118,6 +2157,93 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             child: const Text("确定"),
           ),
         ],
+      ),
+    );
+  }
+
+  Future<void> _showLargeDataPathDialog(BuildContext context) async {
+    if (!Platform.isWindows) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final defaultPath = await settings.getDefaultLargeDataRootPath();
+    String tempPath = settings.largeDataRootPath ?? defaultPath;
+
+    if (!context.mounted) return;
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          backgroundColor: const Color(0xFF2C2C2C),
+          title: const Text("大文件数据目录", style: TextStyle(color: Colors.white)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("当前目录", style: TextStyle(color: Colors.white70)),
+              const SizedBox(height: 6),
+              Text(tempPath, style: const TextStyle(color: Colors.white)),
+              const SizedBox(height: 12),
+              const Text("默认目录", style: TextStyle(color: Colors.white70)),
+              const SizedBox(height: 6),
+              Text(defaultPath, style: const TextStyle(color: Colors.white)),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () async {
+                        final result = await FilePicker.platform.getDirectoryPath();
+                        if (result != null && result.isNotEmpty) {
+                          setState(() => tempPath = result);
+                        }
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF3A3A3A),
+                        foregroundColor: Colors.white,
+                      ),
+                      child: const Text("选择目录"),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextButton(
+                      onPressed: () => setState(() => tempPath = defaultPath),
+                      child: const Text("恢复默认", style: TextStyle(color: Colors.white70)),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                "修改后会迁移媒体库视频、缩略图和字幕到新目录。",
+                style: TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("取消", style: TextStyle(color: Colors.grey)),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                final ok = await library.migrateLargeDataRoot(tempPath);
+                if (!context.mounted) return;
+                if (ok) {
+                  AppToast.show("迁移完成", type: AppToastType.success);
+                  Navigator.pop(context);
+                } else {
+                  AppToast.show("迁移失败，请检查目录权限", type: AppToastType.error);
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF4F7BF5),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text("应用并迁移"),
+            ),
+          ],
+        ),
       ),
     );
   }

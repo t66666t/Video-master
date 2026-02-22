@@ -117,7 +117,19 @@ class SubtitleParser {
 
   static String _stripStyleTokens(String text) {
     if (text.isEmpty) return text;
-    return text.replaceAll(RegExp(r'\{\\[^}]*\}'), '').trim();
+    String cleaned = text.replaceAll(RegExp(r'\{\\[^}]*\}'), '');
+    cleaned = cleaned.replaceAll(RegExp(r'<\s*br\s*/?\s*>', caseSensitive: false), '\n');
+    cleaned = cleaned.replaceAll(RegExp(r'</?[^>]+>'), '');
+    cleaned = cleaned.replaceAll('&nbsp;', ' ');
+    cleaned = cleaned.replaceAll('&amp;', '&');
+    cleaned = cleaned.replaceAll('&lt;', '<');
+    cleaned = cleaned.replaceAll('&gt;', '>');
+    cleaned = cleaned.replaceAll('&quot;', '"');
+    cleaned = cleaned.replaceAll('&#39;', "'");
+    cleaned = cleaned.replaceAll(RegExp(r'[ \t]+\n'), '\n');
+    cleaned = cleaned.replaceAll(RegExp(r'\n[ \t]+'), '\n');
+    cleaned = cleaned.split('\n').map((line) => line.trim()).join('\n');
+    return cleaned.trim();
   }
 
   /// 自动解析字幕内容 (根据内容特征)
@@ -289,8 +301,9 @@ class SubtitleParser {
                  String text = parts[textIndex];
                  
                  // Remove ASS tags like {\pos(400,570)} or {\c&HFFFFFF&}
-                 text = text.replaceAll(RegExp(r'\{.*?\}'), '');
-                 text = text.replaceAll(r'\N', '\n').replaceAll(r'\n', '\n');
+                text = text.replaceAll(RegExp(r'\{.*?\}'), '');
+                text = text.replaceAll(r'\N', '\n').replaceAll(r'\n', '\n');
+                text = _stripStyleTokens(text);
                  
                  subtitles.add(SubtitleItem(
                    index: subtitles.length + 1,
@@ -392,6 +405,7 @@ class SubtitleParser {
 
       // 提取歌词文本 (去掉时间标签剩下的部分)
       String text = line.replaceAll(timeTagRegExp, '').trim();
+      text = _stripStyleTokens(text);
       if (text.isEmpty) continue; // 跳过只有时间没歌词的行
 
       for (var match in matches) {

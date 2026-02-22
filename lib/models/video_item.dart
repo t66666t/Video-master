@@ -21,6 +21,7 @@ class VideoItem {
   bool showFloatingSubtitles;
   List<String>? recycledSelectedSubtitlePaths;
   Map<String, String>? recycledAdditionalSubtitles;
+  bool isBilibiliExported;
 
   VideoItem({
     required this.id,
@@ -43,6 +44,7 @@ class VideoItem {
     this.showFloatingSubtitles = true,
     this.recycledSelectedSubtitlePaths,
     this.recycledAdditionalSubtitles,
+    this.isBilibiliExported = false,
   });
 
   Map<String, dynamic> toJson() {
@@ -67,6 +69,7 @@ class VideoItem {
       'showFloatingSubtitles': showFloatingSubtitles,
       'recycledSelectedSubtitlePaths': recycledSelectedSubtitlePaths,
       'recycledExtraSubtitles': recycledAdditionalSubtitles,
+      'isBilibiliExported': isBilibiliExported,
     };
   }
 
@@ -92,6 +95,7 @@ class VideoItem {
       showFloatingSubtitles: json['showFloatingSubtitles'] as bool? ?? true,
       recycledSelectedSubtitlePaths: (json['recycledSelectedSubtitlePaths'] as List?)?.map((e) => e.toString()).toList(),
       recycledAdditionalSubtitles: (json['recycledExtraSubtitles'] as Map<String, dynamic>?)?.map((k, v) => MapEntry(k, v as String)),
+      isBilibiliExported: json['isBilibiliExported'] as bool? ?? false,
     );
   }
 }

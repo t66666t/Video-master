@@ -2,13 +2,17 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/screens/video_player_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 
@@ -218,6 +222,16 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
     }
   }
 
+  String _formatPath(String path) {
+    if (Platform.isMacOS || Platform.isLinux) {
+      final home = Platform.environment['HOME'];
+      if (home != null && path.startsWith(home)) {
+        return path.replaceFirst(home, '~');
+      }
+    }
+    return path;
+  }
+
   Future<void> _showDownloadSettings(BilibiliDownloadService service) async {
      int tempMax = service.maxConcurrentDownloads;
      int tempQuality = service.preferredQuality;
@@ -226,7 +240,24 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
      bool tempAutoImport = service.autoImportToLibrary;
      bool tempAutoDelete = service.autoDeleteTaskAfterImport;
      bool tempSeqExport = service.sequentialExport;
-     
+    String defaultDownloadDir;
+    if (Platform.isWindows) {
+      final dataRootPath = await SettingsService().getDefaultLargeDataRootPath();
+      defaultDownloadDir = p.join(dataRootPath, 'imported_videos');
+    } else if (Platform.isMacOS) {
+      final downloadDir = await getDownloadsDirectory();
+      if (downloadDir != null) {
+        defaultDownloadDir = p.join(downloadDir.path, 'imported_videos');
+      } else {
+        final appDir = await getApplicationDocumentsDirectory();
+        defaultDownloadDir = p.join(appDir.path, 'imported_videos');
+      }
+    } else {
+      final appDir = await getApplicationDocumentsDirectory();
+      defaultDownloadDir = p.join(appDir.path, 'imported_videos');
+    }
+     String? tempCustomPath = service.customDownloadPath;
+    if (!mounted) return;
      await showDialog(
        context: context,
        builder: (ctx) => StatefulBuilder(
@@ -319,13 +350,68 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen> {
                    } : null,
                    contentPadding: EdgeInsets.zero,
                  ),
+                  if (!Platform.isAndroid && !Platform.isIOS) ...[
+                    const SizedBox(height: 16),
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text("下载保存目录", style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.05),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _formatPath(tempCustomPath?.isNotEmpty == true ? tempCustomPath! : defaultDownloadDir),
+                            style: const TextStyle(fontSize: 12, color: Colors.white70),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              ElevatedButton(
+                                onPressed: () async {
+                                  try {
+                                    final path = await FilePicker.platform.getDirectoryPath(
+                                      dialogTitle: "选择下载保存目录",
+                                      lockParentWindow: true,
+                                    );
+                                    if (path != null && path.isNotEmpty) {
+                                      setState(() => tempCustomPath = path);
+                                    }
+                                  } catch (e) {
+                                    AppToast.show("打开目录选择失败，请重试", type: AppToastType.error);
+                                  }
+                                },
+                                child: const Text("选择目录"),
+                              ),
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: () {
+                                  setState(() => tempCustomPath = defaultDownloadDir);
+                                },
+                                child: const Text("使用默认"),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                ],
              ),
              actions: [
                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("取消")),
                ElevatedButton(
                  onPressed: () {
-                    service.updateSettings(tempMax, tempQuality, tempSubLang, tempAi, tempAutoImport, tempAutoDelete, tempSeqExport);
+                    service.updateSettings(tempMax, tempQuality, tempSubLang, tempAi, tempAutoImport, tempAutoDelete, tempSeqExport, customPath: tempCustomPath);
                     Navigator.pop(ctx);
                     AppToast.show("设置已保存", type: AppToastType.success);
                  }, 

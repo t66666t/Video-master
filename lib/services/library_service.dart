@@ -10,9 +10,11 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:ffmpeg_kit_flutter_new_min_gpl/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_min_gpl/return_code.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import 'thumbnail_cache_service.dart';
+import 'settings_service.dart';
 
 class LibraryService extends ChangeNotifier {
   static final LibraryService _instance = LibraryService._internal();
@@ -104,22 +106,191 @@ class LibraryService extends ChangeNotifier {
   final ValueNotifier<String> importStatus = ValueNotifier("");
   
   bool _initialized = false;
-  late Directory _appDocDir;
+  late Directory _dataRootDir;
   
   // Initialize and load data
   Future<void> init() async {
     if (_initialized) return;
-    
-    _appDocDir = await getApplicationDocumentsDirectory();
-    await _loadLibrary();
+    final appDocDir = await getApplicationDocumentsDirectory();
+    Directory targetDir = appDocDir;
+    if (Platform.isWindows) {
+      final settings = SettingsService();
+      targetDir = await settings.resolveLargeDataRootDir();
+    }
+
+    if (Platform.isWindows &&
+        p.normalize(targetDir.path) != p.normalize(appDocDir.path)) {
+      final targetFile = File(p.join(targetDir.path, 'library.json'));
+      final appFile = File(p.join(appDocDir.path, 'library.json'));
+      if (!await targetFile.exists() && await appFile.exists()) {
+        _dataRootDir = appDocDir;
+        await _loadLibrary();
+        await _migrateLargeDataRoot(targetDir, updateSettings: true);
+      } else {
+        _dataRootDir = targetDir;
+        await _loadLibrary();
+      }
+    } else {
+      _dataRootDir = targetDir;
+      await _loadLibrary();
+    }
     
     _initialized = true;
     notifyListeners();
   }
 
+  Future<bool> migrateLargeDataRoot(String newPath) async {
+    if (!Platform.isWindows) return false;
+    final targetDir = Directory(newPath);
+    return _migrateLargeDataRoot(targetDir, updateSettings: true);
+  }
+
+  Future<bool> _migrateLargeDataRoot(Directory targetDir, {bool updateSettings = false}) async {
+    final oldRoot = _dataRootDir;
+    if (p.normalize(oldRoot.path) == p.normalize(targetDir.path)) return true;
+
+    try {
+      if (!await targetDir.exists()) {
+        await targetDir.create(recursive: true);
+      }
+    } catch (_) {
+      return false;
+    }
+
+    await _moveDirectoryIfExists(
+      Directory(p.join(oldRoot.path, 'imported_videos')),
+      Directory(p.join(targetDir.path, 'imported_videos')),
+    );
+    await _moveDirectoryIfExists(
+      Directory(p.join(oldRoot.path, 'thumbnails')),
+      Directory(p.join(targetDir.path, 'thumbnails')),
+    );
+    await _moveDirectoryIfExists(
+      Directory(p.join(oldRoot.path, 'subtitles')),
+      Directory(p.join(targetDir.path, 'subtitles')),
+    );
+
+    await _moveFileIfExists(
+      File(p.join(oldRoot.path, 'library.json')),
+      File(p.join(targetDir.path, 'library.json')),
+    );
+    await _moveFileIfExists(
+      File(p.join(oldRoot.path, 'library.json.bak')),
+      File(p.join(targetDir.path, 'library.json.bak')),
+    );
+    await _moveFileIfExists(
+      File(p.join(oldRoot.path, 'library.json.tmp')),
+      File(p.join(targetDir.path, 'library.json.tmp')),
+    );
+
+    _updatePathsAfterRootChange(oldRoot.path, targetDir.path);
+    _dataRootDir = targetDir;
+    await _saveLibrary();
+
+    if (updateSettings) {
+      final settings = SettingsService();
+      await settings.setLargeDataRootPath(targetDir.path);
+    }
+
+    return true;
+  }
+
+  void _updatePathsAfterRootChange(String oldRoot, String newRoot) {
+    for (final col in _collections.values) {
+      if (col.thumbnailPath != null) {
+        col.thumbnailPath = _replaceRootPath(col.thumbnailPath!, oldRoot, newRoot);
+      }
+    }
+
+    for (final vid in _videos.values) {
+      vid.path = _replaceRootPath(vid.path, oldRoot, newRoot);
+      if (vid.thumbnailPath != null) {
+        vid.thumbnailPath = _replaceRootPath(vid.thumbnailPath!, oldRoot, newRoot);
+      }
+      if (vid.subtitlePath != null) {
+        vid.subtitlePath = _replaceRootPath(vid.subtitlePath!, oldRoot, newRoot);
+      }
+      if (vid.secondarySubtitlePath != null) {
+        vid.secondarySubtitlePath = _replaceRootPath(vid.secondarySubtitlePath!, oldRoot, newRoot);
+      }
+      if (vid.additionalSubtitles != null) {
+        vid.additionalSubtitles = vid.additionalSubtitles!.map(
+          (key, value) => MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
+        );
+      }
+      if (vid.recycledSelectedSubtitlePaths != null) {
+        vid.recycledSelectedSubtitlePaths = vid.recycledSelectedSubtitlePaths!
+            .map((e) => _replaceRootPath(e, oldRoot, newRoot))
+            .toList();
+      }
+      if (vid.recycledAdditionalSubtitles != null) {
+        vid.recycledAdditionalSubtitles = vid.recycledAdditionalSubtitles!.map(
+          (key, value) => MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
+        );
+      }
+    }
+  }
+
+  String _replaceRootPath(String path, String oldRoot, String newRoot) {
+    final normOld = p.normalize(oldRoot);
+    final normPath = p.normalize(path);
+    if (p.equals(normOld, normPath) || p.isWithin(normOld, normPath)) {
+      final rel = p.relative(normPath, from: normOld);
+      return p.join(newRoot, rel);
+    }
+    return path;
+  }
+
+  Future<void> _moveFileIfExists(File src, File dest) async {
+    if (!await src.exists()) return;
+    if (!await dest.parent.exists()) {
+      await dest.parent.create(recursive: true);
+    }
+    try {
+      await src.rename(dest.path);
+    } catch (_) {
+      await src.copy(dest.path);
+      try {
+        await src.delete();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _moveDirectoryIfExists(Directory src, Directory dest) async {
+    if (!await src.exists()) return;
+    if (!await dest.parent.exists()) {
+      await dest.parent.create(recursive: true);
+    }
+    if (!await dest.exists()) {
+      try {
+        await src.rename(dest.path);
+        return;
+      } catch (_) {}
+    }
+    await _copyDirectoryContents(src, dest);
+    try {
+      await src.delete(recursive: true);
+    } catch (_) {}
+  }
+
+  Future<void> _copyDirectoryContents(Directory src, Directory dest) async {
+    if (!await dest.exists()) {
+      await dest.create(recursive: true);
+    }
+    await for (final entity in src.list(followLinks: false)) {
+      final name = p.basename(entity.path);
+      final targetPath = p.join(dest.path, name);
+      if (entity is File) {
+        await entity.copy(targetPath);
+      } else if (entity is Directory) {
+        await _copyDirectoryContents(entity, Directory(targetPath));
+      }
+    }
+  }
+
   Future<void> _loadLibrary() async {
-    final file = File(p.join(_appDocDir.path, 'library.json'));
-    final backupFile = File(p.join(_appDocDir.path, 'library.json.bak'));
+    final file = File(p.join(_dataRootDir.path, 'library.json'));
+    final backupFile = File(p.join(_dataRootDir.path, 'library.json.bak'));
 
     if (!await file.exists()) {
       // Try backup if main file missing
@@ -228,9 +399,9 @@ class LibraryService extends ChangeNotifier {
     _hasPendingSave = false;
 
     try {
-      final file = File(p.join(_appDocDir.path, 'library.json'));
-      final tempFile = File(p.join(_appDocDir.path, 'library.json.tmp'));
-      final backupFile = File(p.join(_appDocDir.path, 'library.json.bak'));
+      final file = File(p.join(_dataRootDir.path, 'library.json'));
+      final tempFile = File(p.join(_dataRootDir.path, 'library.json.tmp'));
+      final backupFile = File(p.join(_dataRootDir.path, 'library.json.bak'));
 
       final data = {
         'collections': _collections.values.map((e) => e.toJson()).toList(),
@@ -317,7 +488,7 @@ class LibraryService extends ChangeNotifier {
     if (previousPath != null &&
         previousPath.isNotEmpty &&
         thumbnailPath != previousPath &&
-        p.isWithin(_appDocDir.path, previousPath)) {
+        p.isWithin(_dataRootDir.path, previousPath)) {
       try {
         final file = File(previousPath);
         if (await file.exists()) {
@@ -382,7 +553,7 @@ class LibraryService extends ChangeNotifier {
         debugPrint("Error getting temp/cache dirs: $e");
       }
       
-      final importedDir = Directory(p.join(_appDocDir.path, 'imported_videos'));
+      final importedDir = Directory(p.join(_dataRootDir.path, 'imported_videos'));
       if (!await importedDir.exists()) {
         await importedDir.create(recursive: true);
       }
@@ -597,6 +768,9 @@ class LibraryService extends ChangeNotifier {
         } else {
           vid.recycledAdditionalSubtitles = null;
         }
+        if (!vid.isBilibiliExported && await _isBilibiliExportedCandidate(vid)) {
+          vid.isBilibiliExported = true;
+        }
         vid.isRecycled = true;
         vid.recycleTime = now;
         parentId = vid.parentId;
@@ -706,7 +880,7 @@ class LibraryService extends ChangeNotifier {
     ThumbnailCacheService().evictFromCache(id);
     if (col.thumbnailPath != null &&
         col.thumbnailPath!.isNotEmpty &&
-        p.isWithin(_appDocDir.path, col.thumbnailPath!)) {
+        p.isWithin(_dataRootDir.path, col.thumbnailPath!)) {
       try {
         final file = File(col.thumbnailPath!);
         if (await file.exists()) {
@@ -743,35 +917,27 @@ class LibraryService extends ChangeNotifier {
       }
     }
     
-    // 2. Delete Cached Subtitles
-    if (vid.isSubtitleCached && vid.subtitlePath != null) {
-       try {
-         final file = File(vid.subtitlePath!);
-         if (await file.exists()) {
-           await file.delete();
-         }
-       } catch (e) {
-         developer.log('Error deleting subtitle', error: e);
-       }
-    }
-    if (vid.isSecondarySubtitleCached && vid.secondarySubtitlePath != null) {
-       try {
-         final file = File(vid.secondarySubtitlePath!);
-         if (await file.exists()) {
-           await file.delete();
-         }
-       } catch (e) {
-         developer.log('Error deleting secondary subtitle', error: e);
-       }
+    // 2. Delete Internal Subtitles
+    try {
+      final subtitlePaths = await _collectAssociatedSubtitlePaths(vid);
+      for (final path in subtitlePaths) {
+        if (!_isInternalPath(path)) continue;
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    } catch (e) {
+      developer.log('Error deleting subtitles', error: e);
     }
 
     // 3. Delete Video File (Only if it's inside app storage)
     // This handles the "cache" user mentioned if the video was copied internally.
     try {
-      bool shouldDelete = false;
+      bool shouldDelete = await _isBilibiliExportedCandidate(vid);
 
       // Check 1: Internal Doc Dir (App Data)
-      if (p.isWithin(_appDocDir.path, vid.path)) {
+      if (p.isWithin(_dataRootDir.path, vid.path)) {
         shouldDelete = true;
       }
       
@@ -1134,7 +1300,7 @@ class LibraryService extends ChangeNotifier {
     
     // Android and other platforms: Use video_thumbnail plugin
     try {
-      final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
+      final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
         await thumbDir.create(recursive: true);
       }
@@ -1156,7 +1322,7 @@ class LibraryService extends ChangeNotifier {
   /// 使用 FFmpeg 生成缩略图（用于 iOS 和其他平台）
   Future<String?> _generateThumbnailFFmpeg(String videoPath) async {
     try {
-      final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
+      final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
         await thumbDir.create(recursive: true);
       }
@@ -1224,7 +1390,7 @@ class LibraryService extends ChangeNotifier {
          return null;
        }
        
-       final thumbDir = Directory(p.join(_appDocDir.path, 'thumbnails'));
+       final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
        if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
        
        // Generate deterministic filename based on video path
@@ -1297,7 +1463,7 @@ class LibraryService extends ChangeNotifier {
   Future<void> updateVideoSubtitles(String videoId, String? subtitlePath, bool isCached, {String? secondarySubtitlePath, bool isSecondaryCached = false}) async {
     final item = _videos[videoId];
     if (item != null) {
-      final subDir = Directory(p.join(_appDocDir.path, 'subtitles'));
+      final subDir = Directory(p.join(_dataRootDir.path, 'subtitles'));
       if ((isCached || isSecondaryCached) && !await subDir.exists()) {
         await subDir.create(recursive: true);
       }
@@ -1470,7 +1636,7 @@ class LibraryService extends ChangeNotifier {
   /// if they are currently in a temporary or cache directory.
   Future<void> _ensureFilePersistence(VideoItem item) async {
     try {
-      final importedDir = Directory(p.join(_appDocDir.path, 'imported_videos'));
+      final importedDir = Directory(p.join(_dataRootDir.path, 'imported_videos'));
       
       // Handle Video File
       item.path = await _moveIfTemporary(item.path, importedDir);
@@ -1518,10 +1684,13 @@ class LibraryService extends ChangeNotifier {
       // Check 3: App Data Dir (Internal but not library root)
       // Files in app data that are NOT in our 'imported_videos' or 'videos' root
       // are often "batch import cache" files (like unzipped files).
-      if (!isTemporary && p.isWithin(_appDocDir.path, currentPath)) {
-        final importedDir = Directory(p.join(_appDocDir.path, 'imported_videos'));
-        // If it's in app doc dir but NOT in our permanent folder, treat as temporary for library
-        if (!p.isWithin(importedDir.path, currentPath)) {
+      if (!isTemporary && p.isWithin(_dataRootDir.path, currentPath)) {
+        final importedDir = Directory(p.join(_dataRootDir.path, 'imported_videos'));
+        final subDir = Directory(p.join(_dataRootDir.path, 'subtitles'));
+        final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
+        if (!p.isWithin(importedDir.path, currentPath) &&
+            !p.isWithin(subDir.path, currentPath) &&
+            !p.isWithin(thumbDir.path, currentPath)) {
           isTemporary = true;
         }
       }
@@ -1596,7 +1765,7 @@ class LibraryService extends ChangeNotifier {
     int size = 0;
     
     // Check Video File
-    if (_isInternalPath(item.path)) {
+    if (_isInternalPath(item.path) || await _isBilibiliExportedCandidate(item)) {
       size += await _getFileSize(item.path);
     }
     final subtitlePaths = await _collectAssociatedSubtitlePaths(item);
@@ -1647,7 +1816,7 @@ class LibraryService extends ChangeNotifier {
 
     if (_initialized) {
       try {
-        final subDir = Directory(p.join(_appDocDir.path, 'subtitles'));
+        final subDir = Directory(p.join(_dataRootDir.path, 'subtitles'));
         if (await subDir.exists()) {
           final docFiles = subDir.listSync().whereType<File>();
           for (final file in docFiles) {
@@ -1676,9 +1845,31 @@ class LibraryService extends ChangeNotifier {
     return size;
   }
 
+  bool _looksLikeBilibiliExportedFile(String path) {
+    final name = p.basenameWithoutExtension(path);
+    final reg = RegExp(r'_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$');
+    return reg.hasMatch(name);
+  }
+
+  Future<String?> _getBilibiliCustomDownloadPath() async {
+    final prefs = await SharedPreferences.getInstance();
+    final path = prefs.getString('bilibili_custom_download_path');
+    if (path == null || path.isEmpty) return null;
+    return path;
+  }
+
+  Future<bool> _isBilibiliExportedCandidate(VideoItem item) async {
+    if (!Platform.isWindows) return item.isBilibiliExported;
+    if (item.isBilibiliExported) return true;
+    final customPath = await _getBilibiliCustomDownloadPath();
+    if (customPath == null) return false;
+    if (!p.isWithin(customPath, item.path)) return false;
+    return _looksLikeBilibiliExportedFile(item.path);
+  }
+
   bool _isInternalPath(String path) {
     if (!_initialized) return false;
-    return p.isWithin(_appDocDir.path, path);
+    return p.isWithin(_dataRootDir.path, path);
   }
 
   Future<int> _getFileSize(String path) async {

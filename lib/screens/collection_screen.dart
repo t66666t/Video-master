@@ -1248,91 +1248,94 @@ class _CollectionScreenState extends State<CollectionScreen> {
                 );
               }
             },
-            onLongPress: _isSelectionMode ? null : () {
-              setState(() {
-                _isSelectionMode = true;
-                _selectedIds.add(collection.id);
-              });
-            },
             child: cardVisual,
           ),
         );
 
-        // 3. Selection Mode Wrapper
-        if (_isSelectionMode) {
-          return Stack(
-            children: [
-              LongPressDraggable<int>(
-                delay: const Duration(milliseconds: 200),
-                data: index,
-                feedback: SizedBox(
-                  width: 140,
-                  height: 160,
-                  child: Opacity(
-                    opacity: 0.9, 
-                    child: Card(
-                      color: const Color(0xFF333333),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
-                      child: Center(
-                        child: _selectedIds.length > 1 && isSelected
-                          ? Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                const Icon(Icons.folder, size: 50, color: Colors.blueAccent),
-                                Text(
-                                  "${_selectedIds.length} 个项目",
-                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                                )
-                              ],
-                            )
-                          : Icon(Icons.folder, size: 60, color: Colors.blueAccent),
-                      ),
-                    )
-                  ),
-                ),
-                childWhenDragging: Opacity(
-                  opacity: 0.3,
-                  child: interactiveCard,
-                ),
-                child: FolderDropTarget(
-                  folderId: collection.id,
-                  index: index,
-                  onMoveToFolder: (draggedIndex, targetId) {
-                    if (draggedIndex >= 0 && draggedIndex < contents.length) {
-                      final draggedItem = contents[draggedIndex];
-                      final draggedId = (draggedItem as dynamic).id;
-                      
-                      List<String> itemsToMove = [];
-                      if (_selectedIds.contains(draggedId)) {
-                         itemsToMove = contents
-                             .where((item) => _selectedIds.contains((item as dynamic).id))
-                             .map((item) => (item as dynamic).id as String)
-                             .toList();
-                      } else {
-                         itemsToMove = [draggedId];
-                      }
-
-                      library.moveItemsToCollection(itemsToMove, targetId);
-                      AppToast.show("已移动到文件夹", type: AppToastType.success);
+        return Stack(
+          children: [
+            LongPressDraggable<int>(
+              delay: const Duration(milliseconds: 160),
+              data: index,
+              onDragStarted: () {
+                if (!_isSelectionMode) {
+                  setState(() {
+                    _isSelectionMode = true;
+                    if (!_selectedIds.contains(collection.id)) {
+                      _selectedIds.add(collection.id);
                     }
-                  },
-                  onReorder: (oldIndex, newIndex) {
-                     final draggedItem = contents[oldIndex];
-                     final draggedId = (draggedItem as dynamic).id;
-                     
-                     if (_selectedIds.contains(draggedId)) {
-                        final itemsToMove = contents
-                             .where((item) => _selectedIds.contains((item as dynamic).id))
-                             .map((item) => (item as dynamic).id as String)
-                             .toList();
-                        library.reorderMultipleItems(widget.collectionId, itemsToMove, oldIndex, newIndex);
-                     } else {
-                        library.reorderItems(widget.collectionId, oldIndex, newIndex);
-                     }
-                  },
-                  child: interactiveCard,
+                  });
+                }
+              },
+              feedback: SizedBox(
+                width: 140,
+                height: 160,
+                child: Opacity(
+                  opacity: 0.9, 
+                  child: Card(
+                    color: const Color(0xFF333333),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
+                    child: Center(
+                      child: _selectedIds.length > 1 && isSelected
+                        ? Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const Icon(Icons.folder, size: 50, color: Colors.blueAccent),
+                              Text(
+                                "${_selectedIds.length} 个项目",
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              )
+                            ],
+                          )
+                        : Icon(Icons.folder, size: 60, color: Colors.blueAccent),
+                    ),
+                  )
                 ),
               ),
+              childWhenDragging: Opacity(
+                opacity: 0.3,
+                child: interactiveCard,
+              ),
+              child: FolderDropTarget(
+                folderId: collection.id,
+                index: index,
+                onMoveToFolder: (draggedIndex, targetId) {
+                  if (draggedIndex >= 0 && draggedIndex < contents.length) {
+                    final draggedItem = contents[draggedIndex];
+                    final draggedId = (draggedItem as dynamic).id;
+                    
+                    List<String> itemsToMove = [];
+                    if (_selectedIds.contains(draggedId)) {
+                       itemsToMove = contents
+                           .where((item) => _selectedIds.contains((item as dynamic).id))
+                           .map((item) => (item as dynamic).id as String)
+                           .toList();
+                    } else {
+                       itemsToMove = [draggedId];
+                    }
+
+                    library.moveItemsToCollection(itemsToMove, targetId);
+                    AppToast.show("已移动到文件夹", type: AppToastType.success);
+                  }
+                },
+                onReorder: (oldIndex, newIndex) {
+                   final draggedItem = contents[oldIndex];
+                   final draggedId = (draggedItem as dynamic).id;
+                   
+                   if (_selectedIds.contains(draggedId)) {
+                      final itemsToMove = contents
+                           .where((item) => _selectedIds.contains((item as dynamic).id))
+                           .map((item) => (item as dynamic).id as String)
+                           .toList();
+                      library.reorderMultipleItems(widget.collectionId, itemsToMove, oldIndex, newIndex);
+                   } else {
+                      library.reorderItems(widget.collectionId, oldIndex, newIndex);
+                   }
+                },
+                child: interactiveCard,
+              ),
+            ),
+            if (_isSelectionMode)
               Positioned(
                 top: 0,
                 right: 0,
@@ -1350,6 +1353,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(collection.id)) {
                           _selectedIds.add(collection.id);
                           _dragSelectionSnapshot.add(collection.id);
@@ -1374,6 +1381,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(collection.id)) {
                           _selectedIds.add(collection.id);
                           _dragSelectionSnapshot.add(collection.id);
@@ -1405,12 +1416,8 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   ),
                 ),
               ),
-            ],
-          );
-        }
-
-        // 4. Default Mode
-        return interactiveCard;
+          ],
+        );
       }
     );
   }
@@ -1614,73 +1621,77 @@ class _CollectionScreenState extends State<CollectionScreen> {
                 );
               }
             },
-            onLongPress: _isSelectionMode ? null : () {
-              setState(() {
-                _isSelectionMode = true;
-                _selectedIds.add(item.id);
-              });
-            },
             child: cardVisual,
           ),
         );
 
-        // 3. Selection Mode Wrapper
-        if (_isSelectionMode) {
-          return Stack(
-            children: [
-              LongPressDraggable<int>(
-                data: index,
-                feedback: SizedBox(
-                  width: 140,
-                  height: 160,
-                  child: Opacity(
-                    opacity: 0.9, 
-                    child: Card(
-                      color: const Color(0xFF333333),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
-                      child: Center(
-                        child: Icon(Icons.movie, size: 60, color: Colors.blueAccent),
-                      ),
-                    )
-                  ),
-                ),
-                childWhenDragging: Opacity(
-                  opacity: 0.3,
-                  child: interactiveCard,
-                ),
-                child: DragTarget<int>(
-                  onWillAcceptWithDetails: (details) => details.data != index,
-                  onAcceptWithDetails: (details) {
-                    final oldIndex = details.data;
-                    final library = Provider.of<LibraryService>(context, listen: false);
-                    final draggedItem = contents[oldIndex];
-                    final draggedId = (draggedItem as dynamic).id;
-
-                    if (_selectedIds.contains(draggedId)) {
-                       final itemsToMove = contents
-                            .where((item) => _selectedIds.contains((item as dynamic).id))
-                            .map((item) => (item as dynamic).id as String)
-                            .toList();
-                       library.reorderMultipleItems(widget.collectionId, itemsToMove, oldIndex, index);
-                    } else {
-                       library.reorderItems(widget.collectionId, oldIndex, index);
+        return Stack(
+          children: [
+            LongPressDraggable<int>(
+              delay: const Duration(milliseconds: 160),
+              data: index,
+              onDragStarted: () {
+                if (!_isSelectionMode) {
+                  setState(() {
+                    _isSelectionMode = true;
+                    if (!_selectedIds.contains(item.id)) {
+                      _selectedIds.add(item.id);
                     }
-                  },
-                  builder: (context, candidateData, rejectedData) {
-                    Widget targetChild = interactiveCard;
-                    if (candidateData.isNotEmpty) {
-                       targetChild = Container(
-                         decoration: BoxDecoration(
-                           border: Border.all(color: Colors.blueAccent, width: 2),
-                           borderRadius: BorderRadius.circular(radius),
-                         ),
-                         child: interactiveCard,
-                       );
-                    }
-                    return targetChild;
-                  },
+                  });
+                }
+              },
+              feedback: SizedBox(
+                width: 140,
+                height: 160,
+                child: Opacity(
+                  opacity: 0.9, 
+                  child: Card(
+                    color: const Color(0xFF333333),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(140 * 0.09)),
+                    child: Center(
+                      child: Icon(Icons.movie, size: 60, color: Colors.blueAccent),
+                    ),
+                  )
                 ),
               ),
+              childWhenDragging: Opacity(
+                opacity: 0.3,
+                child: interactiveCard,
+              ),
+              child: DragTarget<int>(
+                onWillAcceptWithDetails: (details) => details.data != index,
+                onAcceptWithDetails: (details) {
+                  final oldIndex = details.data;
+                  final library = Provider.of<LibraryService>(context, listen: false);
+                  final draggedItem = contents[oldIndex];
+                  final draggedId = (draggedItem as dynamic).id;
+
+                  if (_selectedIds.contains(draggedId)) {
+                     final itemsToMove = contents
+                          .where((item) => _selectedIds.contains((item as dynamic).id))
+                          .map((item) => (item as dynamic).id as String)
+                          .toList();
+                     library.reorderMultipleItems(widget.collectionId, itemsToMove, oldIndex, index);
+                  } else {
+                     library.reorderItems(widget.collectionId, oldIndex, index);
+                  }
+                },
+                builder: (context, candidateData, rejectedData) {
+                  Widget targetChild = interactiveCard;
+                  if (candidateData.isNotEmpty) {
+                     targetChild = Container(
+                       decoration: BoxDecoration(
+                         border: Border.all(color: Colors.blueAccent, width: 2),
+                         borderRadius: BorderRadius.circular(radius),
+                       ),
+                       child: interactiveCard,
+                     );
+                  }
+                  return targetChild;
+                },
+              ),
+            ),
+            if (_isSelectionMode)
               Positioned(
                 top: 0,
                 right: 0,
@@ -1698,6 +1709,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(item.id)) {
                           _selectedIds.add(item.id);
                           _dragSelectionSnapshot.add(item.id);
@@ -1712,12 +1727,20 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     setState(() {
                       _dragSelectionStartIndex = null;
                       _dragSelectionSnapshot.clear();
+                      _isBoxSelecting = false;
+                      _boxStartPos = null;
+                      _boxCurrentPos = null;
+                      _capturedIds.clear();
                     });
                   },
                   onLongPressStart: (details) {
                     setState(() {
                        _dragSelectionStartIndex = index;
                        _dragSelectionSnapshot = Set.from(_selectedIds);
+                       _capturedIds.clear();
+                       _isBoxSelecting = false;
+                       _boxStartPos = null;
+                       _boxCurrentPos = null;
                        if (!_selectedIds.contains(item.id)) {
                           _selectedIds.add(item.id);
                           _dragSelectionSnapshot.add(item.id);
@@ -1749,12 +1772,8 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   ),
                 ),
               ),
-            ],
-          );
-        }
-        
-        // 4. Default Mode
-        return interactiveCard;
+          ],
+        );
       }
     );
   }

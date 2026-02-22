@@ -53,6 +53,13 @@ void main() {
     expect(parsed.first.text, '字幕');
   });
 
+  test('parseSrt strips html style tags', () {
+    final content = '1\n00:00:09,000 --> 00:00:10,000\n<font face="微软雅黑" size="54"><b>我是你们的陈 sir </b></font>\n\n';
+    final parsed = SubtitleParser.parse(content);
+    expect(parsed.length, 1);
+    expect(parsed.first.text, '我是你们的陈 sir');
+  });
+
   test('parse sup file yields image data when available', () async {
     final file = File(r'd:\1spbfq\字幕示例\58c06d2d-608c-435c-9af4-1dc77ae18ae5_main.sup');
     if (!file.existsSync()) return;

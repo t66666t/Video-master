@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
 import '../models/subtitle_style.dart';
 
 class SettingsService extends ChangeNotifier {
@@ -171,6 +173,8 @@ class SettingsService extends ChangeNotifier {
   // New: Action Buttons Collapsed State
   bool isActionButtonsCollapsed = false;
 
+  String? largeDataRootPath;
+
   // New: Window Management
   bool isFullScreen = false;
 
@@ -226,6 +230,7 @@ class SettingsService extends ChangeNotifier {
     autoPauseOnExit = _prefs.getBool('autoPauseOnExit') ?? true;
     autoPlayNextVideo = _prefs.getBool('autoPlayNextVideo') ?? true;
     isActionButtonsCollapsed = _prefs.getBool('isActionButtonsCollapsed') ?? false;
+    largeDataRootPath = _prefs.getString('largeDataRootPath');
     enableSeekPreview = _prefs.getBool('enableSeekPreview') ?? true;
     suppressBilibiliRestrictedDialog = _prefs.getBool('suppressBilibiliRestrictedDialog') ?? false;
 
@@ -770,5 +775,40 @@ class SettingsService extends ChangeNotifier {
         'lastSelectedModelType': lastSelectedModelType,
       },
     };
+  }
+
+  Future<String> getDefaultLargeDataRootPath() async {
+    if (Platform.isWindows) {
+      final exeDir = p.dirname(Platform.resolvedExecutable);
+      return p.join(exeDir, 'VideoPlayerData');
+    }
+    final appDocDir = await getApplicationDocumentsDirectory();
+    return appDocDir.path;
+  }
+
+  Future<Directory> resolveLargeDataRootDir() async {
+    if (!Platform.isWindows) {
+      return getApplicationDocumentsDirectory();
+    }
+    final defaultPath = await getDefaultLargeDataRootPath();
+    final targetPath = (largeDataRootPath != null && largeDataRootPath!.isNotEmpty)
+        ? largeDataRootPath!
+        : defaultPath;
+    final dir = Directory(targetPath);
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
+
+  Future<void> setLargeDataRootPath(String? path) async {
+    if (path == null || path.isEmpty) {
+      largeDataRootPath = null;
+      await _prefs.remove('largeDataRootPath');
+    } else {
+      largeDataRootPath = path;
+      await _prefs.setString('largeDataRootPath', path);
+    }
+    notifyListeners();
   }
 }

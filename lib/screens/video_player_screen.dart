@@ -1656,7 +1656,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
   void _showSubtitleManager() {
     setState(() {
-      _previousSidebarType = SidebarType.subtitles;
+      _previousSidebarType = _activeSidebar;
       _activeSidebar = SidebarType.subtitleManager;
     });
     _userRequestedSubtitles = true;
@@ -2034,6 +2034,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
   // --- Drag Logic ---
   void _enterSubtitleDragMode() {
     setState(() {
+      _previousSidebarType = _activeSidebar;
       _isSubtitleDragMode = true;
       _isGhostDragMode = false;
       _activeSidebar = SidebarType.subtitlePosition;
@@ -2044,6 +2045,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
   void _enterGhostDragMode() {
     setState(() {
+      _previousSidebarType = _activeSidebar;
       _isGhostDragMode = true;
       _isSubtitleDragMode = false;
       _activeSidebar = SidebarType.subtitlePosition;
@@ -2054,11 +2056,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
 
   void _exitSubtitleDragMode() {
     setState(() {
-      if (_isGhostDragMode) {
-        _activeSidebar = SidebarType.subtitles;
+      if (_previousSidebarType != SidebarType.none) {
+        _activeSidebar = _previousSidebarType;
       } else {
         _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
       }
+      _previousSidebarType = SidebarType.none;
       _isSubtitleDragMode = false;
       _isGhostDragMode = false;
       _isSubtitleSnapped = false;
@@ -2174,7 +2177,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
       }
       if (_activeSidebar != SidebarType.subtitles) {
         setState(() {
-          _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+          if (_previousSidebarType != SidebarType.none) {
+            _activeSidebar = _previousSidebarType;
+          } else {
+            _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+          }
+          _previousSidebarType = SidebarType.none;
         });
         return;
       }
@@ -2227,7 +2235,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                   final rawWidth = isLeftHandedMode
                       ? details.globalPosition.dx
                       : (screenWidth - details.globalPosition.dx);
-                  settings.updateSetting('userSubtitleSidebarWidth', rawWidth.clamp(200.0, 600.0));
+                  settings.updateSetting('userSubtitleSidebarWidth', rawWidth.clamp(100.0, 600.0));
                 };
                 instance.onLongPressEnd = (_) {
                   setState(() => _isResizingSidebar = false);
@@ -2517,6 +2525,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
                                   _previousSidebarType = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
                                   _activeSidebar = SidebarType.settings;
                                 }), 
+                                onOpenSubtitleManager: _showSubtitleManager,
                                 onToggleFloatingSubtitleSettings: _toggleFloatingSubtitleSettingsSidebar,
                                 onToggleSidebar: () {
                                   final settings = Provider.of<SettingsService>(context, listen: false);
@@ -2755,7 +2764,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             _isSubtitleDragMode = false;
             _isGhostDragMode = false;
             _isSubtitleSnapped = false;
-            _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+            if (_previousSidebarType != SidebarType.none) {
+              _activeSidebar = _previousSidebarType;
+            } else {
+              _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+            }
             _previousSidebarType = SidebarType.none;
           }),
           onBack: () => setState(() {
@@ -2763,7 +2776,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
             _isSubtitleDragMode = false;
             _isGhostDragMode = false;
             _isSubtitleSnapped = false;
-            _activeSidebar = _previousSidebarType == SidebarType.settings ? SidebarType.settings : SidebarType.subtitles;
+            if (_previousSidebarType != SidebarType.none) {
+              _activeSidebar = _previousSidebarType;
+            } else {
+              _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+            }
             _previousSidebarType = SidebarType.none;
           }),
         );
@@ -2779,8 +2796,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
           },
           onOpenSubtitleSettings: _toggleFloatingSubtitleSettingsSidebar,
           onClose: () => setState(() {
-            if (_previousSidebarType == SidebarType.subtitles) {
-              _activeSidebar = SidebarType.subtitles;
+            if (_previousSidebarType != SidebarType.none) {
+              _activeSidebar = _previousSidebarType;
             } else {
               _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
             }
@@ -2871,6 +2888,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
          return SubtitleManagementSheet(
            key: ValueKey(path),
            videoPath: path,
+           showEmbeddedSubtitles: !(_currentItem?.isBilibiliExported ?? false),
            additionalSubtitles: _currentItem?.additionalSubtitles,
            initialSelectedPaths: _currentSubtitlePaths,
            onSubtitleChanged: () {
@@ -2906,7 +2924,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> with WidgetsBindi
               _activeSidebar = SidebarType.aiTranscription;
             });
           },
-           onClose: () => setState(() => _activeSidebar = SidebarType.subtitles),
+           onClose: () => setState(() {
+             if (_previousSidebarType != SidebarType.none) {
+               _activeSidebar = _previousSidebarType;
+             } else {
+               _activeSidebar = _isSubtitleSidebarVisible ? SidebarType.subtitles : SidebarType.none;
+             }
+             _previousSidebarType = SidebarType.none;
+           }),
          );
 
       case SidebarType.aiTranscription:

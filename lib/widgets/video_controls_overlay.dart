@@ -24,6 +24,7 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onToggleSidebar;
   final bool isSubtitleSidebarVisible;
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onOpenSubtitleManager;
   final VoidCallback? onToggleFloatingSubtitleSettings;
   final VoidCallback onToggleLock; 
   final VoidCallback? onToggleFullScreen; // New: For desktop full screen toggle
@@ -63,6 +64,7 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onToggleSidebar,
     this.isSubtitleSidebarVisible = false,
     this.onOpenSettings,
+    this.onOpenSubtitleManager,
     this.onToggleFloatingSubtitleSettings,
     required this.onToggleLock,
     this.onToggleFullScreen,
@@ -414,7 +416,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (Platform.isAndroid || Platform.isIOS) {
         _currentBrightness = await ScreenBrightness().application;
       } else {
-        _currentBrightness = 0.5;
+        _currentBrightness = 1.0;
       }
       _currentVolume = widget.controller.value.volume;
       // Initialize last volume
@@ -828,9 +830,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (_isLongPressingZone) return; // 互斥
 
     final dx = details.localPosition.dx;
+    final bool isWindows = !kIsWeb && Platform.isWindows;
     
     if (dx < width * 0.2) {
-      // Brightness (Left 20%) - Only on mobile
       if (Platform.isAndroid || Platform.isIOS) {
         try {
           _startDragValue = await ScreenBrightness().application;
@@ -841,15 +843,26 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           _isAdjustingBrightness = true;
           _currentBrightness = _startDragValue;
         });
+      } else if (isWindows) {
+        _startDragValue = _currentBrightness;
+        setState(() {
+          _isAdjustingBrightness = true;
+          _currentBrightness = _startDragValue;
+        });
       }
     } else if (dx > width * 0.8) {
-        // Volume (Right 20%) - Only on mobile
         if (Platform.isAndroid || Platform.isIOS) {
           try {
             _startDragValue = await VolumeController.instance.getVolume();
           } catch (_) {
             _startDragValue = 0.5;
           }
+          setState(() {
+            _isAdjustingVolume = true;
+            _currentVolume = _startDragValue;
+          });
+        } else if (isWindows) {
+          _startDragValue = widget.controller.value.volume;
           setState(() {
             _isAdjustingVolume = true;
             _currentVolume = _startDragValue;
@@ -873,17 +886,26 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     final double delta = -details.primaryDelta! / height; // Sensitivity depends on height
     // Multiplier for sensitivity
     final double change = delta * 1.5; 
+    final bool isWindows = !kIsWeb && Platform.isWindows;
 
     setState(() {
       if (_isAdjustingBrightness && (Platform.isAndroid || Platform.isIOS)) {
         _currentBrightness = (_currentBrightness + change).clamp(0.0, 1.0);
         ScreenBrightness().setApplicationScreenBrightness(_currentBrightness);
+      } else if (_isAdjustingBrightness && isWindows) {
+        _currentBrightness = (_currentBrightness + change).clamp(0.0, 1.0);
       } else if (_isAdjustingVolume && (Platform.isAndroid || Platform.isIOS)) {
         // System Volume Control (Gesture)
         _currentVolume = (_currentVolume + change).clamp(0.0, 1.0);
         VolumeController.instance.setVolume(_currentVolume);
         // Do NOT update widget.controller.setVolume (Software Gain)
         // Do NOT update _sliderVolume
+      } else if (_isAdjustingVolume && isWindows) {
+        _currentVolume = (_currentVolume + change).clamp(0.0, 1.0);
+        widget.controller.setVolume(_currentVolume);
+        if (_currentVolume > 0) {
+          _lastPlayerVolume = _currentVolume;
+        }
       }
     });
   }
@@ -972,6 +994,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final bool isLeftHandedMode = settings.isLeftHandedMode;
         final Alignment timeAlignment = isLeftHandedMode ? Alignment.centerRight : Alignment.centerLeft;
         final Alignment toolsAlignment = isLeftHandedMode ? Alignment.centerLeft : Alignment.centerRight;
+        final bool isWindows = !kIsWeb && Platform.isWindows;
+        final double brightnessOverlayAlpha = (1.0 - _currentBrightness).clamp(0.0, 1.0).toDouble();
         final List<Widget> topLeading = [
           if (!kIsWeb && Platform.isWindows) ...[
             IconButton(
@@ -1001,6 +1025,16 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
               onPressed: () {
                 _startAutoHideTimer();
                 widget.onOpenSettings!();
+              },
+              iconSize: iconSize,
+            ),
+          if (widget.onOpenSubtitleManager != null)
+            IconButton(
+              icon: const Icon(Icons.subtitles, color: Colors.white),
+              tooltip: "字幕库",
+              onPressed: () {
+                _startAutoHideTimer();
+                widget.onOpenSubtitleManager!();
               },
               iconSize: iconSize,
             ),
@@ -1125,6 +1159,14 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                   children: [
                     // Transparent container to catch hits in empty areas
                     Container(color: Colors.transparent),
+                    if (isWindows)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: Container(
+                            color: Colors.black.withValues(alpha: brightnessOverlayAlpha),
+                          ),
+                        ),
+                      ),
 
                     // Subtitles (Gesture Layer for Long Press Drag)
                     // Kept here so it participates in the background gesture arena.

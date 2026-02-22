@@ -36,10 +36,10 @@
 
 *   **联网需求**: 该功能需要网络连接以访问 Bilibili 接口。
 *   **音频上传**: 视频的音频部分将被上传至 Bilibili 服务器进行处理（仅用于转录）。
-*   **多端支持**: 该功能在 Android, iOS, Windows 上均可使用。
+*   **多端支持**: 该功能在 Android, iOS, Windows, macOS 上均可使用。
 
 ## 🛠️ 开发说明
 
 *   **状态管理**: 使用 `TranscriptionManager` (Provider) 管理全局转录状态，确保横竖屏切换时进度同步。
-*   **音频提取**: 使用 FFmpeg 提取音频（Windows 使用 `ffmpeg.exe`，移动端使用 `ffmpeg_kit`）。
+*   **音频提取**: 使用 FFmpeg 提取音频（Windows 使用 `ffmpeg.exe`，移动端使用 `ffmpeg_kit_new`）。
 *   **接口调用**: 封装在 `BcutAsrService` 中。

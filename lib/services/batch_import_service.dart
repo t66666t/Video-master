@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:ffmpeg_kit_flutter_new_min_gpl/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_min_gpl/return_code.dart';
 import 'package:uuid/uuid.dart';
+import 'settings_service.dart';
 
 class BatchItem {
   String id;
@@ -450,8 +451,9 @@ class BatchImportService extends ChangeNotifier {
       if (!await file.exists()) return;
 
       // Check if inside App Doc Dir
-      final appDocDir = await getApplicationDocumentsDirectory();
-      if (p.isWithin(appDocDir.path, path)) {
+      final settings = SettingsService();
+      final dataRoot = await settings.resolveLargeDataRootDir();
+      if (p.isWithin(dataRoot.path, path)) {
         await file.delete();
         debugPrint("Deleted internal batch file: $path");
         return;

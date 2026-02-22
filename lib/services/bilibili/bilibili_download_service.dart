@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -13,6 +14,7 @@ import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_state_manager.dart';
 import 'package:video_player_app/services/bilibili/download_manager.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/thumbnail_cache_service.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
@@ -20,6 +22,7 @@ import 'package:video_player_app/utils/subtitle_util.dart';
 class BilibiliDownloadService extends ChangeNotifier {
   final BilibiliApiService apiService = BilibiliApiService();
   late BilibiliDownloadManager _downloadManager;
+  Future<void>? _initFuture;
   
   // State
   List<BilibiliDownloadTask> tasks = [];
@@ -29,7 +32,8 @@ class BilibiliDownloadService extends ChangeNotifier {
   bool preferAiSubtitles = false;
   bool autoImportToLibrary = true;
   bool autoDeleteTaskAfterImport = false;
-  bool sequentialExport = false; // New Setting
+  bool sequentialExport = false;
+  String? customDownloadPath;
   LibraryService? libraryService;
   final List<BilibiliDownloadEpisode> _downloadQueue = [];
   int _activeDownloads = 0;
@@ -41,10 +45,16 @@ class BilibiliDownloadService extends ChangeNotifier {
     _downloadManager = BilibiliDownloadManager(apiService);
   }
 
-  Future<void> init() async {
+  Future<void> init() {
+    _initFuture ??= _initInternal();
+    return _initFuture!;
+  }
+
+  Future<void> _initInternal() async {
     await apiService.init();
     await _loadTasks();
     await _loadSettings();
+    await _cleanupTempOrphans();
   }
 
   Future<void> _loadSettings() async {
@@ -56,6 +66,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     autoImportToLibrary = prefs.getBool('bilibili_auto_import') ?? true;
     autoDeleteTaskAfterImport = prefs.getBool('bilibili_auto_delete_import') ?? false;
     sequentialExport = prefs.getBool('bilibili_sequential_export') ?? false;
+    customDownloadPath = prefs.getString('bilibili_custom_download_path');
     notifyListeners();
   }
 
@@ -68,10 +79,15 @@ class BilibiliDownloadService extends ChangeNotifier {
     await prefs.setBool('bilibili_auto_import', autoImportToLibrary);
     await prefs.setBool('bilibili_auto_delete_import', autoDeleteTaskAfterImport);
     await prefs.setBool('bilibili_sequential_export', sequentialExport);
+    if (customDownloadPath != null) {
+      await prefs.setString('bilibili_custom_download_path', customDownloadPath!);
+    } else {
+      await prefs.remove('bilibili_custom_download_path');
+    }
     notifyListeners();
   }
   
-  void updateSettings(int maxConcurrent, int quality, String subLang, bool preferAi, bool autoImport, bool autoDelete, bool seqExport) {
+  void updateSettings(int maxConcurrent, int quality, String subLang, bool preferAi, bool autoImport, bool autoDelete, bool seqExport, {String? customPath}) {
     maxConcurrentDownloads = maxConcurrent;
     preferredQuality = quality;
     preferredSubtitleLang = subLang;
@@ -79,6 +95,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     autoImportToLibrary = autoImport;
     autoDeleteTaskAfterImport = autoDelete;
     sequentialExport = seqExport;
+    customDownloadPath = customPath;
     saveSettings();
     applyQualitySettingsToPendingTasks();
     processQueue();
@@ -564,6 +581,30 @@ class BilibiliDownloadService extends ChangeNotifier {
     return candidatesWithIndex.first.value;
   }
 
+  StreamItem? _restoreVideoQuality(List<StreamItem> streams, StreamItem? previous) {
+    if (previous == null || streams.isEmpty) return null;
+    try {
+      return streams.firstWhere((s) =>
+          s.id == previous.id &&
+          s.codecid == previous.codecid &&
+          s.codecs == previous.codecs);
+    } catch (_) {}
+    try {
+      return streams.firstWhere((s) =>
+          s.id == previous.id &&
+          s.codecid == previous.codecid);
+    } catch (_) {}
+    try {
+      return streams.firstWhere((s) =>
+          s.id == previous.id &&
+          s.codecs == previous.codecs);
+    } catch (_) {}
+    try {
+      return streams.firstWhere((s) => s.id == previous.id);
+    } catch (_) {}
+    return null;
+  }
+
   Future<void> fetchEpisodeInfo(BilibiliDownloadEpisode episode) async {
     if (episode.status == DownloadStatus.fetchingInfo) return;
     
@@ -571,6 +612,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     notifyListeners();
 
     try {
+      final oldQuality = episode.selectedVideoQuality;
       final streamInfo = await apiService.fetchPlayUrl(episode.bvid, episode.page.cid);
       
       final task = tasks.firstWhere((t) => t.videos.any((v) => v.episodes.contains(episode)));
@@ -583,11 +625,14 @@ class BilibiliDownloadService extends ChangeNotifier {
       );
       
       episode.availableVideoQualities = streamInfo.videoStreams;
-      if (streamInfo.videoStreams.isNotEmpty) {
+      final restoredQuality = _restoreVideoQuality(streamInfo.videoStreams, oldQuality);
+      if (restoredQuality != null) {
+        episode.selectedVideoQuality = restoredQuality;
+      } else if (streamInfo.videoStreams.isNotEmpty) {
         try {
-           episode.selectedVideoQuality = streamInfo.videoStreams.firstWhere((q) => q.id <= preferredQuality);
+          episode.selectedVideoQuality = streamInfo.videoStreams.firstWhere((q) => q.id <= preferredQuality);
         } catch (_) {
-           episode.selectedVideoQuality = streamInfo.videoStreams.first;
+          episode.selectedVideoQuality = streamInfo.videoStreams.first;
         }
       }
       
@@ -695,7 +740,7 @@ class BilibiliDownloadService extends ChangeNotifier {
        oldSubtitleIndex = ep.availableSubtitles.indexOf(ep.selectedSubtitle!);
     }
 
-    final oldQualityId = ep.selectedVideoQuality?.id;
+    final oldQuality = ep.selectedVideoQuality;
 
     while (retryCount <= 3 && !success) {
       ep.status = DownloadStatus.downloading;
@@ -756,12 +801,9 @@ class BilibiliDownloadService extends ChangeNotifier {
         }
 
         // Restore Quality (Update reference to new object)
-        if (oldQualityId != null) {
-           try {
-             ep.selectedVideoQuality = streamInfo.videoStreams.firstWhere((q) => q.id == oldQualityId);
-           } catch (_) {
-             // If old quality gone, fallback logic will handle it below
-           }
+        final restoredQuality = _restoreVideoQuality(streamInfo.videoStreams, oldQuality);
+        if (restoredQuality != null) {
+          ep.selectedVideoQuality = restoredQuality;
         }
         // --- END Refresh & Restore ---
         
@@ -929,6 +971,82 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
   }
 
+  String _deriveSidecarPath(String path) {
+    return path.replaceAll(RegExp(r'\.[a-zA-Z0-9]+$'), '.srt');
+  }
+
+  Future<bool> _isWithinTempDir(String path) async {
+    final tempDir = await getTemporaryDirectory();
+    return p.isWithin(tempDir.path, path);
+  }
+
+  Future<void> _deleteFileIfExists(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _deleteTempArtifacts(String outputPath) async {
+    if (await _isWithinTempDir(outputPath)) {
+      await _deleteFileIfExists(outputPath);
+    }
+    final sidecarPath = _deriveSidecarPath(outputPath);
+    if (sidecarPath != outputPath && await _isWithinTempDir(sidecarPath)) {
+      await _deleteFileIfExists(sidecarPath);
+    }
+  }
+
+  bool _isTempArtifactName(String name) {
+    return name.startsWith("temp_") || name.startsWith("merged_") || name.startsWith("repaired_");
+  }
+
+  Future<void> _cleanupTempOrphans({Duration? maxAge}) async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      if (!await tempDir.exists()) return;
+
+      final activePaths = <String>{};
+      for (var task in tasks) {
+        for (var video in task.videos) {
+          for (var ep in video.episodes) {
+            if (ep.outputPath != null) {
+              final outputPath = p.normalize(ep.outputPath!);
+              activePaths.add(outputPath);
+              final sidecar = _deriveSidecarPath(outputPath);
+              if (sidecar != outputPath) {
+                activePaths.add(p.normalize(sidecar));
+              }
+            }
+          }
+        }
+      }
+
+      final threshold = maxAge ?? const Duration(hours: 24);
+      final now = DateTime.now();
+
+      await for (final entity in tempDir.list()) {
+        if (entity is! File) continue;
+        final name = entity.uri.pathSegments.last;
+        if (!_isTempArtifactName(name)) continue;
+        final path = p.normalize(entity.path);
+        if (activePaths.contains(path)) continue;
+
+        final stat = await entity.stat();
+        final age = now.difference(stat.modified);
+        if (threshold > Duration.zero && age < threshold) continue;
+
+        try {
+          await entity.delete();
+        } catch (_) {}
+      }
+    } catch (e) {
+      debugPrint("Failed to clean temp orphans: $e");
+    }
+  }
+
   void removeSelected() async {
     final selectedEpisodes = _getSelectedEpisodes();
     final tasksToEvict = <BilibiliDownloadTask>{};
@@ -970,6 +1088,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           if (await f.exists()) {
              try { await f.delete(); } catch (_) {}
           }
+          await _deleteTempArtifacts(ep.outputPath!);
        }
     }
 
@@ -1002,6 +1121,7 @@ class BilibiliDownloadService extends ChangeNotifier {
        if (ep.outputPath != null) {
           final f = File(ep.outputPath!);
           if (await f.exists()) await f.delete();
+          await _deleteTempArtifacts(ep.outputPath!);
        }
        
        for (var v in task.videos) {
@@ -1046,29 +1166,14 @@ class BilibiliDownloadService extends ChangeNotifier {
           if (ep.outputPath != null) {
             final f = File(ep.outputPath!);
             if (await f.exists()) await f.delete();
+            await _deleteTempArtifacts(ep.outputPath!);
           }
         }
       }
     }
-    
-    try {
-       final tempDir = await getTemporaryDirectory();
-       if (await tempDir.exists()) {
-          final files = tempDir.listSync();
-          for (var f in files) {
-             if (f is File) {
-                final name = f.uri.pathSegments.last;
-                if (name.startsWith("temp_") || name.endsWith(".m4s") || name.endsWith(".mp4")) {
-                   try { await f.delete(); } catch (_) {}
-                }
-             }
-          }
-       }
-    } catch (e) {
-       debugPrint("Failed to clean temp dir: $e");
-    }
-    
+
     tasks.clear();
+    await _cleanupTempOrphans(maxAge: Duration.zero);
     saveTasks();
     notifyListeners();
   }
@@ -1193,10 +1298,38 @@ class BilibiliDownloadService extends ChangeNotifier {
     
     if (completedEpisodes.isEmpty) return 0;
 
-    final appDir = await getApplicationDocumentsDirectory();
-    final thumbDir = Directory('${appDir.path}/thumbnails');
+    Directory baseDir;
+    if (customDownloadPath != null && customDownloadPath!.isNotEmpty) {
+      baseDir = Directory(customDownloadPath!);
+      if (!await baseDir.exists()) {
+         try {
+           await baseDir.create(recursive: true);
+         } catch (e) {
+           debugPrint("Failed to create custom dir, falling back to default: $e");
+           baseDir = Directory('${(await getApplicationDocumentsDirectory()).path}/imported_videos');
+         }
+      }
+    } else {
+      if (Platform.isMacOS) {
+        final downloadDir = await getDownloadsDirectory();
+        if (downloadDir != null) {
+          baseDir = Directory(p.join(downloadDir.path, 'imported_videos'));
+        } else {
+          final dataRoot = await SettingsService().resolveLargeDataRootDir();
+          baseDir = Directory(p.join(dataRoot.path, 'imported_videos'));
+        }
+      } else {
+        final dataRoot = await SettingsService().resolveLargeDataRootDir();
+        baseDir = Directory(p.join(dataRoot.path, 'imported_videos'));
+      }
+    }
+    
+    if (!await baseDir.exists()) await baseDir.create(recursive: true);
+
+    final dataRoot = await SettingsService().resolveLargeDataRootDir();
+    final thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
     if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
-    final subDir = Directory('${appDir.path}/subtitles');
+    final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
     if (!await subDir.exists()) await subDir.create(recursive: true);
 
     int count = 0;
@@ -1255,33 +1388,29 @@ class BilibiliDownloadService extends ChangeNotifier {
       if (safePart.length > 20) safePart = safePart.substring(0, 20);
 
       final finalName = "${safeTitle}_${safePart}_$uuid.$extension";
-      final finalPath = "${appDir.path}/imported_videos/$finalName";
+      final finalPath = "${baseDir.path}/$finalName";
       
       debugPrint("=== Import Debug Info ===");
       debugPrint("Source path: ${file.path}");
       debugPrint("Target path: $finalPath");
-      debugPrint("App dir: ${appDir.path}");
+      debugPrint("Base dir: ${baseDir.path}");
       debugPrint("File exists: ${file.existsSync()}");
       debugPrint("========================");
       
-      // Ensure target directory exists
       final targetFile = File(finalPath);
       if (!await targetFile.parent.exists()) {
         await targetFile.parent.create(recursive: true);
       }
 
-      // Copy instead of move to keep source valid for re-import and preview
       if (file.path != finalPath) {
         await file.copy(finalPath);
         debugPrint("File copied successfully");
         debugPrint("Target file exists: ${targetFile.existsSync()}");
         debugPrint("Target file size: ${targetFile.lengthSync()}");
-        // Do NOT delete the source file
+        await _deleteTempArtifacts(file.path);
       }
       
-      // Use the original source path for playback to avoid path issues
-      // This matches the preview player behavior which works correctly
-      final playbackPath = file.path;
+      final playbackPath = finalPath;
       
       String? thumbPath;
       try {
@@ -1305,16 +1434,43 @@ class BilibiliDownloadService extends ChangeNotifier {
       final srtFile = File(srtPath);
       String? defaultSubtitlePath;
       
-      if (await srtFile.exists()) {
+      final hasLocalSubtitle = await srtFile.exists();
+      if (hasLocalSubtitle) {
          final finalSrtPath = "${subDir.path}/${uuid}_default.srt";
          await srtFile.copy(finalSrtPath);
-         // Do NOT delete source subtitle
          defaultSubtitlePath = finalSrtPath;
+         await _deleteTempArtifacts(srtFile.path);
+      }
+
+      if (defaultSubtitlePath != null) {
+         final selected = ep.selectedSubtitle;
+         if (selected != null) {
+            String label = selected.lanDoc;
+            if (label.isEmpty) {
+               label = selected.lan;
+            }
+            if (label.isEmpty) {
+               label = "默认字幕";
+            }
+            if (!extraSubtitles.containsKey(label)) {
+               extraSubtitles[label] = defaultSubtitlePath;
+            }
+         }
       }
       
       if (ep.availableSubtitles.isNotEmpty) {
          for (var sub in ep.availableSubtitles) {
             try {
+               if (hasLocalSubtitle) {
+                  final selected = ep.selectedSubtitle;
+                  if (selected != null) {
+                     if (sub.lan == selected.lan || sub.lanDoc == selected.lanDoc) {
+                        continue;
+                     }
+                  } else if (ep.availableSubtitles.length == 1) {
+                     continue;
+                  }
+               }
                final lang = sub.lan;
                final url = sub.url;
                final resp = await apiService.dio.get(url);
@@ -1365,6 +1521,7 @@ class BilibiliDownloadService extends ChangeNotifier {
         subtitlePath: defaultSubtitlePath,
         additionalSubtitles: extraSubtitles,
         codec: codec,
+        isBilibiliExported: true,
       );
       
       await library.addSingleVideo(item);

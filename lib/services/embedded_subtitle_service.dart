@@ -23,6 +23,24 @@ class EmbeddedSubtitleTrack {
 }
 
 class EmbeddedSubtitleService extends ChangeNotifier {
+
+  String _languageLabel(String? language) {
+    if (language == null) return "未知语言";
+    final normalized = language.toLowerCase().replaceAll('_', '-').trim();
+    if (normalized.isEmpty || normalized == 'und' || normalized == 'unknown') return "未知语言";
+    if (normalized == 'chi' || normalized == 'zho' || normalized.startsWith('zh')) return "中文";
+    if (normalized == 'en' || normalized == 'eng') return "English";
+    if (normalized == 'ja' || normalized == 'jpn') return "日本語";
+    if (normalized == 'ko' || normalized == 'kor') return "한국어";
+    if (normalized == 'fr' || normalized == 'fra' || normalized == 'fre') return "Français";
+    if (normalized == 'de' || normalized == 'deu' || normalized == 'ger') return "Deutsch";
+    if (normalized == 'es' || normalized == 'spa') return "Español";
+    if (normalized == 'ru' || normalized == 'rus') return "Русский";
+    if (normalized == 'it' || normalized == 'ita') return "Italiano";
+    if (normalized == 'pt' || normalized == 'por') return "Português";
+    if (normalized == 'ar' || normalized == 'ara') return "العربية";
+    return normalized.toUpperCase();
+  }
   
   /// 获取视频文件中的内嵌字幕流信息
   Future<List<EmbeddedSubtitleTrack>> getEmbeddedSubtitles(String videoPath) async {
@@ -66,10 +84,14 @@ class EmbeddedSubtitleService extends ChangeNotifier {
              }
           }
           
+          final displayLanguage = _languageLabel(language);
+          final displayTitle = (title.trim().isEmpty || title == "未知标题") && displayLanguage != "未知语言"
+              ? displayLanguage
+              : title;
           tracks.add(EmbeddedSubtitleTrack(
             index: index,
-            title: title,
-            language: language,
+            title: displayTitle,
+            language: displayLanguage,
             codecName: codec,
           ));
         }
@@ -132,10 +154,14 @@ class EmbeddedSubtitleService extends ChangeNotifier {
             language = languageValue.toString();
           }
         }
+        final displayLanguage = _languageLabel(language);
+        final displayTitle = (title.trim().isEmpty || title == "未知标题") && displayLanguage != "未知语言"
+            ? displayLanguage
+            : title;
         tracks.add(EmbeddedSubtitleTrack(
           index: index,
-          title: title,
-          language: language,
+          title: displayTitle,
+          language: displayLanguage,
           codecName: codec,
         ));
       }
