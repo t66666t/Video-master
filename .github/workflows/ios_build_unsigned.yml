@@ -37,11 +37,13 @@ jobs:
 
       - name: Package into IPA
         run: |
-          # 创建 Payload 文件夹结构 (iOS IPA 的标准结构)
           mkdir -p Payload
-          # 将构建生成的 .app 复制到 Payload 中
-          cp -r build/ios/iphoneos/Runner.app Payload/
-          # 压缩为 .ipa 文件
+          APP_PATH=$(ls -1 build/ios/iphoneos/*.app | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found in build/ios/iphoneos"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
           zip -r video_player_app_unsigned.ipa Payload
 
       - name: Upload IPA artifact
