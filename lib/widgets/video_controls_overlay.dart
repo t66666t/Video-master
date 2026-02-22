@@ -37,6 +37,10 @@ class VideoControlsOverlay extends StatefulWidget {
   final bool showSubtitles;
   final VoidCallback onToggleSubtitles;
   final VoidCallback onMoveSubtitles; // New callback for move subtitles
+  final bool isLongPressing;
+  final String longPressFeedbackText;
+  final VoidCallback onLongPressStart;
+  final VoidCallback onLongPressEnd;
 
   // Subtitle Dragging Passthrough
   final List<SubtitleOverlayEntry> subtitleEntries;
@@ -77,6 +81,10 @@ class VideoControlsOverlay extends StatefulWidget {
     required this.showSubtitles,
     required this.onToggleSubtitles,
     required this.onMoveSubtitles, // New parameter
+    required this.isLongPressing,
+    required this.longPressFeedbackText,
+    required this.onLongPressStart,
+    required this.onLongPressEnd,
     required this.subtitleEntries,
     required this.subtitleStyle,
     required this.subtitleAlignment,
@@ -108,8 +116,13 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isProgressDragCanceling = false; // New: For slider drag cancellation
 
   // Long Press Speed
-  bool _isLongPressingZone = false;
-  String _zoneFeedbackText = "";
+  // bool _isLongPressingZone = false; // Moved to parent
+  // String _zoneFeedbackText = ""; // Moved to parent
+  
+  // Double Tap Feedback (Local)
+  bool _showDoubleTapFeedback = false;
+  String _doubleTapFeedbackText = "";
+  
   Offset? _tapPosition;
 
   // Volume & Brightness
@@ -118,7 +131,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   // bool _showVolumeSlider = false; // Removed
   double _currentVolume = 0.0;
   double _currentBrightness = 0.0;
-  double _preLongPressSpeed = 1.0;
+  // double _preLongPressSpeed = 1.0; // Moved to parent
   double _startDragValue = 0.0; // Value at start of drag
   // double _sliderVolume = 1.0; // Removed
   
@@ -375,33 +388,12 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   // Helper to reuse Zone Long Press Logic
   void _startZoneLongPress(double speedMultiplier) {
-      // Use widget.longPressSpeed as requested by user to sync with settings
-      // The speedMultiplier param here is just a placeholder if we wanted override
-      // But user said: "sync with android settings"
-      
-      // Store current speed before increasing
-      _preLongPressSpeed = widget.controller.value.playbackSpeed;
-
-      // We simulate the feedback text logic
-      setState(() {
-        _isLongPressingZone = true;
-        _zoneFeedbackText = "${widget.longPressSpeed}X 速";
-      });
-      widget.onSpeedUpdate(widget.longPressSpeed);
-      
-      // Haptic feedback not needed on PC
+      widget.onLongPressStart();
   }
 
   void _endZoneLongPress() {
-      if (!_isLongPressingZone) return;
-      setState(() {
-        _isLongPressingZone = false;
-        _zoneFeedbackText = "";
-      });
-      widget.onSpeedUpdate(_preLongPressSpeed); // Restore speed
+      widget.onLongPressEnd();
   }
-  bool _isSpeedUpMode = false; // Track if current zone action is speed up (long press) or seek (double tap)
-
   // Accumulated Seek Logic
   Timer? _seekResetTimer;
   int _subtitleSeekAccumulator = 0;
@@ -542,7 +534,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   void _onHorizontalDragStart(DragStartDetails details, double width) {
     if (!widget.controller.value.isInitialized || widget.isLocked) return;
     // 互斥：如果正在长按加速（或显示双击反馈），则不响应滑动
-    if (_isLongPressingZone) return;
+    if (widget.isLongPressing) return;
 
     // Ignore if starting from edges (to avoid conflict with system gestures or volume/brightness)
     // But Volume/Brightness is VerticalDrag, so they shouldn't conflict if direction is clear.
@@ -569,7 +561,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _onHorizontalDragUpdate(DragUpdateDetails details, BuildContext context) {
     if (!_isGestureSeeking || widget.isLocked || _dragStartPosition == null) return;
-    if (_isLongPressingZone) return; // Double check
+    if (widget.isLongPressing) return; // Double check
 
     final double offsetX = details.globalPosition.dx - _dragStartPosition!.dx;
     final int secondsToAdd = (offsetX / 10).round(); 
@@ -741,7 +733,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           target = widget.subtitles[targetIndex].startTime + subtitleOffset;
        }
        
-       _zoneFeedbackText = feedback;
+       _doubleTapFeedbackText = feedback;
        
        // Start Reset Timer (2 seconds to chain commands)
        _seekResetTimer = Timer(const Duration(milliseconds: 2000), () {
@@ -753,10 +745,10 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         // Standard Seek Logic
         if (localPosition.dx < width / 2) {
           target = currentPos - Duration(seconds: seconds);
-          _zoneFeedbackText = "-${seconds}s";
+          _doubleTapFeedbackText = "-${seconds}s";
         } else {
           target = currentPos + Duration(seconds: seconds);
-          _zoneFeedbackText = "+${seconds}s";
+          _doubleTapFeedbackText = "+${seconds}s";
         }
     }
 
@@ -770,8 +762,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     });
 
     setState(() {
-      _isLongPressingZone = true;
-      _isSpeedUpMode = false;
+      _showDoubleTapFeedback = true;
       _tapPosition = localPosition;
     });
     
@@ -779,7 +770,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     Future.delayed(const Duration(milliseconds: 2000), () {
       if (mounted && !_isGestureSeeking && (_seekResetTimer == null || !_seekResetTimer!.isActive)) {
         setState(() {
-          _isLongPressingZone = false;
+          _showDoubleTapFeedback = false;
         });
       }
     });
@@ -796,11 +787,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     // if (!isLeft && !isRight) return;
 
     setState(() {
-      _isLongPressingZone = true;
-      _isSpeedUpMode = true;
       _tapPosition = localPosition;
-      _zoneFeedbackText = "${widget.longPressSpeed}x 速";
-      _preLongPressSpeed = widget.controller.value.playbackSpeed; // 记录当前速度
       
       // 强制结束任何可能存在的滑动状态
       if (_isGestureSeeking) {
@@ -812,22 +799,17 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _isAdjustingVolume = false;
     });
     
-    widget.controller.setPlaybackSpeed(widget.longPressSpeed); // 直接设置临时速度
+    widget.onLongPressStart();
   }
 
   void _handleZoneLongPressEnd(LongPressEndDetails details) {
-    if (!_isLongPressingZone) return;
-    
-    setState(() {
-      _isLongPressingZone = false;
-    });
-    widget.controller.setPlaybackSpeed(_preLongPressSpeed); // 恢复之前的速度
+    widget.onLongPressEnd();
   }
 
   // Vertical Drag for Volume/Brightness
   void _onVerticalDragStart(DragStartDetails details, double width) async {
     if (widget.isLocked) return; // Prevent global drag if locked
-    if (_isLongPressingZone) return; // 互斥
+    if (widget.isLongPressing) return; // 互斥
 
     final dx = details.localPosition.dx;
     final bool isWindows = !kIsWeb && Platform.isWindows;
@@ -878,7 +860,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _onVerticalDragUpdate(DragUpdateDetails details, double height) {
     if (widget.isLocked) return;
-    if (_isLongPressingZone) return; // 互斥
+    if (widget.isLongPressing) return; // 互斥
     if (!_isAdjustingBrightness && !_isAdjustingVolume) return;
 
     // Delta Y is positive when dragging down, negative when dragging up.
@@ -1127,12 +1109,22 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                          _handleZoneLongPressStart(localOffset, width);
                       };
                       instance.onLongPressMoveUpdate = (details) {
-                         if (_isLongPressingZone) return;
+                         if (widget.isLongPressing) return;
                          // Center long press seek removed in favor of Horizontal Drag
                       };
                       instance.onLongPressEnd = (details) {
-                         if (_isLongPressingZone) {
+                         if (widget.isLongPressing) {
                            _handleZoneLongPressEnd(details);
+                         }
+                      };
+                      instance.onLongPressCancel = () {
+                         if (widget.isLongPressing) {
+                           // If gesture is canceled (e.g. system interruption), we must clean up
+                           // But if we use GlobalKey, we hope it persists.
+                           // If it still cancels, we reset. Better safe than stuck.
+                           // Note: LongPressEndDetails is required by _handleZoneLongPressEnd but it only uses it for nothing important (just triggers callback).
+                           // So we can pass a dummy or change the signature.
+                           widget.onLongPressEnd();
                          }
                       };
                     },
@@ -1187,7 +1179,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                     // These are non-interactive visuals driven by state
                     
                     // Zone Feedback (Double Tap / Long Press)
-                    if (_isLongPressingZone && _tapPosition != null)
+                    if ((widget.isLongPressing || _showDoubleTapFeedback) && _tapPosition != null)
                        Positioned(
                          left: _tapPosition!.dx <= width / 2 ? 40 : null,
                          right: _tapPosition!.dx > width / 2 ? 40 : null,
@@ -1201,14 +1193,14 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                            child: Row(
                              children: [
                                Icon(
-                                 _tapPosition!.dx < width / 2 
-                                     ? (_isSpeedUpMode ? Icons.fast_forward : Icons.fast_rewind) 
-                                     : Icons.fast_forward, 
+                                 widget.isLongPressing 
+                                     ? Icons.fast_forward 
+                                     : (_tapPosition!.dx < width / 2 ? Icons.fast_rewind : Icons.fast_forward), 
                                  color: Colors.white
                                ),
                                const SizedBox(width: 8),
                                Text(
-                                 _zoneFeedbackText,
+                                 widget.isLongPressing ? widget.longPressFeedbackText : _doubleTapFeedbackText,
                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
                                ),
                              ],
@@ -1217,7 +1209,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                        ),
 
                     // Gesture Seek Feedback (Center)
-                    if (_isGestureSeeking && !widget.isLocked && !_isLongPressingZone)
+                    if (_isGestureSeeking && !widget.isLocked && !widget.isLongPressing)
                       Center(
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),

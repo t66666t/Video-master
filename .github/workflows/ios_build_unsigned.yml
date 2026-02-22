@@ -21,6 +21,9 @@ jobs:
           channel: 'stable'
           # 不指定具体版本，直接使用最新的 stable 版本，以满足 Dart 3.8.1 的需求
 
+      - name: Clean Flutter
+        run: flutter clean
+
       - name: Get Flutter dependencies
         run: flutter pub get
       

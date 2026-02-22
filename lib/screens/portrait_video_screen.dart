@@ -1884,7 +1884,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen> with WidgetsB
                                     onClearSelection: () => _selectionKey.currentState?.clearSelection(),
                                     showPlayControls: false,
                                     showBottomBar: false,
-                                    focusNode: _videoFocusNode,
+                                    focusNode: _videoFocusNode, isLongPressing: false, longPressFeedbackText: '', onLongPressStart: () {  }, onLongPressEnd: () {  },
                                   ),
                                 // Fullscreen Button (Custom for Portrait)
                                 if (!_isLocked && !_isSubtitleDragMode)
