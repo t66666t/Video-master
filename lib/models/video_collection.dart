@@ -1,0 +1,69 @@
+import 'media_source_ref.dart';
+
+class VideoCollection {
+  final String id;
+  String name;
+  final int createTime;
+  String? thumbnailPath;
+  
+  // New: File System Structure
+  List<String> childrenIds; // Can contain VideoItem IDs or VideoCollection IDs
+  String? parentId; // null means root
+  bool isRecycled;
+  int? recycleTime;
+  MediaSourceRef? sourceRef;
+
+  // Deprecated but kept for migration if needed, though we will try to migrate immediately
+  // List<String> videoIds; 
+
+  VideoCollection({
+    required this.id,
+    required this.name,
+    required this.createTime,
+    this.thumbnailPath,
+    List<String>? childrenIds,
+    this.parentId,
+    this.isRecycled = false,
+    this.recycleTime,
+    this.sourceRef,
+  }) : childrenIds = childrenIds ?? [];
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'name': name,
+      'createTime': createTime,
+      'thumbnailPath': thumbnailPath,
+      'childrenIds': childrenIds,
+      'parentId': parentId,
+      'isRecycled': isRecycled,
+      'recycleTime': recycleTime,
+      'sourceRef': sourceRef?.toJson(),
+    };
+  }
+
+  factory VideoCollection.fromJson(Map<String, dynamic> json) {
+    // Migration logic: if videoIds exists but childrenIds doesn't, use videoIds
+    List<String> loadedChildren = [];
+    if (json['childrenIds'] != null) {
+      loadedChildren = (json['childrenIds'] as List<dynamic>).map((e) => e as String).toList();
+    } else if (json['videoIds'] != null) {
+      loadedChildren = (json['videoIds'] as List<dynamic>).map((e) => e as String).toList();
+    }
+
+    return VideoCollection(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      createTime: json['createTime'] as int,
+      thumbnailPath: json['thumbnailPath'] as String?,
+      childrenIds: loadedChildren,
+      parentId: json['parentId'] as String?,
+      isRecycled: json['isRecycled'] as bool? ?? false,
+      recycleTime: json['recycleTime'] as int?,
+      sourceRef: MediaSourceRef.fromJsonOrNull(json['sourceRef']),
+    );
+  }
+  
+  // Helper to distinguish from VideoItem if needed (though we usually check by ID lookup)
+  bool get isCollection => true;
+}

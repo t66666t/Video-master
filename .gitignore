@@ -1,0 +1,75 @@
+# 二进制文件和可执行文件
+assets/binaries/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 字体文件（太大）
+assets/fonts/
+
+# 依赖包（应该在 pubspec.yaml 中定义）
+packages/
+**/packages/
+
+# 构建输出
+build/
+**/build/
+
+# Dart 工具目录
+.dart_tool/
+.dbg/
+
+# 临时文件和输出
+*.lock
+*.tmp
+*.log
+*.txt
+out.txt
+.metadata
+analyze_*.txt
+dart_analyze_*.txt
+
+# 临时测试文件
+temp_*
+dummy*.mkv
+temp_*.srt
+test_bg*.png
+test_draw*.png
+test_draw*.ass
+
+# ffmpeg 相关
+ffmpeg*.zip
+ffmpeg_temp/
+
+# IDE 文件
+.vscode/
+.idea/
+*.iml
+
+# 其他不需要的文件
+.qoder/
+.kiro/
+.trae/
+*.iss
+*.ps1
+*.png
+*.mkv
+
+# 排除特定的大文件目录
+android/gradle/
+ios/Pods/
+macos/Pods/
+linux/build/
+windows/build/
+
+# Flutter 自动生成的文件
+.flutter-plugins-dependencies
+
+# 测试字幕文件
+test_*.ass
+
+# 保留必要的文件
+!pubspec.yaml
+!pubspec.lock
+!.gitignore

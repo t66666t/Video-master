@@ -1,0 +1,4351 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:developer' as developer;
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:provider/provider.dart';
+import 'package:video_player/video_player.dart';
+import '../models/video_item.dart';
+import '../models/subtitle_model.dart';
+import '../models/subtitle_style.dart';
+import '../services/library_service.dart';
+import '../services/settings_service.dart';
+import '../services/media_playback_service.dart';
+import '../services/playback_navigation_service.dart';
+import '../services/playlist_manager.dart';
+import '../widgets/subtitle_sidebar.dart';
+import '../widgets/subtitle_settings_sheet.dart';
+import '../widgets/video_controls_overlay.dart';
+import '../widgets/subtitle_overlay.dart';
+import '../utils/subtitle_converter.dart';
+import '../utils/subtitle_parser.dart';
+import '../utils/youtube_auto_caption_normalizer.dart';
+import '../widgets/settings_panel.dart';
+import '../widgets/ai_transcription_panel.dart';
+import '../services/transcription_manager.dart';
+import '../widgets/subtitle_management_sheet.dart';
+import 'video_player_screen.dart'; // Landscape screen
+import 'package:path/path.dart' as p;
+import '../services/embedded_subtitle_service.dart';
+import '../utils/app_toast.dart';
+import '../utils/subtitle_drag_snap.dart';
+
+import '../widgets/episode_picker_panel.dart';
+import '../widgets/video_compose_panel.dart';
+import '../widgets/subtitle_editor_panel.dart';
+
+enum PortraitPanel {
+  subtitles,
+  settings,
+  subtitleStyle,
+  ai,
+  subtitleManager,
+  subtitleEditor,
+  episodePicker,
+  videoCompose,
+}
+
+class PortraitVideoScreen extends StatefulWidget {
+  final VideoItem videoItem;
+
+  const PortraitVideoScreen({super.key, required this.videoItem});
+
+  @override
+  State<PortraitVideoScreen> createState() => _PortraitVideoScreenState();
+}
+
+class _PortraitVideoScreenState extends State<PortraitVideoScreen>
+    with WidgetsBindingObserver, RouteAware {
+  final GlobalKey<SelectableRegionState> _selectionKey =
+      GlobalKey<SelectableRegionState>();
+  final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey =
+      GlobalKey<SubtitleSidebarState>();
+  final FocusNode _selectionFocusNode = FocusNode();
+  final FocusNode _videoFocusNode =
+      FocusNode(); // Dedicated focus node for video controls
+  late VideoPlayerController _controller;
+  bool _initialized = false;
+  bool _isControllerAssigned = false;
+  bool _isControllerOwner = true; // 跟踪是否拥有 controller（是否应该在 dispose 时释放）
+  List<SubtitleItem> _subtitles = [];
+  List<SubtitleItem> _secondarySubtitles = [];
+  List<String> _currentSubtitlePaths = [];
+
+  // Shared State Logic
+  bool _isLocked = false;
+  bool _isLongPressing = false;
+  String _longPressFeedbackText = "";
+  double _preLongPressSpeed = 1.0;
+  String _currentSubtitleText = "";
+  String? _currentSecondaryText;
+  int _currentSubtitleIndex = -1;
+  int _currentSecondarySubtitleIndex = -1;
+  List<int> _currentSubtitleIndices = [];
+  List<int> _currentSecondarySubtitleIndices = [];
+  List<SubtitleOverlayEntry> _currentSubtitleEntries = [];
+  final Map<int, Uint8List?> _currentSubtitleImages = <int, Uint8List?>{};
+  int _subtitleImageRequestId = 0;
+  final List<int> _subtitleStartMs = <int>[];
+  final List<int> _secondarySubtitleStartMs = <int>[];
+  Timer? _subtitleSeekTimer;
+  bool _isSubtitleDragMode = false;
+  bool _isSubtitleSnappedX = false;
+  bool _isSubtitleSnappedY = false;
+  bool _isSubtitleNearCenterX = false;
+  bool _isSubtitleNearCenterY = false;
+  bool _isStylePanelDragMode = false;
+  PortraitPanel _activePanel = PortraitPanel.subtitles;
+  bool _isSubtitleEditorExpanded = false;
+
+  // Bottom Control Bar State
+  bool _isDraggingProgress = false;
+  double _dragProgressValue = 0.0;
+  bool _isProgressDragCanceling = false;
+  final bool _showVolumeSlider = false;
+  final LayerLink _volumeButtonLayerLink = LayerLink();
+
+  bool _routeObserverSubscribed = false;
+  bool _isPushingLandscape = false;
+  bool _forceExit = false;
+  bool _iosBackSwipeActive = false;
+  double _iosBackSwipeDistance = 0.0;
+  static const double _iosBackSwipeEdgeWidth = 20.0;
+  static const double _iosBackSwipeTriggerDistance = 60.0;
+  TranscriptionManager? _transcriptionManager;
+
+  // Audio state
+  bool _isAudio = false;
+  late VideoItem _currentItem;
+  SettingsService? _settingsService;
+  bool? _lastShowSubtitles;
+  Duration? _lastSubtitleOffset;
+  bool? _lastSplitSubtitleByLine;
+  bool? _lastVideoContinuousSubtitle;
+  bool? _lastAudioContinuousSubtitle;
+  bool? _lastIsPlayingForServiceSync;
+  String? _autoEmbeddedAttemptedForItemId;
+  bool _isLoadingEmbeddedSubtitle = false;
+  bool _embeddedSubtitleDetected = false;
+
+  Timer? _manualSubtitleWriteTimer;
+  Timer? _customAspectDraftSaveTimer;
+  int _postInitWorkToken = 0;
+
+  bool _isImageSubtitleCodec(String codecName) {
+    final codec = codecName.toLowerCase();
+    return codec == 'hdmv_pgs_subtitle' ||
+        codec == 'dvd_subtitle' ||
+        codec == 'pgs' ||
+        codec == 'pgs_subtitle' ||
+        codec == 'vobsub' ||
+        codec == 'xsub';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _currentItem = widget.videoItem;
+    WidgetsBinding.instance.addObserver(this);
+    // Orientation is handled in didChangeDependencies to support tablet adaptive layout
+    _initPlayer();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        Provider.of<MediaPlaybackService>(
+          context,
+          listen: false,
+        ).addListener(_onPlaybackServiceChange);
+      }
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      _settingsService = settings;
+      _lastShowSubtitles = settings.showSubtitles;
+      _lastSubtitleOffset = settings.subtitleOffset;
+      _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+      _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+      _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+      settings.addListener(_onSettingsChanged);
+      _onSettingsChanged();
+    });
+  }
+
+  void _onSettingsChanged() {
+    final settings = _settingsService;
+    if (settings == null) return;
+
+    final bool changed =
+        _lastShowSubtitles != settings.showSubtitles ||
+        _lastSubtitleOffset != settings.subtitleOffset ||
+        _lastSplitSubtitleByLine != settings.splitSubtitleByLine ||
+        _lastVideoContinuousSubtitle != settings.videoContinuousSubtitle ||
+        _lastAudioContinuousSubtitle != settings.audioContinuousSubtitle;
+
+    if (!changed) return;
+
+    _lastShowSubtitles = settings.showSubtitles;
+    _lastSubtitleOffset = settings.subtitleOffset;
+    _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
+    _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
+    _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+
+    if (_initialized) {
+      _updateSubtitle();
+    }
+  }
+
+  void _applyItemSubtitlePreference(VideoItem item, {bool force = false}) {
+    final settings =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+    if (force || item.showFloatingSubtitles != settings.showSubtitles) {
+      item.showFloatingSubtitles = settings.showSubtitles;
+    }
+  }
+
+  void _setFloatingSubtitles(bool value) {
+    final settings =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+    settings.saveShowSubtitles(value);
+    final currentItem = _currentItem;
+    currentItem.showFloatingSubtitles = value;
+  }
+
+  void _scheduleDeferredPostInitWork(VideoItem item) {
+    final int token = ++_postInitWorkToken;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || token != _postInitWorkToken) return;
+      unawaited(_runDeferredPostInitWork(item, token));
+    });
+  }
+
+  Future<void> _runDeferredPostInitWork(VideoItem item, int token) async {
+    if (!mounted || token != _postInitWorkToken) return;
+    _checkAndLoadAiSubtitle(item);
+
+    if (item.subtitlePath != null) {
+      final List<String> paths = [item.subtitlePath!];
+      if (item.secondarySubtitlePath != null) {
+        paths.add(item.secondarySubtitlePath!);
+      }
+      await _loadSubtitles(paths);
+    } else {
+      final loadedAssociated = await _tryLoadAssociatedSubtitleAsPrimary(item);
+      if (!loadedAssociated && mounted && token == _postInitWorkToken) {
+        _maybeAutoLoadEmbeddedSubtitle();
+      }
+    }
+
+    if (!mounted || token != _postInitWorkToken) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && token == _postInitWorkToken) {
+        _updateSubtitle();
+      }
+    });
+  }
+
+  void _bindControllerListener() {
+    try {
+      _controller.removeListener(_videoListener);
+    } catch (_) {}
+    _controller.addListener(_videoListener);
+  }
+
+  void _onPlaybackServiceChange() {
+    if (!mounted) return;
+    final service = Provider.of<MediaPlaybackService>(context, listen: false);
+
+    // 检查当前路由是否在最顶层（即竖屏页是否可见）
+    // 如果不在最顶层（被横屏页覆盖），则不处理控制器变更，只更新字幕等状态
+    final bool isOnTop = ModalRoute.of(context)?.isCurrent ?? false;
+
+    if (service.currentItem != null &&
+        service.currentItem!.id != _currentItem.id) {
+      // 视频发生变化
+      if (isOnTop) {
+        // 竖屏页在最顶层，正常处理视频切换
+        setState(() {
+          _currentItem = service.currentItem!;
+          _initialized = false;
+          _isControllerAssigned = false;
+          _subtitles = [];
+          _secondarySubtitles = [];
+          _currentSubtitlePaths = [];
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
+          _autoEmbeddedAttemptedForItemId = null;
+          _embeddedSubtitleDetected = false;
+        });
+        _applyItemSubtitlePreference(service.currentItem!, force: true);
+        _postInitWorkToken++;
+        _initPlayer();
+      } else {
+        // 竖屏页在后台（被横屏页覆盖），只更新当前项信息，不处理控制器
+        // 这样当返回竖屏页时，会重新同步状态
+        setState(() {
+          _currentItem = service.currentItem!;
+          _initialized = false;
+          _isControllerAssigned = false;
+        });
+        // 不调用 _initPlayer，让页面重新可见时再处理
+      }
+    } else if (!_initialized &&
+        service.currentItem?.id == _currentItem.id &&
+        service.state != PlaybackState.loading &&
+        service.controller != null) {
+      // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
+      _postInitWorkToken++;
+      _initPlayer();
+    } else if (service.currentItem?.id == _currentItem.id) {
+      // 同步字幕状态（无论是否在顶层都同步，确保字幕设置一致）
+      final bool pathsChanged = !_stringListEquals(
+        service.subtitlePaths,
+        _currentSubtitlePaths,
+      );
+      final bool primaryChanged = service.subtitles.length != _subtitles.length;
+      final bool secondaryChanged =
+          service.secondarySubtitles.length != _secondarySubtitles.length;
+      if (pathsChanged || primaryChanged || secondaryChanged) {
+        if (_shouldKeepLocalSubtitleStateOnServiceClear(service)) {
+          return;
+        }
+        setState(() {
+          _subtitles = service.subtitles;
+          _secondarySubtitles = service.secondarySubtitles;
+          _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
+        });
+        _rebuildSubtitleIndex();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _updateSubtitle();
+        });
+      }
+    }
+  }
+
+  Matrix4 _buildVideoDisplayTransformMatrix() {
+    return Matrix4.identity()..multiply(
+      Matrix4.diagonal3Values(
+        _currentItem.isVideoMirroredH ? -1.0 : 1.0,
+        _currentItem.isVideoMirroredV ? -1.0 : 1.0,
+        1.0,
+      ),
+    );
+  }
+
+  Future<void> _updateVideoDisplayTransform({
+    bool? isMirroredH,
+    bool? isMirroredV,
+  }) async {
+    final bool nextMirroredH = isMirroredH ?? _currentItem.isVideoMirroredH;
+    final bool nextMirroredV = isMirroredV ?? _currentItem.isVideoMirroredV;
+
+    setState(() {
+      _currentItem.isVideoMirroredH = nextMirroredH;
+      _currentItem.isVideoMirroredV = nextMirroredV;
+    });
+
+    final library = Provider.of<LibraryService>(context, listen: false);
+    await library.updateVideoDisplayTransform(
+      _currentItem.id,
+      isMirroredH: nextMirroredH,
+      isMirroredV: nextMirroredV,
+    );
+  }
+
+  bool _shouldKeepLocalSubtitleStateOnServiceClear(
+    MediaPlaybackService service,
+  ) {
+    if (service.subtitlePaths.isNotEmpty ||
+        service.subtitles.isNotEmpty ||
+        service.secondarySubtitles.isNotEmpty) {
+      return false;
+    }
+    if (_currentSubtitlePaths.isEmpty &&
+        _subtitles.isEmpty &&
+        _secondarySubtitles.isEmpty) {
+      return false;
+    }
+    // 自动提取/自动挂载的字幕会先进入当前页内存状态，再异步写回 VideoItem。
+    // 在持久化完成前，如果 service 发来一次空字幕回调，不应把本地已加载字幕误清空。
+    if (_currentSubtitlePaths.isNotEmpty &&
+        (_subtitles.isNotEmpty || _secondarySubtitles.isNotEmpty)) {
+      return true;
+    }
+
+    final expectedPaths = <String>{};
+    final primaryPath = _currentItem.subtitlePath;
+    if (primaryPath != null && primaryPath.isNotEmpty) {
+      expectedPaths.add(p.normalize(primaryPath));
+    }
+    final secondaryPath = _currentItem.secondarySubtitlePath;
+    if (secondaryPath != null && secondaryPath.isNotEmpty) {
+      expectedPaths.add(p.normalize(secondaryPath));
+    }
+    final associatedPath = _resolveFirstAssociatedSubtitlePath(_currentItem);
+    if (associatedPath != null && associatedPath.isNotEmpty) {
+      expectedPaths.add(p.normalize(associatedPath));
+    }
+    if (expectedPaths.isEmpty) {
+      return false;
+    }
+
+    for (final path in _currentSubtitlePaths) {
+      if (expectedPaths.contains(p.normalize(path))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _stringListEquals(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  String? _resolveFirstAssociatedSubtitlePath(VideoItem item) {
+    final additional = item.additionalSubtitles;
+    if (additional == null || additional.isEmpty) return null;
+    for (final path in additional.values) {
+      if (path.isEmpty) continue;
+      final normalized = p.normalize(path);
+      if (File(normalized).existsSync()) {
+        return normalized;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _persistPrimarySubtitlePathIfNeeded(
+    String subtitlePath, {
+    String? secondarySubtitlePath,
+  }) async {
+    final normalizedPrimary = p.normalize(subtitlePath);
+    final currentPrimary = _currentItem.subtitlePath == null
+        ? null
+        : p.normalize(_currentItem.subtitlePath!);
+    if (currentPrimary == normalizedPrimary) return;
+    try {
+      final settingsService = Provider.of<SettingsService>(
+        context,
+        listen: false,
+      );
+      final libraryService = Provider.of<LibraryService>(
+        context,
+        listen: false,
+      );
+      await libraryService.updateVideoSubtitles(
+        _currentItem.id,
+        normalizedPrimary,
+        settingsService.autoCacheSubtitles,
+        secondarySubtitlePath: secondarySubtitlePath,
+        isSecondaryCached: settingsService.autoCacheSubtitles,
+      );
+      if (mounted) {
+        final updated = libraryService.getVideo(_currentItem.id);
+        if (updated != null) {
+          setState(() {
+            _currentItem = updated;
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<bool> _tryLoadAssociatedSubtitleAsPrimary(VideoItem item) async {
+    if (item.blockAutoAssociatedSubtitleSelection) {
+      return false;
+    }
+    final associatedPath = _resolveFirstAssociatedSubtitlePath(item);
+    if (associatedPath == null) {
+      return false;
+    }
+
+    await _persistPrimarySubtitlePathIfNeeded(
+      associatedPath,
+      secondarySubtitlePath: item.secondarySubtitlePath,
+    );
+    if (!mounted) {
+      return true;
+    }
+
+    final refreshedItem = _currentItem;
+    final primaryPath = refreshedItem.subtitlePath ?? associatedPath;
+    final paths = <String>[primaryPath];
+    final secondaryPath = refreshedItem.secondarySubtitlePath;
+    if (secondaryPath != null &&
+        secondaryPath.isNotEmpty &&
+        secondaryPath != primaryPath) {
+      paths.add(secondaryPath);
+    }
+    await _loadSubtitles(paths);
+    return true;
+  }
+
+  void _maybeAutoLoadEmbeddedSubtitle() {
+    final currentId = _currentItem.id;
+    if (_currentItem.blockAutoAssociatedSubtitleSelection) return;
+    if (_currentItem.prefersManagedAssociatedSubtitles) return;
+    if (_currentItem.hasAttemptedAutoEmbeddedSubtitleLoad) return;
+    if (_autoEmbeddedAttemptedForItemId == currentId) return;
+    if (_currentItem.subtitlePath != null) return;
+    if (_currentSubtitlePaths.isNotEmpty) return;
+    if (_subtitles.isNotEmpty || _secondarySubtitles.isNotEmpty) return;
+    try {
+      final service = Provider.of<MediaPlaybackService>(context, listen: false);
+      if (service.subtitlePaths.isNotEmpty ||
+          service.subtitles.isNotEmpty ||
+          service.secondarySubtitles.isNotEmpty) {
+        return;
+      }
+    } catch (_) {}
+
+    _currentItem.hasAttemptedAutoEmbeddedSubtitleLoad = true;
+    _persistAutoEmbeddedAttemptedFlag(currentId);
+    _autoEmbeddedAttemptedForItemId = currentId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _checkAndLoadEmbeddedSubtitle(
+        showToastWhenNone: false,
+        showLoadingIndicator: false,
+      );
+    });
+  }
+
+  Future<void> _persistAutoEmbeddedAttemptedFlag(String videoId) async {
+    try {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      await library.markAutoEmbeddedSubtitleLoadAttempted(videoId);
+      if (!mounted) return;
+      final refreshed = library.getVideo(videoId);
+      if (refreshed != null) {
+        setState(() {
+          _currentItem = refreshed;
+        });
+      }
+    } catch (_) {}
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_routeObserverSubscribed) {
+      final route = ModalRoute.of(context);
+      if (route is PageRoute) {
+        AppToast.routeObserver.subscribe(this, route);
+        _routeObserverSubscribed = true;
+      }
+    }
+
+    // Listen to TranscriptionManager for auto-mounting subtitles
+    final manager = Provider.of<TranscriptionManager>(context, listen: false);
+    if (_transcriptionManager != manager) {
+      _transcriptionManager?.removeListener(_onTranscriptionUpdate);
+      _transcriptionManager = manager;
+      _transcriptionManager?.addListener(_onTranscriptionUpdate);
+    }
+  }
+
+  void _onTranscriptionUpdate() {
+    if (!mounted || _transcriptionManager == null) return;
+
+    final path = _transcriptionManager!.getGeneratedSrtPathForVideo(
+      _currentItem.path,
+      videoId: _currentItem.id,
+    );
+    if (path != null &&
+        _transcriptionManager!.hasUnconsumedResultForVideo(
+          _currentItem.path,
+          videoId: _currentItem.id,
+        )) {
+      // Avoid repeated loading if already loaded as primary
+      if (_currentSubtitlePaths.isNotEmpty &&
+          _currentSubtitlePaths[0] == path) {
+        return;
+      }
+
+      _transcriptionManager!.markResultConsumedForVideo(
+        _currentItem.path,
+        videoId: _currentItem.id,
+      );
+
+      // 保留当前已加载的副字幕
+      List<String> pathsToLoad = [path];
+      if (_currentSubtitlePaths.length > 1) {
+        pathsToLoad.add(_currentSubtitlePaths[1]);
+      }
+
+      // Auto load
+      _loadSubtitles(pathsToLoad);
+
+      // 不需要在这里保存到 library，TranscriptionManager 已经保存了
+
+      // Show notification
+      AppToast.show("AI 字幕转录完成并已自动加载", type: AppToastType.success);
+    }
+  }
+
+  void _checkAndLoadAiSubtitle(VideoItem currentItem) {
+    try {
+      final manager = Provider.of<TranscriptionManager>(context, listen: false);
+
+      final srtPath = manager.getGeneratedSrtPathForVideo(
+        currentItem.path,
+        videoId: currentItem.id,
+      );
+      if (srtPath != null) {
+        final shouldToast = manager.hasUnconsumedResultForVideo(
+          currentItem.path,
+          videoId: currentItem.id,
+        );
+
+        if (File(srtPath).existsSync()) {
+          debugPrint("检测到AI字幕已完成，自动加载: $srtPath");
+
+          List<String> pathsToLoad = [srtPath];
+          if (currentItem.secondarySubtitlePath != null) {
+            pathsToLoad.add(currentItem.secondarySubtitlePath!);
+          }
+
+          _loadSubtitles(pathsToLoad);
+
+          if (mounted && shouldToast) {
+            AppToast.show("AI 字幕已自动加载", type: AppToastType.success);
+            manager.markResultConsumedForVideo(
+              currentItem.path,
+              videoId: currentItem.id,
+            );
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint("检查AI字幕失败: $e");
+    }
+  }
+
+  void _updateOrientations() {
+    // Detect tablet/large screen
+    final size = MediaQuery.of(context).size;
+    final isTablet = size.shortestSide >= 600;
+
+    if (isTablet) {
+      // On tablet, allow landscape so transition is smooth
+      // The UI will be constrained to center by build method
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+    } else {
+      // On phone, force portrait
+      SystemChrome.setPreferredOrientations([
+        DeviceOrientation.portraitUp,
+        DeviceOrientation.portraitDown,
+      ]);
+    }
+  }
+
+  void _scheduleUpdateOrientations() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _updateOrientations();
+    });
+  }
+
+  @override
+  void didPush() {
+    _scheduleUpdateOrientations();
+  }
+
+  @override
+  void didPopNext() {
+    _scheduleUpdateOrientations();
+  }
+
+  @override
+  void didPushNext() {
+    if (_isPushingLandscape) return;
+    SystemChrome.setPreferredOrientations([]);
+  }
+
+  Future<void> _checkAndLoadEmbeddedSubtitle({
+    bool showToastWhenNone = true,
+    bool showLoadingIndicator = true,
+  }) async {
+    // If we already have subtitles loaded (e.g. from file), don't override
+    if (_subtitles.isNotEmpty) return;
+    if (_isLoadingEmbeddedSubtitle) return;
+
+    // Determine video path
+    String path = _currentItem.path;
+
+    // Check embedded
+    bool loadingShown = false;
+    try {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      _isLoadingEmbeddedSubtitle = true;
+      if (showLoadingIndicator && mounted) {
+        loadingShown = true;
+        AppToast.showLoading("正在检测内嵌字幕...");
+      }
+      final service = Provider.of<EmbeddedSubtitleService>(
+        context,
+        listen: false,
+      );
+      final tracks = await service.getEmbeddedSubtitles(path);
+
+      if (tracks.isNotEmpty && mounted && _subtitles.isEmpty) {
+        setState(() {
+          _embeddedSubtitleDetected = true;
+        });
+        final EmbeddedSubtitleTrack track = tracks.firstWhere(
+          (t) => !_isImageSubtitleCodec(t.codecName),
+          orElse: () => tracks.first,
+        );
+        if (_isImageSubtitleCodec(track.codecName)) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+          if (loadingShown) AppToast.dismiss();
+          AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+          return;
+        }
+
+        // Prepare cache dir
+        final settings = Provider.of<SettingsService>(context, listen: false);
+        final dataRoot = await settings.resolveLargeDataRootDir();
+        final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
+        if (!await subDir.exists()) {
+          await subDir.create(recursive: true);
+        }
+
+        // Extract
+        final extractedPath = await service.extractSubtitle(
+          path,
+          track.index,
+          subDir.path,
+          codecName: track.codecName,
+          videoId: _currentItem.id,
+        );
+
+        if (extractedPath != null && mounted) {
+          // Check again
+          if (_subtitles.isNotEmpty) return;
+
+          List<String> pathsToLoad = [extractedPath];
+          if (_currentSubtitlePaths.length > 1) {
+            pathsToLoad.add(_currentSubtitlePaths[1]);
+          }
+          await _loadSubtitles(pathsToLoad);
+          if (mounted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _subtitleSidebarKey.currentState?.jumpToFirstSubtitleTop();
+            });
+          }
+
+          if (_currentItem.subtitlePath == null) {
+            try {
+              final String? currentSecondary = _currentSubtitlePaths.length > 1
+                  ? _currentSubtitlePaths[1]
+                  : _currentItem.secondarySubtitlePath;
+              await library.updateVideoSubtitles(
+                _currentItem.id,
+                extractedPath,
+                settings.autoCacheSubtitles,
+                secondarySubtitlePath: currentSecondary,
+                isSecondaryCached: settings.autoCacheSubtitles,
+              );
+              final updated = library.getVideo(_currentItem.id);
+              if (updated != null && mounted) {
+                setState(() {
+                  _currentItem = updated;
+                });
+              }
+            } catch (_) {}
+          }
+
+          if (!mounted) return;
+          if (loadingShown) AppToast.dismiss();
+          final isImage = _isImageSubtitleCodec(track.codecName);
+          AppToast.show(
+            isImage ? "已加载内嵌图像字幕: ${track.title}" : "已加载内嵌字幕: ${track.title}",
+            type: AppToastType.success,
+          );
+          if (isImage) {
+            AppToast.show("图像字幕无法转为文本，将以位图渲染", type: AppToastType.info);
+          }
+        }
+      } else {
+        if (mounted) {
+          if (_embeddedSubtitleDetected) {
+            setState(() {
+              _embeddedSubtitleDetected = false;
+            });
+          }
+          if (loadingShown) AppToast.dismiss();
+          if (showToastWhenNone) {
+            AppToast.show("未找到内嵌字幕");
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint("Auto load embedded subtitle failed: $e");
+      if (loadingShown) AppToast.dismiss();
+      if (mounted) {
+        if (_embeddedSubtitleDetected) {
+          setState(() {
+            _embeddedSubtitleDetected = false;
+          });
+        }
+        AppToast.show("内嵌字幕检测失败", type: AppToastType.error);
+      }
+    } finally {
+      _isLoadingEmbeddedSubtitle = false;
+    }
+  }
+
+  Future<void> _initPlayer() async {
+    // Refresh video item
+    VideoItem currentItem = _currentItem;
+    try {
+      final libItem = Provider.of<LibraryService>(
+        context,
+        listen: false,
+      ).getVideo(currentItem.id);
+      if (libItem != null && libItem.lastUpdated >= currentItem.lastUpdated) {
+        currentItem = libItem;
+      }
+    } catch (e) {
+      debugPrint("Error refreshing item: $e");
+    }
+    _currentItem = currentItem;
+    _applyItemSubtitlePreference(currentItem, force: true);
+    final settingsService =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+
+    // Check if this is audio
+    _isAudio = currentItem.type == MediaType.audio;
+
+    // 检查 MediaPlaybackService 状态
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+
+      // 如果 Service 正在加载此视频，等待它完成
+      if (playbackService.currentItem?.id == currentItem.id &&
+          playbackService.state == PlaybackState.loading) {
+        debugPrint(
+          "PortraitVideoScreen: Waiting for service to load ${currentItem.title}",
+        );
+        if (mounted) {
+          setState(() {
+            _initialized = false;
+          });
+        }
+        return;
+      }
+
+      // 如果 Service 已经有这个视频的 controller，直接复用
+      if (playbackService.currentItem?.id == currentItem.id &&
+          playbackService.controller != null) {
+        // 如果之前持有本地 controller，先释放，防止声音重叠
+        if (_isControllerAssigned && _isControllerOwner) {
+          try {
+            _controller.removeListener(_videoListener);
+            _controller.dispose();
+          } catch (e) {
+            debugPrint("Error disposing old controller: $e");
+          }
+        }
+
+        // 使用现有的 controller
+        _controller = playbackService.controller!;
+        _isControllerAssigned = true;
+        _isControllerOwner = false; // 不拥有这个 controller，不应该 dispose
+
+        if (!mounted) return;
+
+        await _applyInitialPortraitDefaultAspectRatioIfNeeded();
+        await _syncPlaybackSpeedToCurrentController(
+          settingsService.effectiveGlobalPlaybackSpeed,
+        );
+
+        setState(() {
+          _initialized = true;
+        });
+
+        _bindControllerListener();
+        _scheduleDeferredPostInitWork(currentItem);
+
+        // 不需要再次调用 play()，因为 MediaPlaybackService 已经在管理播放状态
+        // 但为了保险起见，同步一次状态
+        playbackService.updatePlaybackStateFromController();
+        if (playbackService.isPlaying) {
+          if (!_controller.value.isPlaying) playbackService.resume();
+        } else {
+          if (_controller.value.isPlaying) playbackService.pause();
+        }
+        return;
+      }
+    } catch (e) {
+      debugPrint("无法获取 MediaPlaybackService: $e");
+      // 继续使用原有逻辑创建新的 controller
+    }
+
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (playbackService.currentItem?.id != currentItem.id ||
+          playbackService.controller == null) {
+        if (mounted) {
+          setState(() {
+            _initialized = false;
+          });
+        }
+        playbackService.play(currentItem);
+        return;
+      }
+    } catch (_) {}
+
+    final file = File(currentItem.path);
+    // Initialize controller immediately to prevent LateInitializationError in UI
+    _controller = VideoPlayerController.file(
+      file,
+      videoPlayerOptions: MediaPlaybackService.buildVideoPlayerOptions(
+        settings: SettingsService(),
+      ),
+    );
+    _isControllerAssigned = true;
+    final libraryService = Provider.of<LibraryService>(context, listen: false);
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+
+    if (!await file.exists()) {
+      developer.log('Video file not found: ${currentItem.path}');
+      if (mounted) {
+        AppToast.show("视频文件不存在: ${currentItem.path}", type: AppToastType.error);
+      }
+      return;
+    }
+
+    try {
+      // Add timeout to prevent hanging if file is problematic
+      await _controller.initialize().timeout(const Duration(seconds: 10));
+
+      if (!mounted) return;
+
+      await _applyInitialPortraitDefaultAspectRatioIfNeeded();
+
+      // Update duration if missing
+      final duration = _controller.value.duration.inMilliseconds;
+
+      if (currentItem.durationMs == 0 || currentItem.durationMs != duration) {
+        libraryService.updateVideoDuration(currentItem.id, duration);
+      }
+
+      // Seek to last position
+      if (currentItem.lastPositionMs > 0) {
+        await _controller.seekTo(
+          Duration(milliseconds: currentItem.lastPositionMs),
+        );
+      }
+
+      // Apply global settings
+      await _controller.setPlaybackSpeed(
+        settingsService.effectiveGlobalPlaybackSpeed,
+      );
+
+      setState(() {
+        _initialized = true;
+      });
+      _bindControllerListener();
+      _scheduleDeferredPostInitWork(currentItem);
+
+      try {
+        final bool shouldResumeAfterAttach = playbackService.isPlaying;
+        await playbackService.setController(_controller);
+        await playbackService.updateMetadata(currentItem);
+        if (shouldResumeAfterAttach) {
+          await playbackService.resume();
+        } else {
+          playbackService.updatePlaybackStateFromController();
+        }
+      } catch (e) {
+        debugPrint("Failed to register controller with service: $e");
+      }
+    } catch (e) {
+      developer.log('Error initializing player', error: e);
+      if (mounted) {
+        AppToast.show("无法加载视频", type: AppToastType.error);
+      }
+    }
+  }
+
+  void _videoListener() {
+    final isPlayingNow = _controller.value.isPlaying;
+    if (_lastIsPlayingForServiceSync != isPlayingNow) {
+      _lastIsPlayingForServiceSync = isPlayingNow;
+      try {
+        final playbackService = Provider.of<MediaPlaybackService>(
+          context,
+          listen: false,
+        );
+        if (playbackService.controller == _controller) {
+          playbackService.updatePlaybackStateFromController();
+        }
+      } catch (_) {}
+    }
+    _updateSubtitle();
+  }
+
+  void _updateSubtitle() {
+    if (!_initialized) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+
+    if (!settings.showSubtitles) {
+      if (_currentSubtitleText.isNotEmpty ||
+          _currentSecondaryText != null ||
+          _currentSubtitleIndex != -1 ||
+          _currentSecondarySubtitleIndex != -1 ||
+          _currentSubtitleEntries.isNotEmpty) {
+        setState(() {
+          _currentSubtitleText = "";
+          _currentSecondaryText = null;
+          _currentSubtitleIndex = -1;
+          _currentSecondarySubtitleIndex = -1;
+          _currentSubtitleIndices = [];
+          _currentSecondarySubtitleIndices = [];
+          _currentSubtitleEntries = [];
+          _currentSubtitleImages.clear();
+        });
+      }
+      return;
+    }
+
+    final position = _controller.value.position;
+    final adjustedPosition = position - settings.subtitleOffset;
+    final int posMs = adjustedPosition.inMilliseconds;
+    final continuousSubtitleEnabled = _isAudio
+        ? settings.audioContinuousSubtitle
+        : settings.videoContinuousSubtitle;
+
+    if (_subtitleStartMs.length != _subtitles.length ||
+        _secondarySubtitleStartMs.length != _secondarySubtitles.length) {
+      _rebuildSubtitleIndex();
+    }
+
+    final List<int> primaryIndices = _subtitles.isEmpty
+        ? <int>[]
+        : _findSubtitleIndicesMs(
+            posMs: posMs,
+            subtitles: _subtitles,
+            startMs: _subtitleStartMs,
+            continuousSubtitleEnabled: continuousSubtitleEnabled,
+          );
+    final List<int> secondaryIndices = _secondarySubtitles.isEmpty
+        ? <int>[]
+        : _findSubtitleIndicesMs(
+            posMs: posMs,
+            subtitles: _secondarySubtitles,
+            startMs: _secondarySubtitleStartMs,
+            continuousSubtitleEnabled: continuousSubtitleEnabled,
+          );
+
+    final List<SubtitleItem> secondaryOverlapItems = secondaryIndices
+        .map((i) => _secondarySubtitles[i])
+        .toList();
+    final List<SubtitleOverlayEntry> entries = <SubtitleOverlayEntry>[];
+
+    if (primaryIndices.isNotEmpty) {
+      for (final int index in primaryIndices) {
+        final SubtitleItem item = _subtitles[index];
+        final Uint8List? image = _currentSubtitleImages[index];
+        final bool hasImage = item.imageLoader != null;
+        String text = hasImage ? "" : item.text;
+        String? secondaryText;
+
+        if (!hasImage &&
+            _secondarySubtitles.isEmpty &&
+            settings.splitSubtitleByLine) {
+          if (text.contains('\n')) {
+            final lines = text.split('\n');
+            text = lines[0];
+            secondaryText = lines.sublist(1).join('\n');
+          }
+        } else if (!hasImage && secondaryOverlapItems.isNotEmpty) {
+          SubtitleItem? best;
+          int bestDelta = 1 << 30;
+          for (final sec in secondaryOverlapItems) {
+            final int delta =
+                (sec.startTime.inMilliseconds - item.startTime.inMilliseconds)
+                    .abs();
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              best = sec;
+            }
+          }
+          secondaryText = best?.text;
+        }
+
+        entries.add(
+          SubtitleOverlayEntry(
+            index: index,
+            text: text,
+            secondaryText: hasImage ? null : secondaryText,
+            image: image,
+          ),
+        );
+      }
+    } else if (secondaryIndices.isNotEmpty) {
+      for (final int index in secondaryIndices) {
+        final SubtitleItem item = _secondarySubtitles[index];
+        entries.add(
+          SubtitleOverlayEntry(
+            index: null,
+            text: "",
+            secondaryText: item.text,
+            image: null,
+          ),
+        );
+      }
+    }
+
+    final int anchorPrimaryIndex = primaryIndices.isNotEmpty
+        ? primaryIndices.first
+        : -1;
+    final int anchorSecondaryIndex = secondaryIndices.isNotEmpty
+        ? secondaryIndices.first
+        : -1;
+    final SubtitleOverlayEntry? anchorEntry = entries.isNotEmpty
+        ? entries.first
+        : null;
+    final bool indicesChanged =
+        !_areIntListsEqual(primaryIndices, _currentSubtitleIndices) ||
+        !_areIntListsEqual(secondaryIndices, _currentSecondarySubtitleIndices);
+    final bool entriesChanged = !_areSubtitleEntryListsEqual(
+      entries,
+      _currentSubtitleEntries,
+    );
+    final bool anchorChanged =
+        anchorPrimaryIndex != _currentSubtitleIndex ||
+        anchorSecondaryIndex != _currentSecondarySubtitleIndex;
+
+    if (!indicesChanged && !entriesChanged && !anchorChanged) return;
+
+    setState(() {
+      _currentSubtitleIndices = primaryIndices;
+      _currentSecondarySubtitleIndices = secondaryIndices;
+      _currentSubtitleEntries = entries;
+      _currentSubtitleIndex = anchorPrimaryIndex;
+      _currentSecondarySubtitleIndex = anchorSecondaryIndex;
+      _currentSubtitleText = anchorEntry?.text ?? "";
+      _currentSecondaryText = anchorEntry?.secondaryText;
+    });
+
+    if (primaryIndices.isNotEmpty) {
+      _loadSubtitleImages(primaryIndices);
+    }
+  }
+
+  void _seekPlaybackPosition(
+    Duration target, {
+    bool syncSubtitleSidebar = false,
+  }) {
+    if (!_initialized || !_controller.value.isInitialized) return;
+    final duration = _controller.value.duration;
+    Duration clamped = target;
+    if (clamped < Duration.zero) clamped = Duration.zero;
+    if (duration > Duration.zero && clamped > duration) clamped = duration;
+
+    _subtitleSeekTimer?.cancel();
+    _subtitleSeekTimer = null;
+    if (syncSubtitleSidebar && _activePanel == PortraitPanel.subtitles) {
+      _subtitleSidebarKey.currentState?.locateToTime(clamped);
+    }
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (playbackService.controller == _controller) {
+        playbackService.seekTo(clamped);
+      } else {
+        _controller.seekTo(clamped);
+      }
+    } catch (_) {
+      _controller.seekTo(clamped);
+    }
+  }
+
+  void _seekToSubtitleFast(Duration target) {
+    _seekPlaybackPosition(target);
+  }
+
+  void _togglePlay() {
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (playbackService.controller == _controller) {
+        playbackService.updatePlaybackStateFromController();
+        if (_controller.value.isPlaying) {
+          playbackService.pause();
+        } else {
+          playbackService.resume();
+        }
+        return;
+      }
+    } catch (_) {}
+
+    if (_controller.value.isPlaying) {
+      _controller.pause();
+    } else {
+      _controller.play();
+    }
+  }
+
+  void _startLongPressSpeed() {
+    final settings =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+    _preLongPressSpeed = _controller.value.playbackSpeed;
+    setState(() {
+      _isLongPressing = true;
+      _longPressFeedbackText = "${settings.longPressSpeed}x";
+    });
+    _controller.setPlaybackSpeed(settings.longPressSpeed);
+  }
+
+  void _endLongPressSpeed() {
+    if (!_isLongPressing) return;
+    setState(() {
+      _isLongPressing = false;
+    });
+    _controller.setPlaybackSpeed(_preLongPressSpeed);
+  }
+
+  Future<void> _syncPlaybackSpeedToCurrentController(double speed) async {
+    await _controller.setPlaybackSpeed(speed);
+    if (!mounted) return;
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (playbackService.controller == _controller) {
+        playbackService.updatePlaybackStateFromController();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _handlePlaybackSpeedSelected(double speed) async {
+    final settings =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+    if (settings.isPlaybackSpeedLocked &&
+        !settings.isLockedPlaybackSpeed(speed)) {
+      await _syncPlaybackSpeedToCurrentController(speed);
+      return;
+    }
+    await _syncPlaybackSpeedToCurrentController(speed);
+  }
+
+  Future<void> _handlePlaybackSpeedLockToggle(double speed) async {
+    final settings =
+        _settingsService ??
+        Provider.of<SettingsService>(context, listen: false);
+    await settings.togglePlaybackSpeedLock(speed);
+    await _syncPlaybackSpeedToCurrentController(speed);
+  }
+
+  PopupMenuItem<double> _buildPlaybackSpeedMenuItem(
+    SettingsService settings,
+    double speed,
+  ) {
+    final bool isLockedSpeed = settings.isLockedPlaybackSpeed(speed);
+    return PopupMenuItem<double>(
+      value: speed,
+      padding: EdgeInsets.zero,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onLongPress: () {
+          Navigator.of(context).pop();
+          unawaited(_handlePlaybackSpeedLockToggle(speed));
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(
+            children: [
+              Expanded(child: Text("${speed}x")),
+              if (isLockedSpeed)
+                const Icon(Icons.lock, size: 16, color: Colors.blueAccent),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _enterSubtitleDragMode() {
+    setState(() {
+      _isSubtitleDragMode = true;
+      _isStylePanelDragMode = false;
+      _isSubtitleSnappedX = false;
+      _isSubtitleSnappedY = false;
+      _isSubtitleNearCenterX = false;
+      _isSubtitleNearCenterY = false;
+    });
+  }
+
+  void _exitSubtitleDragMode() {
+    setState(() {
+      _isSubtitleDragMode = false;
+      _isStylePanelDragMode = false;
+      _isSubtitleSnappedX = false;
+      _isSubtitleSnappedY = false;
+      _isSubtitleNearCenterX = false;
+      _isSubtitleNearCenterY = false;
+    });
+  }
+
+  void _enableStylePanelDragMode() {
+    setState(() {
+      _isStylePanelDragMode = true;
+      _isSubtitleDragMode = true;
+      _isSubtitleSnappedX = false;
+      _isSubtitleSnappedY = false;
+      _isSubtitleNearCenterX = false;
+      _isSubtitleNearCenterY = false;
+    });
+  }
+
+  void _disableStylePanelDragMode() {
+    setState(() {
+      _isStylePanelDragMode = false;
+      _isSubtitleDragMode = false;
+      _isSubtitleSnappedX = false;
+      _isSubtitleSnappedY = false;
+      _isSubtitleNearCenterX = false;
+      _isSubtitleNearCenterY = false;
+    });
+  }
+
+  void _updateSubtitlePosition(
+    DragUpdateDetails details,
+    BoxConstraints constraints,
+  ) {
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final currentAlignment = _isAudio
+        ? settings.audioSubtitleAlignment
+        : settings.subtitleAlignment;
+    final snapResult = resolveSubtitleDragSnap(
+      currentAlignment: currentAlignment,
+      dragDelta: details.delta,
+      dragBounds: Size(constraints.maxWidth, constraints.maxHeight),
+      wasSnappedX: _isSubtitleSnappedX,
+      wasSnappedY: _isSubtitleSnappedY,
+    );
+
+    if (_isAudio) {
+      settings.saveAudioSubtitleAlignment(snapResult.alignment);
+    } else {
+      settings.saveSubtitleAlignment(snapResult.alignment);
+    }
+    setState(() {
+      _isSubtitleSnappedX = snapResult.snappedX;
+      _isSubtitleSnappedY = snapResult.snappedY;
+      _isSubtitleNearCenterX = snapResult.guideX;
+      _isSubtitleNearCenterY = snapResult.guideY;
+    });
+  }
+
+  Widget _buildPageSubtitleOverlay({
+    required Alignment alignment,
+    required SubtitleStyle style,
+    bool isDragging = false,
+    bool isGestureOnly = false,
+    bool enablePanUpdate = false,
+  }) {
+    return Positioned.fill(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          Widget overlay = SizedBox.expand(
+            child: SubtitleOverlayGroup(
+              entries: _currentSubtitleEntries,
+              alignment: alignment,
+              style: style,
+              isDragging: isDragging,
+              isGestureOnly: isGestureOnly,
+            ),
+          );
+
+          if (enablePanUpdate) {
+            final overlayConstraints = BoxConstraints.tightFor(
+              width: constraints.maxWidth,
+              height: constraints.maxHeight,
+            );
+            overlay = GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onPanUpdate: (details) =>
+                  _updateSubtitlePosition(details, overlayConstraints),
+              child: overlay,
+            );
+          }
+
+          return ClipRect(child: overlay);
+        },
+      ),
+    );
+  }
+
+  Future<void> _pickSubtitle() async {
+    try {
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final library = Provider.of<LibraryService>(context, listen: false);
+
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['srt', 'lrc', 'vtt'],
+        withData: true,
+      );
+
+      if (!mounted) return;
+
+      if (result != null) {
+        final file = result.files.single;
+        String path = file.path!;
+
+        // Auto Cache Logic
+        final String? currentSecondary = _currentSubtitlePaths.length > 1
+            ? _currentSubtitlePaths[1]
+            : _currentItem.secondarySubtitlePath;
+        await library.updateVideoSubtitles(
+          _currentItem.id,
+          path,
+          settings.autoCacheSubtitles,
+          secondarySubtitlePath: currentSecondary,
+          isSecondaryCached: settings.autoCacheSubtitles,
+        );
+
+        final List<String> pathsToLoad = [path];
+        if (currentSecondary != null && currentSecondary.isNotEmpty) {
+          pathsToLoad.add(currentSecondary);
+        }
+        await _loadSubtitles(pathsToLoad);
+
+        if (mounted) {
+          AppToast.show("已加载字幕: ${file.name}", type: AppToastType.success);
+        }
+      }
+    } catch (e) {
+      developer.log('Error picking subtitle', error: e);
+    }
+  }
+
+  bool _subtitleStyleFromCompose = false;
+  bool _subtitleManagerFromCompose = false;
+
+  void _openSubtitleStyleSettings({bool fromCompose = false}) {
+    developer.log('Opening subtitle style settings');
+    setState(() {
+      _subtitleStyleFromCompose = fromCompose;
+      _activePanel = PortraitPanel.subtitleStyle;
+    });
+    if (_initialized) {
+      _enableStylePanelDragMode();
+    }
+  }
+
+  void _openSubtitleManager({bool fromCompose = false}) {
+    setState(() {
+      _subtitleManagerFromCompose = fromCompose;
+      _activePanel = PortraitPanel.subtitleManager;
+    });
+  }
+
+  String _subtitlePathKey(String path) {
+    final normalized = p.normalize(path);
+    if (Platform.isWindows) {
+      return normalized.toLowerCase();
+    }
+    return normalized;
+  }
+
+  bool _additionalSubtitleContainsPath(
+    Map<String, String> additional,
+    String path,
+  ) {
+    final key = _subtitlePathKey(path);
+    for (final value in additional.values) {
+      if (_subtitlePathKey(value) == key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  String _buildUniqueSubtitleLabel(
+    Map<String, String> additional,
+    String baseLabel,
+  ) {
+    if (!additional.containsKey(baseLabel)) return baseLabel;
+    int serial = 2;
+    String next = '$baseLabel $serial';
+    while (additional.containsKey(next)) {
+      serial++;
+      next = '$baseLabel $serial';
+    }
+    return next;
+  }
+
+  String _displayEmbeddedTrackTitle(EmbeddedSubtitleTrack track) {
+    final title = track.title.trim();
+    if (title.isNotEmpty && title != '未知标题') return title;
+    final language = track.language.trim();
+    if (language.isNotEmpty && language != '未知语言') return language;
+    return '流 ${track.index}';
+  }
+
+  Future<void> _prepareEmbeddedSubtitlesForCompose() async {
+    if (_currentItem.path.isEmpty) return;
+    try {
+      final embeddedService = Provider.of<EmbeddedSubtitleService>(
+        context,
+        listen: false,
+      );
+      final library = Provider.of<LibraryService>(context, listen: false);
+      final tracks = await embeddedService.getEmbeddedSubtitles(
+        _currentItem.path,
+      );
+      if (tracks.isEmpty) return;
+      final dataRoot = await SettingsService().resolveLargeDataRootDir();
+      final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
+      if (!await subDir.exists()) {
+        await subDir.create(recursive: true);
+      }
+      final additional = Map<String, String>.from(
+        _currentItem.additionalSubtitles ?? <String, String>{},
+      );
+      bool changed = false;
+      for (final track in tracks) {
+        final extractedPath = await embeddedService.extractSubtitle(
+          _currentItem.path,
+          track.index,
+          subDir.path,
+          codecName: track.codecName,
+          videoId: _currentItem.id,
+        );
+        if (extractedPath == null || extractedPath.isEmpty) {
+          continue;
+        }
+        final normalizedPath = p.normalize(extractedPath);
+        if (_additionalSubtitleContainsPath(additional, normalizedPath)) {
+          continue;
+        }
+        final baseLabel =
+            '内嵌字幕 ${track.index}（${_displayEmbeddedTrackTitle(track)}）';
+        final uniqueLabel = _buildUniqueSubtitleLabel(additional, baseLabel);
+        additional[uniqueLabel] = normalizedPath;
+        changed = true;
+      }
+      if (!changed) return;
+      _currentItem.additionalSubtitles = additional;
+      await library.updateVideoAdditionalSubtitles(_currentItem.id, additional);
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('Prepare embedded subtitles for compose failed: $e');
+    }
+  }
+
+  void _openVideoCompose() async {
+    await _prepareEmbeddedSubtitlesForCompose();
+    if (!mounted) return;
+    setState(() => _activePanel = PortraitPanel.videoCompose);
+  }
+
+  void _closeSubtitleStyleSettings() {
+    _disableStylePanelDragMode();
+    setState(() {
+      _activePanel = _subtitleStyleFromCompose
+          ? PortraitPanel.videoCompose
+          : PortraitPanel.subtitles;
+      _subtitleStyleFromCompose = false;
+    });
+  }
+
+  void _closeSubtitleManager() {
+    setState(() {
+      _activePanel = _subtitleManagerFromCompose
+          ? PortraitPanel.videoCompose
+          : PortraitPanel.subtitles;
+      _subtitleManagerFromCompose = false;
+    });
+  }
+
+  Map<String, String> _buildSubtitleEditorGroups() {
+    final Map<String, String> groups = <String, String>{};
+    final additional = _currentItem.additionalSubtitles;
+    if (additional != null && additional.isNotEmpty) {
+      groups.addAll(additional);
+    }
+    if (_currentItem.subtitlePath != null &&
+        _currentItem.subtitlePath!.isNotEmpty) {
+      groups.putIfAbsent('主字幕', () => _currentItem.subtitlePath!);
+    }
+    if (_currentSubtitlePaths.isNotEmpty &&
+        _currentSubtitlePaths.first.isNotEmpty) {
+      groups.putIfAbsent('当前主字幕', () => _currentSubtitlePaths.first);
+    }
+    if (_currentItem.secondarySubtitlePath != null &&
+        _currentItem.secondarySubtitlePath!.isNotEmpty) {
+      groups.putIfAbsent('副字幕', () => _currentItem.secondarySubtitlePath!);
+    }
+    return groups;
+  }
+
+  String? _resolveActiveSubtitleEditorPath() {
+    if (_currentSubtitlePaths.isNotEmpty &&
+        _currentSubtitlePaths.first.isNotEmpty) {
+      return _currentSubtitlePaths.first;
+    }
+    if (_currentItem.subtitlePath != null &&
+        _currentItem.subtitlePath!.isNotEmpty) {
+      return _currentItem.subtitlePath;
+    }
+    return null;
+  }
+
+  String _normalizeGroupName(String name) {
+    final String normalized = name.trim();
+    return normalized.isEmpty ? '手动字幕' : normalized;
+  }
+
+  Future<String> _createManualSubtitleGroup(String desiredName) async {
+    final String groupName = _normalizeGroupName(desiredName);
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final dataRoot = await settings.resolveLargeDataRootDir();
+    final Directory subDir = Directory(p.join(dataRoot.path, 'subtitles'));
+    if (!await subDir.exists()) {
+      await subDir.create(recursive: true);
+    }
+    final String filePath = p.join(
+      subDir.path,
+      '${_currentItem.id}.manual.${DateTime.now().millisecondsSinceEpoch}.srt',
+    );
+    await _writeSubtitlesToSrt(filePath, _subtitles);
+
+    final Map<String, String> additional = Map<String, String>.from(
+      _currentItem.additionalSubtitles ?? <String, String>{},
+    );
+    String unique = groupName;
+    int serial = 2;
+    while (additional.containsKey(unique)) {
+      unique = '$groupName $serial';
+      serial++;
+    }
+    additional[unique] = filePath;
+    _currentItem.additionalSubtitles = additional;
+    await library.updateVideoAdditionalSubtitles(_currentItem.id, additional);
+    await _applyPrimarySubtitlePath(filePath);
+    return filePath;
+  }
+
+  Future<void> _renameSubtitleGroup(String oldName, String newName) async {
+    final String normalized = _normalizeGroupName(newName);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final Map<String, String> additional = Map<String, String>.from(
+      _currentItem.additionalSubtitles ?? <String, String>{},
+    );
+    if (!additional.containsKey(oldName)) {
+      final String? currentPath = _resolveActiveSubtitleEditorPath();
+      if (currentPath == null || currentPath.isEmpty) return;
+      if (additional.containsKey(normalized)) return;
+      additional[normalized] = currentPath;
+    } else {
+      final String path = additional.remove(oldName)!;
+      if (additional.containsKey(normalized)) return;
+      additional[normalized] = path;
+    }
+    _currentItem.additionalSubtitles = additional;
+    await library.updateVideoAdditionalSubtitles(_currentItem.id, additional);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _writeSubtitlesToSrt(
+    String path,
+    List<SubtitleItem> subtitles,
+  ) async {
+    final StringBuffer buffer = StringBuffer();
+    for (int i = 0; i < subtitles.length; i++) {
+      final SubtitleItem item = subtitles[i];
+      final int index = i + 1;
+      buffer.writeln(index.toString());
+      buffer.writeln(
+        '${_formatSrtTime(item.startTime)} --> ${_formatSrtTime(item.endTime)}',
+      );
+      buffer.writeln(item.text);
+      buffer.writeln();
+    }
+    await File(path).writeAsString(buffer.toString(), flush: true);
+  }
+
+  String _formatSrtTime(Duration duration) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    final int hours = duration.inHours;
+    final int minutes = duration.inMinutes.remainder(60);
+    final int seconds = duration.inSeconds.remainder(60);
+    final int milliseconds = duration.inMilliseconds.remainder(1000);
+    return '${two(hours)}:${two(minutes)}:${two(seconds)},${milliseconds.toString().padLeft(3, '0')}';
+  }
+
+  Future<void> _applyPrimarySubtitlePath(String path) async {
+    if (path.isEmpty) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    String? secondaryPath;
+    if (_currentSubtitlePaths.length > 1) {
+      secondaryPath = _currentSubtitlePaths[1];
+    } else {
+      secondaryPath = _currentItem.secondarySubtitlePath;
+    }
+    final List<String> paths = <String>[path];
+    if (secondaryPath != null &&
+        secondaryPath.isNotEmpty &&
+        secondaryPath != path) {
+      paths.add(secondaryPath);
+    }
+    await _loadSubtitles(paths);
+    await library.updateVideoSubtitles(
+      _currentItem.id,
+      path,
+      settings.autoCacheSubtitles,
+      secondarySubtitlePath: secondaryPath,
+      isSecondaryCached: settings.autoCacheSubtitles,
+    );
+  }
+
+  Future<void> _onSubtitleEditorSubtitlesChanged(
+    List<SubtitleItem> subtitles,
+  ) async {
+    if (!mounted) return;
+    setState(() {
+      _subtitles = List<SubtitleItem>.from(subtitles);
+    });
+    _rebuildSubtitleIndex();
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+    playbackService.setSubtitleState(
+      paths: _currentSubtitlePaths,
+      primary: _subtitles,
+      secondary: _secondarySubtitles,
+    );
+    _updateSubtitle();
+    final String? primaryPath = _resolveActiveSubtitleEditorPath();
+    if (primaryPath == null || primaryPath.isEmpty) return;
+    _manualSubtitleWriteTimer?.cancel();
+    _manualSubtitleWriteTimer = Timer(const Duration(milliseconds: 150), () {
+      _writeSubtitlesToSrt(primaryPath, subtitles);
+    });
+  }
+
+  int _localSubtitleLoadRequestId = 0;
+
+  Future<void> _loadSubtitles(
+    List<String> paths, {
+    bool autoEnableSubtitles = true,
+  }) async {
+    final int requestId = ++_localSubtitleLoadRequestId;
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+
+    if (paths.isEmpty) {
+      // 清空字幕时也同步到 MediaPlaybackService
+      playbackService.clearSubtitleState();
+      _subtitleStartMs.clear();
+      _secondarySubtitleStartMs.clear();
+      return;
+    }
+
+    // Helper to parse file
+    Future<List<SubtitleItem>> parseFile(String path) async {
+      try {
+        final file = File(path);
+        if (!await file.exists()) return [];
+
+        final length = await file.length();
+        if (length > 100 * 1024 * 1024) {
+          debugPrint(
+            "Subtitle file too large ($length bytes), skipping: $path",
+          );
+          return [];
+        }
+
+        final ext = path.toLowerCase();
+        final bool shouldNormalizeYouTubeAutoCaptions =
+            _shouldNormalizeYouTubeAutoCaptions(path);
+        if (ext.endsWith('.sup') || ext.endsWith('.idx')) {
+          if (mounted) {
+            AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+          }
+          return [];
+        } else if (ext.endsWith('.sub')) {
+          if (await SubtitleConverter.isMicroDvdSub(path)) {
+            final converted = await SubtitleConverter.convert(
+              inputPath: path,
+              targetExtension: '.srt',
+            );
+            if (converted != null) return await parseFile(converted);
+            return [];
+          }
+          if (mounted) {
+            AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
+          }
+          return [];
+        }
+
+        final bytes = await file.readAsBytes();
+        final content = SubtitleParser.decodeBytes(bytes);
+
+        if (content.isNotEmpty) {
+          var parsed = SubtitleParser.parse(content);
+          parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+          if (shouldNormalizeYouTubeAutoCaptions &&
+              YouTubeAutoCaptionNormalizer.shouldNormalize(
+                subtitles: parsed,
+                subtitlePath: path,
+                videoItem: _currentItem,
+              )) {
+            parsed = YouTubeAutoCaptionNormalizer.normalize(parsed);
+          }
+          return parsed;
+        }
+      } catch (e) {
+        debugPrint("Error loading subtitle: $e");
+      }
+      return [];
+    }
+
+    final primary = await parseFile(paths[0]);
+    List<SubtitleItem> secondary = [];
+    if (paths.length > 1) {
+      secondary = await parseFile(paths[1]);
+    }
+
+    if (!mounted) return;
+    if (requestId != _localSubtitleLoadRequestId) return;
+
+    setState(() {
+      _subtitles = primary;
+      _secondarySubtitles = secondary;
+      _currentSubtitlePaths = List.from(paths);
+      _currentSubtitleText = "";
+      _currentSecondaryText = null;
+      _currentSubtitleIndex = -1;
+      _currentSecondarySubtitleIndex = -1;
+      _currentSubtitleIndices = [];
+      _currentSecondarySubtitleIndices = [];
+      _currentSubtitleEntries = [];
+      _currentSubtitleImages.clear();
+    });
+    _rebuildSubtitleIndex();
+
+    playbackService.setSubtitleState(
+      paths: paths,
+      primary: primary,
+      secondary: secondary,
+    );
+    if (autoEnableSubtitles && (primary.isNotEmpty || secondary.isNotEmpty)) {
+      // Keep the per-item snapshot aligned with the persisted global toggle
+      // without overriding the user's current floating subtitle preference.
+      _applyItemSubtitlePreference(_currentItem, force: true);
+    }
+    _updateSubtitle();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _updateSubtitle();
+    });
+  }
+
+  void _rebuildSubtitleIndex() {
+    _subtitleStartMs
+      ..clear()
+      ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
+    _secondarySubtitleStartMs
+      ..clear()
+      ..addAll(_secondarySubtitles.map((e) => e.startTime.inMilliseconds));
+  }
+
+  bool _shouldNormalizeYouTubeAutoCaptions(String subtitlePath) {
+    final currentItem = _currentItem;
+    final sourceRef = currentItem.sourceRef;
+    final sourceValue = (sourceRef?.originalValue ?? sourceRef?.value ?? '')
+        .toLowerCase();
+    final bool isYouTubeSource =
+        sourceValue.contains('youtube.com') || sourceValue.contains('youtu.be');
+    if (!isYouTubeSource ||
+        !currentItem.usesManagedAssociatedSubtitles ||
+        currentItem.isBilibiliExported) {
+      return false;
+    }
+
+    final baseName = p.basename(p.normalize(subtitlePath)).toLowerCase();
+    return baseName.contains('auto') ||
+        baseName.contains('asr') ||
+        baseName.contains('caption') ||
+        baseName.contains('srv') ||
+        baseName.contains('自动');
+  }
+
+  int _getEffectiveEndMs({
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required int index,
+    required bool continuousSubtitleEnabled,
+  }) {
+    final SubtitleItem item = subtitles[index];
+    if (!continuousSubtitleEnabled) return item.endTime.inMilliseconds;
+    if (index + 1 < subtitles.length) return startMs[index + 1];
+    return item.endTime.inMilliseconds;
+  }
+
+  int _binarySearchLastStartLE(List<int> startMs, int posMs) {
+    int low = 0;
+    int high = startMs.length - 1;
+    int ans = -1;
+    while (low <= high) {
+      final int mid = (low + high) >> 1;
+      if (startMs[mid] <= posMs) {
+        ans = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return ans;
+  }
+
+  List<int> _findSubtitleIndicesMs({
+    required int posMs,
+    required List<SubtitleItem> subtitles,
+    required List<int> startMs,
+    required bool continuousSubtitleEnabled,
+  }) {
+    if (subtitles.isEmpty) return <int>[];
+    final int candidate = _binarySearchLastStartLE(startMs, posMs);
+    if (candidate < 0 || candidate >= subtitles.length) return <int>[];
+
+    final List<int> indices = <int>[];
+    for (int i = candidate; i >= 0; i--) {
+      if (startMs[i] > posMs) continue;
+      final int endMs = _getEffectiveEndMs(
+        subtitles: subtitles,
+        startMs: startMs,
+        index: i,
+        continuousSubtitleEnabled: continuousSubtitleEnabled,
+      );
+      if (posMs < endMs) {
+        indices.add(i);
+      } else {
+        break;
+      }
+    }
+    if (indices.length <= 1) return indices;
+    indices.sort();
+    return indices;
+  }
+
+  bool _areIntListsEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  bool _areSubtitleEntryListsEqual(
+    List<SubtitleOverlayEntry> a,
+    List<SubtitleOverlayEntry> b,
+  ) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      final SubtitleOverlayEntry left = a[i];
+      final SubtitleOverlayEntry right = b[i];
+      if (left.index != right.index) return false;
+      if (left.text != right.text) return false;
+      if (left.secondaryText != right.secondaryText) return false;
+      if (left.image != right.image) return false;
+    }
+    return true;
+  }
+
+  void _pruneSubtitleImages(Set<int> keepIndices) {
+    if (_currentSubtitleImages.isEmpty) return;
+    final keysToRemove = _currentSubtitleImages.keys
+        .where((k) => !keepIndices.contains(k))
+        .toList();
+    for (final key in keysToRemove) {
+      _currentSubtitleImages.remove(key);
+    }
+  }
+
+  void _loadSubtitleImages(List<int> indices) {
+    final Set<int> indexSet = indices.toSet();
+    _pruneSubtitleImages(indexSet);
+    if (indexSet.isEmpty) return;
+
+    final int requestId = ++_subtitleImageRequestId;
+    for (final int index in indexSet) {
+      final SubtitleItem item = _subtitles[index];
+      final imageLoader = item.imageLoader;
+      if (imageLoader == null) continue;
+      if (_currentSubtitleImages.containsKey(index)) continue;
+
+      imageLoader().then((image) {
+        if (!mounted) return;
+        if (requestId != _subtitleImageRequestId) return;
+        if (!indexSet.contains(index)) return;
+
+        setState(() {
+          _currentSubtitleImages[index] = image;
+          _currentSubtitleEntries = _currentSubtitleEntries
+              .map(
+                (entry) => entry.index == index
+                    ? SubtitleOverlayEntry(
+                        index: entry.index,
+                        text: entry.text,
+                        secondaryText: entry.secondaryText,
+                        image: image,
+                      )
+                    : entry,
+              )
+              .toList();
+        });
+      });
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _saveProgress();
+    }
+  }
+
+  @override
+  void deactivate() {
+    _saveProgress();
+    super.deactivate();
+  }
+
+  Future<void> _handleExit() async {
+    try {
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      await _saveProgress();
+
+      if (!PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup &&
+          settings.autoPauseOnExit &&
+          _controller.value.isPlaying) {
+        if (playbackService.controller == _controller) {
+          await playbackService.pause();
+        } else {
+          await _controller.pause();
+        }
+      }
+
+      // Force sync state
+      if (!_isControllerOwner) {
+        playbackService.updatePlaybackStateFromController();
+      }
+    } catch (e) {
+      debugPrint("Exit sync error: $e");
+    }
+  }
+
+  Future<void> _handleBackRequest() async {
+    final navigator = Navigator.of(context);
+    if (_forceExit) {
+      _updateOrientations();
+      if (mounted) navigator.pop();
+      return;
+    }
+
+    if (_isSubtitleDragMode && !_isStylePanelDragMode) {
+      _exitSubtitleDragMode();
+      return;
+    }
+
+    if (_activePanel == PortraitPanel.subtitleEditor &&
+        _isSubtitleEditorExpanded) {
+      if (!mounted) return;
+      setState(() {
+        _isSubtitleEditorExpanded = false;
+      });
+      return;
+    }
+
+    if (_activePanel != PortraitPanel.subtitles) {
+      if (!mounted) return;
+      setState(() {
+        if (_activePanel == PortraitPanel.subtitleStyle) {
+          _isStylePanelDragMode = false;
+          _isSubtitleDragMode = false;
+          _isSubtitleSnappedX = false;
+          _isSubtitleSnappedY = false;
+          _isSubtitleNearCenterX = false;
+          _isSubtitleNearCenterY = false;
+        }
+        if (_activePanel == PortraitPanel.subtitleStyle &&
+            _subtitleStyleFromCompose) {
+          _activePanel = PortraitPanel.videoCompose;
+        } else if (_activePanel == PortraitPanel.subtitleManager &&
+            _subtitleManagerFromCompose) {
+          _activePanel = PortraitPanel.videoCompose;
+        } else {
+          _activePanel = PortraitPanel.subtitles;
+        }
+        _subtitleStyleFromCompose = false;
+        _subtitleManagerFromCompose = false;
+        _isSubtitleEditorExpanded = false;
+      });
+      return;
+    }
+
+    await _handleExit();
+    if (!mounted) return;
+    _updateOrientations();
+    navigator.pop();
+  }
+
+  void _onIosBackSwipeStart(DragStartDetails details) {
+    if (!Platform.isIOS) return;
+    _iosBackSwipeActive = true;
+    _iosBackSwipeDistance = 0.0;
+  }
+
+  void _onIosBackSwipeUpdate(DragUpdateDetails details) {
+    if (!_iosBackSwipeActive) return;
+    _iosBackSwipeDistance += details.delta.dx;
+    if (_iosBackSwipeDistance >= _iosBackSwipeTriggerDistance) {
+      _iosBackSwipeActive = false;
+      _iosBackSwipeDistance = 0.0;
+      _handleBackRequest();
+    }
+  }
+
+  void _onIosBackSwipeEnd(DragEndDetails details) {
+    _iosBackSwipeActive = false;
+    _iosBackSwipeDistance = 0.0;
+  }
+
+  @override
+  void dispose() {
+    // Try to sync one last time (fire and forget)
+    _handleExit();
+
+    if (_routeObserverSubscribed) {
+      AppToast.routeObserver.unsubscribe(this);
+    }
+
+    try {
+      Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      ).removeListener(_onPlaybackServiceChange);
+    } catch (_) {}
+    _settingsService?.removeListener(_onSettingsChanged);
+
+    _transcriptionManager?.removeListener(_onTranscriptionUpdate);
+    _selectionFocusNode.dispose();
+    _subtitleSeekTimer?.cancel();
+    _customAspectDraftSaveTimer?.cancel();
+    _manualSubtitleWriteTimer?.cancel();
+
+    WidgetsBinding.instance.removeObserver(this);
+    if (_isControllerAssigned) {
+      _controller.removeListener(_videoListener);
+      // 只有当我们拥有 controller 时才 dispose
+      if (_isControllerOwner) {
+        try {
+          final playbackService = Provider.of<MediaPlaybackService>(
+            context,
+            listen: false,
+          );
+          if (playbackService.controller == _controller) {
+            playbackService.clearController();
+          }
+        } catch (e) {
+          debugPrint("Error clearing controller from service: $e");
+        }
+        _controller.dispose();
+      }
+    }
+    super.dispose();
+  }
+
+  Future<void> _saveProgress() async {
+    if (_isControllerAssigned && _controller.value.isInitialized) {
+      final position = _controller.value.position.inMilliseconds;
+      await Provider.of<LibraryService>(
+        context,
+        listen: false,
+      ).updateVideoProgress(_currentItem.id, position);
+    }
+  }
+
+  void _goToLandscape() async {
+    if (_isPushingLandscape) {
+      return;
+    }
+
+    // Push landscape page with current controller
+    // Use opaque: false to make transition smoother if needed
+    unawaited(_saveProgress()); // Save before switch just in case
+
+    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+      unawaited(
+        SystemChrome.setPreferredOrientations([
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ]),
+      );
+    }
+
+    // 标记控制器已传递给横屏页，竖屏页不再拥有它
+    _isControllerOwner = false;
+
+    _isPushingLandscape = true;
+    try {
+      final navigator = Navigator.of(context);
+      await navigator.push(
+        PageRouteBuilder(
+          settings: PlaybackNavigationService.landscapeRouteSettings(
+            _currentItem,
+          ),
+          pageBuilder: (context, animation, secondaryAnimation) =>
+              VideoPlayerScreen(
+                videoFile: null, // Legacy param, ignored
+                existingController: _controller, // Pass控制器
+                videoItem: _currentItem, // Pass item for context
+                skipAutoPauseOnExit: true,
+              ),
+          opaque: false,
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            return child;
+          },
+          transitionDuration: Duration.zero,
+          reverseTransitionDuration: Duration.zero,
+        ),
+      );
+    } finally {
+      _isPushingLandscape = false;
+    }
+
+    if (!mounted) return;
+
+    // 从横屏返回后，需要重新同步控制器状态
+    // 因为横屏页可能已经切换了视频，导致控制器被替换
+    _isControllerAssigned = false;
+    _initialized = false;
+
+    // Restore orientation logic based on device type
+    _updateOrientations();
+
+    // 重新初始化播放器以同步 Service 的状态
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+    final bool needsReinit =
+        playbackService.currentItem?.id != _currentItem.id ||
+        playbackService.controller == null;
+    if (needsReinit) {
+      _postInitWorkToken++;
+      _initPlayer();
+    } else {
+      _currentItem = playbackService.currentItem!;
+      _controller = playbackService.controller!;
+      _isControllerAssigned = true;
+      _isControllerOwner = false;
+      _isAudio = _currentItem.type == MediaType.audio;
+      _initialized = _controller.value.isInitialized;
+      _bindControllerListener();
+      _scheduleDeferredPostInitWork(_currentItem);
+      if (mounted) {
+        setState(() {});
+      }
+    }
+
+    // 同步字幕状态
+    try {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      final updated = library.getVideo(_currentItem.id);
+      if (updated != null) {
+        _currentItem = updated;
+      }
+    } catch (_) {}
+
+    final bool hasServiceSubtitleState =
+        playbackService.subtitles.isNotEmpty ||
+        playbackService.secondarySubtitles.isNotEmpty;
+    if (hasServiceSubtitleState) {
+      setState(() {
+        _subtitles = List<SubtitleItem>.from(playbackService.subtitles);
+        _secondarySubtitles = List<SubtitleItem>.from(
+          playbackService.secondarySubtitles,
+        );
+        _currentSubtitlePaths = List<String>.from(
+          playbackService.subtitlePaths,
+        );
+        _currentSubtitleText = "";
+        _currentSecondaryText = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _currentSubtitleIndices = [];
+        _currentSecondarySubtitleIndices = [];
+        _currentSubtitleEntries = [];
+        _currentSubtitleImages.clear();
+      });
+      _rebuildSubtitleIndex();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _updateSubtitle();
+      });
+    } else if (playbackService.subtitlePaths.isNotEmpty) {
+      await _loadSubtitles(playbackService.subtitlePaths);
+    } else if (_currentItem.subtitlePath != null) {
+      final List<String> paths = [_currentItem.subtitlePath!];
+      if (_currentItem.secondarySubtitlePath != null) {
+        paths.add(_currentItem.secondarySubtitlePath!);
+      }
+      await _loadSubtitles(paths);
+    } else if (!_currentItem.blockAutoAssociatedSubtitleSelection &&
+        _resolveFirstAssociatedSubtitlePath(_currentItem) != null) {
+      await _tryLoadAssociatedSubtitleAsPrimary(_currentItem);
+    } else {
+      setState(() {
+        _subtitles = [];
+        _secondarySubtitles = [];
+        _currentSubtitlePaths = [];
+        _currentSubtitleText = "";
+        _currentSecondaryText = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _currentSubtitleIndices = [];
+        _currentSecondarySubtitleIndices = [];
+        _currentSubtitleEntries = [];
+        _currentSubtitleImages.clear();
+      });
+      playbackService.clearSubtitleState();
+    }
+
+    setState(() {});
+
+    // 自动跟随字幕开启时，从横屏返回后自动定位
+    // 等待转场动画完成，避免在动画过程中滚动
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      if (settings.autoScrollSubtitles) {
+        Future.delayed(const Duration(milliseconds: 400), () {
+          if (mounted) {
+            _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
+          }
+        });
+      }
+    });
+  }
+
+  double _nativeVideoAspectRatio() {
+    if (_isControllerAssigned &&
+        _controller.value.isInitialized &&
+        _controller.value.aspectRatio > 0) {
+      return _controller.value.aspectRatio;
+    }
+    return 16 / 9;
+  }
+
+  double _portraitDisplayAspectRatio() {
+    final manual = _currentItem.portraitDisplayAspectRatio;
+    if (manual != null && manual.isFinite && manual > 0) {
+      return manual;
+    }
+    if (_isAudio) return 1.0;
+    return _nativeVideoAspectRatio();
+  }
+
+  String _portraitAspectRatioLabel(double? ratio) {
+    if (ratio == null) return '原始';
+    if ((ratio - 1.0).abs() < 0.01) return '1:1';
+    if ((ratio - (16 / 9)).abs() < 0.01) return '16:9';
+    if ((ratio - (4 / 3)).abs() < 0.01) return '4:3';
+    if ((ratio - (3 / 2)).abs() < 0.01) return '3:2';
+    return '${ratio.toStringAsFixed(2)}:1';
+  }
+
+  bool _isPresetAspectRatio(double ratio, {bool includeSquare = false}) {
+    return (includeSquare && (ratio - 1.0).abs() < 0.01) ||
+        (ratio - (16 / 9)).abs() < 0.01 ||
+        (ratio - (4 / 3)).abs() < 0.01 ||
+        (ratio - (3 / 2)).abs() < 0.01;
+  }
+
+  Future<void> _applyInitialPortraitDefaultAspectRatioIfNeeded() async {
+    if (_isAudio ||
+        !_isControllerAssigned ||
+        !_controller.value.isInitialized ||
+        _currentItem.hasPortraitAspectPreferenceInitialized) {
+      return;
+    }
+
+    const double portraitThreshold = 1.0 - 0.0001;
+    final double nativeRatio = _controller.value.aspectRatio;
+    if (nativeRatio <= 0) return;
+
+    final double? manual = _currentItem.portraitDisplayAspectRatio;
+    if (manual != null && manual.isFinite && manual > 0) {
+      setState(() {
+        _currentItem.hasPortraitAspectPreferenceInitialized = true;
+      });
+      try {
+        final library = Provider.of<LibraryService>(context, listen: false);
+        await library.updateVideoPortraitDisplayAspectRatio(
+          _currentItem.id,
+          manual,
+          customWidth: _currentItem.portraitCustomAspectWidth,
+          customHeight: _currentItem.portraitCustomAspectHeight,
+          markInitialized: true,
+        );
+      } catch (_) {}
+      return;
+    }
+
+    if (nativeRatio < portraitThreshold) {
+      await _persistPortraitAspectRatio(4 / 3);
+    }
+  }
+
+  Future<void> _persistPortraitAspectRatio(
+    double? ratio, {
+    double? customWidth,
+    double? customHeight,
+  }) async {
+    if (_isAudio) return;
+    final normalized =
+        (ratio != null && ratio.isFinite && ratio > 0 && ratio <= 10)
+        ? ratio
+        : null;
+    final normalizedWidth =
+        (customWidth != null && customWidth.isFinite && customWidth > 0)
+        ? customWidth
+        : null;
+    final normalizedHeight =
+        (customHeight != null && customHeight.isFinite && customHeight > 0)
+        ? customHeight
+        : null;
+
+    setState(() {
+      _currentItem.portraitDisplayAspectRatio = normalized;
+      _currentItem.portraitCustomAspectWidth = normalizedWidth;
+      _currentItem.portraitCustomAspectHeight = normalizedHeight;
+      _currentItem.hasPortraitAspectPreferenceInitialized = true;
+    });
+
+    try {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      await library.updateVideoPortraitDisplayAspectRatio(
+        _currentItem.id,
+        normalized,
+        customWidth: normalizedWidth,
+        customHeight: normalizedHeight,
+      );
+      if (!mounted) return;
+      final updated = library.getVideo(_currentItem.id);
+      if (updated != null) {
+        setState(() {
+          _currentItem = updated;
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _showPortraitAspectRatioSheet() async {
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final String initWidthText = settings.portraitCustomAspectDraftWidthText;
+    final String initHeightText = settings.portraitCustomAspectDraftHeightText;
+
+    final TextEditingController widthController = TextEditingController(
+      text: initWidthText,
+    );
+    final TextEditingController heightController = TextEditingController(
+      text: initHeightText,
+    );
+
+    String lastSavedWidthText = initWidthText;
+    String lastSavedHeightText = initHeightText;
+    Timer? customAspectLiveApplyTimer;
+    double? lastLiveAppliedRatio;
+
+    Future<void> persistCustomAspectDraft({bool immediate = false}) async {
+      final widthText = widthController.text;
+      final heightText = heightController.text;
+      if (widthText == lastSavedWidthText &&
+          heightText == lastSavedHeightText) {
+        return;
+      }
+
+      Future<void> doSave() async {
+        await settings.savePortraitCustomAspectDraftTexts(
+          widthText: widthText,
+          heightText: heightText,
+        );
+        lastSavedWidthText = widthText;
+        lastSavedHeightText = heightText;
+      }
+
+      _customAspectDraftSaveTimer?.cancel();
+      if (immediate) {
+        await doSave();
+      } else {
+        _customAspectDraftSaveTimer = Timer(
+          const Duration(milliseconds: 180),
+          () {
+            doSave();
+          },
+        );
+      }
+    }
+
+    final Color panelColor = const Color(0xFF1E1E1E);
+
+    final Color chipColor = const Color(0xFF2B2B2B);
+
+    try {
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: panelColor,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        builder: (sheetContext) {
+          double? selected =
+              _currentItem.portraitDisplayAspectRatio ??
+              (_isAudio ? 1.0 : null);
+          String? errorText;
+
+          Future<void> apply(
+            double? ratio, {
+            double? customWidth,
+            double? customHeight,
+          }) async {
+            await _persistPortraitAspectRatio(
+              ratio,
+              customWidth: customWidth,
+              customHeight: customHeight,
+            );
+          }
+
+          return StatefulBuilder(
+            builder: (context, setSheetState) {
+              bool shouldLiveSyncCustomInput() {
+                final applied = _currentItem.portraitDisplayAspectRatio;
+                return applied != null &&
+                    applied.isFinite &&
+                    applied > 0 &&
+                    !_isPresetAspectRatio(applied, includeSquare: _isAudio);
+              }
+
+              void scheduleLiveCustomApply() {
+                if (!shouldLiveSyncCustomInput()) return;
+                final double? width = double.tryParse(
+                  widthController.text.trim(),
+                );
+                final double? height = double.tryParse(
+                  heightController.text.trim(),
+                );
+                if (width == null ||
+                    height == null ||
+                    !width.isFinite ||
+                    !height.isFinite ||
+                    width <= 0 ||
+                    height <= 0) {
+                  return;
+                }
+                final double ratio = width / height;
+                if (!ratio.isFinite || ratio <= 0 || ratio > 10) return;
+                if (lastLiveAppliedRatio != null &&
+                    (lastLiveAppliedRatio! - ratio).abs() < 0.0001) {
+                  return;
+                }
+
+                customAspectLiveApplyTimer?.cancel();
+                customAspectLiveApplyTimer = Timer(
+                  const Duration(milliseconds: 120),
+                  () async {
+                    await apply(
+                      ratio,
+                      customWidth: width,
+                      customHeight: height,
+                    );
+                    if (!mounted) return;
+                    setSheetState(() {
+                      selected = ratio;
+                      errorText = null;
+                    });
+                    lastLiveAppliedRatio = ratio;
+                  },
+                );
+              }
+
+              Widget option(String title, double? ratio) {
+                final bool isSelected =
+                    (selected == null && ratio == null) ||
+                    (selected != null &&
+                        ratio != null &&
+                        (selected! - ratio).abs() < 0.01);
+                return AnimatedContainer(
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOut,
+                  margin: const EdgeInsets.only(right: 8, bottom: 8),
+                  child: Material(
+                    color: isSelected
+                        ? const Color(0xFF1565C0).withValues(alpha: 0.28)
+                        : chipColor,
+                    borderRadius: BorderRadius.circular(12),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () async {
+                        setSheetState(() {
+                          selected = ratio;
+                          errorText = null;
+                        });
+                        await apply(
+                          ratio,
+                          customWidth: null,
+                          customHeight: null,
+                        );
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              isSelected
+                                  ? Icons.radio_button_checked
+                                  : Icons.radio_button_unchecked,
+                              size: 16,
+                              color: isSelected
+                                  ? const Color(0xFF64B5F6)
+                                  : Colors.white60,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              title,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }
+
+              return Padding(
+                padding: EdgeInsets.fromLTRB(
+                  16,
+                  14,
+                  16,
+                  16 + MediaQuery.of(context).viewInsets.bottom,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.aspect_ratio,
+                          color: Colors.white70,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 8),
+                        const Text(
+                          '竖屏页显示比例',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const Spacer(),
+                        Text(
+                          '当前：${_portraitAspectRatioLabel(_currentItem.portraitDisplayAspectRatio ?? (_isAudio ? 1.0 : null))}',
+                          style: const TextStyle(
+                            color: Colors.white60,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      children: [
+                        if (_isAudio)
+                          option('1:1', 1.0)
+                        else
+                          option('原始比例', null),
+                        option('16:9', 16 / 9),
+                        option('4:3', 4 / 3),
+                        option('3:2', 3 / 2),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Material(
+                      color: chipColor,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: [
+                            InkWell(
+                              borderRadius: BorderRadius.circular(16),
+                              onTap: () async {
+                                final double? width = double.tryParse(
+                                  widthController.text.trim(),
+                                );
+                                final double? height = double.tryParse(
+                                  heightController.text.trim(),
+                                );
+                                if (width == null ||
+                                    height == null ||
+                                    !width.isFinite ||
+                                    !height.isFinite ||
+                                    width <= 0 ||
+                                    height <= 0) {
+                                  setSheetState(() {
+                                    errorText = '请输入有效的宽高数值';
+                                  });
+                                  return;
+                                }
+
+                                final double ratio = width / height;
+                                if (!ratio.isFinite ||
+                                    ratio <= 0 ||
+                                    ratio > 10) {
+                                  setSheetState(() {
+                                    errorText = '宽高比最大支持 10:1';
+                                  });
+                                  return;
+                                }
+
+                                setSheetState(() {
+                                  selected = ratio;
+                                  errorText = null;
+                                });
+                                await apply(
+                                  ratio,
+                                  customWidth: width,
+                                  customHeight: height,
+                                );
+                                lastLiveAppliedRatio = ratio;
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 10),
+                                child: Icon(
+                                  selected != null &&
+                                          !_isPresetAspectRatio(
+                                            selected!,
+                                            includeSquare: _isAudio,
+                                          )
+                                      ? Icons.radio_button_checked
+                                      : Icons.radio_button_unchecked,
+                                  size: 18,
+                                  color:
+                                      selected != null &&
+                                          !_isPresetAspectRatio(
+                                            selected!,
+                                            includeSquare: _isAudio,
+                                          )
+                                      ? const Color(0xFF64B5F6)
+                                      : Colors.white60,
+                                ),
+                              ),
+                            ),
+                            const Padding(
+                              padding: EdgeInsets.only(right: 8),
+                              child: Text(
+                                '自定义',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            Expanded(
+                              child: TextField(
+                                controller: widthController,
+                                keyboardType:
+                                    const TextInputType.numberWithOptions(
+                                      decimal: true,
+                                    ),
+                                onChanged: (_) {
+                                  setSheetState(() {
+                                    errorText = null;
+                                  });
+                                  persistCustomAspectDraft();
+                                  scheduleLiveCustomApply();
+                                },
+                                style: const TextStyle(color: Colors.white),
+                                decoration: InputDecoration(
+                                  filled: true,
+                                  fillColor: const Color(0xFF232323),
+                                  hintText: '宽',
+                                  hintStyle: const TextStyle(
+                                    color: Colors.white38,
+                                  ),
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 8,
+                                  ),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(8),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const Padding(
+                              padding: EdgeInsets.symmetric(horizontal: 6),
+                              child: Text(
+                                ':',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            ),
+                            Expanded(
+                              child: TextField(
+                                controller: heightController,
+                                keyboardType:
+                                    const TextInputType.numberWithOptions(
+                                      decimal: true,
+                                    ),
+                                onChanged: (_) {
+                                  setSheetState(() {
+                                    errorText = null;
+                                  });
+                                  persistCustomAspectDraft();
+                                  scheduleLiveCustomApply();
+                                },
+                                style: const TextStyle(color: Colors.white),
+
+                                decoration: InputDecoration(
+                                  filled: true,
+                                  fillColor: const Color(0xFF232323),
+                                  hintText: '高',
+                                  hintStyle: const TextStyle(
+                                    color: Colors.white38,
+                                  ),
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 8,
+                                  ),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(8),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (errorText != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        errorText!,
+                        style: const TextStyle(color: Colors.redAccent),
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      await persistCustomAspectDraft(immediate: true);
+      _customAspectDraftSaveTimer?.cancel();
+      customAspectLiveApplyTimer?.cancel();
+      widthController.dispose();
+      heightController.dispose();
+    }
+  }
+
+  String _formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, "0");
+    String twoDigitMinutes = twoDigits(duration.inMinutes.remainder(60));
+    String twoDigitSeconds = twoDigits(duration.inSeconds.remainder(60));
+    return "${twoDigits(duration.inHours)}:$twoDigitMinutes:$twoDigitSeconds";
+  }
+
+  bool _isInCancelArea(Offset globalPosition) {
+    if (!mounted) return false;
+    final RenderBox? box = context.findRenderObject() as RenderBox?;
+    if (box == null) return false;
+    final localOffset = box.globalToLocal(globalPosition);
+    return localOffset.dy < box.size.height * 0.25;
+  }
+
+  Widget _buildBottomControlBar() {
+    final settings = Provider.of<SettingsService>(context);
+    final playbackService = Provider.of<MediaPlaybackService>(context);
+
+    return ValueListenableBuilder(
+      valueListenable: _controller,
+      builder: (context, value, child) {
+        // Use metadata if controller not ready
+        final duration = value.isInitialized
+            ? value.duration
+            : Duration(milliseconds: _currentItem.durationMs);
+        final position = value.isInitialized
+            ? value.position
+            : Duration(milliseconds: _currentItem.lastPositionMs);
+
+        // Ensure valid slider values
+        final double maxDuration = duration.inMilliseconds.toDouble();
+        final double currentPos = position.inMilliseconds.toDouble();
+        final double sliderMax = maxDuration > 0 ? maxDuration : 1.0;
+        final double sliderValue = currentPos.clamp(0.0, sliderMax);
+
+        return Container(
+          color: const Color(0xFF1E1E1E),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+          height: 36, // Extremely short height
+          child: Row(
+            children: [
+              // Time - show drag position when dragging, otherwise show current position
+              Text(
+                _isDraggingProgress
+                    ? "${_formatDuration(Duration(milliseconds: _dragProgressValue.toInt()))} / ${_formatDuration(duration)}"
+                    : "${_formatDuration(position)} / ${_formatDuration(duration)}",
+                style: const TextStyle(color: Colors.white, fontSize: 10),
+              ),
+
+              const SizedBox(width: 8),
+
+              // Progress Slider
+              Expanded(
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerMove: (event) {
+                    if (!_isDraggingProgress || _isLocked) return;
+                    final isInCancelArea = _isInCancelArea(event.position);
+                    if (isInCancelArea != _isProgressDragCanceling) {
+                      setState(() {
+                        _isProgressDragCanceling = isInCancelArea;
+                      });
+                    }
+                  },
+                  onPointerCancel: (event) {
+                    if (!_isDraggingProgress) return;
+                    setState(() {
+                      _isDraggingProgress = false;
+                      _isProgressDragCanceling = false;
+                    });
+                  },
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: _isProgressDragCanceling
+                          ? Colors.grey
+                          : const Color(0xFF0D47A1),
+                      inactiveTrackColor: Colors.white24,
+                      thumbColor: _isProgressDragCanceling
+                          ? Colors.grey
+                          : const Color(0xFF1565C0),
+                      overlayColor: const Color(0x291565C0),
+                      thumbShape: const RoundSliderThumbShape(
+                        enabledThumbRadius: 6.0,
+                      ),
+                      trackHeight: 2.0,
+                      overlayShape: const RoundSliderOverlayShape(
+                        overlayRadius: 10,
+                      ),
+                    ),
+                    child: Slider(
+                      min: 0.0,
+                      max: sliderMax,
+                      value: _isDraggingProgress
+                          ? _dragProgressValue
+                          : sliderValue,
+                      onChanged: (newValue) {
+                        setState(() {
+                          _isDraggingProgress = true;
+                          _dragProgressValue = newValue;
+                        });
+                      },
+                      onChangeEnd: (newValue) {
+                        if (!_isProgressDragCanceling) {
+                          final pos = Duration(milliseconds: newValue.toInt());
+                          _seekPlaybackPosition(pos);
+                        }
+                        setState(() {
+                          _isDraggingProgress = false;
+                          _isProgressDragCanceling = false;
+                        });
+                      },
+                    ),
+                  ),
+                ),
+              ),
+
+              // Tools
+
+              // Speed
+              PopupMenuButton<double>(
+                initialValue: value.playbackSpeed,
+                tooltip: "倍速",
+                onSelected: (speed) {
+                  unawaited(_handlePlaybackSpeedSelected(speed));
+                },
+                constraints: const BoxConstraints(
+                  maxHeight: 400,
+                ), // Limit height to ensure scrolling behavior is obvious
+                itemBuilder: (context) =>
+                    [
+                      0.25,
+                      0.5,
+                      0.75,
+                      1.0,
+                      1.25,
+                      1.5,
+                      2.0,
+                      2.5,
+                      3.0,
+                      4.0,
+                      5.0,
+                    ].map((speed) {
+                      return _buildPlaybackSpeedMenuItem(settings, speed);
+                    }).toList(),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        "${value.playbackSpeed}x",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      if (settings.isLockedPlaybackSpeed(
+                        value.playbackSpeed,
+                      )) ...[
+                        const SizedBox(width: 4),
+                        const Icon(
+                          Icons.lock,
+                          size: 12,
+                          color: Colors.blueAccent,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+
+              // Subtitle Toggle
+              IconButton(
+                icon: Icon(
+                  settings.showSubtitles
+                      ? Icons.subtitles
+                      : Icons.subtitles_off,
+                  color: settings.showSubtitles
+                      ? Colors.blueAccent
+                      : Colors.white70,
+                  size: 18,
+                ),
+                onPressed: () => _setFloatingSubtitles(!settings.showSubtitles),
+                tooltip: "字幕开关",
+                padding: const EdgeInsets.all(4),
+                constraints: const BoxConstraints(),
+              ),
+
+              // Volume Toggle (Mute/Unmute)
+              IconButton(
+                icon: Icon(
+                  playbackService.isMuted ? Icons.volume_off : Icons.volume_up,
+                  color: playbackService.isMuted
+                      ? Colors.redAccent
+                      : Colors.white,
+                  size: 18,
+                ),
+                onPressed: () {
+                  unawaited(playbackService.toggleMute());
+                },
+                tooltip: playbackService.isMuted ? "取消静音" : "静音",
+                padding: const EdgeInsets.all(4),
+                constraints: const BoxConstraints(),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildExternalControls() {
+    final settings = Provider.of<SettingsService>(context);
+    final playlistManager = Provider.of<PlaylistManager>(context);
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+
+    // Reduced sizes by ~50-60% to meet user request (80% reduction requested but that would be too small, so aiming for "much smaller")
+    const double iconSize = 50.0;
+    const double seekIconSize = 28.0;
+
+    return ValueListenableBuilder(
+      valueListenable: _controller,
+      builder: (context, value, child) {
+        return Container(
+          color: const Color(0xFF1E1E1E), // Match SubtitleSidebar background
+          padding: const EdgeInsets.symmetric(
+            vertical: 0.1,
+          ), // Minimal padding to fit tightly
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Previous Episode
+              IconButton(
+                icon: Icon(
+                  Icons.skip_previous,
+                  color: playlistManager.hasPrevious
+                      ? Colors.white
+                      : Colors.white38,
+                ),
+                onPressed: playlistManager.hasPrevious
+                    ? () => playbackService.playPrevious(
+                        autoPlay: settings.autoPlayNextVideo,
+                      )
+                    : null,
+                iconSize: 32,
+                tooltip: "上一集",
+              ),
+              const SizedBox(width: 16),
+
+              // Seek Backward
+              InkWell(
+                onTap: () {
+                  final newPos =
+                      value.position -
+                      Duration(seconds: settings.doubleTapSeekSeconds);
+                  final pos = newPos < Duration.zero ? Duration.zero : newPos;
+                  if (playbackService.controller == _controller) {
+                    playbackService.seekTo(pos);
+                  } else {
+                    _controller.seekTo(pos);
+                  }
+                },
+                borderRadius: BorderRadius.circular(30),
+                child: SizedBox(
+                  width: seekIconSize + 16,
+                  height: seekIconSize + 16,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Icon(
+                        Icons.replay,
+                        color: Colors.white,
+                        size: seekIconSize,
+                      ),
+                      Text(
+                        "${settings.doubleTapSeekSeconds}",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 30),
+
+              // Play/Pause
+              IconButton(
+                iconSize: iconSize,
+                icon: Icon(
+                  value.isPlaying
+                      ? Icons.pause_circle_filled
+                      : Icons.play_circle_fill,
+                  color: Colors.white,
+                ),
+                onPressed: _togglePlay,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+              ),
+
+              const SizedBox(width: 30),
+
+              // Seek Forward
+              InkWell(
+                onTap: () {
+                  final newPos =
+                      value.position +
+                      Duration(seconds: settings.doubleTapSeekSeconds);
+                  final duration = value.duration;
+                  final pos = newPos > duration ? duration : newPos;
+                  if (playbackService.controller == _controller) {
+                    playbackService.seekTo(pos);
+                  } else {
+                    _controller.seekTo(pos);
+                  }
+                },
+                borderRadius: BorderRadius.circular(30),
+                child: SizedBox(
+                  width: seekIconSize + 16,
+                  height: seekIconSize + 16,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      Transform(
+                        alignment: Alignment.center,
+                        transform: Matrix4.rotationY(3.14159),
+                        child: Icon(
+                          Icons.replay,
+                          color: Colors.white,
+                          size: seekIconSize,
+                        ),
+                      ),
+                      Text(
+                        "${settings.doubleTapSeekSeconds}",
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 8,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(width: 16),
+              // Next Episode
+              IconButton(
+                icon: Icon(
+                  Icons.skip_next,
+                  color: playlistManager.hasNext
+                      ? Colors.white
+                      : Colors.white38,
+                ),
+                onPressed: playlistManager.hasNext
+                    ? () => playbackService.playNext(
+                        autoPlay: settings.autoPlayNextVideo,
+                      )
+                    : null,
+                iconSize: 32,
+                tooltip: "下一集",
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<SettingsService>(
+      builder: (context, settings, child) {
+        // Use WillPopScope to handle back button and reset orientation early
+        // This helps reduce the "jank" when returning to a landscape screen
+        return PopScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, result) {
+            if (didPop) return;
+            _handleBackRequest();
+          },
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            body: SelectableRegion(
+              key: _selectionKey,
+              selectionControls: materialTextSelectionControls,
+              focusNode: _selectionFocusNode,
+              child: GestureDetector(
+                onTap: () {
+                  // 点击空白区域取消文字选择
+                  _selectionKey.currentState?.clearSelection();
+                  FocusManager.instance.primaryFocus?.unfocus();
+                },
+                behavior: HitTestBehavior.translucent,
+                child: OrientationBuilder(
+                  builder: (context, orientation) {
+                    // If device is in landscape (e.g. tablet), limit width to simulate portrait mode
+                    return Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 500),
+                        child: SafeArea(
+                          top: true,
+                          bottom: false,
+                          child: Stack(
+                            children: [
+                              Column(
+                                children: [
+                                  if (!(_activePanel ==
+                                          PortraitPanel.subtitleEditor &&
+                                      _isSubtitleEditorExpanded))
+                                    // 1. Video Area (Top)
+                                    Container(
+                                      color: Colors.black,
+                                      child: AspectRatio(
+                                        aspectRatio:
+                                            _portraitDisplayAspectRatio(),
+                                        child: LayoutBuilder(
+                                          builder: (context, constraints) {
+                                            return Stack(
+                                              fit: StackFit.expand,
+                                              children: [
+                                                if (_initialized)
+                                                  if (_isAudio)
+                                                    Container(
+                                                      color: Colors.black,
+                                                      child: const Center(
+                                                        child: Icon(
+                                                          Icons.music_note,
+                                                          size: 80,
+                                                          color: Colors.white24,
+                                                        ),
+                                                      ),
+                                                    )
+                                                  else
+                                                    Center(
+                                                      child: AspectRatio(
+                                                        aspectRatio:
+                                                            _nativeVideoAspectRatio(),
+                                                        child: Transform(
+                                                          alignment:
+                                                              Alignment.center,
+                                                          transform:
+                                                              _buildVideoDisplayTransformMatrix(),
+                                                          child: VideoPlayer(
+                                                            _controller,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    )
+                                                else ...[
+                                                  if (_currentItem
+                                                              .thumbnailPath !=
+                                                          null &&
+                                                      File(
+                                                        _currentItem
+                                                            .thumbnailPath!,
+                                                      ).existsSync())
+                                                    Image.file(
+                                                      File(
+                                                        _currentItem
+                                                            .thumbnailPath!,
+                                                      ),
+                                                      fit: BoxFit.cover,
+                                                    )
+                                                  else
+                                                    Container(
+                                                      color: Colors.black,
+                                                    ),
+                                                  Center(
+                                                    child:
+                                                        CircularProgressIndicator(
+                                                          color: Colors.white
+                                                              .withValues(
+                                                                alpha: 0.5,
+                                                              ),
+                                                        ),
+                                                  ),
+                                                ],
+                                                if (_isDraggingProgress &&
+                                                    !_isLocked)
+                                                  Positioned.fill(
+                                                    child: Container(
+                                                      color: Colors.black
+                                                          .withValues(
+                                                            alpha:
+                                                                _isProgressDragCanceling
+                                                                ? 0.28
+                                                                : 0.16,
+                                                          ),
+                                                      alignment:
+                                                          Alignment.center,
+                                                      child: Text(
+                                                        _isProgressDragCanceling
+                                                            ? "松手取消"
+                                                            : "上滑至此区域取消",
+                                                        style: const TextStyle(
+                                                          color: Colors.white,
+                                                          fontSize: 16,
+                                                          fontWeight:
+                                                              FontWeight.bold,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                // Visible Subtitles
+                                                if (_initialized &&
+                                                    settings.showSubtitles)
+                                                  _isAudio
+                                                      ? _buildPageSubtitleOverlay(
+                                                          alignment: settings
+                                                              .audioSubtitleAlignment,
+                                                          style: settings
+                                                              .audioSubtitleStylePortrait,
+                                                          isDragging:
+                                                              _isSubtitleDragMode,
+                                                        )
+                                                      : Positioned.fill(
+                                                          child: Center(
+                                                            child: AspectRatio(
+                                                              aspectRatio:
+                                                                  _nativeVideoAspectRatio(),
+                                                              child: SubtitleOverlayGroup(
+                                                                entries:
+                                                                    _currentSubtitleEntries,
+                                                                alignment: settings
+                                                                    .subtitleAlignment,
+                                                                style: settings
+                                                                    .subtitleStylePortrait,
+                                                                isDragging:
+                                                                    _isSubtitleDragMode,
+                                                                isVisualOnly:
+                                                                    false,
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                // Controls Overlay
+                                                if (_isControllerAssigned &&
+                                                    !_isSubtitleDragMode)
+                                                  VideoControlsOverlay(
+                                                    controller: _controller,
+                                                    isLocked: _isLocked,
+                                                    onTogglePlay: _togglePlay,
+                                                    onBackPressed: () {
+                                                      // Reset orientation immediately for smooth transition
+                                                      SystemChrome.setPreferredOrientations(
+                                                        [
+                                                          DeviceOrientation
+                                                              .portraitUp,
+                                                        ],
+                                                      );
+                                                      Navigator.of(
+                                                        context,
+                                                      ).maybePop();
+                                                    },
+                                                    onSeekTo: (position) {
+                                                      _seekPlaybackPosition(
+                                                        position,
+                                                      );
+                                                    },
+                                                    onExitPressed: () async {
+                                                      _forceExit = true;
+                                                      await _handleExit();
+                                                      SystemChrome.setPreferredOrientations(
+                                                        [
+                                                          DeviceOrientation
+                                                              .portraitUp,
+                                                        ],
+                                                      );
+                                                      if (context.mounted) {
+                                                        Navigator.of(
+                                                          context,
+                                                        ).pop();
+                                                      }
+                                                    },
+                                                    onToggleSidebar: null,
+                                                    onToggleFullScreen: () =>
+                                                        settings
+                                                            .toggleFullScreen(),
+                                                    onOpenSettings: null,
+                                                    onOpenSubtitleEditor: null,
+                                                    onOpenVideoCompose: null,
+
+                                                    onToggleLock: () =>
+                                                        setState(
+                                                          () => _isLocked =
+                                                              !_isLocked,
+                                                        ),
+                                                    onSpeedUpdate: (speed) =>
+                                                        unawaited(
+                                                          _handlePlaybackSpeedSelected(
+                                                            speed,
+                                                          ),
+                                                        ),
+                                                    onSpeedLockToggle:
+                                                        (speed) => unawaited(
+                                                          _handlePlaybackSpeedLockToggle(
+                                                            speed,
+                                                          ),
+                                                        ),
+                                                    doubleTapSeekSeconds: settings
+                                                        .doubleTapSeekSeconds,
+                                                    enableDoubleTapSubtitleSeek:
+                                                        settings
+                                                            .enableDoubleTapSubtitleSeek,
+                                                    subtitles: _subtitles,
+                                                    longPressSpeed:
+                                                        settings.longPressSpeed,
+                                                    showSubtitles:
+                                                        settings.showSubtitles,
+                                                    onToggleSubtitles: () =>
+                                                        _setFloatingSubtitles(
+                                                          !settings
+                                                              .showSubtitles,
+                                                        ),
+                                                    onMoveSubtitles:
+                                                        _enterSubtitleDragMode,
+                                                    subtitleEntries:
+                                                        _currentSubtitleEntries,
+                                                    subtitleStyle: _isAudio
+                                                        ? settings
+                                                              .audioSubtitleStylePortrait
+                                                        : settings
+                                                              .subtitleStylePortrait,
+                                                    subtitleAlignment: _isAudio
+                                                        ? settings
+                                                              .audioSubtitleAlignment
+                                                        : settings
+                                                              .subtitleAlignment,
+                                                    onEnterSubtitleDragMode:
+                                                        _enterSubtitleDragMode,
+                                                    onClearSelection: () =>
+                                                        _selectionKey
+                                                            .currentState
+                                                            ?.clearSelection(),
+                                                    showPlayControls: false,
+                                                    showBottomBar: false,
+                                                    focusNode: _videoFocusNode,
+                                                    isLongPressing:
+                                                        _isLongPressing,
+                                                    longPressFeedbackText:
+                                                        _longPressFeedbackText,
+                                                    onLongPressStart:
+                                                        _startLongPressSpeed,
+                                                    onLongPressEnd:
+                                                        _endLongPressSpeed,
+                                                    mediaTitle:
+                                                        _currentItem.title,
+                                                    onOpenAspectRatio:
+                                                        _showPortraitAspectRatioSheet,
+                                                    aspectRatioLabel:
+                                                        _portraitAspectRatioLabel(
+                                                          _currentItem
+                                                                  .portraitDisplayAspectRatio ??
+                                                              (_isAudio
+                                                                  ? 1.0
+                                                                  : null),
+                                                        ),
+                                                    compactTopRightButtons:
+                                                        true,
+                                                  ),
+
+                                                // Fullscreen Button (Custom for Portrait)
+                                                if (!_isLocked &&
+                                                    !_isSubtitleDragMode)
+                                                  Positioned(
+                                                    bottom: 10,
+                                                    right: 10,
+                                                    child: IconButton(
+                                                      icon: Icon(
+                                                        Icons.fullscreen,
+                                                        color: _initialized
+                                                            ? Colors.white
+                                                            : Colors.white38,
+                                                        size: 30,
+                                                      ),
+                                                      onPressed: _initialized
+                                                          ? _goToLandscape
+                                                          : null,
+                                                      style:
+                                                          IconButton.styleFrom(
+                                                            backgroundColor:
+                                                                Colors.black45,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                // Drag Mode Layer
+                                                if (_initialized &&
+                                                    _isSubtitleDragMode) ...[
+                                                  _isAudio
+                                                      ? _buildPageSubtitleOverlay(
+                                                          alignment: settings
+                                                              .audioSubtitleAlignment,
+                                                          style: settings
+                                                              .audioSubtitleStylePortrait,
+                                                          isDragging: true,
+                                                          isGestureOnly: true,
+                                                          enablePanUpdate: true,
+                                                        )
+                                                      : Center(
+                                                          child: AspectRatio(
+                                                            aspectRatio:
+                                                                _nativeVideoAspectRatio(),
+                                                            child: LayoutBuilder(
+                                                              builder:
+                                                                  (
+                                                                    context,
+                                                                    videoConstraints,
+                                                                  ) {
+                                                                    return Stack(
+                                                                      fit: StackFit
+                                                                          .expand,
+                                                                      children: [
+                                                                        Align(
+                                                                          alignment:
+                                                                              settings.subtitleAlignment,
+                                                                          child: GestureDetector(
+                                                                            onPanUpdate:
+                                                                                (
+                                                                                  details,
+                                                                                ) => _updateSubtitlePosition(
+                                                                                  details,
+                                                                                  videoConstraints,
+                                                                                ),
+                                                                            child: SubtitleOverlayGroup(
+                                                                              entries: _currentSubtitleEntries,
+                                                                              alignment: settings.subtitleAlignment,
+                                                                              style: settings.subtitleStylePortrait,
+                                                                              isDragging: true,
+                                                                              isGestureOnly: true,
+                                                                            ),
+                                                                          ),
+                                                                        ),
+                                                                      ],
+                                                                    );
+                                                                  },
+                                                            ),
+                                                          ),
+                                                        ),
+                                                  if (_isSubtitleNearCenterX)
+                                                    Center(
+                                                      child: Container(
+                                                        width:
+                                                            _isSubtitleSnappedX
+                                                            ? 2
+                                                            : 1,
+                                                        height: double.infinity,
+                                                        color: Colors.white
+                                                            .withValues(
+                                                              alpha:
+                                                                  _isSubtitleSnappedX
+                                                                  ? 0.52
+                                                                  : 0.22,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  if (_isSubtitleNearCenterY)
+                                                    Center(
+                                                      child: Container(
+                                                        width: double.infinity,
+                                                        height:
+                                                            _isSubtitleSnappedY
+                                                            ? 2
+                                                            : 1,
+                                                        color: Colors.white
+                                                            .withValues(
+                                                              alpha:
+                                                                  _isSubtitleSnappedY
+                                                                  ? 0.52
+                                                                  : 0.22,
+                                                            ),
+                                                      ),
+                                                    ),
+                                                  Positioned(
+                                                    top: 20,
+                                                    left: 0,
+                                                    right: 0,
+                                                    child: Center(
+                                                      child: Container(
+                                                        padding:
+                                                            const EdgeInsets.symmetric(
+                                                              horizontal: 16,
+                                                              vertical: 8,
+                                                            ),
+                                                        decoration: BoxDecoration(
+                                                          color: Colors.black54,
+                                                          borderRadius:
+                                                              BorderRadius.circular(
+                                                                20,
+                                                              ),
+                                                        ),
+                                                        child: Text(
+                                                          _isStylePanelDragMode
+                                                              ? "拖拽调整位置"
+                                                              : "拖拽调整位置 (点击退出)",
+                                                          style: TextStyle(
+                                                            color: Colors.white,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                  if (!_isStylePanelDragMode)
+                                                    Positioned.fill(
+                                                      child: GestureDetector(
+                                                        onTap:
+                                                            _exitSubtitleDragMode,
+                                                        behavior:
+                                                            HitTestBehavior
+                                                                .translucent,
+                                                        child: Container(),
+                                                      ),
+                                                    ),
+                                                ],
+                                              ],
+                                            );
+                                          },
+                                        ),
+                                      ),
+                                    ),
+                                  if (!(_activePanel ==
+                                          PortraitPanel.subtitleEditor &&
+                                      _isSubtitleEditorExpanded))
+                                    // 2. External Play Controls (Middle) + Bottom Bar
+                                    Stack(
+                                      clipBehavior: Clip.none,
+                                      children: [
+                                        Column(
+                                          children: [
+                                            if (_isControllerAssigned) ...[
+                                              _buildExternalControls(),
+                                              _buildBottomControlBar(),
+                                            ] else
+                                              const SizedBox(
+                                                height: 86,
+                                              ), // Approximate height placeholder
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  // 3. Subtitle Sidebar (Bottom)
+                                  Expanded(
+                                    child: AnimatedSwitcher(
+                                      duration: const Duration(
+                                        milliseconds: 300,
+                                      ),
+                                      layoutBuilder:
+                                          (
+                                            Widget? currentChild,
+                                            List<Widget> previousChildren,
+                                          ) {
+                                            return Stack(
+                                              alignment: Alignment.topCenter,
+                                              fit: StackFit.expand,
+                                              children: <Widget>[
+                                                ...previousChildren,
+                                                ...?(currentChild == null
+                                                    ? null
+                                                    : <Widget>[currentChild]),
+                                              ],
+                                            );
+                                          },
+                                      transitionBuilder:
+                                          (
+                                            Widget child,
+                                            Animation<double> animation,
+                                          ) {
+                                            return SlideTransition(
+                                              position:
+                                                  Tween<Offset>(
+                                                    begin: const Offset(
+                                                      0.0,
+                                                      1.0,
+                                                    ),
+                                                    end: Offset.zero,
+                                                  ).animate(
+                                                    CurvedAnimation(
+                                                      parent: animation,
+                                                      curve:
+                                                          Curves.easeOutCubic,
+                                                    ),
+                                                  ),
+                                              child: child,
+                                            );
+                                          },
+                                      child: _buildBottomPanel(settings),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              // Volume Slider Overlay (Global)
+                              if (_showVolumeSlider && _isControllerAssigned)
+                                CompositedTransformFollower(
+                                  link: _volumeButtonLayerLink,
+                                  targetAnchor: Alignment.bottomCenter,
+                                  followerAnchor: Alignment.topCenter,
+                                  offset: const Offset(0, 5),
+                                  child: Material(
+                                    color: Colors.transparent,
+                                    child: Container(
+                                      height: 120,
+                                      width: 32,
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFF1E1E1E),
+                                        borderRadius: BorderRadius.circular(16),
+                                        boxShadow: [
+                                          BoxShadow(
+                                            color: Colors.black45,
+                                            blurRadius: 4,
+                                            offset: Offset(0, 2),
+                                          ),
+                                        ],
+                                      ),
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 8,
+                                      ),
+                                      child: RotatedBox(
+                                        quarterTurns: -1,
+                                        child: SliderTheme(
+                                          data: SliderTheme.of(context).copyWith(
+                                            activeTrackColor: Colors.white,
+                                            inactiveTrackColor: Colors.white24,
+                                            thumbColor: Colors.white,
+                                            thumbShape:
+                                                const RoundSliderThumbShape(
+                                                  enabledThumbRadius: 6.0,
+                                                ),
+                                            trackHeight: 2.0,
+                                            overlayShape:
+                                                const RoundSliderOverlayShape(
+                                                  overlayRadius: 12,
+                                                ),
+                                          ),
+                                          child: Slider(
+                                            value: _controller.value.volume,
+                                            onChanged: (v) {
+                                              final playbackService =
+                                                  Provider.of<
+                                                    MediaPlaybackService
+                                                  >(context, listen: false);
+                                              unawaited(
+                                                playbackService.setVolume(v),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              if (Platform.isIOS)
+                                Positioned(
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: _iosBackSwipeEdgeWidth,
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.translucent,
+                                    onHorizontalDragStart: _onIosBackSwipeStart,
+                                    onHorizontalDragUpdate:
+                                        _onIosBackSwipeUpdate,
+                                    onHorizontalDragEnd: _onIosBackSwipeEnd,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildBottomPanel(SettingsService settings) {
+    if (!_isControllerAssigned) {
+      return const Center(
+        child: CircularProgressIndicator(color: Colors.white24),
+      );
+    }
+    switch (_activePanel) {
+      case PortraitPanel.ai:
+        return AiTranscriptionPanel(
+          videoPath: _currentItem.path,
+          videoId: _currentItem.id,
+          onBack: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onCompleted: (path) async {
+            final settingsService = Provider.of<SettingsService>(
+              context,
+              listen: false,
+            );
+            final libraryService = Provider.of<LibraryService>(
+              context,
+              listen: false,
+            );
+
+            // Auto load generated subtitle
+            if (await File(path).exists()) {
+              List<String> pathsToLoad = [path];
+              if (_currentSubtitlePaths.length > 1) {
+                pathsToLoad.add(_currentSubtitlePaths[1]);
+              }
+              await _loadSubtitles(pathsToLoad);
+              // Also update library
+              final String? currentSecondary = _currentSubtitlePaths.length > 1
+                  ? _currentSubtitlePaths[1]
+                  : _currentItem.secondarySubtitlePath;
+              libraryService.updateVideoSubtitles(
+                _currentItem.id,
+                path,
+                settingsService.autoCacheSubtitles,
+                secondarySubtitlePath: currentSecondary,
+                isSecondaryCached: settingsService.autoCacheSubtitles,
+              );
+              if (mounted) {
+                AppToast.show("AI 字幕已生成并自动加载", type: AppToastType.success);
+              }
+            }
+          },
+        );
+      case PortraitPanel.subtitleManager:
+        final List<String> selectedPathsForSheet =
+            _currentSubtitlePaths.isNotEmpty
+            ? List<String>.from(_currentSubtitlePaths)
+            : <String>[
+                if (_currentItem.subtitlePath != null &&
+                    _currentItem.subtitlePath!.isNotEmpty)
+                  _currentItem.subtitlePath!,
+                if (_currentItem.secondarySubtitlePath != null &&
+                    _currentItem.secondarySubtitlePath!.isNotEmpty)
+                  _currentItem.secondarySubtitlePath!,
+              ];
+        final associatedSubtitlesForSheet = Map<String, String>.from(
+          _currentItem.additionalSubtitles ?? const <String, String>{},
+        );
+        return SubtitleManagementSheet(
+          key: ValueKey(_currentItem.path),
+          videoPath: _currentItem.path,
+          videoId: _currentItem.id,
+          showEmbeddedSubtitles:
+              !_currentItem.prefersManagedAssociatedSubtitles,
+          additionalSubtitles: associatedSubtitlesForSheet,
+          preferAssociatedSubtitlesOnly:
+              _currentItem.prefersManagedAssociatedSubtitles,
+          initialSelectedPaths: selectedPathsForSheet,
+          onSubtitleChanged: () {
+            // Reload if needed or handled by logic
+          },
+          onSubtitleSelected: (paths) async {
+            final settingsService = Provider.of<SettingsService>(
+              context,
+              listen: false,
+            );
+            final libraryService = Provider.of<LibraryService>(
+              context,
+              listen: false,
+            );
+
+            await _loadSubtitles(paths);
+            if (mounted) {
+              String? path0;
+              String? path1;
+
+              if (paths.isNotEmpty) path0 = paths[0];
+              if (paths.length > 1) path1 = paths[1];
+
+              await libraryService.updateVideoSubtitles(
+                _currentItem.id,
+                path0,
+                settingsService.autoCacheSubtitles,
+                secondarySubtitlePath: path1,
+                isSecondaryCached: settingsService.autoCacheSubtitles,
+              );
+              final updated = libraryService.getVideo(_currentItem.id);
+              if (updated != null && mounted) {
+                setState(() {
+                  _currentItem = updated;
+                });
+              }
+              // Keep open, no pop needed here as it is an inline panel replacement
+            }
+          },
+          onSubtitlePreview: (path) async {
+            final settingsService = Provider.of<SettingsService>(
+              context,
+              listen: false,
+            );
+            final libraryService = Provider.of<LibraryService>(
+              context,
+              listen: false,
+            );
+
+            List<String> pathsToLoad = [path];
+            if (_currentSubtitlePaths.length > 1) {
+              pathsToLoad.add(_currentSubtitlePaths[1]);
+            }
+            await _loadSubtitles(pathsToLoad);
+            // Do not close panel
+            if (mounted) {
+              final String? currentSecondary = _currentSubtitlePaths.length > 1
+                  ? _currentSubtitlePaths[1]
+                  : _currentItem.secondarySubtitlePath;
+              libraryService.updateVideoSubtitles(
+                _currentItem.id,
+                path,
+                settingsService.autoCacheSubtitles,
+                secondarySubtitlePath: currentSecondary,
+                isSecondaryCached: settingsService.autoCacheSubtitles,
+              );
+            }
+          },
+          onClose: _closeSubtitleManager,
+          onOpenAi: () => setState(() => _activePanel = PortraitPanel.ai),
+        );
+      case PortraitPanel.episodePicker:
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            return EpisodePickerPanel(
+              key: const ValueKey("EpisodePickerPanel_Portrait"),
+              panelWidth: constraints.maxWidth,
+              panelHeight: constraints.maxHeight,
+              onClose: () =>
+                  setState(() => _activePanel = PortraitPanel.subtitles),
+              isPortrait: true,
+            );
+          },
+        );
+      case PortraitPanel.videoCompose:
+        return VideoComposePanel(
+          key: ValueKey('video_compose_${_currentItem.id}'),
+          videoItem: _currentItem,
+          currentSelectedPaths: List<String>.from(_currentSubtitlePaths),
+          availableSubtitleMap: _buildAvailableSubtitleMap(),
+          onBack: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onOpenSubtitleStyle: () =>
+              _openSubtitleStyleSettings(fromCompose: true),
+          onOpenSubtitleManager: () => _openSubtitleManager(fromCompose: true),
+        );
+      case PortraitPanel.subtitleEditor:
+        final Map<String, String> groups = _buildSubtitleEditorGroups();
+        String? activePath = _resolveActiveSubtitleEditorPath();
+        if (activePath == null && groups.isNotEmpty) {
+          activePath = groups.values.first;
+        }
+        return SubtitleEditorPanel(
+          groups: groups,
+          activeGroupPath: activePath,
+          subtitles: _subtitles,
+          currentSubtitleIndex: _currentSubtitleIndex,
+          currentPlaybackPosition: _controller.value.isInitialized
+              ? _controller.value.position
+              : Duration.zero,
+          onSelectGroupPath: _applyPrimarySubtitlePath,
+          onCreateGroup: (name) async {
+            await _createManualSubtitleGroup(name);
+            if (mounted) setState(() {});
+          },
+          onRenameGroup: (oldName, newName) async {
+            await _renameSubtitleGroup(oldName, newName);
+          },
+          onSubtitlesChanged: _onSubtitleEditorSubtitlesChanged,
+          onSeekTo: _seekToSubtitleFast,
+          onBack: () => setState(() {
+            _activePanel = PortraitPanel.subtitles;
+            _isSubtitleEditorExpanded = false;
+          }),
+          isExpanded: _isSubtitleEditorExpanded,
+          onToggleExpanded: () => setState(() {
+            _isSubtitleEditorExpanded = !_isSubtitleEditorExpanded;
+          }),
+        );
+      case PortraitPanel.settings:
+        final displayedPlaybackSpeed =
+            _isControllerAssigned && _controller.value.isInitialized
+            ? _controller.value.playbackSpeed
+            : settings.effectiveGlobalPlaybackSpeed;
+        final bool showMobilePlaybackControls =
+            !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+        return SettingsPanel(
+          key: const ValueKey("SettingsPanel"),
+          playbackSpeed: displayedPlaybackSpeed,
+          isAudioMode: _isAudio,
+          syncAudioSubtitleStyleWithVideo:
+              settings.syncAudioSubtitleStyleWithVideo,
+          onSyncAudioSubtitleStyleWithVideoChanged: _isAudio
+              ? (value) => settings.setAudioSubtitleStyleSyncWithVideo(value)
+              : null,
+          isPlaybackSpeedLocked: settings.isPlaybackSpeedLocked,
+          lockedPlaybackSpeed: settings.isPlaybackSpeedLocked
+              ? settings.playbackSpeed
+              : null,
+          showSubtitles: settings.showSubtitles,
+          isMirroredH: _currentItem.isVideoMirroredH,
+          isMirroredV: _currentItem.isVideoMirroredV,
+          doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
+          enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
+          onDoubleTapSubtitleSeekChanged: (val) =>
+              settings.saveEnableDoubleTapSubtitleSeek(val),
+          subtitleDelay: settings.subtitleDelay,
+          longPressSpeed: settings.longPressSpeed,
+          autoCacheSubtitles: settings.autoCacheSubtitles,
+          onSpeedChanged: (val) => unawaited(_handlePlaybackSpeedSelected(val)),
+          onSpeedLongPress: (val) =>
+              unawaited(_handlePlaybackSpeedLockToggle(val)),
+          onSubtitleToggle: (val) => _setFloatingSubtitles(val),
+          onMirrorHChanged: (val) =>
+              unawaited(_updateVideoDisplayTransform(isMirroredH: val)),
+          onMirrorVChanged: (val) =>
+              unawaited(_updateVideoDisplayTransform(isMirroredV: val)),
+          onSeekSecondsChanged: (val) => settings.saveDoubleTapSeekSeconds(val),
+          onSubtitleDelayChanged: (val) => settings.setSubtitleDelay(val),
+          onSubtitleDelayChangeEnd: (val) => settings.saveSubtitleDelay(val),
+          onLongPressSpeedChanged: (val) => settings.saveLongPressSpeed(val),
+          onAutoCacheSubtitlesChanged: (val) =>
+              settings.saveAutoCacheSubtitles(val),
+          splitSubtitleByLine: settings.splitSubtitleByLine,
+          onSplitSubtitleByLineChanged: (val) =>
+              settings.saveSplitSubtitleByLine(val),
+          continuousSubtitle: _isAudio
+              ? settings.audioContinuousSubtitle
+              : settings.videoContinuousSubtitle,
+          onContinuousSubtitleChanged: (value) {
+            if (_isAudio) {
+              settings.saveAudioContinuousSubtitle(value);
+            } else {
+              settings.saveVideoContinuousSubtitle(value);
+            }
+          },
+          autoPauseOnExit: settings.autoPauseOnExit,
+          onAutoPauseOnExitChanged: (val) => settings.saveAutoPauseOnExit(val),
+          pausePlaybackWhenAppBackgrounded:
+              settings.pausePlaybackWhenAppBackgrounded,
+          onPausePlaybackWhenAppBackgroundedChanged: (val) =>
+              settings.savePausePlaybackWhenAppBackgrounded(val),
+          allowConcurrentPlayback: settings.allowConcurrentPlayback,
+          onAllowConcurrentPlaybackChanged: (val) =>
+              settings.saveAllowConcurrentPlayback(val),
+          enableHeadsetMediaControls: settings.enableHeadsetMediaControls,
+          onEnableHeadsetMediaControlsChanged: (val) =>
+              settings.saveEnableHeadsetMediaControls(val),
+          showMobilePlaybackControls: showMobilePlaybackControls,
+          autoPlayNextVideo: settings.autoPlayNextVideo,
+          onAutoPlayNextVideoChanged: (val) =>
+              settings.saveAutoPlayNextVideo(val),
+          autoPlayOnCompletion: settings.autoPlayOnCompletion,
+          onAutoPlayOnCompletionChanged: (val) =>
+              settings.saveAutoPlayOnCompletion(val),
+          autoPlayOnCompletionFromStart: settings.autoPlayOnCompletionFromStart,
+          onAutoPlayOnCompletionFromStartChanged: (val) =>
+              settings.saveAutoPlayOnCompletionFromStart(val),
+          enableSeekPreview: settings.enableSeekPreview,
+          onEnableSeekPreviewChanged: (val) =>
+              settings.saveEnableSeekPreview(val),
+          isLeftHandedMode: settings.isLeftHandedMode,
+          onLeftHandedModeChanged: (val) => settings.saveLeftHandedMode(val),
+          onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onLoadSubtitle: _pickSubtitle,
+          onOpenSubtitleSettings: _openSubtitleStyleSettings,
+        );
+      case PortraitPanel.subtitleStyle:
+        return SubtitleSettingsSheet(
+          key: const ValueKey("SubtitleSettingsSheet"),
+          style: _isAudio
+              ? settings.audioSubtitleStylePortrait
+              : settings.subtitleStylePortrait,
+          isLandscape: false,
+          isAudio: _isAudio,
+          syncAudioSubtitleStyleWithVideo:
+              settings.syncAudioSubtitleStyleWithVideo,
+          onSyncAudioSubtitleStyleWithVideoChanged: _isAudio
+              ? (value) => settings.setAudioSubtitleStyleSyncWithVideo(value)
+              : null,
+          hideGhostModeToggle: true,
+          // 文字样式改变时同步到横竖屏
+          onTextStyleChanged: (newTextStyle) {
+            if (_isAudio) {
+              if (settings.syncAudioSubtitleStyleWithVideo) {
+                settings.saveSubtitleTextStyle(newTextStyle);
+              } else {
+                settings.saveAudioSubtitleTextStyle(newTextStyle);
+              }
+            } else {
+              settings.saveSubtitleTextStyle(newTextStyle);
+            }
+          },
+          // 布局样式改变时同步到横竖屏
+          onLayoutStyleChanged: (newLayoutStyle) {
+            if (_isAudio) {
+              settings.saveAudioSubtitleLayoutPortrait(newLayoutStyle);
+            } else {
+              settings.saveSubtitleLayoutPortrait(newLayoutStyle);
+            }
+          },
+          // 向后兼容的回调
+          onStyleChanged: (newStyle) {
+            if (_isAudio) {
+              if (settings.syncAudioSubtitleStyleWithVideo) {
+                settings.saveSubtitleTextStyle(newStyle.textStyle);
+                settings.saveAudioSubtitleLayoutPortrait(newStyle.layoutStyle);
+              } else {
+                settings.saveAudioSubtitleStylePortrait(newStyle);
+              }
+            } else {
+              settings.saveSubtitleStylePortrait(newStyle);
+            }
+          },
+          onClose: _closeSubtitleStyleSettings,
+          onBack: _closeSubtitleStyleSettings,
+        );
+      case PortraitPanel.subtitles:
+        return SubtitleSidebar(
+          key: _subtitleSidebarKey,
+          subtitles: _subtitles,
+          secondarySubtitles: _secondarySubtitles,
+          controller: _controller,
+          onItemTap: _seekToSubtitleFast,
+          onClose: () {}, // Maybe close app? or hide sidebar?
+          onOpenSettings: () {
+            developer.log('Opening settings panel');
+            setState(() => _activePanel = PortraitPanel.settings);
+          },
+          onLoadSubtitle: _pickSubtitle,
+          onOpenSubtitleStyle: _openSubtitleStyleSettings,
+          onOpenSubtitleManager: _openSubtitleManager,
+          onClearSelection: () => _selectionKey.currentState?.clearSelection(),
+          onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
+          onOpenEpisodePicker: () =>
+              setState(() => _activePanel = PortraitPanel.episodePicker),
+          onOpenVideoCompose: _openVideoCompose,
+          onOpenSubtitleEditor: () => setState(() {
+            _activePanel = PortraitPanel.subtitleEditor;
+            _isSubtitleEditorExpanded = false;
+          }),
+          isCompact: true,
+          isPortrait: true,
+          focusNode: _videoFocusNode,
+          isVisible: _activePanel == PortraitPanel.subtitles,
+          showEmbeddedLoadingMessage:
+              _embeddedSubtitleDetected &&
+              _isLoadingEmbeddedSubtitle &&
+              _subtitles.isEmpty &&
+              _secondarySubtitles.isEmpty,
+        );
+    }
+  }
+
+  Map<String, String> _buildAvailableSubtitleMap() {
+    final Map<String, String> map = <String, String>{};
+    final additional = _currentItem.additionalSubtitles;
+    final Map<String, String> nameByPath = <String, String>{};
+    if (additional != null && additional.isNotEmpty) {
+      additional.forEach((name, path) {
+        if (path.isEmpty) return;
+        nameByPath[_subtitlePathKey(path)] = name;
+      });
+    }
+    String embeddedFallbackName(String path, String fallback) {
+      final normalized = p.basename(path);
+      final match = RegExp(r'\.stream_(\d+)').firstMatch(normalized);
+      if (match == null) return fallback;
+      final index = match.group(1);
+      if (index == null || index.isEmpty) return fallback;
+      return '内嵌字幕 $index';
+    }
+
+    String nameForPath(String path, {String fallback = '未命名字幕'}) {
+      final name = nameByPath[_subtitlePathKey(path)];
+      if (name != null && name.trim().isNotEmpty) {
+        return name;
+      }
+      return embeddedFallbackName(path, fallback);
+    }
+
+    final String? primary = _currentItem.subtitlePath;
+    if (primary != null && primary.isNotEmpty) {
+      map[primary] = '主字幕（${nameForPath(primary, fallback: '主字幕')}）';
+    }
+    final String? secondary = _currentItem.secondarySubtitlePath;
+    if (secondary != null && secondary.isNotEmpty) {
+      map[secondary] = '副字幕（${nameForPath(secondary, fallback: '副字幕')}）';
+    }
+    if (_currentSubtitlePaths.isNotEmpty) {
+      for (int i = 0; i < _currentSubtitlePaths.length; i++) {
+        final String path = _currentSubtitlePaths[i];
+        if (path.isEmpty) continue;
+        final String role = i == 0 ? '当前主字幕' : '当前副字幕';
+        map[path] = '$role（${nameForPath(path, fallback: role)}）';
+      }
+    }
+    if (additional != null && additional.isNotEmpty) {
+      additional.forEach((name, path) {
+        if (path.isEmpty) return;
+        map[path] = name;
+      });
+    }
+    return map;
+  }
+}

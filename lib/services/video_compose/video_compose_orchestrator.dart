@@ -1,0 +1,295 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+import '../../models/subtitle_model.dart';
+import '../../models/video_compose_models.dart';
+import 'video_compose_ass_renderer.dart';
+import 'video_compose_executor.dart';
+import 'video_compose_font_service.dart';
+import 'video_compose_output_path_service.dart';
+import 'video_compose_probe_service.dart';
+import 'video_compose_subtitle_service.dart';
+import 'video_compose_types.dart';
+
+typedef VideoComposeStatusCallback = void Function({
+  VideoComposeStage? stage,
+  double? progress,
+  String? message,
+  String? error,
+});
+
+typedef VideoComposeArtifactCallback = void Function(String filePath);
+
+class VideoComposeOrchestrator {
+  final VideoComposeProbeService _probeService;
+  final VideoComposeSubtitleService _subtitleService;
+  final VideoComposeAssRenderer _assRenderer;
+  final VideoComposeFontService _fontService;
+  final VideoComposeExecutor _executor;
+  final VideoComposeOutputPathService _outputPathService;
+
+  const VideoComposeOrchestrator({
+    required VideoComposeProbeService probeService,
+    required VideoComposeSubtitleService subtitleService,
+    required VideoComposeAssRenderer assRenderer,
+    required VideoComposeFontService fontService,
+    required VideoComposeExecutor executor,
+    required VideoComposeOutputPathService outputPathService,
+  }) : _probeService = probeService,
+       _subtitleService = subtitleService,
+       _assRenderer = assRenderer,
+       _fontService = fontService,
+       _executor = executor,
+       _outputPathService = outputPathService;
+
+  Future<String?> getSourceResolutionLabel(String videoPath) async {
+    try {
+      final VideoProbeInfo probe = await _probeService.probeVideoInfo(videoPath);
+      if (probe.displayWidth <= 0 || probe.displayHeight <= 0) {
+        return null;
+      }
+      return '${probe.displayWidth}×${probe.displayHeight}';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> cancelRunningCompose() {
+    return _executor.cancel();
+  }
+
+  Future<void> run({
+    required String taskId,
+    required VideoComposeRequest request,
+    required VideoComposeArtifactCallback onArtifact,
+    required VideoComposeStatusCallback onStatus,
+  }) async {
+    final File videoFile = File(request.videoPath);
+    if (!await videoFile.exists()) {
+      throw StateError('视频文件不存在');
+    }
+    final bool softOnly = request.softSubtitleOnly;
+    final bool shouldEmbedSoftSubtitles = request.embedSoftSubtitles || softOnly;
+    final bool shouldRenderVideoSubtitles = !softOnly;
+    final bool softOnlyUseSourceQuality =
+        softOnly && request.softSubtitleUseSourceQuality;
+    VideoProbeInfo? probe;
+    TargetResolution? target;
+    if (shouldRenderVideoSubtitles || !softOnlyUseSourceQuality) {
+      probe = await _probeService.probeVideoInfo(request.videoPath);
+      target = _probeService.targetResolution(
+        sourceWidth: probe.displayWidth,
+        sourceHeight: probe.displayHeight,
+        resolution: request.resolution,
+      );
+    }
+    final bool shouldTranscodeVideo;
+    if (shouldRenderVideoSubtitles) {
+      shouldTranscodeVideo = true;
+    } else if (softOnlyUseSourceQuality) {
+      shouldTranscodeVideo = false;
+    } else if (probe != null && target != null) {
+      final int sourceWidth = _probeService.ensureEven(probe.displayWidth);
+      final int sourceHeight = _probeService.ensureEven(probe.displayHeight);
+      shouldTranscodeVideo =
+          target.width != sourceWidth || target.height != sourceHeight;
+    } else {
+      shouldTranscodeVideo = true;
+    }
+
+    onStatus(
+      stage: VideoComposeStage.preparing,
+      progress: 0.08,
+      message: '加载字幕',
+    );
+
+    final List<VideoComposeSoftSubtitleTrack> softTracks =
+        request.softSubtitleTracks.isNotEmpty
+        ? request.softSubtitleTracks
+        : <VideoComposeSoftSubtitleTrack>[
+            if (request.primarySubtitlePath != null &&
+                request.primarySubtitlePath!.trim().isNotEmpty)
+              VideoComposeSoftSubtitleTrack(
+                path: request.primarySubtitlePath!,
+                title: '主字幕',
+              ),
+            if (request.secondarySubtitlePath != null &&
+                request.secondarySubtitlePath!.trim().isNotEmpty)
+              VideoComposeSoftSubtitleTrack(
+                path: request.secondarySubtitlePath!,
+                title: '副字幕',
+              ),
+          ];
+
+    final List<ComposeSubtitleSource> softSubtitles = <ComposeSubtitleSource>[];
+    List<SubtitleItem> effectivePrimary = const <SubtitleItem>[];
+    List<SubtitleItem> effectiveSecondary = const <SubtitleItem>[];
+    if (shouldEmbedSoftSubtitles) {
+      for (final VideoComposeSoftSubtitleTrack track in softTracks) {
+        if (track.path.trim().isEmpty) continue;
+        final List<SubtitleItem> items =
+            await _subtitleService.loadSubtitle(track.path);
+        if (items.isEmpty) continue;
+        softSubtitles.add(
+          ComposeSubtitleSource(
+            title: track.title.trim().isEmpty ? '字幕' : track.title.trim(),
+            language: 'chi',
+            items: items,
+          ),
+        );
+      }
+    }
+
+    if (!softOnly) {
+      final String? primaryPath = request.primarySubtitlePath;
+      final String? secondaryPath = request.renderSecondarySubtitle
+          ? request.secondarySubtitlePath
+          : null;
+      if ((primaryPath == null || primaryPath.isEmpty) &&
+          (secondaryPath == null || secondaryPath.isEmpty)) {
+        throw StateError('未选择可渲染字幕');
+      }
+      final List<SubtitleItem> primarySubtitles =
+          await _subtitleService.loadSubtitle(primaryPath);
+      final List<SubtitleItem> secondarySubtitles =
+          await _subtitleService.loadSubtitle(secondaryPath);
+      effectivePrimary = primarySubtitles;
+      effectiveSecondary = secondarySubtitles;
+      if (effectivePrimary.isEmpty && effectiveSecondary.isNotEmpty) {
+        effectivePrimary = effectiveSecondary;
+        effectiveSecondary = const <SubtitleItem>[];
+      }
+      if (effectivePrimary.isEmpty) {
+        throw StateError('主字幕为空，无法合成');
+      }
+      if (request.continuousSubtitle && probe != null) {
+        effectivePrimary = _subtitleService.continuousSubtitles(
+          effectivePrimary,
+          probe.duration,
+        );
+        if (effectiveSecondary.isNotEmpty) {
+          effectiveSecondary = _subtitleService.continuousSubtitles(
+            effectiveSecondary,
+            probe.duration,
+          );
+        }
+      }
+    }
+
+    onStatus(
+      stage: VideoComposeStage.preparing,
+      progress: 0.15,
+      message: shouldRenderVideoSubtitles
+          ? '生成字幕样式'
+          : (shouldTranscodeVideo ? '准备转码' : '快速封装'),
+    );
+
+    final Directory tempDir = await getTemporaryDirectory();
+    String? assPath;
+    if (shouldRenderVideoSubtitles) {
+      assPath = p.join(
+        tempDir.path,
+        'compose_${DateTime.now().millisecondsSinceEpoch}.ass',
+      );
+      onArtifact(assPath);
+      await File(assPath).writeAsString(
+        _assRenderer.buildAssContent(
+          width: target!.width,
+          height: target.height,
+          primary: effectivePrimary,
+          secondary: effectiveSecondary,
+          style: request.subtitleStyle,
+          alignment: request.subtitleAlignment,
+        ),
+        flush: true,
+      );
+    }
+
+    final List<ComposeSubtitleInput> softSubtitleInputs =
+        <ComposeSubtitleInput>[];
+    for (int i = 0; i < softSubtitles.length; i++) {
+      final ComposeSubtitleSource source = softSubtitles[i];
+      final String softPath = p.join(
+        tempDir.path,
+        'compose_soft_${DateTime.now().millisecondsSinceEpoch}_$i.srt',
+      );
+      onArtifact(softPath);
+      await File(softPath).writeAsString(
+        _subtitleService.buildSrtContent(source.items),
+        flush: true,
+      );
+      softSubtitleInputs.add(
+        ComposeSubtitleInput(
+          path: softPath,
+          title: source.title,
+          language: source.language,
+        ),
+      );
+    }
+
+    await _outputPathService.ensureParentDirectory(request.outputPath);
+
+    String? fontsDir;
+    if (shouldRenderVideoSubtitles) {
+      fontsDir = await _fontService.resolveAssFontsDir();
+    }
+    if ((Platform.isAndroid || Platform.isIOS) &&
+        shouldRenderVideoSubtitles &&
+        _fontService.requiresBundledFonts(request.subtitleStyle) &&
+        (fontsDir == null || fontsDir.isEmpty)) {
+      throw StateError('移动端内置字体资源加载失败');
+    }
+    if ((Platform.isAndroid || Platform.isIOS) && shouldRenderVideoSubtitles) {
+      await _fontService.configureForRender(fontsDir: fontsDir);
+    }
+
+    final String filter = _executor.buildVideoFilter(
+      sourceWidth: probe?.displayWidth ?? 0,
+      sourceHeight: probe?.displayHeight ?? 0,
+      targetWidth: shouldTranscodeVideo ? (target?.width ?? 0) : 0,
+      targetHeight: shouldTranscodeVideo ? (target?.height ?? 0) : 0,
+      assPath: assPath,
+      fontsDir: fontsDir,
+    );
+
+    onStatus(
+      stage: VideoComposeStage.rendering,
+      progress: 0.2,
+      message: shouldRenderVideoSubtitles
+          ? '渲染字幕'
+          : (shouldTranscodeVideo ? '转码并封装' : '快速封装中'),
+    );
+
+    await _executor.execute(
+      request: request,
+      filter: filter,
+      softSubtitleInputs: softSubtitleInputs,
+      duration: probe?.duration ?? Duration.zero,
+      transcodeVideo: shouldTranscodeVideo,
+      onProgress: (double ratio) {
+        onStatus(
+          stage: VideoComposeStage.rendering,
+          progress: 0.2 + ratio * 0.72,
+          message: '渲染中 ${(ratio * 100).toStringAsFixed(0)}%',
+        );
+      },
+    );
+
+    onStatus(
+      stage: VideoComposeStage.finalizing,
+      progress: 0.96,
+      message: '封装输出',
+    );
+
+    final File outputFile = File(request.outputPath);
+    if (!await outputFile.exists()) {
+      throw StateError('输出文件不存在');
+    }
+    final int outputSize = await outputFile.length();
+    if (outputSize <= 1024) {
+      throw StateError('输出文件异常');
+    }
+  }
+}

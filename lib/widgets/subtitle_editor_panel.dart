@@ -1,0 +1,760 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import '../models/subtitle_model.dart';
+import '../services/settings_service.dart';
+
+typedef SubtitleGroupPathCallback = Future<void> Function(String path);
+typedef SubtitleGroupNameCallback = Future<void> Function(String name);
+typedef SubtitleGroupRenameCallback =
+    Future<void> Function(String oldName, String newName);
+typedef SubtitleItemsPersistCallback =
+    Future<void> Function(List<SubtitleItem> subtitles);
+
+class SubtitleEditorPanel extends StatefulWidget {
+  final Map<String, String> groups;
+  final String? activeGroupPath;
+  final List<SubtitleItem> subtitles;
+  final int currentSubtitleIndex;
+  final Duration currentPlaybackPosition;
+  final SubtitleGroupPathCallback onSelectGroupPath;
+  final SubtitleGroupNameCallback onCreateGroup;
+  final SubtitleGroupRenameCallback onRenameGroup;
+  final SubtitleItemsPersistCallback onSubtitlesChanged;
+  final ValueChanged<Duration> onSeekTo;
+  final VoidCallback onBack;
+  final bool isExpanded;
+  final VoidCallback onToggleExpanded;
+
+  const SubtitleEditorPanel({
+    super.key,
+    required this.groups,
+    required this.activeGroupPath,
+    required this.subtitles,
+    required this.currentSubtitleIndex,
+    required this.currentPlaybackPosition,
+    required this.onSelectGroupPath,
+    required this.onCreateGroup,
+    required this.onRenameGroup,
+    required this.onSubtitlesChanged,
+    required this.onSeekTo,
+    required this.onBack,
+    required this.isExpanded,
+    required this.onToggleExpanded,
+  });
+
+  @override
+  State<SubtitleEditorPanel> createState() => _SubtitleEditorPanelState();
+}
+
+class _SubtitleEditorPanelState extends State<SubtitleEditorPanel> {
+  final TextEditingController _textController = TextEditingController();
+  final ItemScrollController _itemScrollController = ItemScrollController();
+  final ItemPositionsListener _itemPositionsListener =
+      ItemPositionsListener.create();
+  final List<List<SubtitleItem>> _undoStack = <List<SubtitleItem>>[];
+  final List<List<SubtitleItem>> _redoStack = <List<SubtitleItem>>[];
+  Timer? _persistDebounce;
+  List<SubtitleItem> _editingSubtitles = <SubtitleItem>[];
+  String? _selectedGroupPath;
+  int _selectedIndex = -1;
+  bool _deleteMode = false;
+  bool _isApplyingText = false;
+  int _lastAutoFollowTargetIndex = -1;
+
+  int _clampSelectionOffset(int offset, int maxLength) {
+    if (offset < 0) return 0;
+    if (offset > maxLength) return maxLength;
+    return offset;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _syncFromWidget(resetHistory: true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _tryAutoFollow(force: true);
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant SubtitleEditorPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final bool groupChanged =
+        oldWidget.activeGroupPath != widget.activeGroupPath;
+    final bool subtitlesChanged = oldWidget.subtitles != widget.subtitles;
+    final bool positionChanged =
+        oldWidget.currentPlaybackPosition != widget.currentPlaybackPosition;
+    if (groupChanged || subtitlesChanged) {
+      _syncFromWidget(resetHistory: groupChanged);
+    } else if (_selectedIndex == -1 &&
+        widget.currentSubtitleIndex >= 0 &&
+        widget.currentSubtitleIndex < _editingSubtitles.length) {
+      _selectedIndex = widget.currentSubtitleIndex;
+      _syncTextController();
+    }
+    if (groupChanged || subtitlesChanged || positionChanged) {
+      _lastAutoFollowTargetIndex = -1;
+    }
+    _tryAutoFollow();
+  }
+
+  @override
+  void dispose() {
+    _persistDebounce?.cancel();
+    _textController.dispose();
+    super.dispose();
+  }
+
+  int _resolveCurrentTargetIndex() {
+    if (_editingSubtitles.isEmpty) return -1;
+    if (widget.currentSubtitleIndex >= 0 &&
+        widget.currentSubtitleIndex < _editingSubtitles.length) {
+      return widget.currentSubtitleIndex;
+    }
+    final int positionMs = widget.currentPlaybackPosition.inMilliseconds;
+    int bestIndex = 0;
+    int bestDistance = 1 << 30;
+    for (int i = 0; i < _editingSubtitles.length; i++) {
+      final SubtitleItem item = _editingSubtitles[i];
+      final int startMs = item.startTime.inMilliseconds;
+      final int endMs = item.endTime.inMilliseconds;
+      final int distance = positionMs < startMs
+          ? (startMs - positionMs)
+          : (positionMs > endMs ? (positionMs - endMs) : 0);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  }
+
+  void _scrollToIndexAtThirtyPercent(
+    int targetIndex, {
+    required bool isAuto,
+    required int attempt,
+  }) {
+    if (!mounted) return;
+    const int maxAttempts = 6;
+    if (!_itemScrollController.isAttached) {
+      if (attempt < maxAttempts) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _scrollToIndexAtThirtyPercent(
+            targetIndex,
+            isAuto: isAuto,
+            attempt: attempt + 1,
+          );
+        });
+      }
+      return;
+    }
+    _itemScrollController.scrollTo(
+      index: targetIndex,
+      duration: isAuto
+          ? const Duration(milliseconds: 180)
+          : const Duration(milliseconds: 260),
+      curve: Curves.easeInOut,
+      alignment: 0.30,
+    );
+  }
+
+  void _locateCurrentSubtitle({required bool isAuto}) {
+    final int target = _resolveCurrentTargetIndex();
+    if (target < 0 || target >= _editingSubtitles.length) return;
+    if (_selectedIndex != target) {
+      setState(() {
+        _selectedIndex = target;
+      });
+      _syncTextController();
+    }
+    _lastAutoFollowTargetIndex = target;
+    _scrollToIndexAtThirtyPercent(target, isAuto: isAuto, attempt: 0);
+  }
+
+  void _tryAutoFollow({bool force = false}) {
+    if (!mounted || !SettingsService().subtitleEditorAutoFollow) return;
+    final int target = _resolveCurrentTargetIndex();
+    if (target < 0) return;
+    if (!force && target == _lastAutoFollowTargetIndex) return;
+    _locateCurrentSubtitle(isAuto: true);
+  }
+
+  void _syncFromWidget({required bool resetHistory}) {
+    _selectedGroupPath = widget.activeGroupPath;
+    _editingSubtitles = List<SubtitleItem>.from(widget.subtitles);
+    if (resetHistory) {
+      _undoStack.clear();
+      _redoStack.clear();
+      _deleteMode = false;
+    }
+    if (_editingSubtitles.isEmpty) {
+      _selectedIndex = -1;
+    } else {
+      final int candidate = widget.currentSubtitleIndex;
+      if (candidate >= 0 && candidate < _editingSubtitles.length) {
+        _selectedIndex = candidate;
+      } else if (_selectedIndex >= _editingSubtitles.length ||
+          _selectedIndex < 0) {
+        _selectedIndex = 0;
+      }
+    }
+    _syncTextController();
+    if (mounted) setState(() {});
+  }
+
+  void _syncTextController() {
+    _isApplyingText = true;
+    final String nextText =
+        (_selectedIndex >= 0 && _selectedIndex < _editingSubtitles.length)
+        ? _editingSubtitles[_selectedIndex].text
+        : '';
+    final TextEditingValue currentValue = _textController.value;
+    final TextSelection nextSelection;
+    if (currentValue.text == nextText) {
+      nextSelection = TextSelection(
+        baseOffset: _clampSelectionOffset(
+          currentValue.selection.baseOffset,
+          nextText.length,
+        ),
+        extentOffset: _clampSelectionOffset(
+          currentValue.selection.extentOffset,
+          nextText.length,
+        ),
+      );
+    } else {
+      nextSelection = TextSelection.collapsed(offset: nextText.length);
+    }
+    _textController.value = currentValue.copyWith(
+      text: nextText,
+      selection: nextSelection,
+      composing: TextRange.empty,
+    );
+    _isApplyingText = false;
+  }
+
+  void _pushUndoSnapshot() {
+    _undoStack.add(List<SubtitleItem>.from(_editingSubtitles));
+    if (_undoStack.length > 80) {
+      _undoStack.removeAt(0);
+    }
+    _redoStack.clear();
+  }
+
+  Future<void> _persistNow() async {
+    await widget.onSubtitlesChanged(List<SubtitleItem>.from(_editingSubtitles));
+  }
+
+  void _persistDebounced() {
+    _persistDebounce?.cancel();
+    _persistDebounce = Timer(const Duration(milliseconds: 220), () {
+      _persistNow();
+    });
+  }
+
+  void _applyTextEdit(String value) {
+    if (_isApplyingText) return;
+    if (_selectedIndex < 0 || _selectedIndex >= _editingSubtitles.length) {
+      return;
+    }
+    final SubtitleItem current = _editingSubtitles[_selectedIndex];
+    if (current.text == value) return;
+    _pushUndoSnapshot();
+    _editingSubtitles[_selectedIndex] = SubtitleItem(
+      index: current.index,
+      startTime: current.startTime,
+      endTime: current.endTime,
+      text: value,
+      imageLoader: current.imageLoader,
+    );
+    setState(() {});
+    _persistDebounced();
+  }
+
+  Future<void> _undo() async {
+    if (_undoStack.isEmpty) return;
+    _redoStack.add(List<SubtitleItem>.from(_editingSubtitles));
+    _editingSubtitles = _undoStack.removeLast();
+    if (_editingSubtitles.isEmpty) {
+      _selectedIndex = -1;
+    } else if (_selectedIndex >= _editingSubtitles.length ||
+        _selectedIndex < 0) {
+      _selectedIndex = 0;
+    }
+    _syncTextController();
+    setState(() {});
+    await _persistNow();
+  }
+
+  Future<void> _redo() async {
+    if (_redoStack.isEmpty) return;
+    _undoStack.add(List<SubtitleItem>.from(_editingSubtitles));
+    _editingSubtitles = _redoStack.removeLast();
+    if (_editingSubtitles.isEmpty) {
+      _selectedIndex = -1;
+    } else if (_selectedIndex >= _editingSubtitles.length ||
+        _selectedIndex < 0) {
+      _selectedIndex = 0;
+    }
+    _syncTextController();
+    setState(() {});
+    await _persistNow();
+  }
+
+  Future<void> _deleteAt(int index) async {
+    if (index < 0 || index >= _editingSubtitles.length) return;
+    _pushUndoSnapshot();
+    _editingSubtitles.removeAt(index);
+    if (_editingSubtitles.isEmpty) {
+      _selectedIndex = -1;
+    } else if (_selectedIndex >= _editingSubtitles.length) {
+      _selectedIndex = _editingSubtitles.length - 1;
+    }
+    _syncTextController();
+    setState(() {});
+    await _persistNow();
+  }
+
+  Future<void> _seekByOffset(int offset) async {
+    if (_editingSubtitles.isEmpty) return;
+    int base = _selectedIndex;
+    if (base < 0 || base >= _editingSubtitles.length) {
+      base = widget.currentSubtitleIndex;
+      if (base < 0 || base >= _editingSubtitles.length) {
+        base = 0;
+      }
+    }
+    final int target = (base + offset).clamp(0, _editingSubtitles.length - 1);
+    setState(() {
+      _selectedIndex = target;
+    });
+    _syncTextController();
+    final SubtitleItem item = _editingSubtitles[target];
+    widget.onSeekTo(item.startTime);
+  }
+
+  Future<void> _promptCreateGroup() async {
+    final controller = TextEditingController(text: '手动字幕');
+    final String? name = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('新建分组'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: '输入分组名称'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+    if (name == null || name.isEmpty) return;
+    await widget.onCreateGroup(name);
+  }
+
+  Future<void> _promptRenameGroup() async {
+    if (_selectedGroupPath == null) return;
+    String? oldName;
+    for (final entry in widget.groups.entries) {
+      if (entry.value == _selectedGroupPath) {
+        oldName = entry.key;
+        break;
+      }
+    }
+    if (oldName == null || oldName.isEmpty) return;
+    final controller = TextEditingController(text: oldName);
+    final String? nextName = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('重命名分组'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: const InputDecoration(hintText: '输入新名称'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, controller.text.trim()),
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+    if (nextName == null || nextName.isEmpty || nextName == oldName) return;
+    await widget.onRenameGroup(oldName, nextName);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final List<MapEntry<String, String>> groupEntries = widget.groups.entries
+        .toList();
+    final bool hasSelection =
+        _selectedIndex >= 0 && _selectedIndex < _editingSubtitles.length;
+    final MediaQueryData mq = MediaQuery.of(context);
+    final double width = mq.size.width;
+    final double height = mq.size.height;
+    final double keyboardInset = mq.viewInsets.bottom;
+    final double widthScale = (width / 390).clamp(0.72, 1.08);
+    final double heightScale = (height / 844).clamp(0.78, 1.1);
+    final double panelHorizontal = (width * 0.026).clamp(8.0, 16.0);
+    final double panelTop = (height * 0.008).clamp(4.0, 10.0);
+    final double panelBottom = (height * 0.008).clamp(4.0, 12.0);
+    final double iconSize = (20 * widthScale).clamp(16.0, 22.0);
+    final double rowNumberWidth = (width * 0.1).clamp(30.0, 42.0);
+    final double timeAreaWidth = (width * 0.23).clamp(78.0, 108.0);
+    final double itemVertical = (6 * heightScale).clamp(3.0, 8.0);
+    final double itemHorizontal = (10 * widthScale).clamp(7.0, 12.0);
+    final double listTextSize = (13 * widthScale).clamp(11.0, 14.0);
+    final double timeTextSize = (11 * widthScale).clamp(9.5, 12.0);
+    return Container(
+      color: const Color(0xFF1E1E1E),
+      child: Column(
+        children: [
+          Padding(
+            padding: EdgeInsets.fromLTRB(
+              panelHorizontal,
+              panelTop,
+              panelHorizontal,
+              (6 * heightScale).clamp(4.0, 8.0),
+            ),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: widget.onBack,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.arrow_back, color: Colors.white70),
+                ),
+                Expanded(
+                  child: DropdownButtonFormField<String>(
+                    initialValue: _selectedGroupPath,
+                    dropdownColor: const Color(0xFF2A2A2A),
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                      border: OutlineInputBorder(),
+                    ),
+                    items: groupEntries
+                        .map(
+                          (entry) => DropdownMenuItem<String>(
+                            value: entry.value,
+                            child: Text(
+                              entry.key,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: (path) async {
+                      if (path == null || path.isEmpty) return;
+                      setState(() {
+                        _selectedGroupPath = path;
+                      });
+                      await widget.onSelectGroupPath(path);
+                    },
+                  ),
+                ),
+                IconButton(
+                  onPressed: _promptCreateGroup,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(
+                    Icons.create_new_folder_outlined,
+                    color: Colors.white70,
+                  ),
+                ),
+                IconButton(
+                  onPressed: _promptRenameGroup,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(
+                    Icons.drive_file_rename_outline,
+                    color: Colors.white70,
+                  ),
+                ),
+                IconButton(
+                  onPressed: widget.onToggleExpanded,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    widget.isExpanded
+                        ? Icons.fullscreen_exit_rounded
+                        : Icons.fullscreen_rounded,
+                    color: Colors.white70,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: panelHorizontal),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: _undoStack.isEmpty ? null : _undo,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    Icons.undo,
+                    color: _undoStack.isEmpty ? Colors.white24 : Colors.white70,
+                  ),
+                ),
+                IconButton(
+                  onPressed: _redoStack.isEmpty ? null : _redo,
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    Icons.redo,
+                    color: _redoStack.isEmpty ? Colors.white24 : Colors.white70,
+                  ),
+                ),
+                IconButton(
+                  onPressed: () {
+                    setState(() {
+                      _deleteMode = !_deleteMode;
+                    });
+                  },
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(
+                    Icons.delete_outline,
+                    color: _deleteMode ? Colors.redAccent : Colors.white70,
+                  ),
+                ),
+                const Spacer(),
+                IconButton(
+                  onPressed: () => _locateCurrentSubtitle(isAuto: false),
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.my_location, color: Colors.white70),
+                ),
+                IconButton(
+                  onPressed: () {
+                    final bool newValue = !SettingsService().subtitleEditorAutoFollow;
+                    SettingsService()
+                        .updateSetting('subtitleEditorAutoFollow', newValue)
+                        .then((_) {
+                          if (!mounted) return;
+                          setState(() {});
+                          if (newValue) {
+                            _tryAutoFollow(force: true);
+                          }
+                        });
+                  },
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      Icon(
+                        SettingsService().subtitleEditorAutoFollow
+                            ? Icons.gps_fixed
+                            : Icons.gps_not_fixed,
+                        color: SettingsService().subtitleEditorAutoFollow
+                            ? Colors.blueAccent
+                            : Colors.white70,
+                      ),
+                      if (SettingsService().subtitleEditorAutoFollow)
+                        Positioned(
+                          right: -2,
+                          bottom: -2,
+                          child: Text(
+                            'A',
+                            style: TextStyle(
+                              fontSize: (7 * widthScale).clamp(6.0, 8.0),
+                              fontWeight: FontWeight.bold,
+                              color: Colors.blueAccent,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => _seekByOffset(-1),
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.skip_previous, color: Colors.white70),
+                ),
+                IconButton(
+                  onPressed: () => _seekByOffset(1),
+                  iconSize: iconSize,
+                  visualDensity: VisualDensity.compact,
+                  icon: const Icon(Icons.skip_next, color: Colors.white70),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ScrollablePositionedList.builder(
+              itemScrollController: _itemScrollController,
+              itemPositionsListener: _itemPositionsListener,
+              itemCount: _editingSubtitles.length,
+              itemBuilder: (context, index) {
+                final item = _editingSubtitles[index];
+                final bool selected = index == _selectedIndex;
+                final Color borderColor = selected
+                    ? Colors.blueAccent
+                    : (_deleteMode
+                          ? Colors.redAccent.withValues(alpha: 0.35)
+                          : Colors.white12);
+                return InkWell(
+                  onTap: () async {
+                    if (_deleteMode) {
+                      await _deleteAt(index);
+                      return;
+                    }
+                    setState(() {
+                      _selectedIndex = index;
+                    });
+                    _syncTextController();
+                    widget.onSeekTo(item.startTime);
+                  },
+                  child: Container(
+                    margin: EdgeInsets.symmetric(
+                      horizontal: panelHorizontal,
+                      vertical: (4 * heightScale).clamp(2.0, 6.0),
+                    ),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: itemHorizontal,
+                      vertical: itemVertical,
+                    ),
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? Colors.white10
+                          : (index.isEven
+                                ? Colors.white.withValues(alpha: 0.05)
+                                : Colors.white.withValues(alpha: 0.02)),
+                      borderRadius: BorderRadius.circular(
+                        (8 * widthScale).clamp(6.0, 10.0),
+                      ),
+                      border: Border.all(color: borderColor),
+                    ),
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: rowNumberWidth,
+                          child: Text(
+                            '${index + 1}',
+                            style: TextStyle(
+                              color: Colors.white54,
+                              fontSize: (12 * widthScale).clamp(10.0, 13.0),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: Text(
+                            item.text.isEmpty ? '（空文本）' : item.text,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: selected ? Colors.white : Colors.white70,
+                              fontSize: listTextSize,
+                              height: 1.2,
+                            ),
+                          ),
+                        ),
+                        SizedBox(width: (8 * widthScale).clamp(5.0, 9.0)),
+                        SizedBox(
+                          width: timeAreaWidth,
+                          child: Text(
+                            _formatDuration(item.startTime),
+                            textAlign: TextAlign.right,
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: timeTextSize,
+                              fontWeight: FontWeight.w400,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          AnimatedPadding(
+            duration: const Duration(milliseconds: 140),
+            curve: Curves.easeOut,
+            padding: EdgeInsets.only(bottom: keyboardInset),
+            child: Container(
+              padding: EdgeInsets.fromLTRB(
+                panelHorizontal,
+                (8 * heightScale).clamp(6.0, 10.0),
+                panelHorizontal,
+                panelBottom,
+              ),
+              decoration: BoxDecoration(
+                color: const Color(0xFF232323),
+                border: Border(
+                  top: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+                ),
+              ),
+              child: TextField(
+                controller: _textController,
+                minLines: widget.isExpanded ? 4 : 2,
+                maxLines: widget.isExpanded ? 10 : 4,
+                enabled: hasSelection,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: (14 * widthScale).clamp(12.0, 15.0),
+                  height: 1.25,
+                ),
+                decoration: InputDecoration(
+                  hintText: hasSelection ? '编辑字幕文本（实时写入）' : '请选择字幕行',
+                  hintStyle: const TextStyle(color: Colors.white38),
+                  filled: true,
+                  fillColor: const Color(0xFF2A2A2A),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: Colors.white24),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: Colors.white24),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide(color: theme.colorScheme.primary),
+                  ),
+                ),
+                onChanged: _applyTextEdit,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatDuration(Duration d) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    final int hours = d.inHours;
+    final int minutes = d.inMinutes.remainder(60);
+    final int seconds = d.inSeconds.remainder(60);
+    final int millis = d.inMilliseconds.remainder(1000);
+    return '${two(hours)}:${two(minutes)}:${two(seconds)}.${millis.toString().padLeft(3, '0')}';
+  }
+}

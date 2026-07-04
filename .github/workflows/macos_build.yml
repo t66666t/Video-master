@@ -1,0 +1,44 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build macOS App
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Install CocoaPods (macOS)
+        run: |
+          cd macos
+          pod install --repo-update
+          cd ..
+
+      - name: Build macOS App (Release)
+        run: flutter build macos --release
+
+      - name: Package macOS App
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/fluent_player.app"
+          zip -r fluent_player_macos.zip "$APP_PATH"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluent_player_macos
+          path: fluent_player_macos.zip
