@@ -13,20 +13,37 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_installer.dart';
 import '../models/media_source_ref.dart';
 import '../models/video_collection.dart';
+import '../utils/media_library_search_query.dart';
 import '../models/video_item.dart';
+import '../models/managed_subtitle_asset.dart';
 import 'thumbnail_cache_service.dart';
+import 'audio_playback_compatibility_service.dart';
 import 'settings_service.dart';
 import 'temporary_storage_cleanup_models.dart';
 import '../utils/media_duration_probe.dart';
+import '../utils/media_chapter_probe.dart';
+import '../utils/serial_task_queue.dart';
+import '../utils/subtitle_file_matcher.dart';
+import 'subtitle_discovery_service.dart';
+import 'task_subtitle_storage_service.dart';
+import 'chapter_thumbnail_service.dart';
 
 enum StructuredImportSortField { fileName, modifiedTime }
 
 enum StructuredImportSortDirection { ascending, descending }
+
+/// Whether the in-memory media library is durably stored on disk.
+///
+/// A retry is intentionally represented as a recoverable state instead of an
+/// exception: existing callers keep their current behavior while the UI can
+/// truthfully tell the user that the latest changes are not durable yet.
+enum LibraryPersistenceStatus { healthy, retryScheduled }
 
 class StructuredImportSortOptions {
   final StructuredImportSortField field;
@@ -113,21 +130,10 @@ class _FileSystemEntrySnapshot {
 
 class _StructuredImportAccumulator {
   final List<String> newVideoIds = [];
+  final List<String> newCollectionIds = [];
   int createdFolderCount = 0;
   int importedMediaCount = 0;
   int restoredMediaCount = 0;
-}
-
-class _StructuredImportStateSnapshot {
-  final Map<String, VideoCollection> collections;
-  final Map<String, VideoItem> videos;
-  final List<String> rootChildrenIds;
-
-  const _StructuredImportStateSnapshot({
-    required this.collections,
-    required this.videos,
-    required this.rootChildrenIds,
-  });
 }
 
 class LibraryService extends ChangeNotifier {
@@ -140,7 +146,9 @@ class LibraryService extends ChangeNotifier {
     if (!kDebugMode) return;
     try {
       final client = HttpClient();
-      final request = await client.postUrl(Uri.parse('http://127.0.0.1:7777/event'));
+      final request = await client.postUrl(
+        Uri.parse('http://127.0.0.1:7777/event'),
+      );
       request.headers.contentType = ContentType.json;
       request.write(
         jsonEncode({
@@ -161,7 +169,7 @@ class LibraryService extends ChangeNotifier {
   static final LibraryService _instance = LibraryService._internal();
   factory LibraryService() => _instance;
   LibraryService._internal();
-  static const Set<String> supportedMediaExtensions = {
+  static const Set<String> supportedVideoExtensions = {
     '.mp4',
     '.mov',
     '.avi',
@@ -181,6 +189,12 @@ class LibraryService extends ChangeNotifier {
     '.vob',
     '.ogv',
     '.divx',
+    '.asf',
+    '.mxf',
+    '.qt',
+    '.y4m',
+  };
+  static const Set<String> supportedAudioExtensions = {
     '.mp3',
     '.m4a',
     '.wav',
@@ -191,20 +205,40 @@ class LibraryService extends ChangeNotifier {
     '.opus',
     '.m4b',
     '.aiff',
+    '.aif',
+    '.aifc',
+    '.ape',
+    '.alac',
+    '.caf',
+    '.amr',
+    '.ac3',
+    '.eac3',
+    '.dts',
+    '.mka',
+    '.mp2',
+    '.oga',
+    '.ra',
+    '.tta',
+    '.wv',
+    '.dsf',
+    '.dff',
+    '.au',
+    '.snd',
+  };
+  static const Set<String> supportedMediaExtensions = {
+    ...supportedVideoExtensions,
+    ...supportedAudioExtensions,
   };
   static const List<String> _supportedArchiveSuffixes = [
     '.zip',
     '.tar',
     '.tgz',
     '.tar.gz',
-    '.gz',
     '.tbz',
     '.tbz2',
     '.tar.bz2',
-    '.bz2',
     '.txz',
     '.tar.xz',
-    '.xz',
   ];
   static const String _archiveImportMarkerName = '.import_in_progress.json';
   static const String _importedArchivesDirName = 'imported_archives';
@@ -219,7 +253,6 @@ class LibraryService extends ChangeNotifier {
   List<String> _rootChildrenIds = [];
   final Map<String, int> _itemSizeCache = {};
   final Map<String, Future<int>> _itemSizeInFlight = {};
-  final Map<String, Future<List<String>>> _directoryFilePathsCache = {};
   final List<Completer<void>> _sizeCalculationWaitQueue = [];
   int _activeSizeCalculationCount = 0;
 
@@ -300,20 +333,7 @@ class LibraryService extends ChangeNotifier {
   // Helper function to detect media type from file extension
   MediaType _detectMediaType(String path) {
     final ext = p.extension(path).toLowerCase();
-    const audioExtensions = {
-      '.mp3',
-      '.m4a',
-      '.wav',
-      '.flac',
-      '.ogg',
-      '.aac',
-      '.wma',
-      '.opus',
-      '.m4b',
-      '.aiff',
-    };
-
-    if (audioExtensions.contains(ext)) {
+    if (supportedAudioExtensions.contains(ext)) {
       return MediaType.audio;
     }
     return MediaType.video;
@@ -344,6 +364,27 @@ class LibraryService extends ChangeNotifier {
       }
     }
     return false;
+  }
+
+  @visibleForTesting
+  static Map<String, int> extractArchiveForTesting({
+    required String archivePath,
+    required String outputPath,
+    int? maxEntryCount,
+    int? maxTotalBytes,
+    int? maxSingleFileBytes,
+    int? maxPathDepth,
+    int? maxCompressionRatio,
+  }) {
+    return _extractArchiveToDiskWithParentsSync(
+      archivePath: archivePath,
+      outputPath: outputPath,
+      maxEntryCount: maxEntryCount,
+      maxTotalBytes: maxTotalBytes,
+      maxSingleFileBytes: maxSingleFileBytes,
+      maxPathDepth: maxPathDepth,
+      maxCompressionRatio: maxCompressionRatio,
+    );
   }
 
   static String archiveDisplayName(String archivePath) {
@@ -518,11 +559,53 @@ class LibraryService extends ChangeNotifier {
   final ValueNotifier<bool> isImporting = ValueNotifier(false);
   final ValueNotifier<double> importProgress = ValueNotifier(0.0);
   final ValueNotifier<String> importStatus = ValueNotifier("");
+  bool _importOperationActive = false;
+  bool get hasActiveImport => _importOperationActive;
 
   bool _initialized = false;
   late Directory _dataRootDir;
   bool _isDurationBackfillRunning = false;
   bool _hasScheduledDurationBackfill = false;
+  bool _isChapterBackfillRunning = false;
+  bool _hasScheduledChapterBackfill = false;
+
+  /// 当前 library.json 的 schema 版本。
+  /// 版本 0 = 旧版（无 schemaVersion 字段），需要执行比例迁移。
+  /// 版本 1 = 已执行竖屏比例 1:1 修复迁移。
+  /// 版本 2 = 应用管理的字幕按 VideoItem.id 隔离到任务目录。
+  static const int _currentLibrarySchemaVersion = 2;
+  bool _needsPostLoadSave = false;
+
+  static const List<Duration> _saveRetryDelays = <Duration>[
+    Duration(seconds: 2),
+    Duration(seconds: 10),
+    Duration(seconds: 30),
+    Duration(minutes: 2),
+    Duration(minutes: 5),
+  ];
+  LibraryPersistenceStatus _persistenceStatus =
+      LibraryPersistenceStatus.healthy;
+  Object? _lastPersistenceError;
+  DateTime? _lastPersistenceFailureAt;
+  int _consecutivePersistenceFailures = 0;
+  int _persistenceFailureEpisode = 0;
+  Timer? _saveRetryTimer;
+
+  @visibleForTesting
+  Future<void> Function()? writeLibrarySnapshotOverrideForTesting;
+  @visibleForTesting
+  List<Duration>? saveRetryDelaysForTesting;
+
+  LibraryPersistenceStatus get persistenceStatus => _persistenceStatus;
+  bool get hasPersistenceFailure =>
+      _persistenceStatus != LibraryPersistenceStatus.healthy;
+  Object? get lastPersistenceError => _lastPersistenceError;
+  DateTime? get lastPersistenceFailureAt => _lastPersistenceFailureAt;
+  int get consecutivePersistenceFailures => _consecutivePersistenceFailures;
+
+  /// Increases only when a new failure period begins. The UI uses this to
+  /// present at most one dismissible notice per period, even if retries fail.
+  int get persistenceFailureEpisode => _persistenceFailureEpisode;
 
   // Initialize and load data
   Future<void> init() async {
@@ -553,9 +636,16 @@ class LibraryService extends ChangeNotifier {
     await _cleanupIncompleteArchiveImports();
     unawaited(_cleanupOrphanedArchiveSelectionCaches());
 
+    // 如果数据迁移修改了数据，立即保存
+    if (_needsPostLoadSave) {
+      _needsPostLoadSave = false;
+      await _saveLibrary();
+    }
+
     _initialized = true;
     notifyListeners();
     _scheduleDurationBackfill();
+    _scheduleChapterBackfill();
   }
 
   Future<void> clearThumbnailDiskCache() async {
@@ -627,6 +717,40 @@ class LibraryService extends ChangeNotifier {
     return generatedPath;
   }
 
+  /// Ensures an imported audio item has a persistent, portable playback file.
+  /// The original path is retained for source identity and user-facing details.
+  Future<String> ensureCompatiblePlaybackFile(VideoItem item) async {
+    return _prepareCompatiblePlaybackFile(item, saveLibrary: true);
+  }
+
+  Future<String> _prepareCompatiblePlaybackFile(
+    VideoItem item, {
+    required bool saveLibrary,
+  }) async {
+    if (item.type != MediaType.audio) return item.path;
+    final playbackFile = await AudioPlaybackCompatibilityService.resolve(
+      File(item.path),
+      isAudio: true,
+      existingPlaybackPath: item.playbackPath,
+      persistentDirectory: Directory(
+        p.join(_dataRootDir.path, 'compatible_audio'),
+      ),
+    );
+    final resolvedPath = playbackFile.path;
+    final newPlaybackPath = _samePath(resolvedPath, item.path)
+        ? null
+        : resolvedPath;
+    if (item.playbackPath != newPlaybackPath) {
+      item.playbackPath = newPlaybackPath;
+      item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      if (saveLibrary) {
+        await _saveLibrary();
+        notifyListeners();
+      }
+    }
+    return resolvedPath;
+  }
+
   void _scheduleDurationBackfill() {
     if (_hasScheduledDurationBackfill) return;
     _hasScheduledDurationBackfill = true;
@@ -669,6 +793,60 @@ class LibraryService extends ChangeNotifier {
       }
     } finally {
       _isDurationBackfillRunning = false;
+    }
+  }
+
+  void _scheduleChapterBackfill() {
+    if (_hasScheduledChapterBackfill) return;
+    _hasScheduledChapterBackfill = true;
+    Future<void>(() async {
+      // Give startup rendering priority and avoid running a second ffprobe in
+      // parallel with the legacy duration migration.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      while (_isDurationBackfillRunning) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      await _backfillUnprobedChapters();
+    });
+  }
+
+  Future<void> _backfillUnprobedChapters() async {
+    if (_isChapterBackfillRunning) return;
+    _isChapterBackfillRunning = true;
+    try {
+      final pendingItems = _videos.values
+          .where((item) => !item.hasProbedChapters)
+          .toList();
+      if (pendingItems.isEmpty) return;
+
+      var changed = false;
+      var notifyCounter = 0;
+      for (final item in pendingItems) {
+        if (!await File(item.path).exists()) continue;
+        item.chapters = await MediaChapterProbe.probe(
+          item.path,
+          durationMs: item.durationMs,
+        );
+        item.hasProbedChapters = true;
+        item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+        changed = true;
+        notifyCounter++;
+        if (notifyCounter >= 4) {
+          notifyCounter = 0;
+          await _saveLibrary();
+          notifyListeners();
+        }
+        // Chapter migration is deliberately progressive so a large library
+        // cannot monopolize ffprobe or the UI isolate at startup.
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+
+      if (changed) {
+        await _saveLibrary();
+        notifyListeners();
+      }
+    } finally {
+      _isChapterBackfillRunning = false;
     }
   }
 
@@ -744,6 +922,13 @@ class LibraryService extends ChangeNotifier {
 
     for (final vid in _videos.values) {
       vid.path = _replaceRootPath(vid.path, oldRoot, newRoot);
+      if (vid.playbackPath != null) {
+        vid.playbackPath = _replaceRootPath(
+          vid.playbackPath!,
+          oldRoot,
+          newRoot,
+        );
+      }
       if (vid.thumbnailPath != null) {
         vid.thumbnailPath = _replaceRootPath(
           vid.thumbnailPath!,
@@ -765,12 +950,28 @@ class LibraryService extends ChangeNotifier {
           newRoot,
         );
       }
+      if (vid.danmakuPath != null) {
+        vid.danmakuPath = _replaceRootPath(vid.danmakuPath!, oldRoot, newRoot);
+      }
       if (vid.additionalSubtitles != null) {
         vid.additionalSubtitles = vid.additionalSubtitles!.map(
           (key, value) =>
               MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
         );
       }
+      if (vid.localSubtitles != null) {
+        vid.localSubtitles = vid.localSubtitles!.map(
+          (key, value) =>
+              MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
+        );
+      }
+      vid.managedSubtitleAssets = vid.managedSubtitleAssets
+          .map(
+            (asset) => asset.copyWith(
+              path: _replaceRootPath(asset.path, oldRoot, newRoot),
+            ),
+          )
+          .toList(growable: false);
       if (vid.recycledSelectedSubtitlePaths != null) {
         vid.recycledSelectedSubtitlePaths = vid.recycledSelectedSubtitlePaths!
             .map((e) => _replaceRootPath(e, oldRoot, newRoot))
@@ -778,6 +979,12 @@ class LibraryService extends ChangeNotifier {
       }
       if (vid.recycledAdditionalSubtitles != null) {
         vid.recycledAdditionalSubtitles = vid.recycledAdditionalSubtitles!.map(
+          (key, value) =>
+              MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
+        );
+      }
+      if (vid.recycledLocalSubtitles != null) {
+        vid.recycledLocalSubtitles = vid.recycledLocalSubtitles!.map(
           (key, value) =>
               MapEntry(key, _replaceRootPath(value, oldRoot, newRoot)),
         );
@@ -953,12 +1160,56 @@ class LibraryService extends ChangeNotifier {
         }
       }
     }
+
+    // Schema migration
+    final int savedSchemaVersion = data['schemaVersion'] as int? ?? 0;
+    if (savedSchemaVersion < _currentLibrarySchemaVersion) {
+      await _migratePortraitAspectRatioIfNeeded(savedSchemaVersion);
+      await _migrateTaskSubtitleAssetsIfNeeded(savedSchemaVersion);
+    }
   }
 
-  // Debounce saving
-  bool _isSaving = false;
+  /// 数据迁移：修复旧版代码为竖屏视频错误设置的 1:1 比例。
+  ///
+  /// 旧版 `_applyInitialPortraitDefaultAspectRatioIfNeeded` 对竖屏视频设置了
+  /// portraitDisplayAspectRatio = 1.0，并标记 hasPortraitAspectPreferenceInitialized = true。
+  /// 当前版本已改为设置 4/3，但旧数据中的 1.0 值因 initialized 标志无法被纠正。
+  ///
+  /// 此迁移将受影响视频的比例重置为 null、initialized 标志重置为 false，
+  /// 使下次打开视频时由当前代码重新评估。
+  Future<void> _migratePortraitAspectRatioIfNeeded(int savedVersion) async {
+    if (savedVersion >= 1) return;
+
+    bool changed = false;
+    for (final item in _videos.values) {
+      if (item.type != MediaType.video) continue;
+
+      final ratio = item.portraitDisplayAspectRatio;
+      if (ratio == null) continue;
+      if ((ratio - 1.0).abs() >= 0.01) continue;
+      // 跳过用户通过自定义宽高设置的 1:1（保留用户意图）
+      if (item.portraitCustomAspectWidth != null ||
+          item.portraitCustomAspectHeight != null) {
+        continue;
+      }
+
+      item.portraitDisplayAspectRatio = null;
+      item.hasPortraitAspectPreferenceInitialized = false;
+      changed = true;
+    }
+
+    if (changed) {
+      _needsPostLoadSave = true;
+    }
+  }
+
+  // Debounce non-critical saves, while serializing every actual disk write.
+  // Each caller receives the Future for its own queued write, so awaiting a
+  // save never returns merely because another save is already in progress.
   bool _hasPendingSave = false;
   Timer? _saveDebounceTimer;
+  final SerialTaskQueue _saveQueue = SerialTaskQueue();
+  final SerialTaskQueue _postImportQueue = SerialTaskQueue();
   static const Duration _saveDebounceDelay = Duration(seconds: 20);
 
   /// Schedule a debounced save for non-critical updates (e.g. progress).
@@ -968,63 +1219,144 @@ class LibraryService extends ChangeNotifier {
     _saveDebounceTimer?.cancel();
     _saveDebounceTimer = Timer(_saveDebounceDelay, () {
       _saveDebounceTimer = null;
-      if (_hasPendingSave && !_isSaving) {
-        _saveLibrary();
+      if (_hasPendingSave) {
+        unawaited(
+          _saveLibrary().catchError((Object error, StackTrace stackTrace) {
+            developer.log(
+              'Error saving debounced library update',
+              error: error,
+              stackTrace: stackTrace,
+            );
+          }),
+        );
       }
     });
   }
 
-  Future<void> _saveLibrary() async {
+  Future<void> _saveLibrary() {
     _saveDebounceTimer?.cancel();
     _saveDebounceTimer = null;
-    if (_isSaving) {
-      _hasPendingSave = true;
-      return;
-    }
-
-    _isSaving = true;
     _hasPendingSave = false;
+    _saveRetryTimer?.cancel();
+    _saveRetryTimer = null;
 
+    return _saveQueue.enqueue(_writeLibrarySnapshot);
+  }
+
+  /// Lets the user request an immediate retry without exposing storage errors
+  /// to every existing library mutation call site.
+  Future<void> retryLibraryPersistence() {
+    if (!hasPersistenceFailure) return Future<void>.value();
+    return _saveLibrary();
+  }
+
+  @visibleForTesting
+  Future<void> saveLibraryForTesting() => _saveLibrary();
+
+  @visibleForTesting
+  void resetPersistenceForTesting() {
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = null;
+    _saveRetryTimer?.cancel();
+    _saveRetryTimer = null;
+    _hasPendingSave = false;
+    _persistenceStatus = LibraryPersistenceStatus.healthy;
+    _lastPersistenceError = null;
+    _lastPersistenceFailureAt = null;
+    _consecutivePersistenceFailures = 0;
+    _persistenceFailureEpisode = 0;
+    writeLibrarySnapshotOverrideForTesting = null;
+    saveRetryDelaysForTesting = null;
+  }
+
+  Future<void> _writeLibrarySnapshot() async {
     try {
-      final file = File(p.join(_dataRootDir.path, 'library.json'));
-      final tempFile = File(p.join(_dataRootDir.path, 'library.json.tmp'));
-      final backupFile = File(p.join(_dataRootDir.path, 'library.json.bak'));
-
-      final data = {
-        'collections': _collections.values.map((e) => e.toJson()).toList(),
-        'videos': _videos.values.map((e) => e.toJson()).toList(),
-        'rootChildrenIds': _rootChildrenIds,
-      };
-
-      // 1. Write to temp file
-      await tempFile.writeAsString(json.encode(data), flush: true);
-
-      // 2. Create backup of current valid file
-      if (await file.exists()) {
-        await file.copy(backupFile.path);
+      final override = writeLibrarySnapshotOverrideForTesting;
+      if (override != null) {
+        await override();
+      } else {
+        await _performLibrarySnapshotWrite();
       }
-
-      // 3. Replace main file. Windows rename-overwrite is unreliable, so use
-      // delete+rename first and fall back to copy if needed.
-      try {
-        if (await file.exists()) {
-          await file.delete();
-        }
-        await tempFile.rename(file.path);
-      } catch (_) {
-        await tempFile.copy(file.path);
-        await tempFile.delete();
-      }
-    } catch (e) {
-      debugPrint("Error saving library: $e");
-    } finally {
-      _isSaving = false;
-      if (_hasPendingSave) {
-        // Trigger another save if requested during this save
-        _saveLibrary();
-      }
+      _recordPersistenceSuccess();
+    } catch (error, stackTrace) {
+      developer.log(
+        'Error saving library',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      _recordPersistenceFailure(error);
     }
-    // Only notify if needed, but usually save is triggered by data change which already notifies
+  }
+
+  Future<void> _performLibrarySnapshotWrite() async {
+    final file = File(p.join(_dataRootDir.path, 'library.json'));
+    final tempFile = File(p.join(_dataRootDir.path, 'library.json.tmp'));
+    final backupFile = File(p.join(_dataRootDir.path, 'library.json.bak'));
+
+    final data = {
+      'collections': _collections.values.map((e) => e.toJson()).toList(),
+      'videos': _videos.values.map((e) => e.toJson()).toList(),
+      'rootChildrenIds': _rootChildrenIds,
+      'schemaVersion': _currentLibrarySchemaVersion,
+    };
+
+    // 1. Write to temp file.
+    await tempFile.writeAsString(json.encode(data), flush: true);
+
+    // 2. Create a backup of the current valid file.
+    if (await file.exists()) {
+      await file.copy(backupFile.path);
+    }
+
+    // 3. Replace the main file. Windows rename-overwrite is unreliable, so
+    // use delete+rename first and fall back to copy if needed.
+    try {
+      if (await file.exists()) {
+        await file.delete();
+      }
+      await tempFile.rename(file.path);
+    } catch (_) {
+      await tempFile.copy(file.path);
+      await tempFile.delete();
+    }
+  }
+
+  void _recordPersistenceFailure(Object error) {
+    final startsNewEpisode = !hasPersistenceFailure;
+    _persistenceStatus = LibraryPersistenceStatus.retryScheduled;
+    _lastPersistenceError = error;
+    _lastPersistenceFailureAt = DateTime.now();
+    _consecutivePersistenceFailures++;
+    if (startsNewEpisode) {
+      _persistenceFailureEpisode++;
+    }
+    _schedulePersistenceRetry();
+    notifyListeners();
+  }
+
+  void _recordPersistenceSuccess() {
+    if (!hasPersistenceFailure) return;
+    _saveRetryTimer?.cancel();
+    _saveRetryTimer = null;
+    _persistenceStatus = LibraryPersistenceStatus.healthy;
+    _lastPersistenceError = null;
+    _lastPersistenceFailureAt = null;
+    _consecutivePersistenceFailures = 0;
+    notifyListeners();
+  }
+
+  void _schedulePersistenceRetry() {
+    _saveRetryTimer?.cancel();
+    final delays = saveRetryDelaysForTesting ?? _saveRetryDelays;
+    if (delays.isEmpty) return;
+    final delayIndex = min(
+      _consecutivePersistenceFailures - 1,
+      delays.length - 1,
+    );
+    _saveRetryTimer = Timer(delays[delayIndex], () {
+      _saveRetryTimer = null;
+      unawaited(_saveLibrary());
+    });
   }
 
   // Get contents for a specific folder (null for root)
@@ -1049,6 +1381,72 @@ class LibraryService extends ChangeNotifier {
         if (!vid.isRecycled) results.add(vid);
       }
     }
+
+    return results;
+  }
+
+  /// Returns a virtual, read-only view of every active folder and media item
+  /// whose display text matches [query]. The returned objects are the original
+  /// library objects, so actions performed from a search result still mutate
+  /// the real item instead of a copy.
+  List<dynamic> searchContents(String query) {
+    final searchQuery = MediaLibrarySearchQuery(query);
+    if (searchQuery.isEmpty) return const <dynamic>[];
+
+    bool hasRecycledAncestor(String? parentId) {
+      final visited = <String>{};
+      var currentId = parentId;
+      while (currentId != null && visited.add(currentId)) {
+        final parent = _collections[currentId];
+        if (parent == null) return false;
+        if (parent.isRecycled) return true;
+        currentId = parent.parentId;
+      }
+      return false;
+    }
+
+    String displayText(dynamic item) =>
+        item is VideoCollection ? item.name : (item as VideoItem).title;
+
+    // Match every card independently. A matching folder contributes only its
+    // own card; its children must match their own rendered titles to appear.
+    final results = <dynamic>[
+      ..._collections.values.where(
+        (collection) =>
+            !collection.isRecycled &&
+            !hasRecycledAncestor(collection.parentId) &&
+            searchQuery.matchesTitle(collection.name),
+      ),
+      ..._videos.values.where((video) {
+        if (video.isRecycled || hasRecycledAncestor(video.parentId)) {
+          return false;
+        }
+        return searchQuery.matchesTitle(video.title);
+      }),
+    ];
+
+    // Keep folders together, then prefer exact/prefix matches and newer items.
+    // This ordering exists only in the virtual result view and is never saved.
+    results.sort((left, right) {
+      final leftIsFolder = left is VideoCollection;
+      final rightIsFolder = right is VideoCollection;
+      if (leftIsFolder != rightIsFolder) return leftIsFolder ? -1 : 1;
+
+      final rankComparison = searchQuery
+          .rankTitle(displayText(left))
+          .compareTo(searchQuery.rankTitle(displayText(right)));
+      if (rankComparison != 0) return rankComparison;
+
+      final leftTime = left is VideoCollection
+          ? left.createTime
+          : (left as VideoItem).lastUpdated;
+      final rightTime = right is VideoCollection
+          ? right.createTime
+          : (right as VideoItem).lastUpdated;
+      final timeComparison = rightTime.compareTo(leftTime);
+      if (timeComparison != 0) return timeComparison;
+      return displayText(left).compareTo(displayText(right));
+    });
 
     return results;
   }
@@ -1133,18 +1531,16 @@ class LibraryService extends ChangeNotifier {
       throw FileSystemException('目录不存在', folderPath);
     }
 
-    var folderCount = 1;
-    var mediaFileCount = 0;
-    await for (final entity in rootDir.list(
-      recursive: true,
-      followLinks: false,
-    )) {
-      if (entity is Directory) {
-        folderCount++;
-      } else if (entity is File && isSupportedMediaPath(entity.path)) {
-        mediaFileCount++;
-      }
-    }
+    // 将递归遍历移入独立 Isolate，避免大文件夹扫描阻塞 UI 线程。
+    // 这是 Windows 端"导入文件夹时点击即闪退"的核心根因：
+    // UI isolate 被阻塞后 Windows 判定应用无响应并强杀进程。
+    final result = await compute(_analyzeFolderSelectionIsolate, folderPath)
+        .timeout(
+          const Duration(seconds: 30),
+          onTimeout: () {
+            throw TimeoutException('文件夹扫描超时（30秒），请检查目录是否过大或包含软链接环路');
+          },
+        );
 
     final name = p.basename(p.normalize(rootDir.path));
     return StructuredImportSelectionSummary(
@@ -1152,14 +1548,14 @@ class LibraryService extends ChangeNotifier {
       sourceName: name,
       rootCollectionName: name,
       isArchive: false,
-      folderCount: folderCount,
-      mediaFileCount: mediaFileCount,
+      folderCount: result['folderCount'] as int,
+      mediaFileCount: result['mediaFileCount'] as int,
     );
   }
 
   StructuredImportSelectionSummary analyzeArchiveSelection(String archivePath) {
     if (!isSupportedArchivePath(archivePath)) {
-      throw UnsupportedError('当前仅支持常见 zip/tar/gz/bz2/xz 压缩包');
+      throw UnsupportedError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
     }
     return StructuredImportSelectionSummary(
       sourcePath: archivePath,
@@ -1176,32 +1572,65 @@ class LibraryService extends ChangeNotifier {
     String folderPath,
     String? parentId, {
     required StructuredImportSortOptions sortOptions,
-  }) async {
-    final rootDir = Directory(folderPath);
-    if (!await rootDir.exists()) {
-      throw FileSystemException('目录不存在', folderPath);
+  }) {
+    // Snapshot once: changing the global switch affects the next import
+    // immediately, while this folder import remains internally consistent.
+    final copyImportedFilesToLibrary =
+        SettingsService().copyImportedMediaToPrivateStorage;
+    return _runExclusiveImport(() async {
+      final rootDir = Directory(folderPath);
+      if (!await rootDir.exists()) {
+        throw FileSystemException('目录不存在', folderPath);
+      }
+      final rootName = p.basename(p.normalize(rootDir.path));
+      return _importDirectoryTreeIntoLibrary(
+        sourceDir: rootDir,
+        rootCollectionName: rootName,
+        parentId: parentId,
+        sortOptions: sortOptions,
+        importLabel: '文件夹',
+        copyImportedFilesToLibrary: copyImportedFilesToLibrary,
+        totalMediaEntriesHint: null,
+      );
+    });
+  }
+
+  Future<T> _runExclusiveImport<T>(Future<T> Function() operation) async {
+    if (_importOperationActive) {
+      throw StateError('已有导入任务正在运行，请等待完成后再试');
     }
-    final rootName = p.basename(p.normalize(rootDir.path));
-    return _importDirectoryTreeIntoLibrary(
-      sourceDir: rootDir,
-      rootCollectionName: rootName,
-      parentId: parentId,
-      sortOptions: sortOptions,
-      importLabel: '文件夹',
-      totalMediaEntriesHint: null,
-    );
+    _importOperationActive = true;
+    try {
+      return await operation();
+    } finally {
+      _importOperationActive = false;
+    }
   }
 
   Future<StructuredImportExecutionResult> importArchiveSelection(
     String archivePath,
     String? parentId, {
     required StructuredImportSortOptions sortOptions,
+  }) {
+    return _runExclusiveImport(
+      () => _importArchiveSelectionInternal(
+        archivePath,
+        parentId,
+        sortOptions: sortOptions,
+      ),
+    );
+  }
+
+  Future<StructuredImportExecutionResult> _importArchiveSelectionInternal(
+    String archivePath,
+    String? parentId, {
+    required StructuredImportSortOptions sortOptions,
   }) async {
     if (!isSupportedArchivePath(archivePath)) {
-      throw UnsupportedError('当前仅支持常见 zip/tar/gz/bz2/xz 压缩包');
+      throw UnsupportedError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
     }
 
-    final shouldDeleteSourceArchive = await _isPathInTemporaryDirectories(
+    final shouldDeleteSourceArchive = await _isAppOwnedArchiveCachePath(
       archivePath,
     );
     final importRootDir = await _createArchiveImportDirectory(archivePath);
@@ -1209,13 +1638,16 @@ class LibraryService extends ChangeNotifier {
       isImporting.value = true;
       await _setImportProgress(progress: 0.0, status: '正在准备解压压缩包...');
       await _setImportProgress(progress: 0.0, status: '正在后台解压压缩包...');
-      final extractionSummary = await compute(
-        _extractArchiveToDiskWorker,
-        <String, String>{
-          'archivePath': archivePath,
-          'destDir': importRootDir.path,
-        },
-      );
+      final extractionSummary =
+          await compute(_extractArchiveToDiskWorker, <String, Object?>{
+            'archivePath': archivePath,
+            'destDir': importRootDir.path,
+            'maxEntryCount': _defaultMaxArchiveEntryCount,
+            'maxTotalBytes': _defaultMaxArchiveTotalBytes,
+            'maxSingleFileBytes': _defaultMaxArchiveSingleFileBytes,
+            'maxPathDepth': _defaultMaxArchivePathDepth,
+            'maxCompressionRatio': _defaultMaxArchiveCompressionRatio,
+          });
       final extractedMediaEntries =
           extractionSummary['extractedMediaEntries'] ?? 0;
       if (extractedMediaEntries <= 0) {
@@ -1233,6 +1665,7 @@ class LibraryService extends ChangeNotifier {
         importLabel: '压缩包',
         moveImportedFilesToLibrary: true,
         totalMediaEntriesHint: extractedMediaEntries,
+        deferPostProcessing: true,
       );
     } catch (_) {
       await _deleteDirectoryIfExists(importRootDir);
@@ -1261,14 +1694,15 @@ class LibraryService extends ChangeNotifier {
     required StructuredImportSortOptions sortOptions,
     required String importLabel,
     bool moveImportedFilesToLibrary = false,
+    bool copyImportedFilesToLibrary = false,
     required int? totalMediaEntriesHint,
+    bool deferPostProcessing = false,
   }) async {
     await Future.delayed(const Duration(milliseconds: 120));
     if (parentId != null && !_collections.containsKey(parentId)) {
       throw StateError('目标文件夹不存在');
     }
 
-    final snapshot = _captureStructuredImportState();
     final accumulator = _StructuredImportAccumulator();
     DateTime lastNotifyTime = DateTime.now();
     late VideoCollection rootCollection;
@@ -1279,7 +1713,11 @@ class LibraryService extends ChangeNotifier {
       importProgress.value = 0.0;
       importStatus.value = '正在创建文件夹结构...';
 
-      rootCollection = _createCollectionInMemory(rootCollectionName, parentId);
+      rootCollection = _createCollectionInMemory(
+        rootCollectionName,
+        parentId,
+        accumulator,
+      );
       accumulator.createdFolderCount++;
 
       await _importDirectoryContentsRecursive(
@@ -1290,19 +1728,37 @@ class LibraryService extends ChangeNotifier {
         lastNotifyTime: () => lastNotifyTime,
         updateLastNotifyTime: (value) => lastNotifyTime = value,
         moveImportedFilesToLibrary: moveImportedFilesToLibrary,
+        copyImportedFilesToLibrary: copyImportedFilesToLibrary,
         totalMediaEntriesHint: totalMediaEntriesHint,
         importLabel: importLabel,
+        probeDurationDuringImport: !deferPostProcessing,
       );
 
       await _saveLibrary();
       notifyListeners();
 
-      await _generateThumbnailsForImportedIds(
-        accumulator.newVideoIds,
-        statusPrefix: importLabel,
-      );
-      await _saveLibrary();
-      notifyListeners();
+      if (deferPostProcessing) {
+        final postProcessIds = List<String>.from(accumulator.newVideoIds);
+        unawaited(
+          _postImportQueue
+              .enqueue(() => _postProcessImportedIds(postProcessIds))
+              .catchError((Object error, StackTrace stackTrace) {
+                developer.log(
+                  '导入后媒体处理失败',
+                  error: error,
+                  stackTrace: stackTrace,
+                  name: 'library.post_import',
+                );
+              }),
+        );
+      } else {
+        await _generateThumbnailsForImportedIds(
+          accumulator.newVideoIds,
+          statusPrefix: importLabel,
+        );
+        await _saveLibrary();
+        notifyListeners();
+      }
 
       return StructuredImportExecutionResult(
         rootCollectionId: rootCollection.id,
@@ -1312,7 +1768,7 @@ class LibraryService extends ChangeNotifier {
       );
     } catch (e) {
       await _cleanupStructuredImportArtifacts(accumulator.newVideoIds);
-      _restoreStructuredImportState(snapshot);
+      _rollbackStructuredImportState(accumulator);
       await _saveLibrary();
       notifyListeners();
       rethrow;
@@ -1331,8 +1787,10 @@ class LibraryService extends ChangeNotifier {
     required DateTime Function() lastNotifyTime,
     required void Function(DateTime value) updateLastNotifyTime,
     required bool moveImportedFilesToLibrary,
+    required bool copyImportedFilesToLibrary,
     required int? totalMediaEntriesHint,
     required String importLabel,
+    required bool probeDurationDuringImport,
   }) async {
     final entries = await _collectImportEntries(sourceDir, sortOptions);
     for (final entry in entries) {
@@ -1340,6 +1798,7 @@ class LibraryService extends ChangeNotifier {
         final childCollection = _createCollectionInMemory(
           entry.name,
           parentCollectionId,
+          accumulator,
         );
         accumulator.createdFolderCount++;
         await _importDirectoryContentsRecursive(
@@ -1350,8 +1809,10 @@ class LibraryService extends ChangeNotifier {
           lastNotifyTime: lastNotifyTime,
           updateLastNotifyTime: updateLastNotifyTime,
           moveImportedFilesToLibrary: moveImportedFilesToLibrary,
+          copyImportedFilesToLibrary: copyImportedFilesToLibrary,
           totalMediaEntriesHint: totalMediaEntriesHint,
           importLabel: importLabel,
+          probeDurationDuringImport: probeDurationDuringImport,
         );
       } else {
         await _addStructuredMediaFile(
@@ -1359,6 +1820,8 @@ class LibraryService extends ChangeNotifier {
           parentId: parentCollectionId,
           accumulator: accumulator,
           moveImportedFilesToLibrary: moveImportedFilesToLibrary,
+          copyImportedFilesToLibrary: copyImportedFilesToLibrary,
+          probeDuration: probeDurationDuringImport,
         );
         await _updateStructuredImportProgressIfNeeded(
           accumulator: accumulator,
@@ -1369,7 +1832,7 @@ class LibraryService extends ChangeNotifier {
         );
       }
 
-      if (DateTime.now().difference(lastNotifyTime()).inMilliseconds > 250) {
+      if (DateTime.now().difference(lastNotifyTime()).inMilliseconds > 600) {
         notifyListeners();
         updateLastNotifyTime(DateTime.now());
       }
@@ -1446,7 +1909,6 @@ class LibraryService extends ChangeNotifier {
     return entries;
   }
 
-  @visibleForTesting
   static int compareStructuredImportNames(String left, String right) {
     final leftParts = _splitNaturalSortParts(left);
     final rightParts = _splitNaturalSortParts(right);
@@ -1526,8 +1988,22 @@ class LibraryService extends ChangeNotifier {
     required String? parentId,
     required _StructuredImportAccumulator accumulator,
     required bool moveImportedFilesToLibrary,
+    required bool copyImportedFilesToLibrary,
+    required bool probeDuration,
   }) async {
     final id = const Uuid().v4();
+
+    final shouldManageSidecarSubtitles =
+        moveImportedFilesToLibrary || copyImportedFilesToLibrary;
+    final discoveredSubtitles = shouldManageSidecarSubtitles
+        ? await const SubtitleDiscoveryService().scanVideoDirectory(
+            videoPath: filePath,
+            rules: SubtitleScanRules(
+              prefixMatchMode: SettingsService().desktopSubtitlePrefixMatchMode,
+              caseSensitive: SettingsService().desktopSubtitleScanCaseSensitive,
+            ),
+          )
+        : const <DiscoveredSubtitleFile>[];
 
     var effectivePath = filePath;
     if (moveImportedFilesToLibrary) {
@@ -1535,11 +2011,21 @@ class LibraryService extends ChangeNotifier {
         filePath,
         fileNamePrefix: id,
       );
+      if (_samePath(effectivePath, filePath)) {
+        throw FileSystemException('压缩包媒体移入应用存储失败', filePath);
+      }
+    } else if (copyImportedFilesToLibrary) {
+      effectivePath = await _copyImportedMediaToPrivateStorage(
+        filePath,
+        fileNamePrefix: id,
+      );
     }
 
     final originalTitle = _normalizeImportedName(p.basename(filePath));
     final sourceFingerprint = await _computeSourceFingerprint(effectivePath);
-    final durationMs = await _probeMediaDurationMs(effectivePath);
+    final durationMs = probeDuration
+        ? await _probeMediaDurationMs(effectivePath)
+        : 0;
     final item = VideoItem(
       id: id,
       path: effectivePath,
@@ -1551,6 +2037,26 @@ class LibraryService extends ChangeNotifier {
       type: _detectMediaType(effectivePath),
       sourceFingerprint: sourceFingerprint,
     );
+    try {
+      await _adoptStructuredImportSubtitles(item, discoveredSubtitles);
+      if (probeDuration) {
+        item.chapters = await MediaChapterProbe.probe(
+          effectivePath,
+          durationMs: durationMs,
+        );
+        item.hasProbedChapters = true;
+      }
+      await _prepareCompatiblePlaybackFile(item, saveLibrary: false);
+    } catch (_) {
+      await TaskSubtitleStorageService(
+        dataRootOverride: _dataRootDir,
+      ).deleteTaskDirectory(id);
+      if ((moveImportedFilesToLibrary || copyImportedFilesToLibrary) &&
+          _isInternalPath(effectivePath)) {
+        await _deleteFileIfExists(effectivePath);
+      }
+      rethrow;
+    }
     _videos[id] = item;
     if (parentId != null && _collections.containsKey(parentId)) {
       _collections[parentId]!.childrenIds.add(id);
@@ -1561,7 +2067,53 @@ class LibraryService extends ChangeNotifier {
     accumulator.importedMediaCount++;
   }
 
-  VideoCollection _createCollectionInMemory(String name, String? parentId) {
+  Future<void> _adoptStructuredImportSubtitles(
+    VideoItem item,
+    List<DiscoveredSubtitleFile> subtitles,
+  ) async {
+    if (subtitles.isEmpty) return;
+
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    final localSubtitles = <String, String>{};
+    final managedAssets = <ManagedSubtitleAsset>[];
+    for (final subtitle in subtitles) {
+      final copiedPath = await storage.copyIntoTask(
+        item.id,
+        subtitle.path,
+        preferredFileName: p.basename(subtitle.path),
+      );
+      var displayName = p.basename(subtitle.path);
+      if (localSubtitles.containsKey(displayName)) {
+        final baseName = displayName;
+        var serial = 2;
+        while (localSubtitles.containsKey('$baseName（$serial）')) {
+          serial++;
+        }
+        displayName = '$baseName（$serial）';
+      }
+      localSubtitles[displayName] = copiedPath;
+      managedAssets.add(
+        ManagedSubtitleAsset(
+          assetId: const Uuid().v4(),
+          path: p.normalize(copiedPath),
+          kind: ManagedSubtitleAssetKind.imported,
+          displayName: displayName,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+    }
+
+    item.localSubtitles = localSubtitles;
+    item.managedSubtitleAssets = managedAssets;
+    item.subtitlePath = managedAssets.first.path;
+    item.isSubtitleCached = true;
+  }
+
+  VideoCollection _createCollectionInMemory(
+    String name,
+    String? parentId,
+    _StructuredImportAccumulator accumulator,
+  ) {
     final collection = VideoCollection(
       id: const Uuid().v4(),
       name: name,
@@ -1569,6 +2121,7 @@ class LibraryService extends ChangeNotifier {
       parentId: parentId,
     );
     _collections[collection.id] = collection;
+    accumulator.newCollectionIds.add(collection.id);
     if (parentId != null && _collections.containsKey(parentId)) {
       _collections[parentId]!.childrenIds.add(collection.id);
     } else {
@@ -1577,37 +2130,50 @@ class LibraryService extends ChangeNotifier {
     return collection;
   }
 
-  _StructuredImportStateSnapshot _captureStructuredImportState() {
-    return _StructuredImportStateSnapshot(
-      collections: _collections.map(
-        (key, value) => MapEntry(key, VideoCollection.fromJson(value.toJson())),
-      ),
-      videos: _videos.map(
-        (key, value) => MapEntry(key, VideoItem.fromJson(value.toJson())),
-      ),
-      rootChildrenIds: List<String>.from(_rootChildrenIds),
-    );
-  }
-
-  void _restoreStructuredImportState(_StructuredImportStateSnapshot snapshot) {
-    _collections = snapshot.collections;
-    _videos = snapshot.videos;
-    _rootChildrenIds = snapshot.rootChildrenIds;
+  void _rollbackStructuredImportState(
+    _StructuredImportAccumulator accumulator,
+  ) {
+    for (final videoId in accumulator.newVideoIds) {
+      final item = _videos.remove(videoId);
+      if (item?.parentId != null) {
+        _collections[item!.parentId]?.childrenIds.remove(videoId);
+      } else {
+        _rootChildrenIds.remove(videoId);
+      }
+    }
+    for (final collectionId in accumulator.newCollectionIds.reversed) {
+      final collection = _collections.remove(collectionId);
+      if (collection?.parentId != null) {
+        _collections[collection!.parentId]?.childrenIds.remove(collectionId);
+      } else {
+        _rootChildrenIds.remove(collectionId);
+      }
+    }
     _invalidateSizeCaches();
   }
 
   Future<void> _generateThumbnailsForImportedIds(
     List<String> newIds, {
     required String statusPrefix,
+    bool reportProgress = true,
   }) async {
     if (newIds.isEmpty) {
-      await _setImportProgress(progress: 1.0, status: '$statusPrefix导入完成');
+      if (reportProgress) {
+        await _setImportProgress(progress: 1.0, status: '$statusPrefix导入完成');
+      }
       return;
     }
 
-    await _setImportProgress(progress: 0.7, status: '正在生成缩略图...');
+    if (reportProgress) {
+      await _setImportProgress(progress: 0.7, status: '正在生成缩略图...');
+    }
     var current = 0;
-    const batchSize = 4;
+    // Windows 端每个 _generateThumbnailWindows 最多启动 2 个 ffmpeg 进程，
+    // batchSize=4 时峰值可达 8+ 个 ffmpeg.exe 并发，易耗尽内存导致闪退。
+    // 降为 2 后峰值约 4 个，内存占用更可控。
+    final isDesktop =
+        Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+    final batchSize = isDesktop ? 2 : 1;
     for (int i = 0; i < newIds.length; i += batchSize) {
       final batch = newIds.sublist(
         i,
@@ -1619,18 +2185,64 @@ class LibraryService extends ChangeNotifier {
           if (item == null || item.type != MediaType.video) {
             return;
           }
-          item.thumbnailPath = await _generateThumbnail(
-            item.path,
-            videoId: item.id,
-          );
+          // 独立 try-catch：单个缩略图失败不应中断整批导入
+          try {
+            item.thumbnailPath = await _generateThumbnail(
+              item.path,
+              videoId: item.id,
+            );
+          } catch (e) {
+            developer.log(
+              '缩略图生成失败: ${item.path}',
+              error: e,
+              name: 'library.thumbnail',
+            );
+          }
         }),
       );
       current += batch.length;
-      final progress = 0.7 + (current / newIds.length) * 0.3;
-      await _setImportProgress(
-        progress: progress.clamp(0.0, 1.0).toDouble(),
-        status: '正在生成缩略图...($current/${newIds.length})',
-      );
+      if (reportProgress) {
+        final progress = 0.7 + (current / newIds.length) * 0.3;
+        await _setImportProgress(
+          progress: progress.clamp(0.0, 1.0).toDouble(),
+          status: '正在生成缩略图...($current/${newIds.length})',
+        );
+      }
+    }
+  }
+
+  Future<void> _postProcessImportedIds(List<String> importedIds) async {
+    var changed = false;
+    for (final id in importedIds) {
+      final item = _videos[id];
+      if (item == null) continue;
+      if (item.durationMs <= 0) {
+        final durationMs = await _probeMediaDurationMs(item.path);
+        if (durationMs > 0 && _videos[id] != null) {
+          item.durationMs = durationMs;
+          item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+          changed = true;
+        }
+      }
+      if (!item.hasProbedChapters && _videos[id] != null) {
+        item.chapters = await MediaChapterProbe.probe(
+          item.path,
+          durationMs: item.durationMs,
+        );
+        item.hasProbedChapters = true;
+        item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+        changed = true;
+      }
+    }
+
+    await _generateThumbnailsForImportedIds(
+      importedIds,
+      statusPrefix: '后台',
+      reportProgress: false,
+    );
+    if (changed || importedIds.isNotEmpty) {
+      await _saveLibrary();
+      notifyListeners();
     }
   }
 
@@ -1640,7 +2252,6 @@ class LibraryService extends ChangeNotifier {
   }) async {
     importProgress.value = progress;
     importStatus.value = status;
-    notifyListeners();
   }
 
   Future<void> _cleanupStructuredImportArtifacts(
@@ -1668,6 +2279,11 @@ class LibraryService extends ChangeNotifier {
           }
         } catch (_) {}
       }
+      try {
+        await TaskSubtitleStorageService(
+          dataRootOverride: _dataRootDir,
+        ).deleteTaskDirectory(videoId);
+      } catch (_) {}
     }
   }
 
@@ -1746,7 +2362,7 @@ class LibraryService extends ChangeNotifier {
       }
 
       if (archivePath != null &&
-          await _isPathInTemporaryDirectories(archivePath)) {
+          await _isAppOwnedArchiveCachePath(archivePath)) {
         await _deleteFileIfExists(archivePath);
       }
     }
@@ -1932,7 +2548,7 @@ class LibraryService extends ChangeNotifier {
       if (archivePath == null || archivePath.isEmpty) {
         continue;
       }
-      if (await _isPathInTemporaryDirectories(archivePath)) {
+      if (await _isAppOwnedArchiveCachePath(archivePath)) {
         protected.add(_normalizeTemporaryStoragePath(archivePath));
       }
     }
@@ -1995,13 +2611,14 @@ class LibraryService extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<bool> _isPathInTemporaryDirectories(String filePath) async {
+  Future<bool> _isAppOwnedArchiveCachePath(String filePath) async {
     try {
       final normalizedPath = p.normalize(filePath);
       final tempDir = await getTemporaryDirectory();
-      final normalizedTemp = p.normalize(tempDir.path);
-      if (p.equals(normalizedTemp, normalizedPath) ||
-          p.isWithin(normalizedTemp, normalizedPath)) {
+      final archiveCache = p.normalize(
+        p.join(tempDir.path, _pickedArchivesCacheDirName),
+      );
+      if (p.isWithin(archiveCache, normalizedPath)) {
         return true;
       }
 
@@ -2009,9 +2626,10 @@ class LibraryService extends ChangeNotifier {
         final extCacheDirs = await getExternalCacheDirectories();
         if (extCacheDirs != null) {
           for (final dir in extCacheDirs) {
-            final normalizedCache = p.normalize(dir.path);
-            if (p.equals(normalizedCache, normalizedPath) ||
-                p.isWithin(normalizedCache, normalizedPath)) {
+            final externalArchiveCache = p.normalize(
+              p.join(dir.path, _pickedArchivesCacheDirName),
+            );
+            if (p.isWithin(externalArchiveCache, normalizedPath)) {
               return true;
             }
           }
@@ -2027,6 +2645,45 @@ class LibraryService extends ChangeNotifier {
       preserveExtension: true,
       fallbackName: 'file',
     );
+  }
+
+  /// Creates a verified app-managed copy without ever exposing a partially
+  /// copied file as a playable media source.
+  Future<String> _copyImportedMediaToPrivateStorage(
+    String sourcePath, {
+    required String fileNamePrefix,
+  }) async {
+    final normalizedSourcePath = p.normalize(sourcePath);
+    final importedDir = Directory(p.join(_dataRootDir.path, 'imported_videos'));
+    final sourceFile = File(normalizedSourcePath);
+    if (!await sourceFile.exists()) {
+      throw FileSystemException('导入源文件不存在', normalizedSourcePath);
+    }
+
+    await importedDir.create(recursive: true);
+    final safeName = _sanitizeImportedFileName(p.basename(sourcePath));
+    final targetPath = p.join(importedDir.path, '${fileNamePrefix}_$safeName');
+    final partialPath = '$targetPath.partial';
+    final partialFile = File(partialPath);
+    final targetFile = File(targetPath);
+
+    try {
+      await _deleteFileIfExists(partialPath);
+      await sourceFile.copy(partialPath);
+      final sourceLength = await sourceFile.length();
+      final copiedLength = await partialFile.length();
+      if (sourceLength != copiedLength) {
+        throw FileSystemException('媒体副本校验失败（文件大小不一致）', normalizedSourcePath);
+      }
+      if (await targetFile.exists()) {
+        throw FileSystemException('媒体副本目标已存在', targetPath);
+      }
+      await partialFile.rename(targetPath);
+      return targetPath;
+    } catch (_) {
+      await _deleteFileIfExists(partialPath);
+      rethrow;
+    }
   }
 
   Future<String> _moveStructuredImportFileToLibrary(
@@ -2079,16 +2736,25 @@ class LibraryService extends ChangeNotifier {
     bool reuseExistingItem = false,
     List<String>? originalTitles,
   }) async {
-    // Give UI a chance to render the "Started importing" snackbar
-    await Future.delayed(const Duration(milliseconds: 200));
-
     int total = filePaths.length;
     if (total == 0) return;
+    final copyImportedMediaToPrivateStorage =
+        SettingsService().copyImportedMediaToPrivateStorage;
 
     // Validate parent
     if (parentId != null && !_collections.containsKey(parentId)) {
       return; // Parent not found
     }
+    if (_importOperationActive) {
+      debugPrint(
+        'Ignored overlapping media import while another import is active',
+      );
+      return;
+    }
+    _importOperationActive = true;
+
+    // Give UI a chance to render the "Started importing" snackbar.
+    await Future.delayed(const Duration(milliseconds: 200));
 
     try {
       isImporting.value = true;
@@ -2112,15 +2778,9 @@ class LibraryService extends ChangeNotifier {
         debugPrint("Error getting temp/cache dirs: $e");
       }
 
-      final importedDir = Directory(
-        p.join(_dataRootDir.path, 'imported_videos'),
-      );
-      if (!await importedDir.exists()) {
-        await importedDir.create(recursive: true);
-      }
-
       for (int i = 0; i < filePaths.length; i++) {
         var path = filePaths[i];
+        final id = const Uuid().v4();
         // 使用原始标题（如果提供了），否则使用路径的文件名
         final originalTitle = _normalizeImportedName(
           (originalTitles != null && i < originalTitles.length)
@@ -2143,7 +2803,7 @@ class LibraryService extends ChangeNotifier {
 
         // 0. Cache Rescue (Copy cached files to persistent storage)
         // 如果 useOriginalPath 为 true，则跳过缓存救援和文件复制，直接使用原始路径
-        if (!useOriginalPath) {
+        if (!useOriginalPath || copyImportedMediaToPrivateStorage) {
           bool isCached = false;
           if (allowCacheRescue) {
             if (tempDir != null && p.isWithin(tempDir.path, path)) {
@@ -2158,34 +2818,31 @@ class LibraryService extends ChangeNotifier {
             }
           }
 
-          if ((allowCacheRescue && isCached) || shouldCopy) {
+          if ((allowCacheRescue && isCached) ||
+              shouldCopy ||
+              copyImportedMediaToPrivateStorage) {
             try {
-              final originalFile = File(path);
-              if (await originalFile.exists()) {
-                final fileName = p.basename(path);
-                // Use timestamp to prevent name collision
-                final newPath = p.join(
-                  importedDir.path,
-                  "${DateTime.now().millisecondsSinceEpoch}_$fileName",
-                );
-
-                await originalFile.copy(newPath);
-                path = newPath; // Use the new permanent path
-                debugPrint(
-                  "Copied video to: $path (Cached: $isCached, Forced: $shouldCopy)",
-                );
-              }
+              path = await _copyImportedMediaToPrivateStorage(
+                path,
+                fileNamePrefix: id,
+              );
+              debugPrint(
+                "Copied video to: $path (Cached: $isCached, Forced: ${shouldCopy || copyImportedMediaToPrivateStorage})",
+              );
             } catch (e) {
-              debugPrint("Error copying file: $e");
-              // If copy fails but we must copy, we might want to skip or try continuing with original?
-              // For now, continue with original path if copy fails, though it might be broken later.
+              developer.log(
+                '复制导入媒体到应用私有目录失败',
+                error: e,
+                name: 'library.import',
+              );
+              importStatus.value = '复制媒体失败，已跳过：$originalTitle';
+              continue;
             }
           }
         } else {
           debugPrint("Using original path (no copy): $path");
         }
 
-        final id = Uuid().v4();
         final durationMs = await _probeMediaDurationMs(path);
         final item = VideoItem(
           id: id,
@@ -2198,6 +2855,12 @@ class LibraryService extends ChangeNotifier {
           type: _detectMediaType(path),
           sourceFingerprint: sourceFingerprint,
         );
+        item.chapters = await MediaChapterProbe.probe(
+          path,
+          durationMs: durationMs,
+        );
+        item.hasProbedChapters = true;
+        await _prepareCompatiblePlaybackFile(item, saveLibrary: false);
 
         _videos[id] = item;
 
@@ -2279,6 +2942,7 @@ class LibraryService extends ChangeNotifier {
       isImporting.value = false;
       importProgress.value = 0.0;
       importStatus.value = "";
+      _importOperationActive = false;
     }
   }
 
@@ -2306,14 +2970,15 @@ class LibraryService extends ChangeNotifier {
         vid.recycledSelectedSubtitlePaths = selectedPaths.isEmpty
             ? null
             : selectedPaths;
-        final snapshotPaths = await _collectAssociatedSubtitlePaths(vid);
-        if (snapshotPaths.isNotEmpty) {
-          vid.recycledAdditionalSubtitles = {
-            for (final path in snapshotPaths) p.basename(path): path,
-          };
-        } else {
-          vid.recycledAdditionalSubtitles = null;
-        }
+        // Preserve origin maps independently. Reconstructing this map from all
+        // referenced subtitle paths would wrongly turn selected/local files
+        // into download-associated subtitles after recycle-bin restore.
+        vid.recycledAdditionalSubtitles = vid.additionalSubtitles == null
+            ? null
+            : Map<String, String>.from(vid.additionalSubtitles!);
+        vid.recycledLocalSubtitles = vid.localSubtitles == null
+            ? null
+            : Map<String, String>.from(vid.localSubtitles!);
         if (!vid.isBilibiliExported &&
             await _isBilibiliExportedCandidate(vid)) {
           vid.isBilibiliExported = true;
@@ -2362,6 +3027,12 @@ class LibraryService extends ChangeNotifier {
             vid.recycledAdditionalSubtitles!,
           );
           vid.recycledAdditionalSubtitles = null;
+        }
+        if (vid.recycledLocalSubtitles != null) {
+          vid.localSubtitles = Map<String, String>.from(
+            vid.recycledLocalSubtitles!,
+          );
+          vid.recycledLocalSubtitles = null;
         }
         parentId = vid.parentId;
       } else {
@@ -2457,6 +3128,25 @@ class LibraryService extends ChangeNotifier {
     // 清理缩略图缓存
     ThumbnailCacheService().evictFromCache(vid.id);
 
+    // Managed compatibility copies live with the library until permanent
+    // deletion (moving to the recycle bin intentionally keeps them).
+    if (vid.playbackPath != null && _isInternalPath(vid.playbackPath!)) {
+      try {
+        final referencedElsewhere = _videos.values.any(
+          (item) =>
+              item.id != vid.id &&
+              item.playbackPath != null &&
+              _samePath(item.playbackPath!, vid.playbackPath!),
+        );
+        final file = File(vid.playbackPath!);
+        if (!referencedElsewhere && await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        developer.log('Error deleting compatible playback file', error: e);
+      }
+    }
+
     // 1. Delete Thumbnail
     if (vid.thumbnailPath != null) {
       try {
@@ -2473,22 +3163,43 @@ class LibraryService extends ChangeNotifier {
       }
     }
 
-    // 2. Delete Internal Subtitles
+    // 2. Delete only this card's task-owned subtitles. Archive sidecars are
+    // adopted here during import; sidecars next to external media stay external
+    // and are never card-owned.
     try {
-      final subtitlePaths = await _collectAssociatedSubtitlePaths(vid);
-      for (final path in subtitlePaths) {
-        final canDelete =
-            _isInternalPath(path) ||
-            await _isManagedAiSubtitlePathForVideo(path, vid);
-        if (!canDelete) continue;
-        if (_isSubtitlePathReferencedByOtherVideo(path, vid.id)) continue;
-        final file = File(path);
-        if (await file.exists()) {
+      final storage = TaskSubtitleStorageService(
+        dataRootOverride: _dataRootDir,
+      );
+      await storage.deleteTaskDirectory(vid.id);
+      final danmakuPath = vid.danmakuPath;
+      if (danmakuPath != null && _isInternalPath(danmakuPath)) {
+        final file = File(danmakuPath);
+        if (await file.exists() &&
+            !_subtitleReferencesContainPathInOtherVideo(danmakuPath, vid.id)) {
           await file.delete();
         }
       }
     } catch (e) {
       developer.log('Error deleting subtitles', error: e);
+    }
+
+    try {
+      await ChapterThumbnailService.instance.deleteForVideo(vid.id);
+    } catch (e) {
+      developer.log('Error deleting chapter thumbnails', error: e);
+    }
+
+    // OCR frames are disposable working data and never participate in task
+    // recovery. Permanently deleting a video card must also remove any frames
+    // left by an interrupted or crashed OCR job for that video.
+    try {
+      final safeVideoId = vid.id.replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+      final ocrTemp = Directory(
+        p.join(_dataRootDir.path, 'ocr_temp', safeVideoId),
+      );
+      if (await ocrTemp.exists()) await ocrTemp.delete(recursive: true);
+    } catch (e) {
+      developer.log('Error deleting OCR temporary frames', error: e);
     }
 
     // 3. Delete Video File (Only if it's inside app storage)
@@ -2873,9 +3584,9 @@ class LibraryService extends ChangeNotifier {
     String videoPath, {
     String? videoId,
   }) async {
-    // Skip thumbnail generation for audio files
+    // Audio: extract embedded cover art (album art)
     if (_detectMediaType(videoPath) == MediaType.audio) {
-      return null;
+      return await _extractAudioCoverArt(videoPath, videoId: videoId);
     }
 
     // Windows Specific Implementation
@@ -2888,7 +3599,10 @@ class LibraryService extends ChangeNotifier {
       return await _generateThumbnailFFmpeg(videoPath, videoId: videoId);
     }
 
-    // Android and other platforms: Use video_thumbnail plugin
+    // Android and other platforms: use the system thumbnail path first. Some
+    // Android MediaMetadataRetriever implementations advertise AV1 support but
+    // fail while extracting a 4K frame, so Android gets a software FFmpeg
+    // fallback below.
     try {
       final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
@@ -2909,11 +3623,17 @@ class LibraryService extends ChangeNotifier {
         quality: 75,
       );
       if (tempPath == null) {
+        if (Platform.isAndroid) {
+          return await _generateThumbnailFFmpeg(videoPath, videoId: videoId);
+        }
         return null;
       }
 
       final tempFile = File(tempPath);
       if (!await tempFile.exists() || await tempFile.length() <= 0) {
+        if (Platform.isAndroid) {
+          return await _generateThumbnailFFmpeg(videoPath, videoId: videoId);
+        }
         return null;
       }
 
@@ -2926,11 +3646,43 @@ class LibraryService extends ChangeNotifier {
       return outPath;
     } catch (e) {
       developer.log('Thumbnail error', error: e);
+      if (Platform.isAndroid) {
+        return await _generateThumbnailFFmpeg(videoPath, videoId: videoId);
+      }
       return null;
     }
   }
 
   /// 使用 FFmpeg 生成缩略图（用于 iOS 和其他平台）
+  Future<FFmpegSession?> _executeFfmpegWithTimeout(
+    List<String> arguments,
+    Duration timeout,
+  ) async {
+    final completer = Completer<FFmpegSession>();
+    FFmpegSession? runningSession;
+    var timedOut = false;
+    runningSession = await FFmpegKit.executeWithArgumentsAsync(arguments, (
+      session,
+    ) {
+      if (!timedOut && !completer.isCompleted) {
+        completer.complete(session);
+      }
+    });
+    try {
+      return await completer.future.timeout(timeout);
+    } on TimeoutException {
+      timedOut = true;
+      try {
+        await runningSession.cancel();
+      } catch (_) {}
+      developer.log(
+        'FFmpeg task timed out after ${timeout.inSeconds}s',
+        name: 'library.ffmpeg',
+      );
+      return null;
+    }
+  }
+
   Future<String?> _generateThumbnailFFmpeg(
     String videoPath, {
     String? videoId,
@@ -2956,11 +3708,22 @@ class LibraryService extends ChangeNotifier {
       // -vframes 1: Extract only 1 frame
       // -vf scale=-1:200: Resize to height 200px maintaining aspect ratio
       // -q:v 2: High quality JPEG
-      final session = await FFmpegKit.execute(
-        '-y -i "$videoPath" -ss 00:00:01 -vframes 1 -vf scale=-1:200 -q:v 2 "$outPath"',
-      );
+      final session = await _executeFfmpegWithTimeout(<String>[
+        '-y',
+        '-i',
+        videoPath,
+        '-ss',
+        '00:00:01',
+        '-vframes',
+        '1',
+        '-vf',
+        'scale=-1:200',
+        '-q:v',
+        '2',
+        outPath,
+      ], const Duration(seconds: 30));
 
-      final returnCode = await session.getReturnCode();
+      final returnCode = await session?.getReturnCode();
 
       if (ReturnCode.isSuccess(returnCode)) {
         if (await outFile.exists() && await outFile.length() > 0) {
@@ -2970,11 +3733,20 @@ class LibraryService extends ChangeNotifier {
       }
 
       // If failed, try without seek (some videos might be very short)
-      final session2 = await FFmpegKit.execute(
-        '-y -i "$videoPath" -vframes 1 -vf scale=-1:200 -q:v 2 "$outPath"',
-      );
+      final session2 = await _executeFfmpegWithTimeout(<String>[
+        '-y',
+        '-i',
+        videoPath,
+        '-vframes',
+        '1',
+        '-vf',
+        'scale=-1:200',
+        '-q:v',
+        '2',
+        outPath,
+      ], const Duration(seconds: 20));
 
-      final returnCode2 = await session2.getReturnCode();
+      final returnCode2 = await session2?.getReturnCode();
 
       if (ReturnCode.isSuccess(returnCode2)) {
         if (await outFile.exists() && await outFile.length() > 0) {
@@ -2987,6 +3759,105 @@ class LibraryService extends ChangeNotifier {
       return null;
     } catch (e) {
       developer.log('FFmpeg thumbnail error', error: e);
+      return null;
+    }
+  }
+
+  /// 提取音频文件的嵌入式封面图（专辑封面）。
+  /// 使用 FFmpegKit 提取音频中嵌入的图片流。
+  Future<String?> _extractAudioCoverArt(
+    String audioPath, {
+    String? videoId,
+  }) async {
+    try {
+      final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
+      if (!await thumbDir.exists()) {
+        await thumbDir.create(recursive: true);
+      }
+
+      final outPath = _thumbnailOutputPath(audioPath, videoId: videoId);
+      final outFile = File(outPath);
+      if (await outFile.exists() && await outFile.length() > 0) {
+        return outPath;
+      }
+
+      // FFmpegKit: extract embedded artwork (attached picture stream)
+      // -map 0:v selects video streams (includes attached pictures)
+      // -map -0:V excludes "real" video streams (leaving attached pictures only)
+      // -vframes 1: extract one frame
+      // -q:v 2: high quality JPEG
+      final session = await _executeFfmpegWithTimeout(<String>[
+        '-y',
+        '-i',
+        audioPath,
+        '-map',
+        '0:v:0?',
+        '-frames:v',
+        '1',
+        '-c:v',
+        'mjpeg',
+        '-q:v',
+        '2',
+        outPath,
+      ], const Duration(seconds: 20));
+
+      final returnCode = await session?.getReturnCode();
+      if (ReturnCode.isSuccess(returnCode)) {
+        if (await outFile.exists() && await outFile.length() > 0) {
+          developer.log('Audio cover art extracted: $outPath');
+          return outPath;
+        }
+      }
+
+      // Fallback: try extracting any first video frame
+      final session2 = await _executeFfmpegWithTimeout(<String>[
+        '-y',
+        '-i',
+        audioPath,
+        '-map',
+        '0:v:0?',
+        '-frames:v',
+        '1',
+        outPath,
+      ], const Duration(seconds: 20));
+      final returnCode2 = await session2?.getReturnCode();
+      if (ReturnCode.isSuccess(returnCode2)) {
+        if (await outFile.exists() && await outFile.length() > 0) {
+          developer.log('Audio cover art extracted (fallback): $outPath');
+          return outPath;
+        }
+      }
+
+      return null;
+    } catch (e) {
+      developer.log('Audio cover art extraction error', error: e);
+      return null;
+    }
+  }
+
+  Future<int?> _runCliProcessWithTimeout(
+    String executable,
+    List<String> arguments,
+    Duration timeout,
+  ) async {
+    final process = await Process.start(executable, arguments);
+    final stdoutDrain = process.stdout.drain<void>();
+    final stderrDrain = process.stderr.drain<void>();
+    try {
+      final exitCode = await process.exitCode.timeout(timeout);
+      await Future.wait<void>([stdoutDrain, stderrDrain]);
+      return exitCode;
+    } on TimeoutException {
+      process.kill();
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      try {
+        await Future.wait<void>([
+          stdoutDrain.timeout(const Duration(seconds: 1)),
+          stderrDrain.timeout(const Duration(seconds: 1)),
+        ]);
+      } catch (_) {}
       return null;
     }
   }
@@ -3013,21 +3884,18 @@ class LibraryService extends ChangeNotifier {
       // -map 0:v selects all video streams
       // -map -0:V excludes "real" video streams (leaving attached pictures)
       try {
-        await Process.run(
-          ffmpegPath,
-          [
-            '-y',
-            '-i',
-            videoPath,
-            '-map',
-            '0:v',
-            '-map',
-            '-0:V',
-            '-c',
-            'copy',
-            outPath,
-          ],
-        ).timeout(const Duration(seconds: 5)); // Add timeout to prevent hanging
+        await _runCliProcessWithTimeout(ffmpegPath, [
+          '-y',
+          '-i',
+          videoPath,
+          '-map',
+          '0:v',
+          '-map',
+          '-0:V',
+          '-c',
+          'copy',
+          outPath,
+        ], const Duration(seconds: 5));
 
         if (await File(outPath).exists() && await File(outPath).length() > 0) {
           return outPath;
@@ -3037,16 +3905,20 @@ class LibraryService extends ChangeNotifier {
       }
 
       // 2. Fallback: Extract first frame
-      await Process.run(ffmpegPath, [
+      await _runCliProcessWithTimeout(ffmpegPath, [
         '-y',
-        '-i', videoPath,
-        '-ss', '0',
-        '-vframes', '1',
+        '-i',
+        videoPath,
+        '-ss',
+        '0',
+        '-vframes',
+        '1',
         '-vf',
         'scale=-1:200', // Resize to height 200px to optimize speed and size
-        '-q:v', '2', // High quality JPEG
+        '-q:v',
+        '2', // High quality JPEG
         outPath,
-      ]).timeout(const Duration(seconds: 15));
+      ], const Duration(seconds: 15));
 
       if (await File(outPath).exists() && await File(outPath).length() > 0) {
         return outPath;
@@ -3069,7 +3941,28 @@ class LibraryService extends ChangeNotifier {
   }
 
   Future<int> _probeMediaDurationMs(String mediaPath) async {
-    return MediaDurationProbe.probeDurationMs(mediaPath);
+    // Bulk imports avoid constructing a VideoPlayerController per file. The
+    // native probe has its own cancellation and this outer timeout is a final
+    // guard against plugin/channel failures.
+    try {
+      return await MediaDurationProbe.probeDurationMs(
+        mediaPath,
+        allowVideoPlayerFallback: false,
+      ).timeout(
+        const Duration(seconds: 15),
+        onTimeout: () {
+          developer.log('媒体时长探测超时: $mediaPath', name: 'library.duration_probe');
+          return 0;
+        },
+      );
+    } catch (e) {
+      developer.log(
+        '媒体时长探测失败: $mediaPath',
+        error: e,
+        name: 'library.duration_probe',
+      );
+      return 0;
+    }
   }
 
   /// Lightweight progress update: only updates in-memory value and schedules
@@ -3107,6 +4000,10 @@ class LibraryService extends ChangeNotifier {
   }) async {
     final item = _videos[videoId];
     if (item != null) {
+      final oldPrimaryPath = item.subtitlePath;
+      final oldSecondaryPath = item.secondarySubtitlePath;
+      final oldPrimaryWasCached = item.isSubtitleCached;
+      final oldSecondaryWasCached = item.isSecondarySubtitleCached;
       final shouldCachePrimary =
           subtitlePath != null &&
           isCached &&
@@ -3115,7 +4012,13 @@ class LibraryService extends ChangeNotifier {
           secondarySubtitlePath != null &&
           isSecondaryCached &&
           await _shouldCacheSubtitleByCopy(secondarySubtitlePath);
-      final subDir = Directory(p.join(_dataRootDir.path, 'subtitles'));
+      final storage = TaskSubtitleStorageService(
+        dataRootOverride: _dataRootDir,
+      );
+      final subDir = await storage.taskDirectory(
+        videoId,
+        create: shouldCachePrimary || shouldCacheSecondary,
+      );
       if ((shouldCachePrimary || shouldCacheSecondary) &&
           !await subDir.exists()) {
         await subDir.create(recursive: true);
@@ -3124,23 +4027,33 @@ class LibraryService extends ChangeNotifier {
       // 1. Process Primary Subtitle
       if (subtitlePath != null) {
         String finalPath = subtitlePath;
+        var cachedPrimary = false;
         if (shouldCachePrimary) {
           final ext = p.extension(subtitlePath);
           // Use _main suffix to avoid collision with secondary if same extension
-          final newFileName = "${videoId}_main$ext";
+          final newFileName = "main$ext";
           final newPath = p.join(subDir.path, newFileName);
 
           if (subtitlePath != newPath) {
             try {
               await File(subtitlePath).copy(newPath);
               finalPath = newPath;
+              cachedPrimary = true;
+              _upsertManagedSubtitleAssetInMemory(
+                item,
+                finalPath,
+                ManagedSubtitleAssetKind.cached,
+                '主字幕缓存',
+              );
             } catch (e) {
               developer.log('Error copying primary subtitle', error: e);
             }
+          } else {
+            cachedPrimary = true;
           }
         }
         item.subtitlePath = finalPath;
-        item.isSubtitleCached = shouldCachePrimary;
+        item.isSubtitleCached = cachedPrimary;
       } else {
         // If null passed (cleared), clear it
         item.subtitlePath = null;
@@ -3150,22 +4063,32 @@ class LibraryService extends ChangeNotifier {
       // 2. Process Secondary Subtitle
       if (secondarySubtitlePath != null) {
         String finalSecPath = secondarySubtitlePath;
+        var cachedSecondary = false;
         if (shouldCacheSecondary) {
           final ext = p.extension(secondarySubtitlePath);
-          final newFileName = "${videoId}_sec$ext";
+          final newFileName = "secondary$ext";
           final newPath = p.join(subDir.path, newFileName);
 
           if (secondarySubtitlePath != newPath) {
             try {
               await File(secondarySubtitlePath).copy(newPath);
               finalSecPath = newPath;
+              cachedSecondary = true;
+              _upsertManagedSubtitleAssetInMemory(
+                item,
+                finalSecPath,
+                ManagedSubtitleAssetKind.cached,
+                '副字幕缓存',
+              );
             } catch (e) {
               developer.log('Error copying secondary subtitle', error: e);
             }
+          } else {
+            cachedSecondary = true;
           }
         }
         item.secondarySubtitlePath = finalSecPath;
-        item.isSecondarySubtitleCached = shouldCacheSecondary;
+        item.isSecondarySubtitleCached = cachedSecondary;
       } else {
         // If null passed (cleared), clear it
         item.secondarySubtitlePath = null;
@@ -3185,8 +4108,70 @@ class LibraryService extends ChangeNotifier {
       item.blockAutoAssociatedSubtitleSelection =
           item.subtitlePath == null && item.secondarySubtitlePath == null;
 
+      await _deleteReplacedManagedSubtitleCache(
+        oldPrimaryPath,
+        videoId: videoId,
+        wasCached: oldPrimaryWasCached,
+        currentItem: item,
+      );
+      await _deleteReplacedManagedSubtitleCache(
+        oldSecondaryPath,
+        videoId: videoId,
+        wasCached: oldSecondaryWasCached,
+        currentItem: item,
+      );
+
+      _invalidateVideoSizeCache(videoId);
       await _saveLibrary();
     }
+  }
+
+  Future<void> _deleteReplacedManagedSubtitleCache(
+    String? oldPath, {
+    required String videoId,
+    required bool wasCached,
+    required VideoItem currentItem,
+  }) async {
+    if (!wasCached || oldPath == null || oldPath.isEmpty) return;
+    if (_subtitleReferencesContainPath(currentItem, oldPath)) return;
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    if (!await storage.isTaskOwnedPath(oldPath, videoId)) return;
+    try {
+      final file = File(oldPath);
+      if (await file.exists()) await file.delete();
+      currentItem.managedSubtitleAssets = currentItem.managedSubtitleAssets
+          .where((asset) => !_samePath(asset.path, oldPath))
+          .toList(growable: false);
+    } catch (error) {
+      developer.log('Error deleting replaced subtitle cache', error: error);
+    }
+  }
+
+  void _upsertManagedSubtitleAssetInMemory(
+    VideoItem item,
+    String path,
+    ManagedSubtitleAssetKind kind,
+    String displayName, {
+    String? sourceAssetId,
+    String? language,
+  }) {
+    if (item.managedSubtitleAssets.any(
+      (asset) => _samePath(asset.path, path),
+    )) {
+      return;
+    }
+    item.managedSubtitleAssets = <ManagedSubtitleAsset>[
+      ...item.managedSubtitleAssets,
+      ManagedSubtitleAsset(
+        assetId: const Uuid().v4(),
+        path: p.normalize(path),
+        kind: kind,
+        displayName: displayName,
+        sourceAssetId: sourceAssetId,
+        language: language,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      ),
+    ];
   }
 
   Future<bool> _shouldCacheSubtitleByCopy(String subtitlePath) async {
@@ -3219,11 +4204,519 @@ class LibraryService extends ChangeNotifier {
   ) async {
     final item = _videos[videoId];
     if (item != null) {
-      item.additionalSubtitles = additionalSubtitles;
+      item.additionalSubtitles = await _adoptSubtitleMapIntoTask(
+        item,
+        additionalSubtitles,
+        ManagedSubtitleAssetKind.downloaded,
+      );
       item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      _invalidateVideoSizeCache(videoId);
       await _saveLibrary();
       notifyListeners();
     }
+  }
+
+  Future<void> updateVideoLocalSubtitles(
+    String videoId,
+    Map<String, String>? localSubtitles,
+  ) async {
+    final item = _videos[videoId];
+    if (item != null) {
+      item.localSubtitles = await _adoptSubtitleMapIntoTask(
+        item,
+        localSubtitles,
+        ManagedSubtitleAssetKind.imported,
+      );
+      item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      _invalidateVideoSizeCache(videoId);
+      await _saveLibrary();
+      notifyListeners();
+    }
+  }
+
+  Future<Map<String, String>?> _adoptSubtitleMapIntoTask(
+    VideoItem item,
+    Map<String, String>? subtitles,
+    ManagedSubtitleAssetKind kind,
+  ) async {
+    if (subtitles == null) return null;
+    if (subtitles.isEmpty) return <String, String>{};
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    final adoptedBySource = <String, String>{};
+    final result = <String, String>{};
+    for (final entry in subtitles.entries) {
+      final sourcePath = entry.value;
+      var ownedPath = sourcePath;
+      try {
+        final alreadyOwned = await storage.isTaskOwnedPath(sourcePath, item.id);
+        if (!alreadyOwned) {
+          final sourceKey = _normalizeCachePath(sourcePath);
+          ownedPath =
+              adoptedBySource[sourceKey] ??
+              await storage.copyIntoTask(
+                item.id,
+                sourcePath,
+                preferredFileName: p.basename(sourcePath),
+              );
+          adoptedBySource[sourceKey] = ownedPath;
+          _replaceSubtitleReferences(item, sourcePath, ownedPath);
+        }
+        if (!await File(ownedPath).exists()) {
+          throw FileSystemException('任务字幕文件不存在', ownedPath);
+        }
+        _upsertManagedSubtitleAssetInMemory(
+          item,
+          ownedPath,
+          kind,
+          entry.key.trim().isEmpty ? p.basename(ownedPath) : entry.key,
+        );
+      } catch (error, stackTrace) {
+        // Preserve the old reference if copying fails. A failed adoption must
+        // never make an otherwise usable subtitle disappear from the card.
+        developer.log(
+          'Unable to adopt subtitle into task ${item.id}',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+      result[entry.key] = ownedPath;
+    }
+    return result;
+  }
+
+  /// Schema v2 migration. Only files with an unambiguous task owner are moved.
+  /// Files referenced by multiple cards and filename-only guesses stay in place
+  /// and continue to behave as external companion subtitles.
+  Future<void> _migrateTaskSubtitleAssetsIfNeeded(int savedVersion) async {
+    if (savedVersion >= 2) return;
+
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    final ownersByPath = <String, Set<String>>{};
+    for (final item in _videos.values) {
+      for (final path in _allSubtitleReferencePaths(item)) {
+        if (path.trim().isEmpty) continue;
+        ownersByPath
+            .putIfAbsent(_normalizeCachePath(path), () => <String>{})
+            .add(item.id);
+      }
+    }
+
+    final topLevelFiles = <File>[];
+    final legacyDirectory = Directory(p.join(_dataRootDir.path, 'subtitles'));
+    if (await legacyDirectory.exists()) {
+      try {
+        await for (final entity in legacyDirectory.list(followLinks: false)) {
+          if (entity is File && _isSupportedSubtitlePath(entity.path)) {
+            topLevelFiles.add(entity);
+          }
+        }
+      } on FileSystemException catch (error) {
+        developer.log(
+          'Unable to enumerate legacy subtitles during schema v2 migration',
+          error: error,
+        );
+      }
+    }
+
+    final migratedSourceKeys = <String>{};
+    for (final item in _videos.values) {
+      final candidates = <String>{..._explicitManagedSubtitlePaths(item)};
+      for (final file in topLevelFiles) {
+        if (_hasTaskIdFilePrefix(file.path, item.id)) {
+          candidates.add(file.path);
+        }
+      }
+
+      for (final sourcePath in candidates) {
+        if (!_isSupportedSubtitlePath(sourcePath)) continue;
+        final sourceKey = _normalizeCachePath(sourcePath);
+        if (migratedSourceKeys.contains(sourceKey)) continue;
+
+        if (await storage.isTaskOwnedPath(sourcePath, item.id)) {
+          if (await File(sourcePath).exists()) {
+            _upsertManagedSubtitleAssetInMemory(
+              item,
+              sourcePath,
+              _inferManagedSubtitleKind(sourcePath),
+              p.basename(sourcePath),
+            );
+          }
+          continue;
+        }
+
+        final owners = ownersByPath[sourceKey] ?? const <String>{};
+        if (owners.length > 1 ||
+            (owners.isNotEmpty && !owners.contains(item.id))) {
+          continue;
+        }
+        final explicitlyReferenced = _explicitManagedSubtitlePaths(
+          item,
+        ).any((path) => _samePath(path, sourcePath));
+        if (!explicitlyReferenced &&
+            !_hasTaskIdFilePrefix(sourcePath, item.id)) {
+          continue;
+        }
+
+        final source = File(sourcePath);
+        if (!await source.exists()) continue;
+        try {
+          final destinationPath = await storage.allocatePath(
+            item.id,
+            p.basename(sourcePath),
+          );
+          final destination = File(destinationPath);
+          var availableAtDestination = false;
+          try {
+            await source.rename(destinationPath);
+            availableAtDestination = true;
+          } on FileSystemException {
+            await source.copy(destinationPath);
+            availableAtDestination = await destination.exists();
+            if (availableAtDestination) {
+              try {
+                await source.delete();
+              } on FileSystemException {
+                // A safe duplicate is preferable to losing either reference.
+              }
+            }
+          }
+          if (!availableAtDestination) continue;
+
+          _replaceSubtitleReferences(item, sourcePath, destinationPath);
+          _upsertManagedSubtitleAssetInMemory(
+            item,
+            destinationPath,
+            _inferManagedSubtitleKind(sourcePath),
+            p.basename(sourcePath),
+          );
+          migratedSourceKeys.add(sourceKey);
+        } catch (error, stackTrace) {
+          developer.log(
+            'Unable to migrate legacy subtitle for task ${item.id}',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
+      }
+
+      try {
+        final existingTaskFiles = await storage.listTaskSubtitles(item.id);
+        for (final file in existingTaskFiles) {
+          _upsertManagedSubtitleAssetInMemory(
+            item,
+            file.path,
+            _inferManagedSubtitleKind(file.path),
+            p.basename(file.path),
+          );
+        }
+      } catch (error) {
+        developer.log(
+          'Unable to reconcile task subtitles for ${item.id}',
+          error: error,
+        );
+      }
+    }
+
+    // Persist schemaVersion=2 even when there were no files to move.
+    _needsPostLoadSave = true;
+  }
+
+  Iterable<String> _allSubtitleReferencePaths(VideoItem item) sync* {
+    if (item.subtitlePath != null) yield item.subtitlePath!;
+    if (item.secondarySubtitlePath != null) {
+      yield item.secondarySubtitlePath!;
+    }
+    yield* item.additionalSubtitles?.values ?? const <String>[];
+    yield* item.localSubtitles?.values ?? const <String>[];
+    yield* item.recycledSelectedSubtitlePaths ?? const <String>[];
+    yield* item.recycledAdditionalSubtitles?.values ?? const <String>[];
+    yield* item.recycledLocalSubtitles?.values ?? const <String>[];
+    for (final asset in item.managedSubtitleAssets) {
+      yield asset.path;
+    }
+  }
+
+  Set<String> _explicitManagedSubtitlePaths(VideoItem item) {
+    final paths = <String>{
+      ...?item.additionalSubtitles?.values,
+      ...?item.localSubtitles?.values,
+      ...?item.recycledAdditionalSubtitles?.values,
+      ...?item.recycledLocalSubtitles?.values,
+      ...item.managedSubtitleAssets.map((asset) => asset.path),
+    };
+    if (item.isSubtitleCached && item.subtitlePath != null) {
+      paths.add(item.subtitlePath!);
+    }
+    if (item.isSecondarySubtitleCached && item.secondarySubtitlePath != null) {
+      paths.add(item.secondarySubtitlePath!);
+    }
+    for (final path in <String?>[
+      item.subtitlePath,
+      item.secondarySubtitlePath,
+      ...?item.recycledSelectedSubtitlePaths,
+    ]) {
+      if (path != null && _looksLikeLegacyGeneratedSubtitle(path, item.id)) {
+        paths.add(path);
+      }
+    }
+    return paths;
+  }
+
+  bool _looksLikeLegacyGeneratedSubtitle(String path, String videoId) {
+    final name = p.basename(path).toLowerCase();
+    return _hasTaskIdFilePrefix(path, videoId) ||
+        name.contains('.ai.') ||
+        name.contains('.manual.') ||
+        name.contains('.translated.') ||
+        name.contains('.stream_') ||
+        name.contains('.imported.') ||
+        name.endsWith('_main${p.extension(name)}') ||
+        name.endsWith('_sec${p.extension(name)}');
+  }
+
+  bool _hasTaskIdFilePrefix(String path, String videoId) {
+    final name = p.basename(path).toLowerCase();
+    final id = videoId.toLowerCase();
+    return name.startsWith('$id.') || name.startsWith('${id}_');
+  }
+
+  bool _isSupportedSubtitlePath(String path) {
+    return SubtitleFileMatcher.supportedExtensions.contains(
+      p.extension(path).toLowerCase(),
+    );
+  }
+
+  ManagedSubtitleAssetKind _inferManagedSubtitleKind(String path) {
+    final name = p.basename(path).toLowerCase();
+    if (name.contains('.translated.') || name.contains('.translation.')) {
+      return ManagedSubtitleAssetKind.translated;
+    }
+    if (name.contains('.manual.')) return ManagedSubtitleAssetKind.manual;
+    if (name.contains('.stream_')) return ManagedSubtitleAssetKind.embedded;
+    if (name.contains('.download')) return ManagedSubtitleAssetKind.downloaded;
+    if (name.contains('.imported.')) return ManagedSubtitleAssetKind.imported;
+    if (name.contains('.ai.')) return ManagedSubtitleAssetKind.ai;
+    if (name.contains('.ocr.')) return ManagedSubtitleAssetKind.ocr;
+    if (name.startsWith('main.') ||
+        name.startsWith('secondary.') ||
+        name.contains('_main.') ||
+        name.contains('_sec.')) {
+      return ManagedSubtitleAssetKind.cached;
+    }
+    return ManagedSubtitleAssetKind.imported;
+  }
+
+  void _replaceSubtitleReferences(
+    VideoItem item,
+    String oldPath,
+    String newPath,
+  ) {
+    String replace(String value) => _samePath(value, oldPath) ? newPath : value;
+    if (item.subtitlePath != null) {
+      item.subtitlePath = replace(item.subtitlePath!);
+    }
+    if (item.secondarySubtitlePath != null) {
+      item.secondarySubtitlePath = replace(item.secondarySubtitlePath!);
+    }
+    item.additionalSubtitles = item.additionalSubtitles?.map(
+      (key, value) => MapEntry(key, replace(value)),
+    );
+    item.localSubtitles = item.localSubtitles?.map(
+      (key, value) => MapEntry(key, replace(value)),
+    );
+    item.recycledSelectedSubtitlePaths = item.recycledSelectedSubtitlePaths
+        ?.map(replace)
+        .toList(growable: false);
+    item.recycledAdditionalSubtitles = item.recycledAdditionalSubtitles?.map(
+      (key, value) => MapEntry(key, replace(value)),
+    );
+    item.recycledLocalSubtitles = item.recycledLocalSubtitles?.map(
+      (key, value) => MapEntry(key, replace(value)),
+    );
+    item.managedSubtitleAssets = item.managedSubtitleAssets
+        .map(
+          (asset) => _samePath(asset.path, oldPath)
+              ? asset.copyWith(path: newPath)
+              : asset,
+        )
+        .toList(growable: false);
+  }
+
+  List<ManagedSubtitleAsset> getManagedSubtitleAssets(String videoId) {
+    return List<ManagedSubtitleAsset>.unmodifiable(
+      _videos[videoId]?.managedSubtitleAssets ?? const <ManagedSubtitleAsset>[],
+    );
+  }
+
+  ManagedSubtitleAsset? managedSubtitleAssetForPath(
+    String videoId,
+    String path,
+  ) {
+    final item = _videos[videoId];
+    if (item == null) return null;
+    for (final asset in item.managedSubtitleAssets) {
+      if (_samePath(asset.path, path)) return asset;
+    }
+    return null;
+  }
+
+  Future<ManagedSubtitleAsset?> registerManagedSubtitleAsset(
+    String videoId, {
+    required String path,
+    required ManagedSubtitleAssetKind kind,
+    required String displayName,
+    String? sourceAssetId,
+    String? language,
+  }) async {
+    final item = _videos[videoId];
+    if (item == null) return null;
+    final existing = managedSubtitleAssetForPath(videoId, path);
+    if (existing != null) return existing;
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    if (!await storage.isTaskOwnedPath(path, videoId)) {
+      throw StateError('只能登记当前媒体任务目录内的字幕');
+    }
+    final asset = ManagedSubtitleAsset(
+      assetId: const Uuid().v4(),
+      path: p.normalize(path),
+      kind: kind,
+      displayName: displayName.trim().isEmpty
+          ? p.basename(path)
+          : displayName.trim(),
+      sourceAssetId: sourceAssetId,
+      language: language,
+      createdAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    item.managedSubtitleAssets = <ManagedSubtitleAsset>[
+      ...item.managedSubtitleAssets,
+      asset,
+    ];
+    _invalidateVideoSizeCache(videoId);
+    await _saveLibrary();
+    notifyListeners();
+    return asset;
+  }
+
+  Future<ManagedSubtitleAsset?> registerManagedLocalSubtitle(
+    String videoId, {
+    required String path,
+    required ManagedSubtitleAssetKind kind,
+    required String displayName,
+    String? language,
+  }) async {
+    final item = _videos[videoId];
+    if (item == null) return null;
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    if (!await storage.isTaskOwnedPath(path, videoId)) {
+      throw StateError('只能登记当前媒体任务目录内的字幕');
+    }
+    var name = displayName.trim().isEmpty
+        ? p.basename(path)
+        : displayName.trim();
+    final local = <String, String>{...?item.localSubtitles};
+    if (local.containsKey(name) && !_samePath(local[name]!, path)) {
+      final base = name;
+      var serial = 2;
+      while (local.containsKey('$base（$serial）')) {
+        serial++;
+      }
+      name = '$base（$serial）';
+    }
+    var asset = managedSubtitleAssetForPath(videoId, path);
+    if (asset == null) {
+      asset = ManagedSubtitleAsset(
+        assetId: const Uuid().v4(),
+        path: p.normalize(path),
+        kind: kind,
+        displayName: name,
+        language: language,
+        createdAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      item.managedSubtitleAssets = <ManagedSubtitleAsset>[
+        ...item.managedSubtitleAssets,
+        asset,
+      ];
+    }
+    local[name] = p.normalize(path);
+    item.localSubtitles = local;
+    item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+    _invalidateVideoSizeCache(videoId);
+    await _saveLibrary();
+    notifyListeners();
+    return asset;
+  }
+
+  Future<void> reconcileManagedSubtitleAssets(
+    String videoId,
+    Iterable<String> paths,
+  ) async {
+    final item = _videos[videoId];
+    if (item == null) return;
+    final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
+    var changed = false;
+    for (final path in paths) {
+      if (item.managedSubtitleAssets.any(
+        (asset) => _samePath(asset.path, path),
+      )) {
+        continue;
+      }
+      if (!await storage.isTaskOwnedPath(path, videoId) ||
+          !await File(path).exists()) {
+        continue;
+      }
+      _upsertManagedSubtitleAssetInMemory(
+        item,
+        path,
+        _inferManagedSubtitleKind(path),
+        p.basename(path),
+      );
+      changed = true;
+    }
+    if (!changed) return;
+    _invalidateVideoSizeCache(videoId);
+    await _saveLibrary();
+    notifyListeners();
+  }
+
+  List<String> managedSubtitleDeletionPaths(String videoId, String path) {
+    final item = _videos[videoId];
+    if (item == null) return <String>[path];
+    final root = managedSubtitleAssetForPath(videoId, path);
+    if (root == null) return <String>[path];
+    final ids = <String>{root.assetId};
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (final asset in item.managedSubtitleAssets) {
+        if (asset.sourceAssetId != null &&
+            ids.contains(asset.sourceAssetId) &&
+            ids.add(asset.assetId)) {
+          changed = true;
+        }
+      }
+    }
+    return item.managedSubtitleAssets
+        .where((asset) => ids.contains(asset.assetId))
+        .map((asset) => asset.path)
+        .toList(growable: false);
+  }
+
+  Future<void> removeManagedSubtitleAssetsByPaths(
+    String videoId,
+    Iterable<String> paths,
+  ) async {
+    final item = _videos[videoId];
+    if (item == null) return;
+    final keys = paths.map(_normalizeCachePath).toSet();
+    if (keys.isEmpty) return;
+    final previousCount = item.managedSubtitleAssets.length;
+    item.managedSubtitleAssets = item.managedSubtitleAssets
+        .where((asset) => !keys.contains(_normalizeCachePath(asset.path)))
+        .toList(growable: false);
+    if (item.managedSubtitleAssets.length == previousCount) return;
+    _invalidateVideoSizeCache(videoId);
+    await _saveLibrary();
+    notifyListeners();
   }
 
   Future<void> updateVideoSubtitleVisibility(
@@ -3326,6 +4819,8 @@ class LibraryService extends ChangeNotifier {
     bool useOriginalPath = false,
     bool reuseExistingItem = false,
   }) async {
+    final copyImportedMediaToPrivateStorage =
+        SettingsService().copyImportedMediaToPrivateStorage;
     // #region debug-point A:add-single-video-enter
     unawaited(
       _reportDebugEvent(
@@ -3362,7 +4857,12 @@ class LibraryService extends ChangeNotifier {
 
     // 2. Handle file persistence for temp/cache files
     // 如果 useOriginalPath 为 true，则跳过文件持久化处理，直接使用原始路径
-    if (!useOriginalPath) {
+    if (copyImportedMediaToPrivateStorage) {
+      item.path = await _copyImportedMediaToPrivateStorage(
+        item.path,
+        fileNamePrefix: item.id,
+      );
+    } else if (!useOriginalPath) {
       await _ensureFilePersistence(item);
     } else {
       debugPrint(
@@ -3373,6 +4873,29 @@ class LibraryService extends ChangeNotifier {
     if (item.durationMs <= 0) {
       item.durationMs = await _probeMediaDurationMs(item.path);
     }
+    if (!item.hasProbedChapters) {
+      if (item.chapters.isEmpty) {
+        item.chapters = await MediaChapterProbe.probe(
+          item.path,
+          durationMs: item.durationMs,
+        );
+      }
+      item.hasProbedChapters = true;
+    }
+
+    // Downloaded/imported subtitle groups are task assets. Adopt them before
+    // publishing the card so no other card can observe their original path as
+    // if it were shared state.
+    item.additionalSubtitles = await _adoptSubtitleMapIntoTask(
+      item,
+      item.additionalSubtitles,
+      ManagedSubtitleAssetKind.downloaded,
+    );
+    item.localSubtitles = await _adoptSubtitleMapIntoTask(
+      item,
+      item.localSubtitles,
+      ManagedSubtitleAssetKind.imported,
+    );
 
     // #region debug-point D:add-single-video-after-probe
     unawaited(
@@ -3389,10 +4912,7 @@ class LibraryService extends ChangeNotifier {
     );
     // #endregion
 
-    // 3. For audio files, ensure thumbnailPath is null
-    if (item.type == MediaType.audio) {
-      item.thumbnailPath = null;
-    }
+    // 3. Audio cover art / video thumbnail will be generated asynchronously below
 
     _videos[item.id] = item;
 
@@ -3424,10 +4944,11 @@ class LibraryService extends ChangeNotifier {
     );
     // #endregion
 
-    // Generate thumbnail asynchronously (only for video files)
-    if (item.type == MediaType.video &&
-        (item.thumbnailPath == null ||
-            _requiresWindowsThumbnailRepair(item.thumbnailPath))) {
+    // Generate thumbnail asynchronously (video thumbnail + audio cover art)
+    if ((item.type == MediaType.video &&
+            (item.thumbnailPath == null ||
+                _requiresWindowsThumbnailRepair(item.thumbnailPath))) ||
+        (item.type == MediaType.audio && item.thumbnailPath == null)) {
       _generateThumbnail(item.path, videoId: item.id).then((thumb) {
         // #region debug-point C:add-single-video-thumb-finished
         unawaited(
@@ -3445,7 +4966,15 @@ class LibraryService extends ChangeNotifier {
         // #endregion
         if (thumb != null) {
           item.thumbnailPath = thumb;
-          _saveLibrary(); // Save again with thumbnail
+          unawaited(
+            _saveLibrary().catchError((Object error, StackTrace stackTrace) {
+              developer.log(
+                'Error saving generated thumbnail',
+                error: error,
+                stackTrace: stackTrace,
+              );
+            }),
+          );
           notifyListeners();
         }
       });
@@ -3465,20 +4994,41 @@ class LibraryService extends ChangeNotifier {
       // Handle Video File
       item.path = await _moveIfTemporary(item.path, importedDir);
 
-      // Handle Subtitle File
+      final taskSubtitleDir = await TaskSubtitleStorageService(
+        dataRootOverride: _dataRootDir,
+      ).taskDirectory(item.id, create: true);
+
+      // Temporary subtitle picker/download results are owned by this card.
       if (item.subtitlePath != null) {
+        final previousPath = item.subtitlePath!;
         item.subtitlePath = await _moveIfTemporary(
-          item.subtitlePath!,
-          importedDir,
+          previousPath,
+          taskSubtitleDir,
         );
+        if (!_samePath(previousPath, item.subtitlePath!)) {
+          _upsertManagedSubtitleAssetInMemory(
+            item,
+            item.subtitlePath!,
+            ManagedSubtitleAssetKind.imported,
+            p.basename(item.subtitlePath!),
+          );
+        }
       }
 
-      // Handle Secondary Subtitle
       if (item.secondarySubtitlePath != null) {
+        final previousPath = item.secondarySubtitlePath!;
         item.secondarySubtitlePath = await _moveIfTemporary(
-          item.secondarySubtitlePath!,
-          importedDir,
+          previousPath,
+          taskSubtitleDir,
         );
+        if (!_samePath(previousPath, item.secondarySubtitlePath!)) {
+          _upsertManagedSubtitleAssetInMemory(
+            item,
+            item.secondarySubtitlePath!,
+            ManagedSubtitleAssetKind.imported,
+            p.basename(item.secondarySubtitlePath!),
+          );
+        }
       }
     } catch (e) {
       debugPrint("Error ensuring file persistence: $e");
@@ -3669,121 +5219,22 @@ class LibraryService extends ChangeNotifier {
         await _isBilibiliExportedCandidate(item)) {
       size += await _getFileSize(item.path);
     }
-    final subtitlePaths = await _collectAssociatedSubtitlePaths(item);
-    for (final path in subtitlePaths) {
-      if (_isInternalPath(path)) {
-        size += await _getFileSize(path);
-      }
+    if (item.playbackPath != null &&
+        !_samePath(item.playbackPath!, item.path) &&
+        _isInternalPath(item.playbackPath!)) {
+      size += await _getFileSize(item.playbackPath!);
     }
+    size += await TaskSubtitleStorageService(
+      dataRootOverride: _dataRootDir,
+    ).taskDirectorySize(item.id);
 
     // Check Thumbnail
     if (item.thumbnailPath != null && _isInternalPath(item.thumbnailPath!)) {
       size += await _getFileSize(item.thumbnailPath!);
     }
+    size += await ChapterThumbnailService.instance.directorySize(item.id);
 
     return size;
-  }
-
-  Future<Set<String>> _collectAssociatedSubtitlePaths(VideoItem item) async {
-    final paths = <String>{};
-    if (item.subtitlePath != null) {
-      paths.add(item.subtitlePath!);
-    }
-    if (item.secondarySubtitlePath != null) {
-      paths.add(item.secondarySubtitlePath!);
-    }
-    if (item.additionalSubtitles != null) {
-      paths.addAll(item.additionalSubtitles!.values);
-    }
-    if (item.recycledSelectedSubtitlePaths != null) {
-      paths.addAll(item.recycledSelectedSubtitlePaths!);
-    }
-    if (item.recycledAdditionalSubtitles != null) {
-      paths.addAll(item.recycledAdditionalSubtitles!.values);
-    }
-
-    final videoName = p.basenameWithoutExtension(item.path);
-    final extractedPrefixes = <String>{
-      "$videoName.stream_",
-      "${item.id}.stream_",
-    };
-    try {
-      final videoFile = File(item.path);
-      final dir = videoFile.parent;
-      final files = await _listFilePathsInDirectory(dir);
-      for (final filePath in files) {
-        final name = p.basename(filePath);
-        final matchesExtractedPrefix = extractedPrefixes.any(name.startsWith);
-        if (!matchesExtractedPrefix && !name.startsWith(videoName)) continue;
-        if (matchesExtractedPrefix) continue;
-        final ext = p.extension(filePath).toLowerCase();
-        if ([
-          '.srt',
-          '.vtt',
-          '.ass',
-          '.ssa',
-          '.sup',
-          '.lrc',
-          '.sub',
-          '.idx',
-          '.scc',
-        ].contains(ext)) {
-          paths.add(filePath);
-        }
-      }
-    } catch (_) {}
-
-    final aiFileNames = _expectedAiSubtitleFileNames(item);
-    if (_initialized) {
-      await _collectMatchingSubtitleFilesFromDir(
-        Directory(p.join(_dataRootDir.path, 'subtitles')),
-        extractedPrefixes,
-        aiFileNames,
-        paths,
-        includeExtractedPrefix: true,
-      );
-    }
-    try {
-      final appDocDir = await getApplicationDocumentsDirectory();
-      await _collectMatchingSubtitleFilesFromDir(
-        Directory(p.join(appDocDir.path, 'subtitles')),
-        extractedPrefixes,
-        aiFileNames,
-        paths,
-        includeExtractedPrefix: true,
-      );
-    } catch (_) {}
-    if (Platform.isAndroid) {
-      await _collectMatchingSubtitleFilesFromDir(
-        Directory('/storage/emulated/0/Download'),
-        extractedPrefixes,
-        aiFileNames,
-        paths,
-        includeExtractedPrefix: false,
-      );
-    }
-
-    return paths;
-  }
-
-  Future<void> _collectMatchingSubtitleFilesFromDir(
-    Directory dir,
-    Set<String> extractedPrefixes,
-    Set<String> aiFileNames,
-    Set<String> paths, {
-    required bool includeExtractedPrefix,
-  }) async {
-    try {
-      final files = await _listFilePathsInDirectory(dir);
-      for (final filePath in files) {
-        final name = p.basename(filePath);
-        final matchesExtractedPrefix =
-            includeExtractedPrefix && extractedPrefixes.any(name.startsWith);
-        if (aiFileNames.contains(name) || matchesExtractedPrefix) {
-          paths.add(filePath);
-        }
-      }
-    } catch (_) {}
   }
 
   Future<int> _calculateCollectionSize(VideoCollection col) async {
@@ -3806,7 +5257,25 @@ class LibraryService extends ChangeNotifier {
   void _invalidateSizeCaches() {
     _itemSizeCache.clear();
     _itemSizeInFlight.clear();
-    _directoryFilePathsCache.clear();
+  }
+
+  void _invalidateVideoSizeCache(String videoId) {
+    final videoKey = 'video:$videoId';
+    _itemSizeCache.remove(videoKey);
+    _itemSizeInFlight.remove(videoKey);
+    _itemSizeCache.removeWhere((key, _) => key.startsWith('collection:'));
+    _itemSizeInFlight.removeWhere((key, _) => key.startsWith('collection:'));
+  }
+
+  /// Invalidates filesystem-derived subtitle data after a subtitle file is
+  /// created or deleted outside LibraryService (for example by translation).
+  void notifySubtitleFilesChanged({String? videoId}) {
+    if (videoId == null || videoId.isEmpty) {
+      _invalidateSizeCaches();
+    } else {
+      _invalidateVideoSizeCache(videoId);
+    }
+    notifyListeners();
   }
 
   int get _maxConcurrentSizeCalculations => Platform.isWindows ? 3 : 2;
@@ -3828,35 +5297,6 @@ class LibraryService extends ChangeNotifier {
       if (_sizeCalculationWaitQueue.isNotEmpty) {
         _sizeCalculationWaitQueue.removeAt(0).complete();
       }
-    }
-  }
-
-  Future<List<String>> _listFilePathsInDirectory(Directory dir) async {
-    final dirKey = _normalizeCachePath(dir.path);
-    final cached = _directoryFilePathsCache[dirKey];
-    if (cached != null) {
-      return cached;
-    }
-
-    final future = () async {
-      if (!await dir.exists()) return <String>[];
-      return _runWithSizeCalculationPermit(() async {
-        final filePaths = <String>[];
-        await for (final entity in dir.list(followLinks: false)) {
-          if (entity is File) {
-            filePaths.add(entity.path);
-          }
-        }
-        return filePaths;
-      });
-    }();
-
-    _directoryFilePathsCache[dirKey] = future;
-    try {
-      return await future;
-    } catch (_) {
-      _directoryFilePathsCache.remove(dirKey);
-      rethrow;
     }
   }
 
@@ -3897,39 +5337,6 @@ class LibraryService extends ChangeNotifier {
     return p.isWithin(_dataRootDir.path, path);
   }
 
-  Set<String> _expectedAiSubtitleFileNames(VideoItem item) {
-    final videoName = p.basenameWithoutExtension(item.path);
-    return <String>{"${item.id}.ai.srt", "$videoName.ai.srt"};
-  }
-
-  Future<bool> _isManagedAiSubtitlePathForVideo(
-    String subtitlePath,
-    VideoItem item,
-  ) async {
-    final fileName = p.basename(subtitlePath).toLowerCase();
-    final expectedNames = _expectedAiSubtitleFileNames(
-      item,
-    ).map((name) => name.toLowerCase()).toSet();
-    if (!expectedNames.contains(fileName)) return false;
-    final parentPath = p.dirname(subtitlePath);
-
-    if (_initialized &&
-        _samePath(parentPath, p.join(_dataRootDir.path, 'subtitles'))) {
-      return true;
-    }
-    try {
-      final appDocDir = await getApplicationDocumentsDirectory();
-      if (_samePath(parentPath, p.join(appDocDir.path, 'subtitles'))) {
-        return true;
-      }
-    } catch (_) {}
-    if (Platform.isAndroid &&
-        _samePath(parentPath, '/storage/emulated/0/Download')) {
-      return true;
-    }
-    return false;
-  }
-
   String _thumbnailOutputPath(String videoPath, {String? videoId}) {
     final thumbDir = p.join(_dataRootDir.path, 'thumbnails');
     if (videoId != null && videoId.isNotEmpty) {
@@ -3966,16 +5373,13 @@ class LibraryService extends ChangeNotifier {
     return false;
   }
 
-  bool _isSubtitlePathReferencedByOtherVideo(
+  bool _subtitleReferencesContainPathInOtherVideo(
     String path,
     String currentVideoId,
   ) {
     for (final entry in _videos.entries) {
       if (entry.key == currentVideoId) continue;
-      final item = entry.value;
-      if (_subtitleReferencesContainPath(item, path)) {
-        return true;
-      }
+      if (_subtitleReferencesContainPath(entry.value, path)) return true;
     }
     return false;
   }
@@ -3984,9 +5388,12 @@ class LibraryService extends ChangeNotifier {
     final directPaths = <String?>[
       item.subtitlePath,
       item.secondarySubtitlePath,
+      item.danmakuPath,
       ...?item.additionalSubtitles?.values,
+      ...?item.localSubtitles?.values,
       ...?item.recycledSelectedSubtitlePaths,
       ...?item.recycledAdditionalSubtitles?.values,
+      ...?item.recycledLocalSubtitles?.values,
     ];
     for (final candidate in directPaths) {
       if (candidate != null && _samePath(candidate, path)) {
@@ -4043,6 +5450,112 @@ class _ArchiveTemporaryStorageStats {
 }
 
 const int _maxArchivePathSegmentLength = 120;
+const int _defaultMaxArchiveEntryCount = 20000;
+const int _defaultMaxArchivePathDepth = 64;
+const int _defaultMaxArchiveCompressionRatio = 1000;
+const int _mobileMaxArchiveSingleFileBytes = 4 * 1024 * 1024 * 1024;
+const int _mobileMaxArchiveTotalBytes = 16 * 1024 * 1024 * 1024;
+const int _desktopMaxArchiveSingleFileBytes = 20 * 1024 * 1024 * 1024;
+const int _desktopMaxArchiveTotalBytes = 100 * 1024 * 1024 * 1024;
+
+int get _defaultMaxArchiveSingleFileBytes =>
+    Platform.isAndroid || Platform.isIOS
+    ? _mobileMaxArchiveSingleFileBytes
+    : _desktopMaxArchiveSingleFileBytes;
+
+int get _defaultMaxArchiveTotalBytes => Platform.isAndroid || Platform.isIOS
+    ? _mobileMaxArchiveTotalBytes
+    : _desktopMaxArchiveTotalBytes;
+
+class _ArchiveWriteBudget {
+  final int maxTotalBytes;
+  int writtenBytes = 0;
+
+  _ArchiveWriteBudget(this.maxTotalBytes);
+
+  void reserve(int byteCount) {
+    if (byteCount < 0 || writtenBytes + byteCount > maxTotalBytes) {
+      throw StateError(
+        '压缩包解压后的媒体总大小超过安全上限 '
+        '(${LibraryService.formatSize(maxTotalBytes)})',
+      );
+    }
+    writtenBytes += byteCount;
+  }
+}
+
+/// Delegates archive output to disk while enforcing both per-file and global
+/// byte limits. Archive headers are untrusted, so checking only entry.size is
+/// not sufficient for a forged or malformed compressed stream.
+class _BudgetedArchiveOutputStream extends OutputStream {
+  final OutputFileStream _delegate;
+  final _ArchiveWriteBudget _budget;
+  final int _maxFileBytes;
+  int _writtenForFile = 0;
+
+  _BudgetedArchiveOutputStream(this._delegate, this._budget, this._maxFileBytes)
+    : super(byteOrder: _delegate.byteOrder);
+
+  void _reserve(int count) {
+    if (count < 0 || _writtenForFile + count > _maxFileBytes) {
+      throw StateError(
+        '压缩包内单个媒体超过安全上限 '
+        '(${LibraryService.formatSize(_maxFileBytes)})',
+      );
+    }
+    _budget.reserve(count);
+    _writtenForFile += count;
+  }
+
+  @override
+  int get length => _delegate.length;
+
+  @override
+  bool get isOpen => _delegate.isOpen;
+
+  @override
+  void clear() {
+    _delegate.clear();
+  }
+
+  @override
+  void flush() => _delegate.flush();
+
+  @override
+  void closeSync() => _delegate.closeSync();
+
+  @override
+  Future<void> close() => _delegate.close();
+
+  @override
+  void writeByte(int value) {
+    _reserve(1);
+    _delegate.writeByte(value);
+  }
+
+  @override
+  void writeBytes(List<int> bytes, {int? length}) {
+    final count = length ?? bytes.length;
+    _reserve(count);
+    _delegate.writeBytes(bytes, length: count);
+  }
+
+  @override
+  void writeStream(InputStream stream) {
+    const chunkSize = 1024 * 1024;
+    while (!stream.isEOS) {
+      final count = min(chunkSize, stream.length);
+      if (count <= 0) {
+        break;
+      }
+      final bytes = stream.readBytes(count).toUint8List();
+      writeBytes(bytes);
+    }
+  }
+
+  @override
+  Uint8List subset(int start, [int? end]) => _delegate.subset(start, end);
+}
 
 String _buildArchiveEntryOutputPath({
   required String outputRoot,
@@ -4080,6 +5593,26 @@ String _buildArchiveEntryOutputPath({
   return p.normalize(p.join(outputRoot, p.joinAll(sanitizedSegments)));
 }
 
+/// 在独立 Isolate 中执行文件夹递归扫描，避免阻塞 UI 线程。
+///
+/// 使用 listSync 同步遍历（Isolate 内同步不影响 UI），返回仅含原始计数的
+/// Map，避免跨 Isolate 传递复杂对象。由 [LibraryService.analyzeFolderSelection]
+/// 通过 compute() 调用。
+Map<String, dynamic> _analyzeFolderSelectionIsolate(String folderPath) {
+  final rootDir = Directory(folderPath);
+  var folderCount = 1;
+  var mediaFileCount = 0;
+  for (final entity in rootDir.listSync(recursive: true, followLinks: false)) {
+    if (entity is Directory) {
+      folderCount++;
+    } else if (entity is File &&
+        LibraryService.isSupportedMediaPath(entity.path)) {
+      mediaFileCount++;
+    }
+  }
+  return {'folderCount': folderCount, 'mediaFileCount': mediaFileCount};
+}
+
 String _sanitizeArchivePathSegment(
   String segment, {
   required bool preserveExtension,
@@ -4092,6 +5625,12 @@ String _sanitizeArchivePathSegment(
   cleaned = cleaned.replaceAll(RegExp(r'^[. ]+|[. ]+$'), '');
   if (cleaned.isEmpty || cleaned == '.' || cleaned == '..') {
     cleaned = fallbackName;
+  }
+  final windowsBaseName = p.basenameWithoutExtension(cleaned).toUpperCase();
+  if (RegExp(
+    r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$',
+  ).hasMatch(windowsBaseName)) {
+    cleaned = '_$cleaned';
   }
   if (cleaned.length <= _maxArchivePathSegmentLength) {
     return cleaned;
@@ -4116,12 +5655,12 @@ String _sanitizeArchivePathSegment(
   return '${base.substring(0, keepLength)}$suffix$ext';
 }
 
-Map<String, int> _extractArchiveToDiskWorker(Map<String, String> args) {
+Map<String, int> _extractArchiveToDiskWorker(Map<String, Object?> args) {
   final archivePath = args['archivePath'];
   final destDir = args['destDir'];
-  if (archivePath == null ||
+  if (archivePath is! String ||
       archivePath.isEmpty ||
-      destDir == null ||
+      destDir is! String ||
       destDir.isEmpty) {
     throw ArgumentError('missing archivePath or destDir');
   }
@@ -4129,22 +5668,47 @@ Map<String, int> _extractArchiveToDiskWorker(Map<String, String> args) {
   return _extractArchiveToDiskWithParentsSync(
     archivePath: archivePath,
     outputPath: destDir,
+    maxEntryCount: args['maxEntryCount'] as int?,
+    maxTotalBytes: args['maxTotalBytes'] as int?,
+    maxSingleFileBytes: args['maxSingleFileBytes'] as int?,
+    maxPathDepth: args['maxPathDepth'] as int?,
+    maxCompressionRatio: args['maxCompressionRatio'] as int?,
   );
 }
 
 Map<String, int> _extractArchiveToDiskWithParentsSync({
   required String archivePath,
   required String outputPath,
+  int? maxEntryCount,
+  int? maxTotalBytes,
+  int? maxSingleFileBytes,
+  int? maxPathDepth,
+  int? maxCompressionRatio,
 }) {
   Directory? tempDir;
   InputStream? inputToClose;
   Archive? archive;
-  var normalizedArchivePath = archivePath.toLowerCase();
+  final normalizedArchivePath = archivePath.toLowerCase();
   var decodedArchivePath = archivePath;
   var extractedEntries = 0;
   var extractedMediaEntries = 0;
-  // 单文件大小保护上限：10GB，超过则跳过，避免磁盘耗尽
-  const maxSingleFileSize = 10 * 1024 * 1024 * 1024;
+  var extractedSubtitleEntries = 0;
+  var skippedNonMediaEntries = 0;
+  final effectiveMaxEntryCount = maxEntryCount ?? _defaultMaxArchiveEntryCount;
+  final effectiveMaxTotalBytes = maxTotalBytes ?? _defaultMaxArchiveTotalBytes;
+  final effectiveMaxSingleFileBytes =
+      maxSingleFileBytes ?? _defaultMaxArchiveSingleFileBytes;
+  final effectiveMaxPathDepth = maxPathDepth ?? _defaultMaxArchivePathDepth;
+  final effectiveMaxCompressionRatio =
+      maxCompressionRatio ?? _defaultMaxArchiveCompressionRatio;
+  if (effectiveMaxEntryCount <= 0 ||
+      effectiveMaxTotalBytes <= 0 ||
+      effectiveMaxSingleFileBytes <= 0 ||
+      effectiveMaxPathDepth <= 0 ||
+      effectiveMaxCompressionRatio <= 0) {
+    throw ArgumentError('archive extraction limits must be positive');
+  }
+  final writeBudget = _ArchiveWriteBudget(effectiveMaxTotalBytes);
 
   try {
     Directory(outputPath).createSync(recursive: true);
@@ -4155,12 +5719,20 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
       tempDir = Directory.systemTemp.createTempSync('dart_archive');
       decodedArchivePath = p.join(tempDir.path, 'temp.tar');
       final input = InputFileStream(archivePath);
-      final output = OutputFileStream(decodedArchivePath);
+      final output = _BudgetedArchiveOutputStream(
+        OutputFileStream(decodedArchivePath),
+        _ArchiveWriteBudget(effectiveMaxTotalBytes),
+        effectiveMaxTotalBytes,
+      );
       try {
         GZipDecoder().decodeStream(input, output);
       } finally {
-        try { input.closeSync(); } catch (_) {}
-        try { output.closeSync(); } catch (_) {}
+        try {
+          input.closeSync();
+        } catch (_) {}
+        try {
+          output.closeSync();
+        } catch (_) {}
       }
     } else if (normalizedArchivePath.endsWith('tar.bz2') ||
         normalizedArchivePath.endsWith('tbz') ||
@@ -4168,24 +5740,88 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
       tempDir = Directory.systemTemp.createTempSync('dart_archive');
       decodedArchivePath = p.join(tempDir.path, 'temp.tar');
       final input = InputFileStream(archivePath);
-      final output = OutputFileStream(decodedArchivePath);
+      final output = _BudgetedArchiveOutputStream(
+        OutputFileStream(decodedArchivePath),
+        _ArchiveWriteBudget(effectiveMaxTotalBytes),
+        effectiveMaxTotalBytes,
+      );
       try {
         BZip2Decoder().decodeStream(input, output);
       } finally {
-        try { input.closeSync(); } catch (_) {}
-        try { output.closeSync(); } catch (_) {}
+        try {
+          input.closeSync();
+        } catch (_) {}
+        try {
+          output.closeSync();
+        } catch (_) {}
       }
     } else if (normalizedArchivePath.endsWith('tar.xz') ||
         normalizedArchivePath.endsWith('txz')) {
       tempDir = Directory.systemTemp.createTempSync('dart_archive');
       decodedArchivePath = p.join(tempDir.path, 'temp.tar');
       final input = InputFileStream(archivePath);
-      final output = OutputFileStream(decodedArchivePath);
+      final output = _BudgetedArchiveOutputStream(
+        OutputFileStream(decodedArchivePath),
+        _ArchiveWriteBudget(effectiveMaxTotalBytes),
+        effectiveMaxTotalBytes,
+      );
       try {
         XZDecoder().decodeStream(input, output);
       } finally {
-        try { input.closeSync(); } catch (_) {}
-        try { output.closeSync(); } catch (_) {}
+        try {
+          input.closeSync();
+        } catch (_) {}
+        try {
+          output.closeSync();
+        } catch (_) {}
+      }
+    }
+
+    var decodedEntryCount = 0;
+    var declaredImportBytes = 0;
+    void validateArchiveEntry(ArchiveFile entry) {
+      decodedEntryCount++;
+      if (decodedEntryCount > effectiveMaxEntryCount) {
+        throw StateError('压缩包文件数量超过安全上限 ($effectiveMaxEntryCount)');
+      }
+
+      final pathDepth = entry.name
+          .split(RegExp(r'[\\/]+'))
+          .where((segment) => segment.isNotEmpty)
+          .length;
+      if (pathDepth > effectiveMaxPathDepth) {
+        throw StateError('压缩包目录层级超过安全上限 ($effectiveMaxPathDepth)');
+      }
+
+      final isImportableFile =
+          LibraryService.isSupportedMediaPath(entry.name) ||
+          SubtitleFileMatcher.supportedExtensions.contains(
+            p.extension(entry.name).toLowerCase(),
+          );
+      if (entry.isSymbolicLink || !entry.isFile || !isImportableFile) {
+        return;
+      }
+
+      final entrySize = entry.size;
+      if (entrySize < 0 || entrySize > effectiveMaxSingleFileBytes) {
+        throw StateError(
+          '压缩包内可导入文件超过单文件安全上限 '
+          '(${LibraryService.formatSize(effectiveMaxSingleFileBytes)})',
+        );
+      }
+      declaredImportBytes += entrySize;
+      if (declaredImportBytes > effectiveMaxTotalBytes) {
+        throw StateError(
+          '压缩包内可导入文件总大小超过安全上限 '
+          '(${LibraryService.formatSize(effectiveMaxTotalBytes)})',
+        );
+      }
+
+      final compressedSize = entry.rawContent?.length ?? entrySize;
+      if (entrySize > 0 &&
+          (compressedSize <= 0 ||
+              entrySize > compressedSize * effectiveMaxCompressionRatio)) {
+        throw StateError('压缩包内可导入文件压缩比异常，已停止导入以保护设备存储');
       }
     }
 
@@ -4193,17 +5829,30 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
     if (normalizedDecodedPath.endsWith('.tar')) {
       final input = InputFileStream(decodedArchivePath);
       inputToClose = input;
-      archive = TarDecoder().decodeStream(input);
+      archive = TarDecoder().decodeStream(
+        input,
+        callback: validateArchiveEntry,
+      );
     } else if (normalizedDecodedPath.endsWith('.zip')) {
       final input = InputFileStream(decodedArchivePath);
       inputToClose = input;
-      archive = ZipDecoder().decodeStream(input);
+      archive = ZipDecoder().decodeStream(
+        input,
+        callback: validateArchiveEntry,
+      );
     } else {
-      throw ArgumentError('当前仅支持常见 zip/tar/gz/bz2/xz 压缩包');
+      throw ArgumentError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
     }
 
     final normalizedOutputRoot = p.normalize(outputPath);
+    final claimedOutputPaths = <String, String>{};
     for (final entry in archive) {
+      // Media imports do not need archive links. Skipping every symbolic link
+      // also prevents a later entry from traversing a link whose lexical path
+      // appears to remain inside the extraction root.
+      if (entry.isSymbolicLink) {
+        continue;
+      }
       final normalizedEntryName = entry.name.replaceAll('\\', '/').trim();
       if (normalizedEntryName.isEmpty ||
           normalizedEntryName == '.' ||
@@ -4215,7 +5864,7 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
       final filePath = _buildArchiveEntryOutputPath(
         outputRoot: normalizedOutputRoot,
         entryName: normalizedEntryName,
-        treatAsFile: entry.isFile || entry.isSymbolicLink,
+        treatAsFile: entry.isFile,
       );
       final isSafePath =
           p.equals(normalizedOutputRoot, filePath) ||
@@ -4224,7 +5873,19 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
         continue;
       }
 
-      if (entry.isDirectory && !entry.isSymbolicLink) {
+      final claimKey = Platform.isWindows ? filePath.toLowerCase() : filePath;
+      final previousEntryName = claimedOutputPaths[claimKey];
+      if (previousEntryName != null) {
+        if (entry.isDirectory && previousEntryName == normalizedEntryName) {
+          continue;
+        }
+        throw StateError(
+          '压缩包内存在清理后重名的路径：$previousEntryName / $normalizedEntryName',
+        );
+      }
+      claimedOutputPaths[claimKey] = normalizedEntryName;
+
+      if (entry.isDirectory) {
         Directory(filePath).createSync(recursive: true);
         continue;
       }
@@ -4234,28 +5895,26 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
         parentDir.createSync(recursive: true);
       }
 
-      if (entry.isSymbolicLink) {
-        final linkTarget = p.normalize(entry.symbolicLink ?? '');
-        if (linkTarget.isEmpty || p.isAbsolute(linkTarget)) {
-          continue;
-        }
-        final link = Link(filePath);
-        link.createSync(linkTarget, recursive: true);
-        extractedEntries++;
-        continue;
-      }
-
       if (!entry.isFile) {
         continue;
       }
 
-      // 单文件大小保护：跳过超大文件，避免磁盘耗尽导致系统异常
-      final entrySize = entry.size;
-      if (entrySize > maxSingleFileSize) {
+      // Keep media and supported sidecar subtitles. Other archive contents are
+      // intentionally not inflated into the app-managed import directory.
+      final isMedia = LibraryService.isSupportedMediaPath(filePath);
+      final isSubtitle = SubtitleFileMatcher.supportedExtensions.contains(
+        p.extension(filePath).toLowerCase(),
+      );
+      if (!isMedia && !isSubtitle) {
+        skippedNonMediaEntries++;
         continue;
       }
 
-      final output = OutputFileStream(filePath);
+      final output = _BudgetedArchiveOutputStream(
+        OutputFileStream(filePath),
+        writeBudget,
+        effectiveMaxSingleFileBytes,
+      );
       try {
         entry.writeContent(output);
       } on FileSystemException catch (e) {
@@ -4265,18 +5924,22 @@ Map<String, int> _extractArchiveToDiskWithParentsSync({
           e.osError,
         );
       } finally {
-        try { output.closeSync(); } catch (_) {}
+        try {
+          output.closeSync();
+        } catch (_) {}
       }
 
       extractedEntries++;
-      if (LibraryService.isSupportedMediaPath(filePath)) {
-        extractedMediaEntries++;
-      }
+      if (isMedia) extractedMediaEntries++;
+      if (isSubtitle) extractedSubtitleEntries++;
     }
 
     return <String, int>{
       'extractedEntries': extractedEntries,
       'extractedMediaEntries': extractedMediaEntries,
+      'extractedSubtitleEntries': extractedSubtitleEntries,
+      'skippedNonMediaEntries': skippedNonMediaEntries,
+      'writtenBytes': writeBudget.writtenBytes,
     };
   } finally {
     // 严格按顺序释放资源，每个步骤都有独立 try/catch 确保不中断后续清理

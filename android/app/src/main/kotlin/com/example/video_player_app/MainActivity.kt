@@ -1,10 +1,15 @@
 package com.example.video_player_app
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.ContentUris
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.os.Bundle
 import android.provider.OpenableColumns
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -15,13 +20,13 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import android.webkit.MimeTypeMap
-import android.content.Context
 import java.io.File
 import java.io.FileOutputStream
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.LinkedHashSet
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.Locale
 import kotlin.concurrent.thread
@@ -58,16 +63,27 @@ class MainActivity : AudioServiceFragmentActivity() {
         ".tar",
         ".tgz",
         ".tar.gz",
-        ".gz",
         ".tbz",
         ".tbz2",
         ".tar.bz2",
-        ".bz2",
         ".txz",
         ".tar.xz",
-        ".xz",
     )
     private val ytDlpTasks = ConcurrentHashMap<String, RunningYtDlpTask>()
+    private val sharedIntentExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "shared-intent-resolver")
+    }
+    private var ytDlpWorkerReceiverRegistered = false
+    private val ytDlpWorkerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent != null) handleYtDlpWorkerEvent(intent)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        registerYtDlpWorkerReceiver()
+    }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -103,14 +119,28 @@ class MainActivity : AudioServiceFragmentActivity() {
                     if (uriString.isNullOrBlank()) {
                         result.error("INVALID_ARGS", "missing uri", null)
                     } else {
-                        try {
-                            result.success(materializeArchiveForImport(uriString, displayName))
-                        } catch (e: Exception) {
-                            result.error(
-                                "ARCHIVE_MATERIALIZE_FAILED",
-                                e.message ?: "archive materialize failed",
-                                null,
-                            )
+                        // ContentResolver streams can point at multi-gigabyte files. Copying
+                        // them in a MethodChannel callback blocks Android's main thread and
+                        // can trigger an ANR. Keep all file I/O on a worker thread and only
+                        // marshal the result back to Flutter on the UI thread.
+                        thread(name = "archive-materialize") {
+                            try {
+                                val materializedPath = materializeArchiveForImport(
+                                    uriString,
+                                    displayName,
+                                )
+                                runOnUiThread {
+                                    result.success(materializedPath)
+                                }
+                            } catch (e: Exception) {
+                                runOnUiThread {
+                                    result.error(
+                                        "ARCHIVE_MATERIALIZE_FAILED",
+                                        e.message ?: "archive materialize failed",
+                                        null,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -143,7 +173,31 @@ class MainActivity : AudioServiceFragmentActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, YT_DLP_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getYtDlpBinaryStatus" -> {
-                    result.success(getYtDlpBinaryStatus())
+                    thread(name = "yt-dlp-binary-status", start = true) {
+                        val status = getYtDlpBinaryStatus()
+                        runOnUiThread { result.success(status) }
+                    }
+                }
+                "reloadYtDlpRuntime" -> {
+                    val archivePath = call.argument<String>("archivePath")
+                    if (archivePath.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "missing yt-dlp archive path", null)
+                    } else {
+                        thread(name = "yt-dlp-runtime-reload", start = true) {
+                            try {
+                                val version = reloadYtDlpRuntime(archivePath)
+                                runOnUiThread { result.success(version) }
+                            } catch (e: Exception) {
+                                runOnUiThread {
+                                    result.error(
+                                        "YT_DLP_RUNTIME_INVALID",
+                                        e.message ?: "invalid yt-dlp runtime archive",
+                                        null,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
                 "importYoutubeCookies" -> {
                     val filePath = call.argument<String>("filePath")
@@ -203,7 +257,14 @@ class MainActivity : AudioServiceFragmentActivity() {
                 }
                 "pauseYoutubeDownload" -> {
                     val taskId = call.argument<String>("taskId")
-                    result.success(if (taskId.isNullOrBlank()) false else pauseYoutubeDownload(taskId))
+                    val stopped = !taskId.isNullOrBlank() && pauseYoutubeDownload(taskId)
+                    result.success(
+                        mapOf(
+                            "accepted" to stopped,
+                            "stopped" to stopped,
+                            "reason" to if (stopped) null else "running task not found",
+                        ),
+                    )
                 }
                 "cancelYoutubeDownload" -> {
                     val taskId = call.argument<String>("taskId")
@@ -233,10 +294,7 @@ class MainActivity : AudioServiceFragmentActivity() {
             }
         )
 
-        val launchShared = extractSharedItemsFromIntent(intent)
-        if (launchShared.isNotEmpty()) {
-            pendingSharedItems.addAll(launchShared)
-        }
+        enqueueSharedItemsFromIntent(intent)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -298,23 +356,199 @@ class MainActivity : AudioServiceFragmentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        val sharedItems = extractSharedItemsFromIntent(intent)
-        if (sharedItems.isEmpty()) return
-        val sink = shareEventSink
-        if (sink != null) {
-            sink.success(sharedItems)
-        } else {
-            pendingSharedItems.addAll(sharedItems)
-        }
+        enqueueSharedItemsFromIntent(intent)
     }
 
     override fun onDestroy() {
         ytDlpTasks.values.forEach { task ->
             task.terminationReason = "cancel"
-            runCatching { task.process?.destroy() }
+            sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_CANCEL, task.taskId)
         }
         ytDlpTasks.clear()
+        if (ytDlpWorkerReceiverRegistered) {
+            runCatching { unregisterReceiver(ytDlpWorkerReceiver) }
+            ytDlpWorkerReceiverRegistered = false
+        }
+        sharedIntentExecutor.shutdownNow()
         super.onDestroy()
+    }
+
+    /**
+     * Resolving a shared content URI may query a remote provider or copy a
+     * multi-gigabyte media file into the app cache. Doing that from
+     * configureFlutterEngine/onNewIntent blocks Android's main thread and
+     * delays Flutter's first frame. Resolve serially in the background, then
+     * preserve the existing pending-item/event-channel delivery semantics.
+     */
+    private fun enqueueSharedItemsFromIntent(sourceIntent: Intent?) {
+        if (sourceIntent == null) return
+        val action = sourceIntent.action
+        if (
+            action != Intent.ACTION_SEND &&
+            action != Intent.ACTION_SEND_MULTIPLE &&
+            action != Intent.ACTION_VIEW
+        ) return
+
+        val snapshot = Intent(sourceIntent)
+        sharedIntentExecutor.execute {
+            val sharedItems = extractSharedItemsFromIntent(snapshot)
+            if (sharedItems.isEmpty()) return@execute
+            runOnUiThread {
+                if (isFinishing || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed)) {
+                    return@runOnUiThread
+                }
+                val sink = shareEventSink
+                if (sink != null) {
+                    sink.success(sharedItems)
+                } else {
+                    pendingSharedItems.addAll(sharedItems)
+                }
+            }
+        }
+    }
+
+    private fun registerYtDlpWorkerReceiver() {
+        if (ytDlpWorkerReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(YtDlpWorkerService.ACTION_OUTPUT)
+            addAction(YtDlpWorkerService.ACTION_PROGRESS)
+            addAction(YtDlpWorkerService.ACTION_RESULT)
+            addAction(YtDlpWorkerService.ACTION_ERROR)
+            addAction(YtDlpWorkerService.ACTION_PAUSED)
+            addAction(YtDlpWorkerService.ACTION_CANCELLED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(ytDlpWorkerReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(ytDlpWorkerReceiver, filter)
+        }
+        ytDlpWorkerReceiverRegistered = true
+    }
+
+    private fun sendYtDlpWorkerCommand(action: String, taskId: String) {
+        runCatching {
+            startService(
+                Intent(this, YtDlpWorkerService::class.java)
+                    .setAction(action)
+                    .putExtra(YtDlpWorkerService.EXTRA_TASK_ID, taskId),
+            )
+        }
+    }
+
+    private fun handleYtDlpWorkerEvent(intent: Intent) {
+        val taskId = intent.getStringExtra(YtDlpWorkerService.EXTRA_TASK_ID)
+            ?.trim()
+            .orEmpty()
+        val task = ytDlpTasks[taskId] ?: return
+        when (intent.action) {
+            YtDlpWorkerService.ACTION_OUTPUT -> {
+                handleYoutubeDownloadOutput(
+                    task,
+                    intent.getStringExtra(YtDlpWorkerService.EXTRA_PAYLOAD).orEmpty(),
+                )
+            }
+            YtDlpWorkerService.ACTION_PROGRESS -> {
+                handlePythonProgress(
+                    task,
+                    intent.getStringExtra(YtDlpWorkerService.EXTRA_PAYLOAD).orEmpty(),
+                )
+            }
+            YtDlpWorkerService.ACTION_PAUSED -> {
+                task.status = "paused"
+                task.terminationReason = "pause"
+                emitTaskEvent(
+                    taskId = taskId,
+                    type = "task_paused",
+                    progress = task.progress,
+                    downloadedBytes = task.downloadedBytes,
+                    totalBytes = task.totalBytes,
+                    speedText = task.speedText,
+                    etaText = task.etaText,
+                    outputPath = task.outputPath,
+                    producedPaths = snapshotProducedPaths(task),
+                    message = "Paused",
+                )
+                ytDlpTasks.remove(taskId, task)
+            }
+            YtDlpWorkerService.ACTION_CANCELLED -> {
+                task.status = "cancelled"
+                task.terminationReason = "cancel"
+                emitTaskEvent(
+                    taskId = taskId,
+                    type = "task_cancelled",
+                    progress = task.progress,
+                    outputPath = task.outputPath,
+                    producedPaths = snapshotProducedPaths(task),
+                    errorCode = "USER_CANCELLED",
+                    message = "Cancelled",
+                )
+                cleanupAndroidStagedArtifacts(task)
+                ytDlpTasks.remove(taskId, task)
+            }
+            YtDlpWorkerService.ACTION_RESULT -> {
+                val rawResult = intent
+                    .getStringExtra(YtDlpWorkerService.EXTRA_PAYLOAD)
+                    .orEmpty()
+                finishYtDlpWorkerDownload(task, decodeJsonObject(rawResult) ?: emptyMap())
+            }
+            YtDlpWorkerService.ACTION_ERROR -> {
+                task.status = "failed"
+                task.errorCode = "RUNTIME_ERROR"
+                appendTaskLog(
+                    task,
+                    intent.getStringExtra(YtDlpWorkerService.EXTRA_MESSAGE)
+                        ?: "worker runtime error",
+                )
+                emitTaskEvent(
+                    taskId = taskId,
+                    type = "task_failed",
+                    progress = task.progress,
+                    outputPath = task.outputPath,
+                    producedPaths = snapshotProducedPaths(task),
+                    errorCode = task.errorCode,
+                    message = buildTaskFailureMessage(task, null),
+                )
+                ytDlpTasks.remove(taskId, task)
+            }
+        }
+    }
+
+    private fun finishYtDlpWorkerDownload(
+        task: RunningYtDlpTask,
+        downloadResult: Map<String, Any?>,
+    ) {
+        if (task.terminationReason != null) return
+        val exitCode = (downloadResult["exitCode"] as? Number)?.toInt() ?: 1
+        applyDownloadArtifacts(task, downloadResult)
+        if (exitCode == 0 && hasUsableMediaArtifact(snapshotProducedPaths(task))) {
+            task.status = "completed"
+            emitTaskEvent(
+                taskId = task.taskId,
+                type = "task_completed",
+                progress = 1.0,
+                speedText = task.speedText,
+                etaText = "00:00",
+                outputPath = task.outputPath,
+                producedPaths = snapshotProducedPaths(task),
+                message = "Download completed",
+            )
+        } else {
+            task.status = "failed"
+            task.errorCode = if (exitCode == 0) "NO_MEDIA_ARTIFACT" else "EXIT_$exitCode"
+            emitTaskEvent(
+                taskId = task.taskId,
+                type = "task_failed",
+                progress = task.progress,
+                speedText = task.speedText,
+                etaText = task.etaText,
+                outputPath = task.outputPath,
+                producedPaths = snapshotProducedPaths(task),
+                errorCode = task.errorCode,
+                message = buildTaskFailureMessage(task, exitCode),
+            )
+        }
+        ytDlpTasks.remove(task.taskId, task)
     }
 
     private fun openSystemFilePicker(mimeTypes: List<String>, allowMultiple: Boolean) {
@@ -501,7 +735,7 @@ class MainActivity : AudioServiceFragmentActivity() {
             ?: uri.lastPathSegment
             ?: "archive"
         if (!isArchivePath(displayName)) {
-            throw IllegalArgumentException("当前仅支持常见 zip/tar/gz/bz2/xz 压缩包")
+            throw IllegalArgumentException("当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包")
         }
 
         val directPath = resolveToPath(uri)?.takeIf { isArchivePath(it) }
@@ -554,11 +788,24 @@ class MainActivity : AudioServiceFragmentActivity() {
             }
             outFile = File(archiveDir, uniqueName)
         }
-        contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(outFile).use { output ->
-                input.copyTo(output)
+        val partialFile = File(outFile.parentFile, "${outFile.name}.partial")
+        try {
+            if (partialFile.exists()) {
+                partialFile.delete()
             }
-        } ?: throw IllegalStateException("无法读取压缩包内容")
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(partialFile).use { output ->
+                    input.copyTo(output, bufferSize = 1024 * 1024)
+                    output.fd.sync()
+                }
+            } ?: throw IllegalStateException("无法读取压缩包内容")
+            if (partialFile.length() <= 0L || !partialFile.renameTo(outFile)) {
+                throw IllegalStateException("无法保存压缩包临时副本")
+            }
+        } catch (e: Exception) {
+            runCatching { partialFile.delete() }
+            throw e
+        }
         return outFile.absolutePath
     }
 
@@ -684,40 +931,80 @@ class MainActivity : AudioServiceFragmentActivity() {
         }
     }
 
+    @Volatile
+    private var activeYtDlpRuntimePath: String? = null
+
     private fun getYtDlpPythonModule() = Python.getInstance().getModule("yt_dlp_bridge")
+
+    private fun reloadYtDlpRuntime(archivePath: String): String? {
+        ensurePythonRuntimeReady()
+        val archive = File(archivePath)
+        require(archive.isFile) { "yt-dlp runtime archive does not exist" }
+        val version = getYtDlpPythonModule()
+            .callAttr("configure_runtime", archive.absolutePath)
+            ?.toString()
+        require(!version.isNullOrBlank()) { "unable to read yt-dlp runtime version" }
+        activeYtDlpRuntimePath = archive.absolutePath
+        return version
+    }
 
     private fun queryPythonYtDlpVersion(): String? {
         return runCatching {
             ensurePythonRuntimeReady()
-            getYtDlpPythonModule().callAttr("get_yt_dlp_version")?.toString()
+            val module = getYtDlpPythonModule()
+            val archive = File(filesDir, "yt_dlp/yt-dlp")
+            val version = if (archive.isFile) {
+                module.callAttr("configure_runtime", archive.absolutePath)?.toString()
+            } else {
+                module.callAttr("configure_runtime")?.toString()
+            }
+            activeYtDlpRuntimePath = if (archive.isFile) archive.absolutePath else null
+            version
+        }.recoverCatching {
+            val version = getYtDlpPythonModule().callAttr("configure_runtime")?.toString()
+            activeYtDlpRuntimePath = null
+            version
         }.getOrNull()
     }
 
     private fun getYtDlpBinaryStatus(): Map<String, Any?> {
         val ffmpeg = resolveFfmpegBinary()
+        val hasCli = ffmpeg.exists()
         val ytDlpVersion = queryPythonYtDlpVersion()
         val ytDlpReady = ytDlpVersion != null
+        // 没有独立 CLI 时，FFmpegKit 作为内建后处理引擎始终可用
+        val ffmpegVersion = if (hasCli) {
+            queryBinaryVersion(ffmpeg, listOf("-version"))
+        } else {
+            "FFmpegKit (内建可用)"
+        }
         val diagnosticMessage = buildString {
             append("yt-dlp runtime: python module (Chaquopy)")
             append('\n')
-            append("ffmpeg path: ")
-            append(ffmpeg.absolutePath)
+            append("ffmpeg: ")
+            append(if (hasCli) ffmpeg.absolutePath else "FFmpegKit (内建)")
             if (!ytDlpReady) {
                 append('\n')
                 append("Android Python 运行时或 yt-dlp 模块尚未就绪，请确认构建时已成功安装 Chaquopy 与 yt-dlp 依赖。")
             }
-            if (!ffmpeg.exists()) {
+            if (!hasCli) {
                 append('\n')
-                append("Android 当前没有独立 ffmpeg CLI；下载会自动回退到 FFmpegKit 本地收尾模式，少数依赖 yt-dlp 内建 ffmpeg 的场景可能受限。")
+                append("未检测到独立 ffmpeg CLI；下载后处理将使用 FFmpegKit 完成音视频合成。")
             }
         }
         return mapOf(
             "ytDlpReady" to ytDlpReady,
-            "ffmpegReady" to ffmpeg.exists(),
+            // FFmpegKit is a complete FFmpeg backend for the app even when
+            // yt-dlp cannot invoke a standalone CLI executable directly.
+            "ffmpegReady" to true,
+            "ffmpegCliReady" to hasCli,
+            "ffmpegBackend" to if (hasCli) "独立 CLI" else "FFmpegKit 内置插件",
             "ytDlpVersion" to ytDlpVersion,
-            "ffmpegVersion" to if (ffmpeg.exists()) queryBinaryVersion(ffmpeg, listOf("-version")) else null,
-            "ytDlpPath" to if (ytDlpReady) "python:yt_dlp" else null,
-            "ffmpegPath" to if (ffmpeg.exists()) ffmpeg.absolutePath else null,
+            "ffmpegVersion" to ffmpegVersion,
+            "ytDlpPath" to if (ytDlpReady) {
+                activeYtDlpRuntimePath ?: "python:yt_dlp (APK 内置)"
+            } else null,
+            "ffmpegPath" to if (hasCli) ffmpeg.absolutePath else "FFmpegKit",
             "diagnosticMessage" to diagnosticMessage,
         )
     }
@@ -945,7 +1232,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         val outputDirectory = File(outputDir).apply { mkdirs() }
         ytDlpTasks[taskId]?.let { existing ->
             existing.terminationReason = "cancel"
-            runCatching { existing.process?.destroy() }
+            sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_CANCEL, taskId)
             ytDlpTasks.remove(taskId)
         }
 
@@ -967,9 +1254,21 @@ class MainActivity : AudioServiceFragmentActivity() {
         ytDlpTasks[taskId] = task
         emitTaskEvent(taskId = taskId, type = "task_queued", message = "已加入下载队列")
 
-        thread(name = "yt-dlp-$taskId", isDaemon = true) {
-            monitorYoutubeDownload(task)
-        }
+        task.status = "downloading"
+        emitTaskEvent(
+            taskId = task.taskId,
+            type = "task_started",
+            progress = 0.0,
+            message = "Starting download",
+        )
+        val requestJson = encodeDynamicJson(task.requestPayload)
+            ?: throw IllegalStateException("failed to encode yt-dlp request")
+        startService(
+            Intent(this, YtDlpWorkerService::class.java)
+                .setAction(YtDlpWorkerService.ACTION_START)
+                .putExtra(YtDlpWorkerService.EXTRA_TASK_ID, taskId)
+                .putExtra(YtDlpWorkerService.EXTRA_REQUEST_JSON, requestJson),
+        )
         return true
     }
 
@@ -978,7 +1277,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         task.terminationReason = "pause"
         task.status = "paused"
         task.message = "已暂停"
-        runCatching { task.process?.destroy() }
+        sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_PAUSE, taskId)
         return true
     }
 
@@ -987,7 +1286,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         task.terminationReason = "cancel"
         task.status = "cancelled"
         task.message = "已取消"
-        runCatching { task.process?.destroy() }
+        sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_CANCEL, taskId)
         return true
     }
 
@@ -997,16 +1296,8 @@ class MainActivity : AudioServiceFragmentActivity() {
             task.terminationReason = "cancel"
             task.status = "cancelled"
             task.message = "任务已移除"
-            runCatching { task.process?.destroy() }
-            val outputPath = task.outputPath
-            if (!outputPath.isNullOrBlank()) {
-                runCatching {
-                    val file = File(outputPath)
-                    if (file.exists()) {
-                        file.delete()
-                    }
-                }
-            }
+            sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_CANCEL, taskId)
+            cleanupAndroidStagedArtifacts(task)
         }
         return true
     }
@@ -1085,7 +1376,7 @@ class MainActivity : AudioServiceFragmentActivity() {
                 else -> {
                     if (exitCode == 0) {
                         val producedPaths = snapshotProducedPaths(task)
-                        if (!hasUsableMediaArtifact(producedPaths) && !task.usesAndroidPostProcessMode()) {
+                        if (!hasUsableMediaArtifact(producedPaths)) {
                             task.status = "failed"
                             task.errorCode = "NO_MEDIA_ARTIFACT"
                             task.message = "yt-dlp 下载完成但未产出可用媒体文件"
@@ -1175,6 +1466,9 @@ class MainActivity : AudioServiceFragmentActivity() {
                 )
             }
         } finally {
+            if (task.terminationReason == "cancel") {
+                cleanupAndroidStagedArtifacts(task)
+            }
             ytDlpTasks.remove(task.taskId)
         }
     }
@@ -1261,25 +1555,22 @@ class MainActivity : AudioServiceFragmentActivity() {
 
     private fun hasUsableMediaArtifact(paths: List<String>): Boolean {
         return paths.any { path ->
-            !isTransientArtifact(path) &&
-                !isSubtitleArtifact(path) &&
-                File(path).exists()
+            isMediaPath(path) && File(path).exists()
         }
     }
 
     private fun handlePythonProgress(task: RunningYtDlpTask, rawPayload: String) {
         val payload = decodeJsonObject(rawPayload) ?: return
+        val phase = payload["phase"]?.toString()?.trim().orEmpty()
         val status = payload["status"]?.toString()?.trim().orEmpty()
         val outputPath = payload["outputPath"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-        val progress = when (val value = payload["downloadedBytes"]) {
-            is Number -> {
-                val total = (payload["totalBytes"] as? Number)?.toDouble()
-                if (total != null && total > 0) value.toDouble() / total else null
-            }
-            else -> null
-        }
-        val downloadedBytes = (payload["downloadedBytes"] as? Number)?.toLong()
-        val totalBytes = (payload["totalBytes"] as? Number)?.toLong()
+        val overallProgress = (payload["overallProgress"] as? Number)?.toDouble()
+        val downloadedBytes =
+            (payload["overallDownloadedBytes"] as? Number)?.toLong()
+                ?: (payload["downloadedBytes"] as? Number)?.toLong()
+        val totalBytes =
+            (payload["overallTotalBytes"] as? Number)?.toLong()
+                ?: (payload["totalBytes"] as? Number)?.toLong()
         trackProducedPath(task, outputPath)
         if (downloadedBytes != null) {
             task.downloadedBytes = downloadedBytes
@@ -1290,11 +1581,46 @@ class MainActivity : AudioServiceFragmentActivity() {
         task.speedText = payload["speedText"]?.toString() ?: task.speedText
         task.etaText = payload["etaText"]?.toString() ?: task.etaText
 
+        if (phase == "post_processing") {
+            val postprocessor = payload["postprocessor"]?.toString()?.trim()
+            task.status = "post_processing"
+            task.progress = maxOf(task.progress ?: 0.0, 0.92)
+            task.message = buildPostProcessorMessage(postprocessor, status)
+            emitTaskEvent(
+                taskId = task.taskId,
+                type = "task_post_processing",
+                progress = task.progress,
+                downloadedBytes = task.downloadedBytes,
+                totalBytes = task.totalBytes,
+                speedText = task.speedText,
+                etaText = task.etaText,
+                outputPath = task.outputPath,
+                producedPaths = snapshotProducedPaths(task),
+                message = task.message,
+            )
+            return
+        }
+
+        val mediaKind = payload["mediaKind"]?.toString()?.trim().orEmpty()
+        val formatId = payload["formatId"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        val fragmentIndex = (payload["fragmentIndex"] as? Number)?.toInt()
+        val fragmentCount = (payload["fragmentCount"] as? Number)?.toInt()
+        val stagedProgress = overallProgress?.let {
+            mapMediaDownloadProgress(it)
+        }
+
         when (status) {
             "downloading" -> {
                 task.status = "downloading"
-                task.progress = progress ?: task.progress
-                task.message = "下载中"
+                if (stagedProgress != null) {
+                    task.progress = maxOf(task.progress ?: 0.0, stagedProgress)
+                }
+                task.message = buildDownloadStageMessage(
+                    mediaKind = mediaKind,
+                    formatId = formatId,
+                    fragmentIndex = fragmentIndex,
+                    fragmentCount = fragmentCount,
+                )
                 emitTaskEvent(
                     taskId = task.taskId,
                     type = "task_progress",
@@ -1309,8 +1635,10 @@ class MainActivity : AudioServiceFragmentActivity() {
                 )
             }
             "finished" -> {
-                task.progress = progress ?: task.progress
-                task.message = "下载片段完成，等待后续处理"
+                if (stagedProgress != null) {
+                    task.progress = maxOf(task.progress ?: 0.0, stagedProgress)
+                }
+                task.message = "${downloadKindLabel(mediaKind)}下载完成，准备下一阶段"
                 emitTaskEvent(
                     taskId = task.taskId,
                     type = "task_step",
@@ -1325,6 +1653,46 @@ class MainActivity : AudioServiceFragmentActivity() {
                 )
             }
         }
+    }
+
+    private fun mapMediaDownloadProgress(overallProgress: Double): Double {
+        return (overallProgress.coerceIn(0.0, 1.0) * 0.90).coerceIn(0.0, 0.90)
+    }
+
+    private fun downloadKindLabel(mediaKind: String): String {
+        return when (mediaKind) {
+            "video" -> "视频轨道"
+            "audio" -> "音频轨道"
+            else -> "媒体文件"
+        }
+    }
+
+    private fun buildDownloadStageMessage(
+        mediaKind: String,
+        formatId: String?,
+        fragmentIndex: Int?,
+        fragmentCount: Int?,
+    ): String {
+        val details = mutableListOf<String>()
+        if (!formatId.isNullOrBlank()) {
+            details.add("格式 $formatId")
+        }
+        if (fragmentIndex != null && fragmentCount != null && fragmentCount > 0) {
+            details.add("分片 $fragmentIndex/$fragmentCount")
+        }
+        val suffix = if (details.isEmpty()) "" else " · ${details.joinToString(" · ")}"
+        return "正在下载${downloadKindLabel(mediaKind)}$suffix"
+    }
+
+    private fun buildPostProcessorMessage(postprocessor: String?, status: String): String {
+        val action = when {
+            postprocessor?.contains("merger", ignoreCase = true) == true -> "合并音视频"
+            postprocessor?.contains("thumbnail", ignoreCase = true) == true -> "处理封面"
+            postprocessor?.contains("metadata", ignoreCase = true) == true -> "写入媒体信息"
+            postprocessor?.contains("subtitle", ignoreCase = true) == true -> "处理字幕"
+            else -> "处理下载产物"
+        }
+        return if (status == "finished") "$action 已完成" else "正在$action"
     }
 
     private inner class PythonTaskCallback(
@@ -1429,36 +1797,44 @@ class MainActivity : AudioServiceFragmentActivity() {
             val eta = parseEta(line)
 
             if (progress != null) {
-                task.status = "downloading"
-                task.progress = progress
+                // Structured Python hooks provide track-aware progress. The
+                // textual percentage resets for each stream and would make the
+                // overall bar jump backwards or reach 100% before audio/merge.
                 task.speedText = speed ?: task.speedText
                 task.etaText = eta ?: task.etaText
-                task.message = "下载中"
-                emitTaskEvent(
-                    taskId = task.taskId,
-                    type = "task_progress",
-                    progress = task.progress,
-                    downloadedBytes = task.downloadedBytes,
-                    totalBytes = task.totalBytes,
-                    speedText = task.speedText,
-                    etaText = task.etaText,
-                    outputPath = task.outputPath,
-                    message = task.message,
-                )
             } else if (line.contains("has already been downloaded")) {
-                task.progress = 1.0
+                task.progress = maxOf(task.progress ?: 0.0, 0.90)
                 task.message = "文件已存在，标记为完成"
             }
         }
     }
 
     private fun buildTaskStepMessage(line: String): String? {
+        val lower = line.lowercase()
+        if (lower.contains("retrying fragment") ||
+            (lower.contains("fragment") && lower.contains("retry"))
+        ) {
+            return "分片请求暂时失败，正在重试（最多 2 次）"
+        }
+        if (lower.contains("sleeping") || lower.contains("sleep interval")) {
+            return "服务端要求暂时等待，yt-dlp 将自动继续"
+        }
+        if (lower.contains("timed out") || lower.contains("timeout")) {
+            return "网络响应超时，等待 yt-dlp 重试"
+        }
         if (line.startsWith("[download]")) {
             if (parseProgress(line) != null) {
                 return null
             }
             if (line.contains("has already been downloaded")) {
                 return "文件已存在，直接复用"
+            }
+            val fragmentCount = Regex(
+                "Downloading\\s+(\\d+)\\s+fragments?",
+                RegexOption.IGNORE_CASE,
+            ).find(line)?.groupValues?.getOrNull(1)
+            if (fragmentCount != null) {
+                return "开始下载 $fragmentCount 个媒体分片"
             }
             if (line.contains("Destination:")) {
                 return shortenTaskMessage(line)
@@ -1538,7 +1914,23 @@ class MainActivity : AudioServiceFragmentActivity() {
 
     private fun isTransientArtifact(path: String): Boolean {
         val lowerPath = path.lowercase(Locale.ROOT)
-        return lowerPath.endsWith(".part") || lowerPath.endsWith(".ytdl")
+        return lowerPath.endsWith(".part") ||
+            lowerPath.endsWith(".ytdl") ||
+            lowerPath.endsWith(".tmp") ||
+            lowerPath.endsWith(".temp") ||
+            lowerPath.endsWith(".frag")
+    }
+
+    private fun cleanupAndroidStagedArtifacts(task: RunningYtDlpTask) {
+        val key = task.debugContext["androidTempArtifactKey"]?.toString()?.trim()
+        if (key.isNullOrEmpty()) return
+        val safeKey = key.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        val prefix = "ytdlp_${safeKey}_"
+        val outputDirectory = File(task.outputDir)
+        if (!outputDirectory.exists()) return
+        outputDirectory.walkTopDown()
+            .filter { it.isFile && it.name.startsWith(prefix) }
+            .forEach { file -> runCatching { file.delete() } }
     }
 
     private fun trackProducedPath(task: RunningYtDlpTask, path: String?) {

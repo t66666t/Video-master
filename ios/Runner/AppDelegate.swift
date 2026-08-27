@@ -7,13 +7,16 @@ import UIKit
   private let shareEventChannelName = "com.example.video_player_app/share_intent_events"
   private let ytDlpChannelName = "com.example.video_player_app/yt_dlp"
   private let ytDlpEventChannelName = "com.example.video_player_app/yt_dlp_events"
-  private var pendingSharedMediaPaths: [String] = []
+  private var pendingSharedItems: [Any] = []
   private var shareEventSink: FlutterEventSink?
   fileprivate var ytDlpEventSink: FlutterEventSink?
   private let mediaExtensions: Set<String> = [
     ".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm", ".wmv", ".3gp", ".m4v", ".ts",
     ".rmvb", ".mpg", ".mpeg", ".f4v", ".m2ts", ".mts", ".vob", ".ogv", ".divx",
     ".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac", ".wma", ".opus", ".m4b", ".aiff",
+  ]
+  private let archiveSuffixes: [String] = [
+    ".zip", ".tar", ".tgz", ".tar.gz", ".tbz", ".tbz2", ".tar.bz2", ".txz", ".tar.xz",
   ]
 
   override func application(
@@ -65,8 +68,8 @@ import UIKit
         return
       }
       if call.method == "getInitialSharedMedia" {
-        result(self.pendingSharedMediaPaths)
-        self.pendingSharedMediaPaths.removeAll()
+        result(self.pendingSharedItems)
+        self.pendingSharedItems.removeAll()
       } else {
         result(FlutterMethodNotImplemented)
       }
@@ -133,14 +136,26 @@ import UIKit
   }
 
   private func handleIncomingUrls(_ urls: [URL]) -> Bool {
-    let paths = urls.compactMap { copyIncomingFileToCache($0) }.filter { isMediaPath($0) }
-    if paths.isEmpty {
+    let supportedUrls = urls.filter { isMediaPath($0.path) || isArchivePath($0.path) }
+    if supportedUrls.isEmpty {
       return false
     }
-    if let sink = shareEventSink {
-      sink(paths)
-    } else {
-      pendingSharedMediaPaths.append(contentsOf: paths)
+
+    // File-provider URLs may point to very large archives. Copying them in
+    // application(_:open:) blocks iOS's main thread and can make the app look
+    // frozen or be terminated by the watchdog, so materialize them off-main.
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self else { return }
+      let items = supportedUrls.compactMap { self.makeIncomingItem($0) }
+      guard !items.isEmpty else { return }
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        if let sink = self.shareEventSink {
+          sink(items)
+        } else {
+          self.pendingSharedItems.append(contentsOf: items)
+        }
+      }
     }
     return true
   }
@@ -153,7 +168,32 @@ import UIKit
     return mediaExtensions.contains(".\(ext)")
   }
 
-  private func copyIncomingFileToCache(_ url: URL) -> String? {
+  private func isArchivePath(_ path: String) -> Bool {
+    let lower = path.lowercased()
+    return archiveSuffixes.contains { lower.hasSuffix($0) }
+  }
+
+  private func makeIncomingItem(_ url: URL) -> Any? {
+    let isArchive = isArchivePath(url.path)
+    guard isArchive || isMediaPath(url.path) else { return nil }
+    let cacheDirectoryName = isArchive ? "picked_archives" : "incoming_media"
+    guard let path = copyIncomingFileToCache(url, directoryName: cacheDirectoryName) else {
+      return nil
+    }
+    if !isArchive {
+      return path
+    }
+    let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+    let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+    return [
+      "kind": "archive",
+      "displayName": url.lastPathComponent,
+      "sizeBytes": size,
+      "path": path,
+    ] as [String: Any]
+  }
+
+  private func copyIncomingFileToCache(_ url: URL, directoryName: String) -> String? {
     guard url.isFileURL else { return nil }
     let accessing = url.startAccessingSecurityScopedResource()
     defer {
@@ -162,7 +202,7 @@ import UIKit
       }
     }
     let fileManager = FileManager.default
-    let incomingDir = fileManager.temporaryDirectory.appendingPathComponent("incoming_media", isDirectory: true)
+    let incomingDir = fileManager.temporaryDirectory.appendingPathComponent(directoryName, isDirectory: true)
     if !fileManager.fileExists(atPath: incomingDir.path) {
       do {
         try fileManager.createDirectory(at: incomingDir, withIntermediateDirectories: true)

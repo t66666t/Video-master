@@ -7,29 +7,37 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:cross_file/cross_file.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path/path.dart' as p;
 import '../services/embedded_subtitle_service.dart';
+import '../services/audio_playback_compatibility_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
+import '../services/playback_orientation_transition.dart';
 import '../services/playlist_manager.dart';
 import '../services/system_media_session_service.dart';
-import '../utils/subtitle_parser.dart';
-import '../utils/subtitle_converter.dart';
-import '../utils/youtube_auto_caption_normalizer.dart';
+import '../services/subtitle_timeline_resolver.dart';
 import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/video_item.dart';
+import '../models/media_chapter.dart';
+import '../models/managed_subtitle_asset.dart';
+import '../models/ocr_subtitle_models.dart';
+import 'music_player_screen.dart'; // Experimental Apple Music page
 import '../services/settings_service.dart';
 import '../services/library_service.dart';
+import '../services/task_subtitle_storage_service.dart';
 import '../widgets/subtitle_overlay.dart';
+import '../widgets/subtitle_display_layer.dart';
+import '../models/subtitle_display_state.dart';
 import '../widgets/video_controls_overlay.dart';
+import '../widgets/player_control_metrics.dart';
+import '../widgets/danmaku_overlay.dart';
+import '../widgets/danmaku_settings_dialog.dart';
 import '../widgets/episode_picker_panel.dart';
 import '../widgets/settings_panel.dart';
 import '../widgets/subtitle_settings_sheet.dart';
@@ -39,26 +47,21 @@ import '../widgets/landscape_subtitle_editor_sidebar.dart';
 import '../widgets/subtitle_management_sheet.dart';
 import '../widgets/ai_transcription_panel.dart';
 import '../widgets/video_compose_panel.dart';
+import '../widgets/ocr_subtitle_panel.dart';
+import '../widgets/chapter_sidebar.dart';
 import '../services/transcription_manager.dart';
+import '../services/ocr_subtitle_manager.dart';
+import '../services/subtitle_discovery_service.dart';
+import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
 import '../utils/subtitle_drag_snap.dart';
-
-List<Map<String, Object?>> _parseTextSubtitlesToSerializable(String content) {
-  final parsed = SubtitleParser.parse(content);
-  final result = <Map<String, Object?>>[];
-  for (final item in parsed) {
-    result.add(<String, Object?>{
-      'i': item.index,
-      's': item.startTime.inMilliseconds,
-      'e': item.endTime.inMilliseconds,
-      't': item.text,
-    });
-  }
-  return result;
-}
+import '../utils/subtitle_file_matcher.dart';
+import '../utils/subtitle_file_picker.dart';
+import '../utils/video_gesture_session_gate.dart';
 
 enum SidebarType {
   none,
+  chapters,
   subtitles,
   settings,
   subtitleStyle,
@@ -67,6 +70,7 @@ enum SidebarType {
   subtitleEditor,
   aiTranscription,
   videoCompose,
+  ocrSubtitle,
 }
 
 class VideoPlayerScreen extends StatefulWidget {
@@ -95,27 +99,46 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   final FocusNode _selectionFocusNode = FocusNode();
   final FocusNode _videoFocusNode =
       FocusNode(); // New: Dedicated focus node for video controls
+  final FocusNode _playbackPageFocusNode = FocusNode(
+    debugLabel: 'PlaybackPageShortcutFocus',
+  );
+  final GlobalKey<VideoControlsOverlayState> _controlsKey =
+      GlobalKey<VideoControlsOverlayState>();
+  final GlobalKey _videoTextureKey = GlobalKey(
+    debugLabel: 'LandscapePlaybackVideoTexture',
+  );
+  final ValueNotifier<bool> _playbackControlsVisibility = ValueNotifier(true);
   final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey =
       GlobalKey<SubtitleSidebarState>();
   late VideoPlayerController _controller;
   bool _controllerAssigned = false;
   bool _initialized = false;
+  bool _isSourceMissing = false;
   bool _isPlaying = false;
   bool _isControllerOwner = true; // Track ownership
   bool _isSubtitleSidebarVisible = true;
   bool _initialControllerConsumed = false;
   bool _isLandscapeViewportReady = true;
+  bool _isOrientationTransitioning = false;
+  bool get _supportsOcrSubtitle =>
+      Platform.isAndroid ||
+      Platform.isIOS ||
+      Platform.isWindows ||
+      Platform.isMacOS;
 
   // Local UI State
   bool _isLocked = false;
   bool _isLongPressing = false;
   String _longPressFeedbackText = "";
   double _preLongPressSpeed = 1.0;
+  MediaPlaybackService? _longPressPlaybackService;
 
   // Sidebar
   SidebarType _activeSidebar = SidebarType.none;
   SidebarType _previousSidebarType = SidebarType.none;
   bool get _isSidebarOpen => _activeSidebar != SidebarType.none;
+  bool get _suppressSubtitleOverlayForOcr =>
+      _activeSidebar == SidebarType.ocrSubtitle;
   bool _isResizingSidebar = false;
   double? _subtitleSidebarWidthOverride;
   bool _forceExit = false;
@@ -142,6 +165,85 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       return mediaQuery.orientation == Orientation.landscape;
     }
     return true;
+  }
+
+  bool get _usesAndroidPhoneOrientationBridge {
+    if (kIsWeb || !Platform.isAndroid || !mounted) return false;
+    if (widget.existingController == null) return false;
+    final display = View.of(context).display;
+    final pixelRatio = display.devicePixelRatio;
+    return pixelRatio > 0 && display.size.shortestSide / pixelRatio < 600;
+  }
+
+  Future<bool> _waitForPlaybackViewport(PlaybackViewportOrientation target) {
+    final view = View.of(context);
+    return PlaybackOrientationTransition.waitForViewport(
+      readSize: () => view.physicalSize,
+      waitForFrame: () => WidgetsBinding.instance.endOfFrame,
+      target: target,
+      readStabilitySignature: () =>
+          PlaybackOrientationTransition.metricsSignature(view),
+    );
+  }
+
+  Future<void> _showOrientationBridge() async {
+    if (!_usesAndroidPhoneOrientationBridge || !mounted) return;
+    setState(() {
+      _isOrientationTransitioning = true;
+    });
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  Future<void> _returnToPortrait({bool saveExitState = true}) async {
+    if (_isOrientationTransitioning) return;
+    final navigator = Navigator.of(context);
+    final useOrientationBridge = _usesAndroidPhoneOrientationBridge;
+    if (useOrientationBridge) {
+      await _showOrientationBridge();
+      if (!mounted) return;
+    }
+
+    try {
+      if (saveExitState) {
+        await _cancelPendingPlaybackIfNeeded();
+        await _handleExit();
+        if (!mounted) return;
+      }
+    } catch (error) {
+      debugPrint('Saving landscape exit state failed: $error');
+    }
+
+    try {
+      if (widget.existingController == null) {
+        await SystemChrome.setPreferredOrientations(<DeviceOrientation>[]);
+      } else {
+        await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+          DeviceOrientation.portraitUp,
+          DeviceOrientation.portraitDown,
+        ]);
+        if (useOrientationBridge) {
+          final reachedPortrait = await _waitForPlaybackViewport(
+            PlaybackViewportOrientation.portrait,
+          );
+          if (!reachedPortrait) {
+            debugPrint(
+              'Playback orientation transition: portrait viewport timed out.',
+            );
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint(
+        'Playback orientation transition: portrait request failed: $error',
+      );
+    }
+    if (mounted) navigator.pop();
+  }
+
+  Future<void> _forceExitPlayer() async {
+    if (_isOrientationTransitioning) return;
+    _forceExit = true;
+    await _returnToPortrait();
   }
 
   double _getMaxResizableSidebarWidth(BuildContext context) {
@@ -181,6 +283,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       return effectiveSubtitleSidebarWidth + _subtitleSidebarResizerLayoutWidth;
     }
     final screenWidth = MediaQuery.of(context).size.width;
+    if (_activeSidebar == SidebarType.chapters) {
+      return screenWidth < 600
+          ? screenWidth * 0.78
+          : (screenWidth * 0.3).clamp(300.0, 440.0);
+    }
     final isSmallScreen = screenWidth < 600;
     return isSmallScreen ? (screenWidth * 0.75).clamp(240.0, 300.0) : 320.0;
   }
@@ -263,6 +370,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     return _initialized &&
         !_isAudio &&
         !_isLocked &&
+        !_isLongPressing &&
+        !_videoGestureSession.blocksTransforms &&
         !_isSubtitleDragMode &&
         !_isGhostDragMode &&
         !_isStyleSidebarDragMode;
@@ -330,6 +439,97 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
 
     return Size(width, height);
+  }
+
+  List<Rect> _playbackControlAvoidanceRects({
+    required BuildContext context,
+    required Size playerSize,
+    required PlayerControlMetrics metrics,
+    required double clearance,
+  }) {
+    final double baseControlsTop =
+        playerSize.height -
+        metrics.bottomControlsHeight(hasChapterButton: false) -
+        clearance;
+    final rects = <Rect>[
+      Rect.fromLTRB(0, baseControlsTop, playerSize.width, playerSize.height),
+    ];
+
+    final chapters = _currentItem?.chapters ?? const <MediaChapter>[];
+    if (chapters.isEmpty) return rects;
+
+    final Duration position = _controllerAssigned
+        ? _controller.value.position
+        : Duration.zero;
+    final MediaChapter chapter =
+        MediaChapter.atPosition(chapters, position) ?? chapters.first;
+    final TextDirection textDirection = Directionality.of(context);
+    final TextStyle chapterTextStyle = DefaultTextStyle.of(context).style.merge(
+      TextStyle(
+        color: Colors.white,
+        fontSize: (13 * metrics.scale).clamp(10.0, 13.0).toDouble(),
+        fontWeight: FontWeight.w600,
+      ),
+    );
+    final double iconSize = (18 * metrics.scale).clamp(16.0, 18.0).toDouble();
+    final double contentGap = (5 * metrics.scale).clamp(3.0, 5.0).toDouble();
+    final double horizontalPadding = (12 * metrics.scale)
+        .clamp(9.0, 12.0)
+        .toDouble();
+    final double measurementSlack = (4 * metrics.scale)
+        .clamp(3.0, 4.0)
+        .toDouble();
+    final TextPainter painter = TextPainter(
+      text: TextSpan(text: chapter.title, style: chapterTextStyle),
+      maxLines: 1,
+      textDirection: textDirection,
+      textScaler: MediaQuery.textScalerOf(context),
+      locale: Localizations.maybeLocaleOf(context),
+      textWidthBasis: TextWidthBasis.longestLine,
+    )..layout();
+
+    final double trackInset = math.max(
+      metrics.overlayRadius,
+      metrics.thumbRadius,
+    );
+    final double sliderWidth = math
+        .max(0, playerSize.width - (metrics.bottomHorizontalPadding * 2))
+        .toDouble();
+    final double maxButtonWidth = math
+        .max(
+          0,
+          (sliderWidth - (trackInset * 2)) * metrics.chapterButtonWidthFactor,
+        )
+        .toDouble();
+    final double measuredButtonWidth =
+        (horizontalPadding * 2) +
+        contentGap +
+        iconSize +
+        painter.width +
+        measurementSlack;
+    final double buttonWidth = math.min(maxButtonWidth, measuredButtonWidth);
+    final double buttonLeft = metrics.bottomHorizontalPadding + trackInset;
+    final double buttonTop =
+        playerSize.height -
+        metrics.bottomPadding -
+        metrics.bottomRowHeight -
+        metrics.progressHitHeight -
+        metrics.chapterButtonHeight -
+        clearance;
+    final double buttonBottom =
+        playerSize.height -
+        metrics.bottomPadding -
+        metrics.bottomRowHeight -
+        metrics.progressHitHeight;
+    rects.add(
+      Rect.fromLTRB(
+        buttonLeft,
+        buttonTop,
+        buttonLeft + buttonWidth,
+        buttonBottom,
+      ),
+    );
+    return rects;
   }
 
   double _normalizeVideoRotation(double radians) {
@@ -486,6 +686,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     bool isVisualOnly = false,
     bool animateAlignment = false,
     bool enablePanUpdate = false,
+    ValueListenable<SubtitleDisplayState>? displayNotifier,
+    ValueListenable<bool>? playbackControlsVisibility,
+    double? playbackControlsTop,
+    List<Rect> Function()? playbackControlRects,
+    bool avoidPlaybackControls = false,
   }) {
     if (videoSize.width <= 0 || videoSize.height <= 0) {
       return const SizedBox.shrink();
@@ -494,14 +699,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     Widget overlay = SizedBox(
       width: videoSize.width,
       height: videoSize.height,
-      child: SubtitleOverlayGroup(
-        entries: _currentSubtitleEntries,
+      child: SubtitleDisplayLayer(
+        notifier: displayNotifier ?? subtitleDisplayNotifier,
         alignment: alignment,
         style: style,
         isDragging: isDragging,
         isGestureOnly: isGestureOnly,
         isVisualOnly: isVisualOnly,
         animateAlignment: animateAlignment,
+        playbackControlsVisibility: playbackControlsVisibility,
+        playbackControlsTop: playbackControlsTop,
+        playbackControlRects: playbackControlRects,
+        avoidPlaybackControls: avoidPlaybackControls,
       ),
     );
 
@@ -519,6 +728,53 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     );
   }
 
+  Widget _buildVideoBoundDanmakuOverlay({
+    required Size videoSize,
+    required double playerHeight,
+    required SettingsService settings,
+  }) {
+    final item = _currentItem;
+    final path = item?.danmakuPath;
+    if (item == null ||
+        !item.isBilibiliExported ||
+        path == null ||
+        path.isEmpty ||
+        !settings.showBilibiliDanmaku ||
+        videoSize.isEmpty ||
+        !File(path).existsSync()) {
+      return const SizedBox.shrink();
+    }
+    final position = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    ).positionNotifier;
+    final overlay = DanmakuOverlay(
+      path: path,
+      position: position,
+      displayArea: settings.bilibiliDanmakuDisplayArea,
+      opacity: settings.bilibiliDanmakuOpacity,
+      fontScale: settings.bilibiliDanmakuFontScale,
+      speed: settings.bilibiliDanmakuSpeed,
+      fontFamily: settings.bilibiliDanmakuFontFamily,
+      fontWeight: settings.bilibiliDanmakuFontWeight,
+      outlineType: settings.bilibiliDanmakuOutlineType,
+      playerHeight: playerHeight,
+    );
+    return Positioned.fill(
+      child: ClipRect(
+        child: settings.bilibiliDanmakuOnlyInVideoArea
+            ? Center(
+                child: SizedBox(
+                  width: videoSize.width,
+                  height: videoSize.height,
+                  child: overlay,
+                ),
+              )
+            : overlay,
+      ),
+    );
+  }
+
   Widget _buildFreeSubtitleOverlay({
     required Alignment alignment,
     required SubtitleStyle style,
@@ -528,19 +784,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     bool animateAlignment = false,
     bool enablePanUpdate = false,
     bool isGhost = false,
+    ValueListenable<SubtitleDisplayState>? displayNotifier,
+    ValueListenable<bool>? playbackControlsVisibility,
+    double? playbackControlsTop,
+    List<Rect> Function()? playbackControlRects,
+    bool avoidPlaybackControls = false,
   }) {
     return Positioned.fill(
       child: LayoutBuilder(
         builder: (context, constraints) {
           Widget overlay = SizedBox.expand(
-            child: SubtitleOverlayGroup(
-              entries: _currentSubtitleEntries,
+            child: SubtitleDisplayLayer(
+              notifier: displayNotifier ?? subtitleDisplayNotifier,
               alignment: alignment,
               style: style,
               isDragging: isDragging,
               isGestureOnly: isGestureOnly,
               isVisualOnly: isVisualOnly,
               animateAlignment: animateAlignment,
+              playbackControlsVisibility: playbackControlsVisibility,
+              playbackControlsTop: playbackControlsTop,
+              playbackControlRects: playbackControlRects,
+              avoidPlaybackControls: avoidPlaybackControls,
             ),
           );
 
@@ -608,6 +873,41 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     ).animate(progress);
     _videoTransformAnimationController.duration = duration;
     _videoTransformAnimationController.forward(from: 0);
+  }
+
+  /// 实验性功能：五连击标题进入 Apple Music 风格播放页面
+  Future<void> _navigateToMusicPlayer() async {
+    final service = Provider.of<MediaPlaybackService>(context, listen: false);
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => MusicPlayerScreen(
+          coverImagePath: _currentItem?.thumbnailPath,
+          title: _currentItem?.title ?? '',
+          onSeek: (pos) => service.seekTo(pos),
+          onPlayPause: () {
+            if (service.isPlaying) {
+              service.pause();
+            } else {
+              service.resume();
+            }
+          },
+          onPrevious: () =>
+              service.playPrevious(autoPlay: settings.autoPlayNextVideo),
+          onNext: () => service.playNext(autoPlay: settings.autoPlayNextVideo),
+        ),
+        fullscreenDialog: true,
+      ),
+    );
+    // 从音乐播放页切回视频播放页完成：将字幕文稿自动定位到当前字幕，
+    // 同时修复切回时字幕文稿显示区偶发空白的问题。
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _subtitleSidebarKey.currentState?.locateToCurrentSubtitle(
+        ignorePointer: true,
+      );
+    });
   }
 
   void _resetVideoUserTransform({bool animated = true}) {
@@ -775,6 +1075,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _handleVideoTransformPointerDown(PointerDownEvent event) {
+    // Keep an independent view of every pointer in this player. This is also
+    // updated while transform gestures are locked so that a finger left on
+    // screen after long-press ends cannot start a new transform session.
+    _videoGestureSession.pointerDown(event.pointer);
     if (!_canUseVideoTransformGestures ||
         !_isWithinVideoViewport(event.localPosition)) {
       return;
@@ -808,6 +1112,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _handleVideoTransformPointerEnd(int pointer) {
+    _videoGestureSession.pointerUp(pointer);
+
+    if (_videoGestureSession.blocksTransforms) {
+      _activeVideoTransformPointers.remove(pointer);
+      return;
+    }
+
     final bool wasTracking =
         _activeVideoTransformPointers.remove(pointer) != null;
     if (!wasTracking) return;
@@ -822,6 +1133,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   List<SubtitleItem> _subtitles = [];
   List<SubtitleItem> _secondarySubtitles = []; // New: Secondary subtitle list
   List<String> _currentSubtitlePaths = []; // Track loaded paths
+  int _subtitleRevision = -1;
   String _currentSubtitleText = "";
   String? _currentSecondaryText; // New: Secondary text state
   Uint8List? _currentSubtitleImage;
@@ -831,16 +1143,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   List<int> _currentSecondarySubtitleIndices = [];
   List<SubtitleOverlayEntry> _currentSubtitleEntries = [];
   final Map<int, Uint8List?> _currentSubtitleImages = <int, Uint8List?>{};
+
+  /// 字幕显示状态通知器 — 字幕更新时仅重建字幕叠加层，不触发整页 setState。
+  final ValueNotifier<SubtitleDisplayState> subtitleDisplayNotifier =
+      ValueNotifier<SubtitleDisplayState>(SubtitleDisplayState.empty);
+  final VideoComposePreviewController _videoComposePreviewController =
+      VideoComposePreviewController();
+  bool _videoComposePreviewActive = false;
   int _subtitleImageRequestId = 0;
-  int _lastSubtitleIndex = 0;
-  int _lastSecondarySubtitleIndex = 0; // New: Secondary index tracking
-  final List<int> _subtitleStartMs = <int>[];
-  final List<int> _secondarySubtitleStartMs = <int>[];
+  SubtitleTimelineResolver _subtitleTimeline = SubtitleTimelineResolver(
+    const <SubtitleItem>[],
+  );
+  SubtitleTimelineResolver _secondarySubtitleTimeline =
+      SubtitleTimelineResolver(const <SubtitleItem>[]);
   Timer? _subtitleSeekTimer;
   bool _isParsingSubtitles = false;
-  int _subtitleParseRequestId = 0;
-  final Map<String, List<SubtitleItem>> _subtitleCache =
-      <String, List<SubtitleItem>>{};
   bool _userRequestedSubtitles = false;
 
   // Subtitle Positioning Mode
@@ -868,6 +1185,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool _isVideoTransformGestureActive = false;
   Rect _lastVideoViewportRect = Rect.zero;
   final Map<int, Offset> _activeVideoTransformPointers = <int, Offset>{};
+  // Once touch long-press wins a gesture session, transform gestures stay
+  // suppressed until every finger from that session has left the screen.
+  // Merely clearing this when the primary long-press finger lifts would let a
+  // remaining second finger accidentally zoom or rotate the video.
+  final VideoGestureSessionGate _videoGestureSession =
+      VideoGestureSessionGate();
   Offset _gestureStartFocalPoint = Offset.zero;
   Offset _gestureCurrentFocalPoint = Offset.zero;
   Offset _gestureStartPointerA = Offset.zero;
@@ -909,6 +1232,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   TranscriptionManager? _transcriptionManager;
+  OcrSubtitleManager? _ocrSubtitleManager;
   VideoItem? _currentItem;
   SettingsService? _settingsService;
   bool? _lastShowSubtitles;
@@ -943,13 +1267,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         });
       });
     WidgetsBinding.instance.addObserver(this);
+    FocusManager.instance.addEarlyKeyEventHandler(_handlePlaybackEarlyKeyEvent);
     _keyboardInsetBottom.value = _readBottomViewInset();
     _currentItem = widget.videoItem;
     _isLandscapeViewportReady =
         kIsWeb ||
         !(Platform.isAndroid || Platform.isIOS) ||
         _isCurrentPhysicalLandscape();
-    if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+    // A handed-off controller means the source page already completed the
+    // physical orientation change. Repeating the platform request here can
+    // make some OEMs start a second window transition after the route appears.
+    if (!kIsWeb &&
+        (Platform.isAndroid || Platform.isIOS) &&
+        widget.existingController == null) {
       unawaited(
         SystemChrome.setPreferredOrientations([
           DeviceOrientation.landscapeLeft,
@@ -984,6 +1314,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         playbackService.addListener(_onPlaybackServiceChange);
         // 横屏播放页禁用自动播放下一集，视频播放完成后暂停
         playbackService.autoPlayNextEnabled = false;
+        // Re-sync subtitles from the service to catch any subtitle changes
+        // that occurred between _initVideo and listener registration.
+        // This fixes the race condition where the portrait page finishes
+        // loading subtitles (and calls setSubtitleState → notifyListeners)
+        // after _initVideo already read the old state but before this
+        // listener was registered, causing the notification to be missed.
+        _syncSubtitlesFromService(playbackService);
+        _onPlaybackServiceChange();
       }
     });
 
@@ -1159,9 +1497,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   String? _resolveFirstAssociatedSubtitlePath(VideoItem item) {
-    final additional = item.additionalSubtitles;
-    if (additional == null || additional.isEmpty) return null;
-    for (final path in additional.values) {
+    final associated = item.downloadAssociatedSubtitles;
+    if (associated.isEmpty) return null;
+    for (final path in associated.values) {
       if (path.isEmpty) continue;
       final normalized = p.normalize(path);
       if (File(normalized).existsSync()) {
@@ -1281,57 +1619,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _controller.addListener(_videoListener);
   }
 
-  bool _shouldKeepLocalSubtitleStateOnServiceClear(
-    MediaPlaybackService service,
-  ) {
-    if (service.subtitlePaths.isNotEmpty ||
-        service.subtitles.isNotEmpty ||
-        service.secondarySubtitles.isNotEmpty) {
-      return false;
-    }
-    if (_currentSubtitlePaths.isEmpty &&
-        _subtitles.isEmpty &&
-        _secondarySubtitles.isEmpty) {
-      return false;
-    }
-    final currentItem = _currentItem;
-    if (currentItem == null) {
-      return false;
+  void _showMissingSource(VideoItem item) {
+    if (_isSourceMissing && _controllerAssigned) {
+      return;
     }
 
-    // 构建当前视频已知的所有字幕路径集合
-    final Set<String> expectedPaths = <String>{};
-    if (currentItem.subtitlePath != null &&
-        currentItem.subtitlePath!.isNotEmpty) {
-      expectedPaths.add(p.normalize(currentItem.subtitlePath!));
+    VideoPlayerController? previousController;
+    final bool disposePrevious = _controllerAssigned && _isControllerOwner;
+    if (_controllerAssigned) {
+      previousController = _controller;
+      try {
+        previousController.removeListener(_videoListener);
+      } catch (_) {}
     }
-    if (currentItem.secondarySubtitlePath != null &&
-        currentItem.secondarySubtitlePath!.isNotEmpty) {
-      expectedPaths.add(p.normalize(currentItem.secondarySubtitlePath!));
-    }
-    final associated = currentItem.additionalSubtitles;
-    if (associated != null) {
-      for (final path in associated.values) {
-        if (path.isNotEmpty) {
-          expectedPaths.add(p.normalize(path));
-        }
-      }
-    }
-    final String? associatedPath = _resolveFirstAssociatedSubtitlePath(
-      currentItem,
+
+    _controller = VideoPlayerController.file(
+      File(item.path),
+      videoPlayerOptions: MediaPlaybackService.buildVideoPlayerOptions(
+        settings: _settingsService ?? SettingsService(),
+      ),
     );
-    if (associatedPath != null && associatedPath.isNotEmpty) {
-      expectedPaths.add(p.normalize(associatedPath));
+    _controllerAssigned = true;
+    _isControllerOwner = true;
+    _bindControllerListener();
+
+    if (disposePrevious && previousController != null) {
+      unawaited(previousController.dispose());
     }
 
-    // 只有当本地字幕路径确实属于当前视频时才保留，
-    // 防止切换视频后残留上一个视频的字幕状态。
-    for (final path in _currentSubtitlePaths) {
-      if (expectedPaths.contains(p.normalize(path))) {
-        return true;
-      }
-    }
-    return false;
+    if (!mounted) return;
+    setState(() {
+      _currentItem = item;
+      _isAudio = item.type == MediaType.audio;
+      _isSourceMissing = true;
+      _initialized = false;
+      _isPlaying = false;
+      _fatalErrorMessage = null;
+    });
   }
 
   void _onPlaybackServiceChange() {
@@ -1344,14 +1668,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     );
 
     if (service.currentItem?.id == _currentItem?.id &&
+        service.isSourceMissing) {
+      _showMissingSource(service.currentItem!);
+      _syncSubtitlesFromService(service);
+      return;
+    }
+    if (service.currentItem?.id == _currentItem?.id &&
+        service.state == PlaybackState.loading &&
+        _isSourceMissing) {
+      setState(() => _isSourceMissing = false);
+    }
+
+    if (service.currentItem?.id == _currentItem?.id &&
         service.state == PlaybackState.error &&
         _fatalErrorMessage == null) {
-      final path = service.currentItem?.path;
-      if (path != null && path.isNotEmpty && !File(path).existsSync()) {
-        _setFatalError("媒体文件不存在，可能已被移动或删除");
-      } else {
-        _setFatalError("媒体加载失败");
-      }
+      _setFatalError("媒体加载失败");
       return;
     }
 
@@ -1363,14 +1694,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       );
 
       // 先移除旧控制器的监听器，防止状态冲突
+      VideoPlayerController? ownedControllerToDispose;
       if (_controllerAssigned) {
         try {
           _controller.removeListener(_videoListener);
         } catch (_) {}
+        if (_isControllerOwner) {
+          ownedControllerToDispose = _controller;
+        }
       }
 
       setState(() {
         _currentItem = service.currentItem;
+        _isSourceMissing = false;
         _initialized = false;
         _isPlaying = false; // Reset play state until init
         _fatalErrorMessage = null;
@@ -1386,77 +1722,91 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _currentSecondarySubtitleIndices = [];
         _currentSubtitleEntries = [];
         _currentSubtitleImages.clear();
+        subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
         _autoEmbeddedAttemptedForItemId = null;
         _suppressAutoEmbeddedForCurrentItem = false;
-        _subtitleCache.clear();
         _isParsingSubtitles = false;
         _embeddedSubtitleDetected = false;
-        _subtitleParseRequestId++;
         _userRequestedSubtitles = false;
-        _subtitleStartMs.clear();
-        _secondarySubtitleStartMs.clear();
+        _rebuildSubtitleIndex();
         // 重置控制器相关状态，让 _initVideo 重新设置
         _controllerAssigned = false;
         _isControllerOwner = false;
       });
+
+      if (ownedControllerToDispose != null) {
+        unawaited(ownedControllerToDispose.dispose());
+      }
 
       _applyItemSubtitlePreference(service.currentItem!, force: true);
 
       // 直接调用 _initVideo 来处理控制器的初始化和同步
       // 避免在这里直接设置 _controller，让 _initVideo 统一处理
       _initVideo();
-    } else if (!_initialized &&
-        service.currentItem?.id == _currentItem?.id &&
+    } else if (service.currentItem?.id == _currentItem?.id &&
         service.state != PlaybackState.loading &&
-        service.controller != null) {
+        service.controller != null &&
+        (!_initialized ||
+            !_controllerAssigned ||
+            !identical(_controller, service.controller))) {
       debugPrint(
         "VideoPlayerScreen: Service ready for current video. Re-initializing.",
       );
+      if (_controllerAssigned && !identical(_controller, service.controller)) {
+        final previousController = _controller;
+        final shouldDisposePrevious = _isControllerOwner;
+        try {
+          previousController.removeListener(_videoListener);
+        } catch (_) {}
+        setState(() {
+          _controllerAssigned = false;
+          _isControllerOwner = false;
+          _initialized = false;
+        });
+        if (shouldDisposePrevious) {
+          unawaited(previousController.dispose());
+        }
+      }
       // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
       _initVideo();
     } else if (service.currentItem?.id == _currentItem?.id) {
-      final bool pathsChanged = !_stringListEquals(
-        service.subtitlePaths,
-        _currentSubtitlePaths,
-      );
-      final bool primaryChanged = service.subtitles.length != _subtitles.length;
-      final bool secondaryChanged =
-          service.secondarySubtitles.length != _secondarySubtitles.length;
-      if (pathsChanged || primaryChanged || secondaryChanged) {
-        if (_shouldKeepLocalSubtitleStateOnServiceClear(service)) {
-          return;
-        }
-        setState(() {
-          _subtitles = service.subtitles;
-          _secondarySubtitles = service.secondarySubtitles;
-          _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
-          _lastSubtitleIndex = 0;
-          _lastSecondarySubtitleIndex = 0;
-          _currentSubtitleText = "";
-          _currentSecondaryText = null;
-          _currentSubtitleImage = null;
-          _currentSubtitleIndex = -1;
-          _currentSecondarySubtitleIndex = -1;
-          _currentSubtitleIndices = [];
-          _currentSecondarySubtitleIndices = [];
-          _currentSubtitleEntries = [];
-          _currentSubtitleImages.clear();
-        });
-        _rebuildSubtitleIndex();
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _updateSubtitle();
-        });
-      }
+      _syncSubtitlesFromService(service);
     }
   }
 
-  bool _stringListEquals(List<String> a, List<String> b) {
-    if (identical(a, b)) return true;
-    if (a.length != b.length) return false;
-    for (int i = 0; i < a.length; i++) {
-      if (a[i] != b[i]) return false;
-    }
-    return true;
+  /// Sync subtitle state from [MediaPlaybackService] to local state if the
+  /// service's subtitle data differs from the local copy. This is called both
+  /// from [_onPlaybackServiceChange] (for live updates) and from the post-frame
+  /// callback in [initState] (to catch any subtitle changes that occurred
+  /// between [_initVideo] and listener registration — e.g. when the portrait
+  /// page finishes loading subtitles after the landscape page is already
+  /// created but before the listener is registered).
+  void _syncSubtitlesFromService(MediaPlaybackService service) {
+    if (!mounted) return;
+    if (service.currentItem?.id != _currentItem?.id) return;
+
+    if (_subtitleRevision == service.subtitleRevision) return;
+
+    setState(() {
+      _subtitleRevision = service.subtitleRevision;
+      _subtitles = List<SubtitleItem>.from(service.subtitles);
+      _secondarySubtitles = List<SubtitleItem>.from(service.secondarySubtitles);
+      _currentSubtitlePaths = List<String>.from(service.subtitlePaths);
+      _currentSubtitleText = "";
+      _currentSecondaryText = null;
+      _currentSubtitleImage = null;
+      _currentSubtitleIndex = -1;
+      _currentSecondarySubtitleIndex = -1;
+      _currentSubtitleIndices = [];
+      _currentSecondarySubtitleIndices = [];
+      _currentSubtitleEntries = [];
+      _currentSubtitleImages.clear();
+      subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
+    });
+    _rebuildSubtitleIndex();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _updateSubtitle();
+    });
   }
 
   void _setFatalError(String message) {
@@ -1549,10 +1899,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   @override
   void dispose() {
+    if (_isLongPressing) {
+      _isLongPressing = false;
+      _videoGestureSession.endLongPress();
+      final playbackService = _longPressPlaybackService;
+      _longPressPlaybackService = null;
+      if (playbackService != null) {
+        unawaited(playbackService.endTemporaryPlaybackSpeed());
+      }
+    }
+    FocusManager.instance.removeEarlyKeyEventHandler(
+      _handlePlaybackEarlyKeyEvent,
+    );
     // Try to sync one last time (fire and forget)
     _handleExit();
 
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
+    _ocrSubtitleManager?.removeListener(_onOcrSubtitleUpdate);
     _settingsService?.removeListener(_onSettingsChanged);
     if (widget.existingController == null) {
       SystemChrome.setPreferredOrientations([]);
@@ -1561,6 +1924,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     _selectionFocusNode.dispose();
     _videoFocusNode.dispose();
+    _playbackPageFocusNode.dispose();
+    subtitleDisplayNotifier.dispose();
+    _playbackControlsVisibility.dispose();
+    _videoComposePreviewController.dispose();
     _subtitleSeekTimer?.cancel();
     _videoTransformAnimationController.dispose();
     _keyboardInsetBottom.dispose();
@@ -1594,6 +1961,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     super.dispose();
   }
 
+  KeyEventResult _handlePlaybackEarlyKeyEvent(KeyEvent event) {
+    if (!mounted || ModalRoute.of(context)?.isCurrent != true) {
+      return KeyEventResult.ignored;
+    }
+    final BuildContext? focusContext =
+        FocusManager.instance.primaryFocus?.context;
+    final bool isEditingText =
+        focusContext?.widget is EditableText ||
+        focusContext?.findAncestorWidgetOfExactType<EditableText>() != null;
+    if (isEditingText) return KeyEventResult.ignored;
+    return _controlsKey.currentState?.handleKeyEvent(
+          _playbackPageFocusNode,
+          event,
+        ) ??
+        KeyEventResult.ignored;
+  }
+
   void _enterImmersiveMode() {
     if (kIsWeb) return;
     if (Platform.isAndroid || Platform.isIOS) {
@@ -1619,9 +2003,35 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
+    if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
+      // A platform interruption may consume pointer-up events. Explicitly
+      // release both gesture ownership and temporary speed so neither can be
+      // left stuck when the app resumes.
+      if (_isLongPressing) {
+        _endLongPressSpeed();
+      }
+      _videoGestureSession.reset();
+      _activeVideoTransformPointers.clear();
+      if (_isVideoTransformGestureActive && mounted) {
+        setState(() {
+          _isVideoTransformGestureActive = false;
+        });
+      }
       _saveProgress();
+    } else if (state == AppLifecycleState.resumed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || ModalRoute.of(context)?.isCurrent != true) return;
+        final BuildContext? focusContext =
+            FocusManager.instance.primaryFocus?.context;
+        final bool isEditingText =
+            focusContext?.widget is EditableText ||
+            focusContext?.findAncestorWidgetOfExactType<EditableText>() != null;
+        if (!isEditingText && _videoFocusNode.canRequestFocus) {
+          _videoFocusNode.requestFocus();
+        }
+      });
     }
   }
 
@@ -1702,6 +2112,29 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _onTranscriptionUpdate();
       });
     }
+
+    final ocrManager = Provider.of<OcrSubtitleManager>(context, listen: false);
+    if (_ocrSubtitleManager != ocrManager) {
+      _ocrSubtitleManager?.removeListener(_onOcrSubtitleUpdate);
+      _ocrSubtitleManager = ocrManager;
+      _ocrSubtitleManager?.addListener(_onOcrSubtitleUpdate);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _onOcrSubtitleUpdate();
+      });
+    }
+  }
+
+  void _onOcrSubtitleUpdate() {
+    if (!mounted || _ocrSubtitleManager == null) return;
+    final job = _ocrSubtitleManager!.job;
+    if (job?.status != OcrSubtitleJobStatus.completed) return;
+    final paths = _ocrSubtitleManager!.consumeCompletedPaths(job!.videoId);
+    if (paths == null || paths.isEmpty) return;
+    if (_currentItem?.id == job.videoId) {
+      unawaited(_applyCompletedOcrSubtitles(paths));
+    } else {
+      AppToast.show('OCR 字幕已生成并保存到字幕管理', type: AppToastType.success);
+    }
   }
 
   void _onTranscriptionUpdate() {
@@ -1716,15 +2149,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       videoId: currentVideoId,
     );
     if (path != null &&
-        _transcriptionManager!.hasUnconsumedResultForVideo(
+        _transcriptionManager!.consumeResultNotificationForVideo(
           currentPath,
           videoId: currentVideoId,
         )) {
-      _transcriptionManager!.markResultConsumedForVideo(
-        currentPath,
-        videoId: currentVideoId,
-      );
-
       // 如果当前字幕已经是这个，就不重复加载
       if (_currentSubtitlePaths.isNotEmpty &&
           _currentSubtitlePaths[0] == path) {
@@ -1769,14 +2197,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
           _loadSubtitles(pathsToLoad);
 
-          if (manager.hasUnconsumedResultForVideo(
-            currentPath,
-            videoId: currentItem.id,
-          )) {
-            manager.markResultConsumedForVideo(
-              currentPath,
-              videoId: currentItem.id,
-            );
+          // 仅在转录完成后第一次进入该视频时提示一次“AI 字幕已自动加载”，
+          // 之后切换/重新进入不再重复弹出。
+          if (mounted &&
+              manager.consumeResultNotificationForVideo(
+                currentPath,
+                videoId: currentItem.id,
+              )) {
+            AppToast.show("AI 字幕已自动加载", type: AppToastType.success);
           }
         }
       }
@@ -1812,55 +2240,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (path == null) return false;
 
     try {
-      final videoFile = File(path);
-      final dir = videoFile.parent;
-      if (!await dir.exists()) return false;
-
-      final videoName = p.basenameWithoutExtension(path);
-      final extractedPrefix = "$videoName.stream_";
-
-      // 扫描目录
-      final files = await dir.list().toList();
-
-      // 筛选字幕文件
-      final subtitleFiles = files.whereType<File>().where((file) {
-        final name = p.basename(file.path);
-        // 必须以视频文件名开头
-        if (!name.startsWith(videoName)) return false;
-        // 排除提取的流文件
-        if (name.startsWith(extractedPrefix)) return false;
-        final ext = p.extension(file.path).toLowerCase();
-        return [
-          '.srt',
-          '.vtt',
-          '.ass',
-          '.ssa',
-          '.sup',
-          '.lrc',
-          '.sub',
-          '.idx',
-          '.scc',
-        ].contains(ext);
-      }).toList();
-
-      if (subtitleFiles.isEmpty) return false;
-
-      // 按修改时间降序排序（与字幕管理区一致），取最新的一个
-      final List<({File file, DateTime modifiedAt})> subtitleEntries = [];
-      for (final file in subtitleFiles) {
-        subtitleEntries.add((
-          file: file,
-          modifiedAt: await file.lastModified(),
-        ));
-      }
-      subtitleEntries.sort((a, b) => b.modifiedAt.compareTo(a.modifiedAt));
-
-      final fileToLoad = subtitleEntries.first.file;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      final subtitleEntries = await const SubtitleDiscoveryService()
+          .scanVideoDirectory(
+            videoPath: path,
+            rules: SubtitleScanRules(
+              prefixMatchMode: settings.desktopSubtitlePrefixMatchMode,
+              caseSensitive: settings.desktopSubtitleScanCaseSensitive,
+            ),
+          );
+      if (subtitleEntries.isEmpty) return false;
+      final fileToLoad = File(subtitleEntries.first.path);
 
       // 加载字幕
       if (mounted) {
         debugPrint("Auto loading external subtitle: ${fileToLoad.path}");
-        final settings = Provider.of<SettingsService>(context, listen: false);
         final library = Provider.of<LibraryService>(context, listen: false);
         List<String> pathsToLoad = [fileToLoad.path];
         if (_currentSubtitlePaths.length > 1) {
@@ -1955,12 +2349,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           return;
         }
 
-        // Prepare cache dir
-        final dataRoot = await settings.resolveLargeDataRootDir();
-        final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-        if (!await subDir.exists()) {
-          await subDir.create(recursive: true);
-        }
+        final itemId = _currentItem!.id;
+        final subDir = await const TaskSubtitleStorageService().taskDirectory(
+          itemId,
+          create: true,
+        );
 
         // Extract
         final extractedPath = await service.extractSubtitle(
@@ -1968,8 +2361,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           track.index,
           subDir.path,
           codecName: track.codecName,
-          videoId: _currentItem?.id,
+          videoId: itemId,
         );
+
+        if (extractedPath != null) {
+          await library.registerManagedSubtitleAsset(
+            itemId,
+            path: extractedPath,
+            kind: ManagedSubtitleAssetKind.embedded,
+            displayName: track.title,
+          );
+        }
 
         if (extractedPath != null && mounted) {
           // Check again if user loaded something while we were extracting
@@ -2051,7 +2453,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
   }
 
-  void _initVideo() {
+  Future<void> _initVideo() async {
     if (_fatalErrorMessage != null && mounted) {
       setState(() {
         _fatalErrorMessage = null;
@@ -2137,8 +2539,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _subtitles = existingSubtitles;
             _secondarySubtitles = existingSecondary;
             _currentSubtitlePaths = List<String>.from(existingPaths);
-            _lastSubtitleIndex = 0;
-            _lastSecondarySubtitleIndex = 0;
             _currentSubtitleText = "";
             _currentSecondaryText = null;
             _currentSubtitleImage = null;
@@ -2148,6 +2548,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _currentSecondarySubtitleIndices = [];
             _currentSubtitleEntries = [];
             _currentSubtitleImages.clear();
+            subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
           });
           _rebuildSubtitleIndex();
         }
@@ -2159,7 +2560,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
       _bindControllerListener();
       _triggerSubtitleRefreshBurst();
-      unawaited(_applySavedPlaybackSpeedToController());
       _scheduleDeferredPostInitWork(currentItem);
     } else {
       // 尝试从 MediaPlaybackService 获取 controller (适用于视频切换或未传递 controller 的情况)
@@ -2170,6 +2570,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             context,
             listen: false,
           );
+
+          if (playbackService.currentItem?.id == currentItem.id &&
+              playbackService.isSourceMissing) {
+            _showMissingSource(currentItem);
+            _syncSubtitlesFromService(playbackService);
+            return;
+          }
 
           // 如果 Service 正在加载此视频，等待它完成
           if (playbackService.currentItem?.id == currentItem.id &&
@@ -2200,7 +2607,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
           if (canReuseController) {
             // 如果之前持有本地 controller，先释放
-            if (_initialized && _isControllerOwner) {
+            if (_controllerAssigned && _isControllerOwner) {
               try {
                 _controller.removeListener(_videoListener);
                 _controller.dispose();
@@ -2215,13 +2622,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
             if (mounted) {
               setState(() {
+                _isSourceMissing = false;
                 _initialized = _controller.value.isInitialized;
                 _isPlaying = playbackService.isPlaying; // 同时更新播放状态
               });
             }
 
             usedService = true;
-            unawaited(_applySavedPlaybackSpeedToController());
 
             // Sync state logic
             if (_controller.value.isInitialized) {
@@ -2244,8 +2651,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                 _subtitles = existingSubtitles;
                 _secondarySubtitles = existingSecondarySubtitles;
                 _currentSubtitlePaths = List<String>.from(existingPaths);
-                _lastSubtitleIndex = 0;
-                _lastSecondarySubtitleIndex = 0;
                 _currentSubtitleText = "";
                 _currentSecondaryText = null;
                 _currentSubtitleImage = null;
@@ -2255,6 +2660,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                 _currentSecondarySubtitleIndices = [];
                 _currentSubtitleEntries = [];
                 _currentSubtitleImages.clear();
+                subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
               });
               _rebuildSubtitleIndex();
             }
@@ -2293,7 +2699,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         String path = widget.videoFile?.path ?? currentItem!.path;
         final file = File(path);
         if (!kIsWeb && !file.existsSync()) {
-          _setFatalError("媒体文件不存在，可能已被移动或删除");
+          if (currentItem != null) {
+            _showMissingSource(currentItem);
+          } else {
+            _setFatalError("媒体文件不存在，可能已被移动或删除");
+          }
           return;
         }
 
@@ -2316,8 +2726,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             videoPlayerOptions: MediaPlaybackService.buildVideoPlayerOptions(),
           );
         } else {
+          final library = Provider.of<LibraryService>(context, listen: false);
+          final playbackPath = currentItem != null
+              ? await library.ensureCompatiblePlaybackFile(currentItem)
+              : (await AudioPlaybackCompatibilityService.resolve(
+                  file,
+                  isAudio: _isAudio,
+                )).path;
+          final playbackFile = File(playbackPath);
+          if (!mounted) return;
           _controller = VideoPlayerController.file(
-            file,
+            playbackFile,
             videoPlayerOptions: MediaPlaybackService.buildVideoPlayerOptions(),
           );
         }
@@ -2327,10 +2746,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             .then((_) async {
               if (!mounted) return;
               setState(() {
+                _isSourceMissing = false;
                 _initialized = true;
               });
 
-              await _applySavedPlaybackSpeedToController();
+              await _applyInitialPlaybackSpeedToController();
               if (!mounted) return;
 
               // 注册控制器到 MediaPlaybackService，确保通知栏控制生效
@@ -2371,7 +2791,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             .catchError((error) {
               debugPrint("Error initializing video: $error");
               debugPrint("Error stack trace: ${StackTrace.current}");
-              _setFatalError("视频初始化失败");
+              if (!mounted) return;
+              if (currentItem != null && !File(currentItem.path).existsSync()) {
+                try {
+                  Provider.of<MediaPlaybackService>(
+                    context,
+                    listen: false,
+                  ).markCurrentSourceMissing(expectedItemId: currentItem.id);
+                } catch (_) {}
+                _showMissingSource(currentItem);
+              } else {
+                _setFatalError("视频初始化失败");
+              }
             });
         _bindControllerListener();
         _triggerSubtitleRefreshBurst();
@@ -2403,7 +2834,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               lower.contains("file not found") ||
               lower.contains("cannot open") ||
               lower.contains("filesystemexception"))) {
-        _setFatalError("媒体文件已不存在或无法访问");
+        final item = _currentItem;
+        if (item != null) {
+          try {
+            Provider.of<MediaPlaybackService>(
+              context,
+              listen: false,
+            ).markCurrentSourceMissing(expectedItemId: item.id);
+          } catch (_) {}
+          _showMissingSource(item);
+        } else {
+          _setFatalError("媒体文件已不存在或无法访问");
+        }
         return;
       }
       // Specific check for HevcConfig or ExoPlaybackException: Source error
@@ -2635,6 +3077,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void _updateSubtitle() {
     if (!_initialized) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
+    if (_videoComposePreviewActive) {
+      _videoComposePreviewController.update(_controller.value.position);
+    }
 
     if (!settings.showSubtitles) {
       if (_currentSubtitleText.isNotEmpty ||
@@ -2643,17 +3088,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           _currentSubtitleIndex != -1 ||
           _currentSecondarySubtitleIndex != -1 ||
           _currentSubtitleEntries.isNotEmpty) {
-        setState(() {
-          _currentSubtitleText = "";
-          _currentSecondaryText = null;
-          _currentSubtitleImage = null;
-          _currentSubtitleIndex = -1;
-          _currentSecondarySubtitleIndex = -1;
-          _currentSubtitleIndices = [];
-          _currentSecondarySubtitleIndices = [];
-          _currentSubtitleEntries = [];
-          _currentSubtitleImages.clear();
-        });
+        _currentSubtitleText = "";
+        _currentSecondaryText = null;
+        _currentSubtitleImage = null;
+        _currentSubtitleIndex = -1;
+        _currentSecondarySubtitleIndex = -1;
+        _currentSubtitleIndices = [];
+        _currentSecondarySubtitleIndices = [];
+        _currentSubtitleEntries = [];
+        _currentSubtitleImages.clear();
+        subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
       }
       return;
     }
@@ -2665,40 +3109,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         ? settings.audioContinuousSubtitle
         : settings.videoContinuousSubtitle;
 
-    if (_subtitleStartMs.length != _subtitles.length ||
-        _secondarySubtitleStartMs.length != _secondarySubtitles.length) {
+    if (_subtitleTimeline.length != _subtitles.length ||
+        _secondarySubtitleTimeline.length != _secondarySubtitles.length) {
       _rebuildSubtitleIndex();
     }
 
     final List<int> primaryIndices = _subtitles.isEmpty
         ? <int>[]
-        : _findSubtitleIndicesMs(
-            posMs: posMs,
-            subtitles: _subtitles,
-            startMs: _subtitleStartMs,
-            lastIndex: _lastSubtitleIndex,
-            continuousSubtitleEnabled: continuousSubtitleEnabled,
+        : _subtitleTimeline.activeIndicesAtMs(
+            posMs,
+            extendToNextStart: continuousSubtitleEnabled,
           );
-    if (primaryIndices.isNotEmpty) {
-      _lastSubtitleIndex = primaryIndices.last;
-    } else {
-      _lastSubtitleIndex = 0;
-    }
 
     final List<int> secondaryIndices = _secondarySubtitles.isEmpty
         ? <int>[]
-        : _findSubtitleIndicesMs(
-            posMs: posMs,
-            subtitles: _secondarySubtitles,
-            startMs: _secondarySubtitleStartMs,
-            lastIndex: _lastSecondarySubtitleIndex,
-            continuousSubtitleEnabled: continuousSubtitleEnabled,
+        : _secondarySubtitleTimeline.activeIndicesAtMs(
+            posMs,
+            extendToNextStart: continuousSubtitleEnabled,
           );
-    if (secondaryIndices.isNotEmpty) {
-      _lastSecondarySubtitleIndex = secondaryIndices.last;
-    } else {
-      _lastSecondarySubtitleIndex = 0;
-    }
 
     final List<SubtitleItem> secondaryOverlapItems = secondaryIndices
         .map((i) => _secondarySubtitles[i])
@@ -2784,18 +3212,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     if (!indicesChanged && !entriesChanged && !anchorChanged) return;
 
-    setState(() {
-      _currentSubtitleIndices = primaryIndices;
-      _currentSecondarySubtitleIndices = secondaryIndices;
-      _currentSubtitleEntries = entries;
-      _currentSubtitleIndex = anchorPrimaryIndex;
-      _currentSecondarySubtitleIndex = anchorSecondaryIndex;
-      _currentSubtitleImage = anchorPrimaryIndex >= 0
-          ? _currentSubtitleImages[anchorPrimaryIndex]
-          : null;
-      _currentSubtitleText = anchorEntry?.text ?? "";
-      _currentSecondaryText = anchorEntry?.secondaryText;
-    });
+    _currentSubtitleIndices = primaryIndices;
+    _currentSecondarySubtitleIndices = secondaryIndices;
+    _currentSubtitleEntries = entries;
+    _currentSubtitleIndex = anchorPrimaryIndex;
+    _currentSecondarySubtitleIndex = anchorSecondaryIndex;
+    _currentSubtitleImage = anchorPrimaryIndex >= 0
+        ? _currentSubtitleImages[anchorPrimaryIndex]
+        : null;
+    _currentSubtitleText = anchorEntry?.text ?? "";
+    _currentSecondaryText = anchorEntry?.secondaryText;
+    subtitleDisplayNotifier.value = SubtitleDisplayState(entries: entries);
 
     if (primaryIndices.isNotEmpty) {
       _loadSubtitleImages(primaryIndices);
@@ -2847,6 +3274,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       );
     } catch (_) {}
 
+    if (_isSourceMissing) {
+      if (playbackService != null) {
+        await playbackService.resume();
+      }
+      return;
+    }
+
     if (playbackService != null && playbackService.controller == _controller) {
       playbackService.updatePlaybackStateFromController();
       if (_controller.value.isPlaying) {
@@ -2868,39 +3302,72 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
   }
 
-  void _startLongPressSpeed() {
+  bool _startLongPressSpeed() {
+    if (_isSourceMissing) return false;
+    // The raw two-finger transform listener and Flutter's long-press
+    // recognizer use different arbitration paths. Resolve that race here:
+    // an established multi-touch/transform session owns this pointer sequence,
+    // while an established long-press locks transforms for the whole sequence.
+    if (!_videoGestureSession.tryStartLongPress(
+      transformActive: _isVideoTransformGestureActive,
+      transformPointerCount: _activeVideoTransformPointers.length,
+    )) {
+      return false;
+    }
+
     final settings = Provider.of<SettingsService>(context, listen: false);
-    _preLongPressSpeed = _controller.value.playbackSpeed;
-    setState(() {
-      _isLongPressing = true;
-      _longPressFeedbackText = "${settings.longPressSpeed}x";
-    });
-    _controller.setPlaybackSpeed(settings.longPressSpeed);
+    MediaPlaybackService? playbackService;
+    try {
+      final candidate = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (candidate.controller == _controller) playbackService = candidate;
+    } catch (_) {}
+    _longPressPlaybackService = playbackService;
+    _preLongPressSpeed =
+        playbackService?.confirmedPlaybackSpeed ??
+        _controller.value.playbackSpeed;
+    _activeVideoTransformPointers.clear();
+    _isVideoTransformGestureActive = false;
+    _isLongPressing = true;
+    _longPressFeedbackText = "${settings.longPressSpeed}x";
+    unawaited(
+      playbackService?.beginTemporaryPlaybackSpeed(settings.longPressSpeed) ??
+          _controller.setPlaybackSpeed(settings.longPressSpeed),
+    );
+    return true;
   }
 
   void _endLongPressSpeed() {
     if (!_isLongPressing) return;
-    setState(() {
-      _isLongPressing = false;
-    });
-    _controller.setPlaybackSpeed(_preLongPressSpeed);
+    _videoGestureSession.endLongPress();
+    _isLongPressing = false;
+    _controlsKey.currentState?.cancelLongPressFeedback();
+    final playbackService = _longPressPlaybackService;
+    _longPressPlaybackService = null;
+    unawaited(
+      playbackService?.endTemporaryPlaybackSpeed() ??
+          _controller.setPlaybackSpeed(_preLongPressSpeed),
+    );
   }
 
   Future<void> _syncPlaybackSpeedToCurrentController(double speed) async {
-    await _controller.setPlaybackSpeed(speed);
-    if (!mounted) return;
+    if (_isSourceMissing) return;
     try {
       final playbackService = Provider.of<MediaPlaybackService>(
         context,
         listen: false,
       );
       if (playbackService.controller == _controller) {
-        playbackService.updatePlaybackStateFromController();
+        await playbackService.setPlaybackSpeed(speed);
+        return;
       }
     } catch (_) {}
+    await _controller.setPlaybackSpeed(speed);
   }
 
-  Future<void> _applySavedPlaybackSpeedToController() async {
+  Future<void> _applyInitialPlaybackSpeedToController() async {
     if (!_controllerAssigned || !_controller.value.isInitialized) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
     final targetSpeed = settings.effectiveGlobalPlaybackSpeed;
@@ -2914,18 +3381,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   Future<void> _handlePlaybackSpeedSelected(double speed) async {
-    final settings = Provider.of<SettingsService>(context, listen: false);
-    if (settings.isPlaybackSpeedLocked &&
-        !settings.isLockedPlaybackSpeed(speed)) {
-      await _syncPlaybackSpeedToCurrentController(speed);
-      return;
-    }
     await _syncPlaybackSpeedToCurrentController(speed);
   }
 
-  Future<void> _handlePlaybackSpeedLockToggle(double speed) async {
+  Future<void> _handlePlaybackSpeedLockChanged(
+    double speed,
+    bool locked,
+  ) async {
     final settings = Provider.of<SettingsService>(context, listen: false);
-    await settings.togglePlaybackSpeedLock(speed);
+    await settings.setPlaybackSpeedLock(speed, locked);
     await _syncPlaybackSpeedToCurrentController(speed);
   }
 
@@ -2934,8 +3398,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       final settings = Provider.of<SettingsService>(context, listen: false);
       final library = Provider.of<LibraryService>(context, listen: false);
 
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
+      final pickedSubtitle = await pickSubtitleFile(
         allowedExtensions: [
           'srt',
           'lrc',
@@ -2947,14 +3410,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           'idx',
           'scc',
         ],
-        withData: true,
       );
 
       if (!mounted) return;
 
-      if (result != null) {
-        final file = result.files.single;
-        String path = file.path!;
+      if (pickedSubtitle != null) {
+        final path = pickedSubtitle.path;
+        final shouldCacheSubtitle =
+            settings.autoCacheSubtitles || pickedSubtitle.requiresPersistence;
 
         // Auto Cache Logic
         if (_currentItem != null) {
@@ -2967,21 +3430,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           await library.updateVideoSubtitles(
             _currentItem!.id,
             path,
-            settings.autoCacheSubtitles,
+            shouldCacheSubtitle,
             secondarySubtitlePath: currentSecondary,
             isSecondaryCached: settings.autoCacheSubtitles,
           );
         }
 
         // Load with preservation of secondary
-        List<String> pathsToLoad = [path];
-        if (_currentSubtitlePaths.length > 1) {
-          pathsToLoad.add(_currentSubtitlePaths[1]);
+        final storedItem = _currentItem == null
+            ? null
+            : library.getVideo(_currentItem!.id);
+        final pathsToLoad = <String>[storedItem?.subtitlePath ?? path];
+        final storedSecondary = storedItem?.secondarySubtitlePath;
+        if (storedSecondary != null && storedSecondary.isNotEmpty) {
+          pathsToLoad.add(storedSecondary);
         }
         await _loadSubtitles(pathsToLoad);
 
         if (mounted) {
-          AppToast.show("已加载字幕: ${file.name}", type: AppToastType.success);
+          AppToast.show(
+            "已加载字幕: ${pickedSubtitle.displayName}",
+            type: AppToastType.success,
+          );
         }
       }
     } catch (e) {
@@ -3008,41 +3478,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     return normalized;
   }
 
-  bool _additionalSubtitleContainsPath(
-    Map<String, String> additional,
-    String path,
-  ) {
-    final key = _subtitlePathKey(path);
-    for (final value in additional.values) {
-      if (_subtitlePathKey(value) == key) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  String _buildUniqueSubtitleLabel(
-    Map<String, String> additional,
-    String baseLabel,
-  ) {
-    if (!additional.containsKey(baseLabel)) return baseLabel;
-    int serial = 2;
-    String next = '$baseLabel $serial';
-    while (additional.containsKey(next)) {
-      serial++;
-      next = '$baseLabel $serial';
-    }
-    return next;
-  }
-
-  String _displayEmbeddedTrackTitle(EmbeddedSubtitleTrack track) {
-    final title = track.title.trim();
-    if (title.isNotEmpty && title != '未知标题') return title;
-    final language = track.language.trim();
-    if (language.isNotEmpty && language != '未知语言') return language;
-    return '流 ${track.index}';
-  }
-
   Future<void> _prepareEmbeddedSubtitlesForCompose() async {
     final item = _currentItem;
     if (item == null || item.path.isEmpty) return;
@@ -3054,15 +3489,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       final library = Provider.of<LibraryService>(context, listen: false);
       final tracks = await embeddedService.getEmbeddedSubtitles(item.path);
       if (tracks.isEmpty) return;
-      final dataRoot = await SettingsService().resolveLargeDataRootDir();
-      final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-      if (!await subDir.exists()) {
-        await subDir.create(recursive: true);
-      }
-      final additional = Map<String, String>.from(
-        item.additionalSubtitles ?? <String, String>{},
+      final subDir = await const TaskSubtitleStorageService().taskDirectory(
+        item.id,
+        create: true,
       );
-      bool changed = false;
       for (final track in tracks) {
         final extractedPath = await embeddedService.extractSubtitle(
           item.path,
@@ -3074,21 +3504,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         if (extractedPath == null || extractedPath.isEmpty) {
           continue;
         }
-        final normalizedPath = p.normalize(extractedPath);
-        if (_additionalSubtitleContainsPath(additional, normalizedPath)) {
-          continue;
-        }
-        final baseLabel =
-            '内嵌字幕 ${track.index}（${_displayEmbeddedTrackTitle(track)}）';
-        final uniqueLabel = _buildUniqueSubtitleLabel(additional, baseLabel);
-        additional[uniqueLabel] = normalizedPath;
-        changed = true;
-      }
-      if (!changed) return;
-      item.additionalSubtitles = additional;
-      await library.updateVideoAdditionalSubtitles(item.id, additional);
-      if (mounted) {
-        setState(() {});
+        await library.registerManagedSubtitleAsset(
+          item.id,
+          path: extractedPath,
+          kind: ManagedSubtitleAssetKind.embedded,
+          displayName: track.title,
+        );
       }
     } catch (e) {
       debugPrint('Prepare embedded subtitles for compose failed: $e');
@@ -3104,6 +3525,70 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     });
   }
 
+  void _showOcrSubtitle() {
+    if (!_supportsOcrSubtitle || _currentItem == null || _isAudio) return;
+    setState(() {
+      _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
+      _activeSidebar = SidebarType.ocrSubtitle;
+    });
+  }
+
+  Future<void> _applyCompletedOcrSubtitles(List<String> paths) async {
+    final item = _currentItem;
+    if (item == null) return;
+    final available = <String>[];
+    for (final path in paths) {
+      if (await File(path).exists()) available.add(path);
+    }
+    if (available.isEmpty) return;
+    final primary = available.first;
+    final secondary = available.length > 1
+        ? available[1]
+        : (_currentSubtitlePaths.length > 1
+              ? _currentSubtitlePaths[1]
+              : item.secondarySubtitlePath);
+    await _loadSubtitles([primary, ?secondary]);
+    if (!mounted || _currentItem?.id != item.id) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    await library.updateVideoSubtitles(
+      item.id,
+      primary,
+      settings.autoCacheSubtitles,
+      secondarySubtitlePath: secondary,
+      isSecondaryCached: settings.autoCacheSubtitles,
+    );
+    if (mounted) {
+      AppToast.show(
+        '已生成 ${available.length} 条 OCR 字幕轨，并自动加载前两条',
+        type: AppToastType.success,
+      );
+    }
+  }
+
+  void _applyVideoComposePreview(VideoComposePreviewConfig config) {
+    if (!mounted) return;
+    if (!_videoComposePreviewActive) {
+      setState(() => _videoComposePreviewActive = true);
+    }
+    unawaited(
+      _videoComposePreviewController.configure(config).then((_) {
+        if (_initialized && _controllerAssigned) {
+          _videoComposePreviewController.update(_controller.value.position);
+        }
+      }),
+    );
+  }
+
+  void _clearVideoComposePreview() {
+    _videoComposePreviewController.clear();
+    if (mounted && _videoComposePreviewActive) {
+      setState(() => _videoComposePreviewActive = false);
+    } else {
+      _videoComposePreviewActive = false;
+    }
+  }
+
   Future<void> _loadSubtitles(
     List<String> paths, {
     bool autoEnableSubtitles = true,
@@ -3113,42 +3598,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       listen: false,
     );
 
-    final int requestId = ++_subtitleParseRequestId;
     final String? itemIdAtStart = _currentItem?.id;
-
-    if (paths.isEmpty) {
-      setState(() {
-        _suppressAutoEmbeddedForCurrentItem = true;
-        _subtitles = [];
-        _secondarySubtitles = [];
-        _currentSubtitlePaths = [];
-        _currentSubtitleText = "";
-        _currentSecondaryText = null;
-        _currentSubtitleImage = null;
-        _currentSubtitleIndex = -1;
-        _currentSecondarySubtitleIndex = -1;
-        _currentSubtitleIndices = [];
-        _currentSecondarySubtitleIndices = [];
-        _currentSubtitleEntries = [];
-        _currentSubtitleImages.clear();
-      });
-      _rebuildSubtitleIndex();
-
-      // 同步到 MediaPlaybackService
-      playbackService.setSubtitleState(
-        paths: const [],
-        primary: const [],
-        secondary: const [],
-      );
-      _triggerSubtitleRefreshBurst();
-      if (_isParsingSubtitles) {
-        setState(() {
-          _isParsingSubtitles = false;
-        });
-      }
-
-      return;
-    }
 
     if (mounted) {
       setState(() {
@@ -3158,26 +3608,27 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _isParsingSubtitles = true;
     }
 
-    // Load Primary
     try {
-      final primaryList = await _parseSubtitleFile(paths[0]);
-
-      List<SubtitleItem> secondaryList = [];
-      if (paths.length > 1) {
-        secondaryList = await _parseSubtitleFile(paths[1]);
+      if (itemIdAtStart == null) return;
+      final bool committed = await playbackService
+          .loadSubtitlePathsForCurrentItem(itemId: itemIdAtStart, paths: paths);
+      if (!committed || !mounted || _currentItem?.id != itemIdAtStart) {
+        return;
       }
 
-      if (!mounted) return;
-      if (requestId != _subtitleParseRequestId) return;
-      if (itemIdAtStart != null && _currentItem?.id != itemIdAtStart) return;
+      final primaryList = List<SubtitleItem>.from(playbackService.subtitles);
+      final secondaryList = List<SubtitleItem>.from(
+        playbackService.secondarySubtitles,
+      );
 
       setState(() {
-        _suppressAutoEmbeddedForCurrentItem = false;
+        _subtitleRevision = playbackService.subtitleRevision;
+        _suppressAutoEmbeddedForCurrentItem = paths.isEmpty;
         _subtitles = primaryList;
         _secondarySubtitles = secondaryList;
-        _currentSubtitlePaths = List.from(paths);
-        _lastSubtitleIndex = 0;
-        _lastSecondarySubtitleIndex = 0;
+        _currentSubtitlePaths = List<String>.from(
+          playbackService.subtitlePaths,
+        );
         _currentSubtitleText = "";
         _currentSecondaryText = null;
         _currentSubtitleImage = null;
@@ -3187,14 +3638,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _currentSecondarySubtitleIndices = [];
         _currentSubtitleEntries = [];
         _currentSubtitleImages.clear();
+        subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
       });
       _rebuildSubtitleIndex();
 
-      playbackService.setSubtitleState(
-        paths: _currentSubtitlePaths,
-        primary: primaryList,
-        secondary: secondaryList,
-      );
       if (autoEnableSubtitles &&
           (primaryList.isNotEmpty || secondaryList.isNotEmpty)) {
         final currentItem = _currentItem;
@@ -3209,153 +3656,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     } finally {
       if (!mounted) {
         _isParsingSubtitles = false;
-      } else if (requestId == _subtitleParseRequestId) {
+      } else {
         setState(() {
           _isParsingSubtitles = false;
         });
-      } else {
-        _isParsingSubtitles = false;
       }
     }
   }
 
   void _rebuildSubtitleIndex() {
-    _subtitleStartMs
-      ..clear()
-      ..addAll(_subtitles.map((e) => e.startTime.inMilliseconds));
-    _secondarySubtitleStartMs
-      ..clear()
-      ..addAll(_secondarySubtitles.map((e) => e.startTime.inMilliseconds));
-  }
-
-  int _getEffectiveEndMs({
-    required List<SubtitleItem> subtitles,
-    required List<int> startMs,
-    required int index,
-    required bool continuousSubtitleEnabled,
-  }) {
-    final SubtitleItem item = subtitles[index];
-    if (!continuousSubtitleEnabled) return item.endTime.inMilliseconds;
-    if (index + 1 < subtitles.length) return startMs[index + 1];
-    return item.endTime.inMilliseconds;
-  }
-
-  int _binarySearchLastStartLE(List<int> startMs, int posMs) {
-    int low = 0;
-    int high = startMs.length - 1;
-    int ans = -1;
-    while (low <= high) {
-      final int mid = (low + high) >> 1;
-      if (startMs[mid] <= posMs) {
-        ans = mid;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    return ans;
-  }
-
-  int _findSubtitleIndexMs({
-    required int posMs,
-    required List<SubtitleItem> subtitles,
-    required List<int> startMs,
-    required int lastIndex,
-    required bool continuousSubtitleEnabled,
-  }) {
-    if (subtitles.isEmpty) return -1;
-
-    if (lastIndex >= 0 && lastIndex < subtitles.length) {
-      final int lastStartMs = startMs[lastIndex];
-      final int lastEndMs = _getEffectiveEndMs(
-        subtitles: subtitles,
-        startMs: startMs,
-        index: lastIndex,
-        continuousSubtitleEnabled: continuousSubtitleEnabled,
-      );
-      if (posMs >= lastStartMs && posMs < lastEndMs) {
-        return lastIndex;
-      }
-      final int nextIndex = lastIndex + 1;
-      if (nextIndex < subtitles.length) {
-        final int nextStartMs = startMs[nextIndex];
-        final int nextEndMs = _getEffectiveEndMs(
-          subtitles: subtitles,
-          startMs: startMs,
-          index: nextIndex,
-          continuousSubtitleEnabled: continuousSubtitleEnabled,
-        );
-        if (posMs >= nextStartMs && posMs < nextEndMs) {
-          return nextIndex;
-        }
-      }
-    }
-
-    final int candidate = _binarySearchLastStartLE(startMs, posMs);
-    if (candidate < 0 || candidate >= subtitles.length) return -1;
-    final int endMs = _getEffectiveEndMs(
-      subtitles: subtitles,
-      startMs: startMs,
-      index: candidate,
-      continuousSubtitleEnabled: continuousSubtitleEnabled,
-    );
-    if (posMs < endMs) return candidate;
-    return -1;
-  }
-
-  List<int> _findSubtitleIndicesMs({
-    required int posMs,
-    required List<SubtitleItem> subtitles,
-    required List<int> startMs,
-    required int lastIndex,
-    required bool continuousSubtitleEnabled,
-  }) {
-    if (subtitles.isEmpty) return <int>[];
-    final int candidate = _findSubtitleIndexMs(
-      posMs: posMs,
-      subtitles: subtitles,
-      startMs: startMs,
-      lastIndex: lastIndex,
-      continuousSubtitleEnabled: continuousSubtitleEnabled,
-    );
-    if (candidate < 0) return <int>[];
-
-    int first = candidate;
-    while (first - 1 >= 0) {
-      final int prevIndex = first - 1;
-      final int prevStart = startMs[prevIndex];
-      final int prevEnd = _getEffectiveEndMs(
-        subtitles: subtitles,
-        startMs: startMs,
-        index: prevIndex,
-        continuousSubtitleEnabled: continuousSubtitleEnabled,
-      );
-      if (posMs >= prevStart && posMs < prevEnd) {
-        first = prevIndex;
-      } else {
-        break;
-      }
-    }
-
-    final List<int> indices = <int>[];
-    int idx = first;
-    while (idx < subtitles.length) {
-      final int start = startMs[idx];
-      if (posMs < start) break;
-      final int end = _getEffectiveEndMs(
-        subtitles: subtitles,
-        startMs: startMs,
-        index: idx,
-        continuousSubtitleEnabled: continuousSubtitleEnabled,
-      );
-      if (posMs < end) {
-        indices.add(idx);
-      } else if (start > posMs) {
-        break;
-      }
-      idx++;
-    }
-    return indices;
+    _subtitleTimeline = SubtitleTimelineResolver(_subtitles);
+    _secondarySubtitleTimeline = SubtitleTimelineResolver(_secondarySubtitles);
   }
 
   void _pruneSubtitleImages(Set<int> keepIndices) {
@@ -3403,138 +3714,27 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         if (requestId != _subtitleImageRequestId) return;
         if (!indexSet.contains(index)) return;
 
-        setState(() {
-          _currentSubtitleImages[index] = image;
-          _currentSubtitleEntries = _currentSubtitleEntries
-              .map(
-                (entry) => entry.index == index
-                    ? SubtitleOverlayEntry(
-                        index: entry.index,
-                        text: entry.text,
-                        secondaryText: entry.secondaryText,
-                        image: image,
-                      )
-                    : entry,
-              )
-              .toList();
-          if (_currentSubtitleIndex == index) {
-            _currentSubtitleImage = image;
-          }
-        });
+        _currentSubtitleImages[index] = image;
+        _currentSubtitleEntries = _currentSubtitleEntries
+            .map(
+              (entry) => entry.index == index
+                  ? SubtitleOverlayEntry(
+                      index: entry.index,
+                      text: entry.text,
+                      secondaryText: entry.secondaryText,
+                      image: image,
+                    )
+                  : entry,
+            )
+            .toList();
+        if (_currentSubtitleIndex == index) {
+          _currentSubtitleImage = image;
+        }
+        subtitleDisplayNotifier.value = SubtitleDisplayState(
+          entries: _currentSubtitleEntries,
+        );
       });
     }
-  }
-
-  Future<List<SubtitleItem>> _parseSubtitleFile(String path) async {
-    try {
-      final file = File(path);
-      if (!await file.exists()) return [];
-
-      final length = await file.length();
-      if (length > 100 * 1024 * 1024) {
-        debugPrint("Subtitle file too large ($length bytes), skipping: $path");
-        return [];
-      }
-
-      final ext = path.toLowerCase();
-      final bool shouldNormalizeYouTubeAutoCaptions =
-          _shouldNormalizeYouTubeAutoCaptions(path);
-      final String cacheKey = shouldNormalizeYouTubeAutoCaptions
-          ? '$path::yt_auto'
-          : '$path::plain';
-      final cached = _subtitleCache[cacheKey];
-      if (cached != null) return cached;
-      List<SubtitleItem> parsed = [];
-
-      if (ext.endsWith('.sup') || ext.endsWith('.idx')) {
-        if (mounted) {
-          AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
-        }
-        return [];
-      } else if (ext.endsWith('.scc')) {
-        final converted = await SubtitleConverter.convert(
-          inputPath: path,
-          targetExtension: '.srt',
-        );
-        if (converted != null) return _parseSubtitleFile(converted);
-      } else if (ext.endsWith('.sub')) {
-        if (await SubtitleConverter.isMicroDvdSub(path)) {
-          final converted = await SubtitleConverter.convert(
-            inputPath: path,
-            targetExtension: '.srt',
-          );
-          if (converted != null) return _parseSubtitleFile(converted);
-        } else {
-          if (mounted) {
-            AppToast.show("当前播放器不支持图像字幕，请转换为文本字幕", type: AppToastType.info);
-          }
-          return [];
-        }
-      } else {
-        List<int> bytes = await file.readAsBytes();
-        String content = SubtitleParser.decodeBytes(bytes);
-
-        if (content.isNotEmpty) {
-          final serialized = await compute(
-            _parseTextSubtitlesToSerializable,
-            content,
-          );
-          parsed = serialized
-              .map(
-                (m) => SubtitleItem(
-                  index: (m['i'] as int?) ?? 0,
-                  startTime: Duration(milliseconds: (m['s'] as int?) ?? 0),
-                  endTime: Duration(milliseconds: (m['e'] as int?) ?? 0),
-                  text: (m['t'] as String?) ?? "",
-                ),
-              )
-              .toList();
-        }
-      }
-
-      if (parsed.isNotEmpty) {
-        parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
-        if (shouldNormalizeYouTubeAutoCaptions &&
-            YouTubeAutoCaptionNormalizer.shouldNormalize(
-              subtitles: parsed,
-              subtitlePath: path,
-              videoItem: _currentItem,
-            )) {
-          parsed = YouTubeAutoCaptionNormalizer.normalize(parsed);
-        }
-        _subtitleCache[cacheKey] = parsed;
-      } else {
-        _subtitleCache.remove(cacheKey);
-      }
-      return parsed;
-    } catch (e) {
-      developer.log('Load sub error', error: e);
-      return [];
-    }
-  }
-
-  bool _shouldNormalizeYouTubeAutoCaptions(String subtitlePath) {
-    final currentItem = _currentItem;
-    if (currentItem == null) {
-      return false;
-    }
-    final sourceRef = currentItem.sourceRef;
-    final sourceValue = (sourceRef?.originalValue ?? sourceRef?.value ?? '')
-        .toLowerCase();
-    final bool isYouTubeSource =
-        sourceValue.contains('youtube.com') || sourceValue.contains('youtu.be');
-    if (!isYouTubeSource ||
-        !currentItem.usesManagedAssociatedSubtitles ||
-        currentItem.isBilibiliExported) {
-      return false;
-    }
-
-    final baseName = p.basename(p.normalize(subtitlePath)).toLowerCase();
-    return baseName.contains('auto') ||
-        baseName.contains('asr') ||
-        baseName.contains('caption') ||
-        baseName.contains('srv') ||
-        baseName.contains('自动');
   }
 
   // --- Drag Logic ---
@@ -3628,7 +3828,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     });
 
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final isGhost = _canUseGhostSidebarEditing(context, settings);
+    final isGhost = fromCompose
+        ? false
+        : _canUseGhostSidebarEditing(context, settings);
     if (_initialized) {
       _enableStyleSidebarDragMode(isGhost: isGhost);
     }
@@ -3672,17 +3874,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   Future<void> _handleBackRequest() async {
-    final navigator = Navigator.of(context);
+    if (_isOrientationTransitioning) return;
     if (_forceExit) {
-      if (widget.existingController == null) {
-        SystemChrome.setPreferredOrientations([]);
-      } else {
-        SystemChrome.setPreferredOrientations([
-          DeviceOrientation.portraitUp,
-          DeviceOrientation.portraitDown,
-        ]);
-      }
-      if (mounted) navigator.pop();
+      await _returnToPortrait();
       return;
     }
 
@@ -3719,6 +3913,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         return;
       }
       if (_activeSidebar != SidebarType.subtitles) {
+        if (_activeSidebar == SidebarType.videoCompose) {
+          _clearVideoComposePreview();
+        }
         setState(() {
           if (_previousSidebarType != SidebarType.none) {
             _activeSidebar = _previousSidebarType;
@@ -3733,14 +3930,64 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       }
     }
 
-    await _cancelPendingPlaybackIfNeeded();
-    await _handleExit();
-    if (!mounted) return;
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
-    navigator.pop();
+    await _returnToPortrait();
+  }
+
+  Widget _buildOrientationBridge(SettingsService settings) {
+    return ColoredBox(
+      color: Colors.black,
+      child: IgnorePointer(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            if (_isSourceMissing) {
+              return const Center(
+                child: Text(
+                  '没有源媒体',
+                  style: TextStyle(color: Colors.white70, fontSize: 20),
+                ),
+              );
+            }
+            if (_initialized && _isAudio) {
+              return const Center(
+                child: Icon(Icons.music_note, size: 80, color: Colors.white24),
+              );
+            }
+            if (!_initialized || !_controllerAssigned) {
+              final thumbnailPath = _currentItem?.thumbnailPath;
+              if (thumbnailPath != null && File(thumbnailPath).existsSync()) {
+                return Image.file(File(thumbnailPath), fit: BoxFit.cover);
+              }
+              return const SizedBox.expand();
+            }
+
+            final viewportSize = Size(
+              constraints.maxWidth,
+              constraints.maxHeight,
+            );
+            final aspectRatio = _controller.value.aspectRatio > 0
+                ? _controller.value.aspectRatio
+                : 16 / 9;
+            final videoSize = _computeContainedVideoSize(
+              viewportSize,
+              aspectRatio,
+            );
+            return ClipRect(
+              child: Center(
+                child: Transform(
+                  alignment: Alignment.center,
+                  transform: _buildVideoTransformMatrix(viewportSize, settings),
+                  child: SizedBox(
+                    width: videoSize.width,
+                    height: videoSize.height,
+                    child: VideoPlayer(_controller, key: _videoTextureKey),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
   }
 
   void _onIosBackSwipeStart(DragStartDetails details) {
@@ -3810,9 +4057,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             color: Colors.black,
             child: hasThumbnail
                 ? Image.file(
-                    File(thumbnailPath!),
+                    File(thumbnailPath),
                     fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) =>
+                    errorBuilder: (_, _, _) =>
                         const ColoredBox(color: Colors.black),
                   )
                 : const ColoredBox(color: Colors.black),
@@ -3831,7 +4078,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux))
+                  if (!kIsWeb &&
+                      (Platform.isWindows ||
+                          Platform.isMacOS ||
+                          Platform.isLinux))
                     IconButton(
                       icon: const Icon(Icons.close, color: Colors.white),
                       tooltip: "退出播放 (Esc)",
@@ -3895,18 +4145,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             ),
           ),
         );
+        // 缓存 sidebarWidth，避免单次 build 调用 3 次 _getSidebarWidth
+        final double sidebarWidth = _getSidebarWidth(context, settings);
         // 侧边栏动画面板：RepaintBoundary 隔离重绘，内容保持开启状态以支持淡出效果
         final Widget sidebarPanel = AnimatedContainer(
           duration: _isResizingSidebar
               ? Duration.zero
               : const Duration(milliseconds: 250),
           curve: Curves.easeOutCubic,
-          width: _isSidebarOpen ? _getSidebarWidth(context, settings) : 0,
+          width: _isSidebarOpen ? sidebarWidth : 0,
           child: RepaintBoundary(
             child: ClipRect(
               child: OverflowBox(
-                minWidth: _getSidebarWidth(context, settings),
-                maxWidth: _getSidebarWidth(context, settings),
+                minWidth: sidebarWidth,
+                maxWidth: sidebarWidth,
                 alignment: isLeftHandedMode
                     ? Alignment.centerRight
                     : Alignment.centerLeft,
@@ -3949,879 +4201,1044 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             if (didPop) return;
             _handleBackRequest();
           },
-          child: Scaffold(
-            key: _scaffoldKey,
-            backgroundColor: _isLandscapeViewportReady
-                ? Colors.black
-                : Colors.transparent,
-            resizeToAvoidBottomInset: false,
-            body: !_isLandscapeViewportReady
-                ? GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () {},
-                    child: const SizedBox.expand(),
-                  )
-                : SelectableRegion(
-                    key: _selectionKey,
-                    selectionControls: materialTextSelectionControls,
-                    focusNode: _selectionFocusNode,
-                    child: GestureDetector(
-                      onTap: () {
-                        // 点击空白区域取消文字选择
-                        _selectionKey.currentState?.clearSelection();
-                        FocusManager.instance.primaryFocus?.unfocus();
-                      },
-                      behavior: HitTestBehavior.translucent,
-                      child: SafeArea(
-                        top: true,
-                        bottom: false,
-                        left: false,
-                        right: false,
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            Row(
-                              children: [
-                                if (isLeftHandedMode) ...sidebarWidgets,
-                                Expanded(
-                                  child: ValueListenableBuilder<double>(
-                                    valueListenable: _keyboardInsetBottom,
-                                    builder:
-                                        (context, keyboardInsetBottom, child) {
-                                          return Transform.translate(
-                                            offset: Offset(
-                                              0,
-                                              _resolveVideoKeyboardShift(
-                                                keyboardInsetBottom,
+          child: Focus(
+            focusNode: _playbackPageFocusNode,
+            onKeyEvent: (node, event) =>
+                _controlsKey.currentState?.handleKeyEvent(node, event) ??
+                KeyEventResult.ignored,
+            child: Scaffold(
+              key: _scaffoldKey,
+              backgroundColor: _isLandscapeViewportReady
+                  ? Colors.black
+                  : Colors.transparent,
+              resizeToAvoidBottomInset: false,
+              body: _isOrientationTransitioning
+                  ? _buildOrientationBridge(settings)
+                  : !_isLandscapeViewportReady
+                  ? GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {},
+                      child: const SizedBox.expand(),
+                    )
+                  : SelectableRegion(
+                      key: _selectionKey,
+                      selectionControls: materialTextSelectionControls,
+                      focusNode: _selectionFocusNode,
+                      child: GestureDetector(
+                        onTap: () {
+                          // 点击空白区域取消文字选择，仅清除选择焦点，
+                          // 不调用 unfocus() 避免清除视频控制焦点的键盘快捷键
+                          _selectionKey.currentState?.clearSelection();
+                          _selectionFocusNode.unfocus();
+                          // 恢复焦点到视频控制 FocusNode，确保快捷键持续可用
+                          WidgetsBinding.instance.addPostFrameCallback((_) {
+                            if (mounted && _videoFocusNode.canRequestFocus) {
+                              _videoFocusNode.requestFocus();
+                            }
+                          });
+                        },
+                        behavior: HitTestBehavior.translucent,
+                        child: SafeArea(
+                          top: true,
+                          bottom: false,
+                          left: false,
+                          right: false,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              Row(
+                                children: [
+                                  if (isLeftHandedMode) ...sidebarWidgets,
+                                  Expanded(
+                                    child: ValueListenableBuilder<double>(
+                                      valueListenable: _keyboardInsetBottom,
+                                      builder:
+                                          (
+                                            context,
+                                            keyboardInsetBottom,
+                                            child,
+                                          ) {
+                                            return Transform.translate(
+                                              offset: Offset(
+                                                0,
+                                                _resolveVideoKeyboardShift(
+                                                  keyboardInsetBottom,
+                                                ),
                                               ),
-                                            ),
-                                            child: child,
+                                              child: child,
+                                            );
+                                          },
+                                      child: LayoutBuilder(
+                                        builder: (context, screenConstraints) {
+                                          final Size playerSurfaceSize = Size(
+                                            screenConstraints.maxWidth,
+                                            screenConstraints.maxHeight,
                                           );
-                                        },
-                                    child: LayoutBuilder(
-                                      builder: (context, screenConstraints) {
-                                        final Size playerSurfaceSize = Size(
-                                          screenConstraints.maxWidth,
-                                          screenConstraints.maxHeight,
-                                        );
-                                        final Rect videoViewportRect =
-                                            Rect.fromLTWH(
-                                              0,
-                                              0,
-                                              playerSurfaceSize.width,
-                                              playerSurfaceSize.height,
-                                            );
-                                        _lastVideoViewportRect =
-                                            videoViewportRect;
-                                        // Ghost Mode Logic
-                                        final isLandscape =
-                                            MediaQuery.of(
-                                              context,
-                                            ).orientation ==
-                                            Orientation.landscape;
-                                        final canEditGhostStyle =
-                                            _canUseGhostSidebarEditing(
-                                              context,
-                                              settings,
-                                            );
-                                        final isGhostActive =
-                                            canEditGhostStyle &&
-                                            ((_activeSidebar ==
-                                                    SidebarType.subtitles) ||
-                                                _isGhostDragMode ||
-                                                _activeSidebar ==
-                                                    SidebarType.subtitleStyle);
-                                        final SubtitleStyle
-                                        activeSubtitleStyle = _isAudio
-                                            ? (isLandscape
-                                                  ? settings
-                                                        .audioSubtitleStyleLandscape
-                                                  : settings
-                                                        .audioSubtitleStylePortrait)
-                                            : (isLandscape
-                                                  ? settings
-                                                        .subtitleStyleLandscape
-                                                  : settings
-                                                        .subtitleStylePortrait);
-                                        final double videoAspectRatio =
-                                            _controller.value.aspectRatio > 0
-                                            ? _controller.value.aspectRatio
-                                            : 16 / 9;
-                                        final Size containedVideoSize =
-                                            _computeContainedVideoSize(
-                                              playerSurfaceSize,
-                                              videoAspectRatio,
-                                            );
+                                          final Rect videoViewportRect =
+                                              Rect.fromLTWH(
+                                                0,
+                                                0,
+                                                playerSurfaceSize.width,
+                                                playerSurfaceSize.height,
+                                              );
+                                          _lastVideoViewportRect =
+                                              videoViewportRect;
+                                          // Ghost Mode Logic
+                                          final isLandscape =
+                                              MediaQuery.of(
+                                                context,
+                                              ).orientation ==
+                                              Orientation.landscape;
+                                          final canEditGhostStyle =
+                                              _canUseGhostSidebarEditing(
+                                                context,
+                                                settings,
+                                              );
+                                          final isGhostActive =
+                                              canEditGhostStyle &&
+                                              !_subtitleStyleFromCompose &&
+                                              ((_activeSidebar ==
+                                                      SidebarType.subtitles) ||
+                                                  _isGhostDragMode ||
+                                                  _activeSidebar ==
+                                                      SidebarType
+                                                          .subtitleStyle);
+                                          final SubtitleStyle
+                                          activeSubtitleStyle = _isAudio
+                                              ? (isLandscape
+                                                    ? settings
+                                                          .audioSubtitleStyleLandscape
+                                                    : settings
+                                                          .audioSubtitleStylePortrait)
+                                              : (isLandscape
+                                                    ? settings
+                                                          .subtitleStyleLandscape
+                                                    : settings
+                                                          .subtitleStylePortrait);
+                                          // 守卫：当从 MediaPlaybackService 异步加载视频时，
+                                          // _initVideo 会在 service 处于 loading 时提前 return，
+                                          // 不给 _controller（late 变量）赋值。此时访问
+                                          // _controller.value 会抛 LateInitializationError，
+                                          // 在 Release 下 ErrorWidget 渲染为空白 → 白屏。
+                                          // 加载期间用 16:9 占位（此时仅渲染 loading 态，不渲染视频）。
+                                          final double videoAspectRatio =
+                                              (_controllerAssigned &&
+                                                  _controller
+                                                          .value
+                                                          .aspectRatio >
+                                                      0)
+                                              ? _controller.value.aspectRatio
+                                              : 16 / 9;
+                                          final Size containedVideoSize =
+                                              _computeContainedVideoSize(
+                                                playerSurfaceSize,
+                                                videoAspectRatio,
+                                              );
+                                          final PlayerControlMetrics
+                                          playbackControlMetrics =
+                                              PlayerControlMetrics.fromSize(
+                                                playerSurfaceSize,
+                                                safeBottom:
+                                                    MediaQuery.maybeOf(
+                                                      context,
+                                                    )?.padding.bottom ??
+                                                    0,
+                                              );
+                                          final double controlsClearance =
+                                              subtitlePlaybackControlsClearance(
+                                                playerSurfaceSize.height,
+                                              );
+                                          final double videoViewportTop =
+                                              (playerSurfaceSize.height -
+                                                  containedVideoSize.height) /
+                                              2;
+                                          final double videoViewportLeft =
+                                              (playerSurfaceSize.width -
+                                                  containedVideoSize.width) /
+                                              2;
+                                          List<Rect>
+                                          playerPlaybackControlRects() =>
+                                              _playbackControlAvoidanceRects(
+                                                context: context,
+                                                playerSize: playerSurfaceSize,
+                                                metrics: playbackControlMetrics,
+                                                clearance: controlsClearance,
+                                              );
+                                          List<Rect>
+                                          videoPlaybackControlRects() =>
+                                              playerPlaybackControlRects()
+                                                  .map(
+                                                    (rect) => rect.translate(
+                                                      -videoViewportLeft,
+                                                      -videoViewportTop,
+                                                    ),
+                                                  )
+                                                  .toList(growable: false);
 
-                                        return Listener(
-                                          behavior: HitTestBehavior.translucent,
-                                          onPointerDown:
-                                              _canUseVideoTransformGestures
-                                              ? _handleVideoTransformPointerDown
-                                              : null,
-                                          onPointerMove:
-                                              _canUseVideoTransformGestures
-                                              ? _handleVideoTransformPointerMove
-                                              : null,
-                                          onPointerUp:
-                                              _canUseVideoTransformGestures
-                                              ? (event) =>
-                                                    _handleVideoTransformPointerEnd(
-                                                      event.pointer,
-                                                    )
-                                              : null,
-                                          onPointerCancel:
-                                              _canUseVideoTransformGestures
-                                              ? (event) =>
-                                                    _handleVideoTransformPointerEnd(
-                                                      event.pointer,
-                                                    )
-                                              : null,
-                                          child: Stack(
-                                            alignment: Alignment.center,
-                                            children: [
-                                              // 1. Video Layer
-                                              Center(
-                                                child:
-                                                    _fatalErrorMessage != null
-                                                    ? Container(
-                                                        color: Colors.black,
-                                                        padding:
-                                                            const EdgeInsets.all(
-                                                              24,
+                                          return Listener(
+                                            behavior:
+                                                HitTestBehavior.translucent,
+                                            onPointerDown:
+                                                _handleVideoTransformPointerDown,
+                                            onPointerMove:
+                                                _handleVideoTransformPointerMove,
+                                            onPointerUp: (event) =>
+                                                _handleVideoTransformPointerEnd(
+                                                  event.pointer,
+                                                ),
+                                            onPointerCancel: (event) =>
+                                                _handleVideoTransformPointerEnd(
+                                                  event.pointer,
+                                                ),
+                                            child: Stack(
+                                              alignment: Alignment.center,
+                                              children: [
+                                                // 1. Video Layer
+                                                Center(
+                                                  child: _isSourceMissing
+                                                      ? const ColoredBox(
+                                                          color: Colors.black,
+                                                          child: Center(
+                                                            child: Text(
+                                                              "没有原媒体",
+                                                              style: TextStyle(
+                                                                color: Colors
+                                                                    .white70,
+                                                                fontSize: 20,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .w500,
+                                                              ),
                                                             ),
-                                                        child: Center(
-                                                          child: ConstrainedBox(
-                                                            constraints:
-                                                                const BoxConstraints(
-                                                                  maxWidth: 520,
-                                                                ),
-                                                            child: Column(
-                                                              mainAxisSize:
-                                                                  MainAxisSize
-                                                                      .min,
-                                                              children: [
-                                                                const Icon(
-                                                                  Icons
-                                                                      .error_outline,
-                                                                  color: Colors
-                                                                      .redAccent,
-                                                                  size: 64,
-                                                                ),
-                                                                const SizedBox(
-                                                                  height: 16,
-                                                                ),
-                                                                const Text(
-                                                                  "无法播放该媒体",
-                                                                  style: TextStyle(
-                                                                    color: Colors
-                                                                        .white,
-                                                                    fontSize:
-                                                                        18,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .w600,
+                                                          ),
+                                                        )
+                                                      : _fatalErrorMessage !=
+                                                            null
+                                                      ? Container(
+                                                          color: Colors.black,
+                                                          padding:
+                                                              const EdgeInsets.all(
+                                                                24,
+                                                              ),
+                                                          child: Center(
+                                                            child: ConstrainedBox(
+                                                              constraints:
+                                                                  const BoxConstraints(
+                                                                    maxWidth:
+                                                                        520,
                                                                   ),
-                                                                ),
-                                                                const SizedBox(
-                                                                  height: 8,
-                                                                ),
-                                                                Text(
-                                                                  _fatalErrorMessage!,
-                                                                  style: const TextStyle(
+                                                              child: Column(
+                                                                mainAxisSize:
+                                                                    MainAxisSize
+                                                                        .min,
+                                                                children: [
+                                                                  const Icon(
+                                                                    Icons
+                                                                        .error_outline,
                                                                     color: Colors
-                                                                        .white70,
+                                                                        .redAccent,
+                                                                    size: 64,
                                                                   ),
-                                                                  textAlign:
-                                                                      TextAlign
-                                                                          .center,
-                                                                ),
-                                                                const SizedBox(
-                                                                  height: 24,
-                                                                ),
-                                                                ElevatedButton(
-                                                                  onPressed: () async {
-                                                                    _forceExit =
-                                                                        true;
-                                                                    await _handleExit();
-                                                                    if (context
-                                                                        .mounted) {
-                                                                      Navigator.of(
-                                                                        context,
-                                                                      ).pop();
-                                                                    }
-                                                                  },
-                                                                  child:
-                                                                      const Text(
-                                                                        "返回",
-                                                                      ),
-                                                                ),
-                                                              ],
-                                                            ),
-                                                          ),
-                                                        ),
-                                                      )
-                                                    : _isRepairing
-                                                    ? Column(
-                                                        mainAxisAlignment:
-                                                            MainAxisAlignment
-                                                                .center,
-                                                        children: [
-                                                          const CircularProgressIndicator(),
-                                                          const SizedBox(
-                                                            height: 16,
-                                                          ),
-                                                          const Text(
-                                                            "正在修复视频...",
-                                                            style: TextStyle(
-                                                              color:
-                                                                  Colors.white,
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                            height: 8,
-                                                          ),
-                                                          Text(
-                                                            "进度: ${(_repairProgress * 100).toStringAsFixed(1)}%",
-                                                            style:
-                                                                const TextStyle(
-                                                                  color: Colors
-                                                                      .white,
-                                                                  fontSize: 16,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                ),
-                                                          ),
-                                                          const SizedBox(
-                                                            height: 8,
-                                                          ),
-                                                          const Text(
-                                                            "转码为 H.264 (兼容模式)",
-                                                            style: TextStyle(
-                                                              color: Colors
-                                                                  .white70,
-                                                              fontSize: 12,
-                                                            ),
-                                                          ),
-                                                        ],
-                                                      )
-                                                    : _initialized
-                                                    ? RepaintBoundary(
-                                                        child: SizedBox.expand(
-                                                          child: Stack(
-                                                            fit:
-                                                                StackFit.expand,
-                                                            children: [
-                                                              if (_isAudio)
-                                                                Container(
-                                                                  color: Colors
-                                                                      .black,
-                                                                  child: const Center(
-                                                                    child: Icon(
-                                                                      Icons
-                                                                          .music_note,
-                                                                      size: 80,
+                                                                  const SizedBox(
+                                                                    height: 16,
+                                                                  ),
+                                                                  const Text(
+                                                                    "无法播放该媒体",
+                                                                    style: TextStyle(
                                                                       color: Colors
-                                                                          .white24,
+                                                                          .white,
+                                                                      fontSize:
+                                                                          18,
+                                                                      fontWeight:
+                                                                          FontWeight
+                                                                              .w600,
                                                                     ),
                                                                   ),
-                                                                )
-                                                              else
-                                                                ClipRect(
-                                                                  child: Stack(
-                                                                    fit: StackFit
-                                                                        .expand,
-                                                                    children: [
-                                                                      Center(
-                                                                        child: Transform(
-                                                                          alignment:
-                                                                              Alignment.center,
-                                                                          transform: _buildVideoTransformMatrix(
-                                                                            videoViewportRect.size,
-                                                                            settings,
-                                                                          ),
-                                                                          child: SizedBox(
-                                                                            width:
-                                                                                containedVideoSize.width,
-                                                                            height:
-                                                                                containedVideoSize.height,
-                                                                            child: ColoredBox(
-                                                                              color: Colors.black,
-                                                                              child: VideoPlayer(
-                                                                                _controller,
-                                                                                key: ValueKey(
-                                                                                  _currentItem?.id,
+                                                                  const SizedBox(
+                                                                    height: 8,
+                                                                  ),
+                                                                  Text(
+                                                                    _fatalErrorMessage!,
+                                                                    style: const TextStyle(
+                                                                      color: Colors
+                                                                          .white70,
+                                                                    ),
+                                                                    textAlign:
+                                                                        TextAlign
+                                                                            .center,
+                                                                  ),
+                                                                  const SizedBox(
+                                                                    height: 24,
+                                                                  ),
+                                                                  ElevatedButton(
+                                                                    onPressed: () =>
+                                                                        unawaited(
+                                                                          _forceExitPlayer(),
+                                                                        ),
+                                                                    child:
+                                                                        const Text(
+                                                                          "返回",
+                                                                        ),
+                                                                  ),
+                                                                ],
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        )
+                                                      : _isRepairing
+                                                      ? Column(
+                                                          mainAxisAlignment:
+                                                              MainAxisAlignment
+                                                                  .center,
+                                                          children: [
+                                                            const CircularProgressIndicator(),
+                                                            const SizedBox(
+                                                              height: 16,
+                                                            ),
+                                                            const Text(
+                                                              "正在修复视频...",
+                                                              style: TextStyle(
+                                                                color: Colors
+                                                                    .white,
+                                                              ),
+                                                            ),
+                                                            const SizedBox(
+                                                              height: 8,
+                                                            ),
+                                                            Text(
+                                                              "进度: ${(_repairProgress * 100).toStringAsFixed(1)}%",
+                                                              style: const TextStyle(
+                                                                color: Colors
+                                                                    .white,
+                                                                fontSize: 16,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold,
+                                                              ),
+                                                            ),
+                                                            const SizedBox(
+                                                              height: 8,
+                                                            ),
+                                                            const Text(
+                                                              "转码为 H.264 (兼容模式)",
+                                                              style: TextStyle(
+                                                                color: Colors
+                                                                    .white70,
+                                                                fontSize: 12,
+                                                              ),
+                                                            ),
+                                                          ],
+                                                        )
+                                                      : _initialized
+                                                      ? RepaintBoundary(
+                                                          child: SizedBox.expand(
+                                                            child: Stack(
+                                                              fit: StackFit
+                                                                  .expand,
+                                                              children: [
+                                                                if (_isAudio)
+                                                                  Container(
+                                                                    color: Colors
+                                                                        .black,
+                                                                    child: const Center(
+                                                                      child: Icon(
+                                                                        Icons
+                                                                            .music_note,
+                                                                        size:
+                                                                            80,
+                                                                        color: Colors
+                                                                            .white24,
+                                                                      ),
+                                                                    ),
+                                                                  )
+                                                                else
+                                                                  ClipRect(
+                                                                    child: Stack(
+                                                                      fit: StackFit
+                                                                          .expand,
+                                                                      children: [
+                                                                        RepaintBoundary(
+                                                                          child: Center(
+                                                                            child: Transform(
+                                                                              alignment: Alignment.center,
+                                                                              transform: _buildVideoTransformMatrix(
+                                                                                videoViewportRect.size,
+                                                                                settings,
+                                                                              ),
+                                                                              child: SizedBox(
+                                                                                width: containedVideoSize.width,
+                                                                                height: containedVideoSize.height,
+                                                                                child: ColoredBox(
+                                                                                  color: Colors.black,
+                                                                                  child: VideoPlayer(
+                                                                                    _controller,
+                                                                                    key: _videoTextureKey,
+                                                                                  ),
                                                                                 ),
                                                                               ),
                                                                             ),
                                                                           ),
                                                                         ),
-                                                                      ),
-                                                                    ],
+                                                                      ],
+                                                                    ),
                                                                   ),
-                                                                ),
-                                                              if (settings
-                                                                      .showSubtitles &&
-                                                                  !isGhostActive)
-                                                                _isAudio
-                                                                    ? _buildFreeSubtitleOverlay(
-                                                                        alignment:
-                                                                            settings.audioSubtitleAlignment,
-                                                                        style:
-                                                                            activeSubtitleStyle,
-                                                                        isDragging:
-                                                                            _isSubtitleDragMode,
-                                                                      )
-                                                                    : _buildVideoBoundSubtitleOverlay(
-                                                                        videoSize:
-                                                                            containedVideoSize,
-                                                                        alignment:
-                                                                            settings.subtitleAlignment,
-                                                                        style:
-                                                                            activeSubtitleStyle,
-                                                                        isDragging:
-                                                                            _isSubtitleDragMode,
-                                                                      ),
-                                                            ],
-                                                          ),
-                                                        ),
-                                                      )
-                                                    : Focus(
-                                                        focusNode:
-                                                            _videoFocusNode,
-                                                        autofocus: true,
-                                                        onKeyEvent:
-                                                            (node, event) =>
-                                                                _handleLoadingKeyEvent(
-                                                                  event,
-                                                                ),
-                                                        child:
-                                                            _buildLoadingState(
-                                                              context,
+                                                                if (!_isAudio)
+                                                                  _buildVideoBoundDanmakuOverlay(
+                                                                    videoSize:
+                                                                        containedVideoSize,
+                                                                    playerHeight:
+                                                                        playerSurfaceSize
+                                                                            .height,
+                                                                    settings:
+                                                                        settings,
+                                                                  ),
+                                                              ],
                                                             ),
-                                                      ),
-                                              ),
-
-                                              if (_initialized &&
-                                                  _activeSidebar ==
-                                                      SidebarType.subtitleStyle)
-                                                Positioned.fill(
-                                                  child: GestureDetector(
-                                                    behavior: HitTestBehavior
-                                                        .translucent,
-                                                    onDoubleTap: _isLocked
-                                                        ? null
-                                                        : _togglePlay,
-                                                  ),
+                                                          ),
+                                                        )
+                                                      : Focus(
+                                                          focusNode:
+                                                              _videoFocusNode,
+                                                          autofocus: true,
+                                                          onKeyEvent:
+                                                              (node, event) =>
+                                                                  _handleLoadingKeyEvent(
+                                                                    event,
+                                                                  ),
+                                                          child:
+                                                              _buildLoadingState(
+                                                                context,
+                                                              ),
+                                                        ),
                                                 ),
 
-                                              // 2. Controls Layer
-                                              if (_initialized &&
-                                                  !_isSubtitleDragMode &&
-                                                  !_isGhostDragMode)
-                                                RepaintBoundary(
-                                                  child: VideoControlsOverlay(
-                                                    controller: _controller,
-                                                    isLocked: _isLocked,
-                                                    onTogglePlay: _togglePlay,
-                                                    onBackPressed: () =>
-                                                        _handleBackRequest(),
-                                                    onSeekTo: (position) {
-                                                      _seekPlaybackPosition(
-                                                        position,
-                                                      );
-                                                    },
-                                                    onExitPressed: () async {
-                                                      _forceExit = true;
-                                                      await _handleExit();
-                                                      SystemChrome.setPreferredOrientations(
-                                                        [
-                                                          DeviceOrientation
-                                                              .portraitUp,
-                                                          DeviceOrientation
-                                                              .portraitDown,
-                                                        ],
-                                                      );
-                                                      if (context.mounted) {
-                                                        Navigator.of(
-                                                          context,
-                                                        ).pop();
-                                                      }
-                                                    },
-                                                    onOpenSettings: () =>
-                                                        setState(() {
-                                                          _previousSidebarType =
-                                                              _normalizedSidebarForRestore(
-                                                                _activeSidebar,
-                                                              );
-                                                          _activeSidebar =
-                                                              SidebarType
-                                                                  .settings;
-                                                        }),
-                                                    onOpenSubtitleManager:
-                                                        _showSubtitleManager,
-                                                    onOpenSubtitleEditor:
-                                                        _showSubtitleEditor,
-                                                    showSubtitleEditorButton:
-                                                        kIsWeb ||
-                                                        !(Platform.isAndroid ||
-                                                            Platform.isIOS),
-                                                    onOpenVideoCompose:
-                                                        _showVideoCompose,
-                                                    onToggleFloatingSubtitleSettings:
-                                                        _toggleFloatingSubtitleSettingsSidebar,
-                                                    onToggleSidebar: () {
-                                                      final settings =
-                                                          Provider.of<
-                                                            SettingsService
-                                                          >(
-                                                            context,
-                                                            listen: false,
-                                                          );
-                                                      setState(() {
-                                                        if (_isSubtitleSidebarVisible) {
-                                                          if (_activeSidebar ==
-                                                              SidebarType
-                                                                  .subtitles) {
-                                                            _isSubtitleSidebarVisible =
-                                                                false;
+                                                if (_initialized &&
+                                                    _activeSidebar ==
+                                                        SidebarType
+                                                            .subtitleStyle)
+                                                  Positioned.fill(
+                                                    child: GestureDetector(
+                                                      behavior: HitTestBehavior
+                                                          .translucent,
+                                                      onDoubleTap: _isLocked
+                                                          ? null
+                                                          : _togglePlay,
+                                                    ),
+                                                  ),
+
+                                                // 2. Controls Layer
+                                                if ((_initialized ||
+                                                        _isSourceMissing) &&
+                                                    _controllerAssigned &&
+                                                    !_isSubtitleDragMode &&
+                                                    !_isGhostDragMode)
+                                                  RepaintBoundary(
+                                                    child: VideoControlsOverlay(
+                                                      key: _controlsKey,
+                                                      playbackControlsVisibility:
+                                                          _playbackControlsVisibility,
+                                                      controller: _controller,
+                                                      isLocked: _isLocked,
+                                                      onTogglePlay: _togglePlay,
+                                                      onBackPressed: () =>
+                                                          _handleBackRequest(),
+                                                      onSeekTo: (position) {
+                                                        _seekPlaybackPosition(
+                                                          position,
+                                                        );
+                                                      },
+                                                      onExitPressed: () async {
+                                                        await _forceExitPlayer();
+                                                      },
+                                                      onOpenSettings: () =>
+                                                          setState(() {
+                                                            _previousSidebarType =
+                                                                _normalizedSidebarForRestore(
+                                                                  _activeSidebar,
+                                                                );
                                                             _activeSidebar =
                                                                 SidebarType
-                                                                    .none;
+                                                                    .settings;
+                                                          }),
+                                                      onOpenSubtitleManager:
+                                                          _showSubtitleManager,
+                                                      onOpenSubtitleEditor:
+                                                          _showSubtitleEditor,
+                                                      showSubtitleEditorButton:
+                                                          kIsWeb ||
+                                                          !(Platform
+                                                                  .isAndroid ||
+                                                              Platform.isIOS),
+                                                      onOpenVideoCompose:
+                                                          _showVideoCompose,
+                                                      onOpenOcrSubtitle:
+                                                          _supportsOcrSubtitle
+                                                          ? _showOcrSubtitle
+                                                          : null,
+                                                      onToggleFloatingSubtitleSettings:
+                                                          _toggleFloatingSubtitleSettingsSidebar,
+                                                      onToggleSidebar: () {
+                                                        final settings =
+                                                            Provider.of<
+                                                              SettingsService
+                                                            >(
+                                                              context,
+                                                              listen: false,
+                                                            );
+                                                        setState(() {
+                                                          if (_isSubtitleSidebarVisible) {
+                                                            if (_activeSidebar ==
+                                                                SidebarType
+                                                                    .subtitles) {
+                                                              _isSubtitleSidebarVisible =
+                                                                  false;
+                                                              _activeSidebar =
+                                                                  SidebarType
+                                                                      .none;
+                                                            } else {
+                                                              _activeSidebar =
+                                                                  SidebarType
+                                                                      .subtitles;
+                                                            }
                                                           } else {
+                                                            _isSubtitleSidebarVisible =
+                                                                true;
                                                             _activeSidebar =
                                                                 SidebarType
                                                                     .subtitles;
                                                           }
-                                                        } else {
-                                                          _isSubtitleSidebarVisible =
-                                                              true;
-                                                          _activeSidebar =
-                                                              SidebarType
-                                                                  .subtitles;
-                                                        }
-                                                      });
-                                                      settings.saveLandscapeSubtitleSidebarVisible(
-                                                        _isSubtitleSidebarVisible,
-                                                      );
-                                                      WidgetsBinding.instance
-                                                          .addPostFrameCallback((
-                                                            _,
-                                                          ) {
-                                                            if (!mounted)
-                                                              return;
-                                                            if (_isSubtitleSidebarVisible &&
-                                                                _activeSidebar ==
-                                                                    SidebarType
-                                                                        .subtitles) {
-                                                              _userRequestedSubtitles =
-                                                                  true;
-                                                              unawaited(
-                                                                _maybeLoadSubtitlesForCurrentItem(
-                                                                  force: true,
-                                                                ),
-                                                              );
-                                                            }
-                                                          });
-                                                    },
-                                                    isSubtitleSidebarVisible:
-                                                        _isSubtitleSidebarVisible,
-                                                    onToggleFullScreen: () =>
-                                                        settings
-                                                            .toggleFullScreen(),
-                                                    onToggleLock: () =>
-                                                        _setScreenLock(
-                                                          !_isLocked,
-                                                        ),
-                                                    onSpeedUpdate: (speed) =>
-                                                        unawaited(
-                                                          _handlePlaybackSpeedSelected(
-                                                            speed,
+                                                        });
+                                                        settings.saveLandscapeSubtitleSidebarVisible(
+                                                          _isSubtitleSidebarVisible,
+                                                        );
+                                                        WidgetsBinding.instance.addPostFrameCallback((
+                                                          _,
+                                                        ) {
+                                                          if (!mounted) {
+                                                            return;
+                                                          }
+                                                          if (_isSubtitleSidebarVisible &&
+                                                              _activeSidebar ==
+                                                                  SidebarType
+                                                                      .subtitles) {
+                                                            _userRequestedSubtitles =
+                                                                true;
+                                                            unawaited(
+                                                              _maybeLoadSubtitlesForCurrentItem(
+                                                                force: true,
+                                                              ),
+                                                            );
+                                                          }
+                                                        });
+                                                      },
+                                                      isSubtitleSidebarVisible:
+                                                          _isSubtitleSidebarVisible,
+                                                      onToggleFullScreen: () =>
+                                                          settings
+                                                              .toggleFullScreen(),
+                                                      onToggleLock: () =>
+                                                          _setScreenLock(
+                                                            !_isLocked,
                                                           ),
-                                                        ),
-                                                    onSpeedLockToggle:
-                                                        (speed) => unawaited(
-                                                          _handlePlaybackSpeedLockToggle(
-                                                            speed,
-                                                          ),
-                                                        ),
-                                                    doubleTapSeekSeconds: settings
-                                                        .doubleTapSeekSeconds,
-                                                    enableDoubleTapSubtitleSeek:
-                                                        settings
-                                                            .enableDoubleTapSubtitleSeek,
-                                                    subtitles: _subtitles,
-                                                    longPressSpeed:
-                                                        settings.longPressSpeed,
-                                                    showSubtitles:
-                                                        settings.showSubtitles,
-                                                    onToggleSubtitles: () =>
-                                                        _setFloatingSubtitles(
+                                                      showDanmakuControls:
+                                                          _currentItem
+                                                              ?.isBilibiliExported ==
+                                                          true,
+                                                      danmakuEnabled: settings
+                                                          .showBilibiliDanmaku,
+                                                      onToggleDanmaku: () => unawaited(
+                                                        settings.saveShowBilibiliDanmaku(
                                                           !settings
-                                                              .showSubtitles,
+                                                              .showBilibiliDanmaku,
                                                         ),
-                                                    onMoveSubtitles: () {
-                                                      final useGhostDrag =
-                                                          _canUseGhostSidebarEditing(
-                                                            context,
-                                                            settings,
-                                                          );
-                                                      if (useGhostDrag) {
-                                                        _enterGhostDragMode();
-                                                      } else {
-                                                        _enterSubtitleDragMode();
-                                                      }
-                                                    },
-                                                    isLongPressing:
-                                                        _isLongPressing,
-                                                    longPressFeedbackText:
-                                                        _longPressFeedbackText,
-                                                    onLongPressStart:
-                                                        _startLongPressSpeed,
-                                                    onLongPressEnd:
-                                                        _endLongPressSpeed,
-                                                    subtitleEntries:
-                                                        _currentSubtitleEntries,
-                                                    subtitleStyle:
-                                                        activeSubtitleStyle,
-                                                    subtitleAlignment: _isAudio
-                                                        ? settings
-                                                              .audioSubtitleAlignment
-                                                        : settings
-                                                              .subtitleAlignment,
-                                                    onEnterSubtitleDragMode:
-                                                        _enterSubtitleDragMode,
-                                                    onClearSelection: () =>
-                                                        _selectionKey
-                                                            .currentState
-                                                            ?.clearSelection(),
-                                                    onToggleEpisodePicker: () =>
-                                                        setState(
-                                                          () => _showEpisodePicker =
-                                                              !_showEpisodePicker,
-                                                        ),
-                                                    focusNode: _videoFocusNode,
-                                                    onPlayPrevious: () =>
-                                                        Provider.of<
-                                                              MediaPlaybackService
-                                                            >(
+                                                      ),
+                                                      onOpenDanmakuSettings:
+                                                          () => unawaited(
+                                                            showDanmakuSettingsDialog(
                                                               context,
-                                                              listen: false,
-                                                            )
-                                                            .playPrevious(
-                                                              autoPlay: settings
-                                                                  .autoPlayNextVideo,
                                                             ),
-                                                    onPlayNext: () =>
-                                                        Provider.of<
-                                                              MediaPlaybackService
-                                                            >(
-                                                              context,
-                                                              listen: false,
-                                                            )
-                                                            .playNext(
-                                                              autoPlay: settings
-                                                                  .autoPlayNextVideo,
-                                                            ),
-                                                    hasPrevious:
-                                                        Provider.of<
-                                                              PlaylistManager
-                                                            >(context)
-                                                            .hasPrevious,
-                                                    hasNext:
-                                                        Provider.of<
-                                                              PlaylistManager
-                                                            >(context)
-                                                            .hasNext,
-                                                    mediaTitle:
-                                                        _currentItem?.title ??
-                                                        '',
-                                                    showResetScreenButton:
-                                                        !_isAudio &&
-                                                        _hasCustomVideoTransform,
-                                                    onResetScreenTransform: () =>
-                                                        _resetVideoUserTransform(),
-                                                    suppressPrimaryGestures:
-                                                        _isVideoTransformGestureActive,
-                                                  ),
-                                                ),
-
-                                              // 3. Drag Mode Layer (Standard)
-                                              if (settings.showSubtitles &&
-                                                  _initialized &&
-                                                  _isSubtitleDragMode)
-                                                _isAudio
-                                                    ? _buildFreeSubtitleOverlay(
-                                                        alignment: settings
-                                                            .audioSubtitleAlignment,
-                                                        style:
-                                                            activeSubtitleStyle,
-                                                        isDragging: true,
-                                                        isGestureOnly: true,
-                                                        enablePanUpdate: true,
-                                                      )
-                                                    : _buildVideoBoundSubtitleOverlay(
-                                                        videoSize:
-                                                            containedVideoSize,
-                                                        alignment: settings
-                                                            .subtitleAlignment,
-                                                        style:
-                                                            activeSubtitleStyle,
-                                                        isDragging: true,
-                                                        isGestureOnly: true,
-                                                        enablePanUpdate: true,
-                                                      ),
-
-                                              // 4. Drag Hints
-                                              if (_isSubtitleDragMode ||
-                                                  _isGhostDragMode) ...[
-                                                if (_isSubtitleNearCenterX)
-                                                  Positioned.fill(
-                                                    child: Center(
-                                                      child: Container(
-                                                        width:
-                                                            _isSubtitleSnappedX
-                                                            ? 2
-                                                            : 1,
-                                                        height: double.infinity,
-                                                        color: Colors.white
-                                                            .withValues(
-                                                              alpha:
-                                                                  _isSubtitleSnappedX
-                                                                  ? 0.52
-                                                                  : 0.22,
-                                                            ),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                if (_isSubtitleNearCenterY)
-                                                  Positioned.fill(
-                                                    child: Center(
-                                                      child: Container(
-                                                        width: double.infinity,
-                                                        height:
-                                                            _isSubtitleSnappedY
-                                                            ? 2
-                                                            : 1,
-                                                        color: Colors.white
-                                                            .withValues(
-                                                              alpha:
-                                                                  _isSubtitleSnappedY
-                                                                  ? 0.52
-                                                                  : 0.22,
-                                                            ),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                Positioned(
-                                                  top: 20,
-                                                  child: Container(
-                                                    padding:
-                                                        const EdgeInsets.symmetric(
-                                                          horizontal: 16,
-                                                          vertical: 8,
-                                                        ),
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.black54,
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            20,
                                                           ),
+                                                      onSpeedUpdate:
+                                                          _handlePlaybackSpeedSelected,
+                                                      doubleTapSeekSeconds: settings
+                                                          .doubleTapSeekSeconds,
+                                                      enableDoubleTapSubtitleSeek:
+                                                          settings
+                                                              .enableDoubleTapSubtitleSeek,
+                                                      subtitles: _subtitles,
+                                                      longPressSpeed: settings
+                                                          .longPressSpeed,
+                                                      showSubtitles: settings
+                                                          .showSubtitles,
+                                                      suppressSubtitleOverlay:
+                                                          _suppressSubtitleOverlayForOcr,
+                                                      onToggleSubtitles: () =>
+                                                          _setFloatingSubtitles(
+                                                            !settings
+                                                                .showSubtitles,
+                                                          ),
+                                                      onMoveSubtitles: () {
+                                                        final useGhostDrag =
+                                                            _canUseGhostSidebarEditing(
+                                                              context,
+                                                              settings,
+                                                            );
+                                                        if (useGhostDrag) {
+                                                          _enterGhostDragMode();
+                                                        } else {
+                                                          _enterSubtitleDragMode();
+                                                        }
+                                                      },
+                                                      isLongPressing:
+                                                          _isLongPressing,
+                                                      longPressFeedbackText:
+                                                          _longPressFeedbackText,
+                                                      onLongPressStart:
+                                                          _startLongPressSpeed,
+                                                      onLongPressEnd:
+                                                          _endLongPressSpeed,
+                                                      subtitleEntries:
+                                                          _currentSubtitleEntries,
+                                                      subtitleStyle:
+                                                          activeSubtitleStyle,
+                                                      subtitleAlignment:
+                                                          _isAudio
+                                                          ? settings
+                                                                .audioSubtitleAlignment
+                                                          : settings
+                                                                .subtitleAlignment,
+                                                      onEnterSubtitleDragMode:
+                                                          _enterSubtitleDragMode,
+                                                      onClearSelection: () =>
+                                                          _selectionKey
+                                                              .currentState
+                                                              ?.clearSelection(),
+                                                      onToggleEpisodePicker:
+                                                          () => setState(
+                                                            () => _showEpisodePicker =
+                                                                !_showEpisodePicker,
+                                                          ),
+                                                      focusNode:
+                                                          _videoFocusNode,
+                                                      onPlayPrevious: () =>
+                                                          Provider.of<
+                                                                MediaPlaybackService
+                                                              >(
+                                                                context,
+                                                                listen: false,
+                                                              )
+                                                              .playPrevious(
+                                                                autoPlay: settings
+                                                                    .autoPlayNextVideo,
+                                                              ),
+                                                      onPlayNext: () =>
+                                                          Provider.of<
+                                                                MediaPlaybackService
+                                                              >(
+                                                                context,
+                                                                listen: false,
+                                                              )
+                                                              .playNext(
+                                                                autoPlay: settings
+                                                                    .autoPlayNextVideo,
+                                                              ),
+                                                      hasPrevious:
+                                                          Provider.of<
+                                                                PlaylistManager
+                                                              >(context)
+                                                              .hasPrevious,
+                                                      hasNext:
+                                                          Provider.of<
+                                                                PlaylistManager
+                                                              >(context)
+                                                              .hasNext,
+                                                      mediaTitle:
+                                                          _currentItem?.title ??
+                                                          '',
+                                                      chapters:
+                                                          _currentItem
+                                                              ?.chapters ??
+                                                          const <
+                                                            MediaChapter
+                                                          >[],
+                                                      onOpenChapters:
+                                                          _currentItem
+                                                                  ?.chapters
+                                                                  .isNotEmpty ==
+                                                              true
+                                                          ? _toggleChapterSidebar
+                                                          : null,
+                                                      isChapterSidebarVisible:
+                                                          _activeSidebar ==
+                                                          SidebarType.chapters,
+                                                      onExperimentalTrigger:
+                                                          _navigateToMusicPlayer,
+                                                      showResetScreenButton:
+                                                          !_isAudio &&
+                                                          _hasCustomVideoTransform,
+                                                      onResetScreenTransform: () =>
+                                                          _resetVideoUserTransform(),
+                                                      suppressPrimaryGestures:
+                                                          _isVideoTransformGestureActive ||
+                                                          _videoGestureSession
+                                                              .blocksTransforms,
+                                                      allowPlayWhenUninitialized:
+                                                          _isSourceMissing,
                                                     ),
-                                                    child: Text(
-                                                      _isGhostDragMode
-                                                          ? "拖拽调整幽灵模式位置"
-                                                          : "拖拽调整位置",
-                                                      style: const TextStyle(
-                                                        color: Colors.white,
+                                                  ),
+
+                                                // 3. Standard Subtitle Layer
+                                                // Keep ordinary subtitles above the controls, just
+                                                // like the ghost layer below. The subtitle widget is
+                                                // intentionally left interactive in non-ghost mode.
+                                                if (_initialized &&
+                                                    (((settings.showSubtitles &&
+                                                            !_suppressSubtitleOverlayForOcr) ||
+                                                        _videoComposePreviewActive)) &&
+                                                    !isGhostActive)
+                                                  _isAudio
+                                                      ? _buildFreeSubtitleOverlay(
+                                                          alignment: settings
+                                                              .audioSubtitleAlignment,
+                                                          style:
+                                                              activeSubtitleStyle,
+                                                          isDragging:
+                                                              _isSubtitleDragMode,
+                                                          displayNotifier:
+                                                              _videoComposePreviewActive
+                                                              ? _videoComposePreviewController
+                                                                    .displayNotifier
+                                                              : null,
+                                                          playbackControlsVisibility:
+                                                              _playbackControlsVisibility,
+                                                          playbackControlRects:
+                                                              playerPlaybackControlRects,
+                                                          avoidPlaybackControls:
+                                                              settings
+                                                                  .avoidPlaybackControlsWithSubtitles &&
+                                                              !_isLocked &&
+                                                              !_isSubtitleDragMode,
+                                                        )
+                                                      : _buildVideoBoundSubtitleOverlay(
+                                                          videoSize:
+                                                              containedVideoSize,
+                                                          alignment: settings
+                                                              .subtitleAlignment,
+                                                          style:
+                                                              activeSubtitleStyle,
+                                                          isDragging:
+                                                              _isSubtitleDragMode,
+                                                          displayNotifier:
+                                                              _videoComposePreviewActive
+                                                              ? _videoComposePreviewController
+                                                                    .displayNotifier
+                                                              : null,
+                                                          playbackControlsVisibility:
+                                                              _playbackControlsVisibility,
+                                                          playbackControlRects:
+                                                              videoPlaybackControlRects,
+                                                          avoidPlaybackControls:
+                                                              settings
+                                                                  .avoidPlaybackControlsWithSubtitles &&
+                                                              !_isLocked &&
+                                                              !_isSubtitleDragMode,
+                                                        ),
+
+                                                // 4. Drag Mode Layer (Standard)
+                                                if (settings.showSubtitles &&
+                                                    !_suppressSubtitleOverlayForOcr &&
+                                                    _initialized &&
+                                                    _isSubtitleDragMode)
+                                                  _isAudio
+                                                      ? _buildFreeSubtitleOverlay(
+                                                          alignment: settings
+                                                              .audioSubtitleAlignment,
+                                                          style:
+                                                              activeSubtitleStyle,
+                                                          isDragging: true,
+                                                          isGestureOnly: true,
+                                                          enablePanUpdate: true,
+                                                        )
+                                                      : _buildVideoBoundSubtitleOverlay(
+                                                          videoSize:
+                                                              containedVideoSize,
+                                                          alignment: settings
+                                                              .subtitleAlignment,
+                                                          style:
+                                                              activeSubtitleStyle,
+                                                          isDragging: true,
+                                                          isGestureOnly: true,
+                                                          enablePanUpdate: true,
+                                                        ),
+
+                                                // 5. Drag Hints
+                                                if (_isSubtitleDragMode ||
+                                                    _isGhostDragMode) ...[
+                                                  if (_isSubtitleNearCenterX)
+                                                    Positioned.fill(
+                                                      child: Center(
+                                                        child: Container(
+                                                          width:
+                                                              _isSubtitleSnappedX
+                                                              ? 2
+                                                              : 1,
+                                                          height:
+                                                              double.infinity,
+                                                          color: Colors.white
+                                                              .withValues(
+                                                                alpha:
+                                                                    _isSubtitleSnappedX
+                                                                    ? 0.52
+                                                                    : 0.22,
+                                                              ),
+                                                        ),
                                                       ),
                                                     ),
+                                                  if (_isSubtitleNearCenterY)
+                                                    Positioned.fill(
+                                                      child: Center(
+                                                        child: Container(
+                                                          width:
+                                                              double.infinity,
+                                                          height:
+                                                              _isSubtitleSnappedY
+                                                              ? 2
+                                                              : 1,
+                                                          color: Colors.white
+                                                              .withValues(
+                                                                alpha:
+                                                                    _isSubtitleSnappedY
+                                                                    ? 0.52
+                                                                    : 0.22,
+                                                              ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  Positioned(
+                                                    top: 20,
+                                                    child: Container(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 16,
+                                                            vertical: 8,
+                                                          ),
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.black54,
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              20,
+                                                            ),
+                                                      ),
+                                                      child: Text(
+                                                        _isGhostDragMode
+                                                            ? "拖拽调整幽灵模式位置"
+                                                            : "拖拽调整位置",
+                                                        style: const TextStyle(
+                                                          color: Colors.white,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+
+                                                // 6. Ghost Mode Subtitle Layer
+                                                if (settings.showSubtitles &&
+                                                    !_suppressSubtitleOverlayForOcr &&
+                                                    isGhostActive)
+                                                  Positioned.fill(
+                                                    child: IgnorePointer(
+                                                      ignoring:
+                                                          !_isGhostDragMode,
+                                                      child: GestureDetector(
+                                                        onPanUpdate:
+                                                            _isGhostDragMode
+                                                            ? (
+                                                                details,
+                                                              ) => _updateSubtitlePosition(
+                                                                details,
+                                                                screenConstraints,
+                                                                isGhost: true,
+                                                              )
+                                                            : null,
+                                                        child: SubtitleDisplayLayer(
+                                                          notifier:
+                                                              subtitleDisplayNotifier,
+                                                          alignment: settings
+                                                              .ghostModeAlignment,
+                                                          style: settings
+                                                              .subtitleStyleGhostLandscape,
+                                                          referenceHeight:
+                                                              containedVideoSize
+                                                                  .height,
+                                                          isDragging:
+                                                              _isGhostDragMode,
+                                                          isVisualOnly:
+                                                              !_isGhostDragMode,
+                                                          animateAlignment:
+                                                              true,
+                                                          playbackControlsVisibility:
+                                                              _playbackControlsVisibility,
+                                                          playbackControlRects:
+                                                              playerPlaybackControlRects,
+                                                          avoidPlaybackControls:
+                                                              settings
+                                                                  .avoidPlaybackControlsWithSubtitles &&
+                                                              !_isLocked &&
+                                                              !_isGhostDragMode,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  ),
+
+                                                // 7. Episode Picker Layer
+                                                Positioned.fill(
+                                                  child: _showEpisodePicker
+                                                      ? GestureDetector(
+                                                          behavior:
+                                                              HitTestBehavior
+                                                                  .opaque,
+                                                          onTap: () {
+                                                            setState(() {
+                                                              _showEpisodePicker =
+                                                                  false;
+                                                            });
+                                                          },
+                                                          child: Container(
+                                                            color: Colors
+                                                                .transparent,
+                                                          ),
+                                                        )
+                                                      : const SizedBox.shrink(),
+                                                ),
+                                                Align(
+                                                  alignment: Alignment.center,
+                                                  child: AnimatedSwitcher(
+                                                    duration: const Duration(
+                                                      milliseconds: 250,
+                                                    ),
+                                                    switchInCurve:
+                                                        Curves.easeOutBack,
+                                                    switchOutCurve:
+                                                        Curves.easeIn,
+                                                    transitionBuilder:
+                                                        (
+                                                          Widget child,
+                                                          Animation<double>
+                                                          animation,
+                                                        ) {
+                                                          return SlideTransition(
+                                                            position:
+                                                                Tween<Offset>(
+                                                                  begin:
+                                                                      const Offset(
+                                                                        0,
+                                                                        0.05,
+                                                                      ),
+                                                                  end: Offset
+                                                                      .zero,
+                                                                ).animate(
+                                                                  animation,
+                                                                ),
+                                                            child:
+                                                                FadeTransition(
+                                                                  opacity:
+                                                                      animation,
+                                                                  child: child,
+                                                                ),
+                                                          );
+                                                        },
+                                                    child: _showEpisodePicker
+                                                        ? EpisodePickerPanel(
+                                                            key: const ValueKey(
+                                                              "EpisodePickerPanel",
+                                                            ),
+                                                            panelWidth:
+                                                                (screenConstraints
+                                                                            .maxWidth *
+                                                                        0.65)
+                                                                    .clamp(
+                                                                      280.0,
+                                                                      800.0,
+                                                                    ),
+                                                            panelHeight:
+                                                                (screenConstraints
+                                                                            .maxHeight *
+                                                                        0.75)
+                                                                    .clamp(
+                                                                      240.0,
+                                                                      700.0,
+                                                                    ),
+                                                            onClose: () => setState(
+                                                              () =>
+                                                                  _showEpisodePicker =
+                                                                      false,
+                                                            ),
+                                                          )
+                                                        : const SizedBox.shrink(
+                                                            key: ValueKey(
+                                                              "EpisodePickerPanel_Empty",
+                                                            ),
+                                                          ),
                                                   ),
                                                 ),
                                               ],
-
-                                              // 5. Ghost Mode Subtitle Layer
-                                              if (settings.showSubtitles &&
-                                                  isGhostActive)
-                                                Positioned.fill(
-                                                  child: IgnorePointer(
-                                                    ignoring: !_isGhostDragMode,
-                                                    child: GestureDetector(
-                                                      onPanUpdate:
-                                                          _isGhostDragMode
-                                                          ? (
-                                                              details,
-                                                            ) => _updateSubtitlePosition(
-                                                              details,
-                                                              screenConstraints,
-                                                              isGhost: true,
-                                                            )
-                                                          : null,
-                                                      child: SubtitleOverlayGroup(
-                                                        entries:
-                                                            _currentSubtitleEntries,
-                                                        alignment: settings
-                                                            .ghostModeAlignment,
-                                                        style: settings
-                                                            .subtitleStyleGhostLandscape,
-                                                        referenceHeight:
-                                                            containedVideoSize
-                                                                .height,
-                                                        isDragging:
-                                                            _isGhostDragMode,
-                                                        isVisualOnly:
-                                                            !_isGhostDragMode,
-                                                        animateAlignment: true,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ),
-
-                                              // 6. Episode Picker Layer
-                                              Positioned.fill(
-                                                child: _showEpisodePicker
-                                                    ? GestureDetector(
-                                                        behavior:
-                                                            HitTestBehavior
-                                                                .opaque,
-                                                        onTap: () {
-                                                          setState(() {
-                                                            _showEpisodePicker =
-                                                                false;
-                                                          });
-                                                        },
-                                                        child: Container(
-                                                          color: Colors
-                                                              .transparent,
-                                                        ),
-                                                      )
-                                                    : const SizedBox.shrink(),
-                                              ),
-                                              Align(
-                                                alignment: Alignment.center,
-                                                child: AnimatedSwitcher(
-                                                  duration: const Duration(
-                                                    milliseconds: 250,
-                                                  ),
-                                                  switchInCurve:
-                                                      Curves.easeOutBack,
-                                                  switchOutCurve: Curves.easeIn,
-                                                  transitionBuilder:
-                                                      (
-                                                        Widget child,
-                                                        Animation<double>
-                                                        animation,
-                                                      ) {
-                                                        return SlideTransition(
-                                                          position:
-                                                              Tween<Offset>(
-                                                                begin:
-                                                                    const Offset(
-                                                                      0,
-                                                                      0.05,
-                                                                    ),
-                                                                end:
-                                                                    Offset.zero,
-                                                              ).animate(
-                                                                animation,
-                                                              ),
-                                                          child: FadeTransition(
-                                                            opacity: animation,
-                                                            child: child,
-                                                          ),
-                                                        );
-                                                      },
-                                                  child: _showEpisodePicker
-                                                      ? EpisodePickerPanel(
-                                                          key: const ValueKey(
-                                                            "EpisodePickerPanel",
-                                                          ),
-                                                          panelWidth:
-                                                              (screenConstraints
-                                                                          .maxWidth *
-                                                                      0.65)
-                                                                  .clamp(
-                                                                    280.0,
-                                                                    800.0,
-                                                                  ),
-                                                          panelHeight:
-                                                              (screenConstraints
-                                                                          .maxHeight *
-                                                                      0.75)
-                                                                  .clamp(
-                                                                    240.0,
-                                                                    700.0,
-                                                                  ),
-                                                          onClose: () => setState(
-                                                            () =>
-                                                                _showEpisodePicker =
-                                                                    false,
-                                                          ),
-                                                        )
-                                                      : const SizedBox.shrink(
-                                                          key: ValueKey(
-                                                            "EpisodePickerPanel_Empty",
-                                                          ),
-                                                        ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        );
-                                      },
+                                            ),
+                                          );
+                                        },
+                                      ),
                                     ),
                                   ),
-                                ),
-                                if (!isLeftHandedMode) ...sidebarWidgets,
-                              ],
-                            ),
-                            if (showResizer)
-                              Positioned(
-                                top: 0,
-                                bottom: 0,
-                                left: isLeftHandedMode
-                                    ? resizableSidebarWidth -
-                                          sidebarResizeOverlayInset
-                                    : null,
-                                right: isLeftHandedMode
-                                    ? null
-                                    : resizableSidebarWidth -
-                                          sidebarResizeOverlayInset,
-                                width: _subtitleSidebarResizerHitWidth,
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onHorizontalDragStart: (_) =>
-                                      _startSidebarResize(settings, context),
-                                  onHorizontalDragUpdate: (details) =>
-                                      _updateSidebarResize(
-                                        settings,
-                                        context,
-                                        isLeftHandedMode,
-                                        details,
-                                      ),
-                                  onHorizontalDragEnd: (_) =>
-                                      _endSidebarResize(settings),
-                                ),
+                                  if (!isLeftHandedMode) ...sidebarWidgets,
+                                ],
                               ),
-                            if (Platform.isIOS)
-                              Positioned(
-                                left: 0,
-                                top: 0,
-                                bottom: 0,
-                                width: _iosBackSwipeEdgeWidth,
-                                child: GestureDetector(
-                                  behavior: HitTestBehavior.translucent,
-                                  onHorizontalDragStart: _onIosBackSwipeStart,
-                                  onHorizontalDragUpdate: _onIosBackSwipeUpdate,
-                                  onHorizontalDragEnd: _onIosBackSwipeEnd,
+                              if (showResizer)
+                                Positioned(
+                                  top: 0,
+                                  bottom: 0,
+                                  left: isLeftHandedMode
+                                      ? resizableSidebarWidth -
+                                            sidebarResizeOverlayInset
+                                      : null,
+                                  right: isLeftHandedMode
+                                      ? null
+                                      : resizableSidebarWidth -
+                                            sidebarResizeOverlayInset,
+                                  width: _subtitleSidebarResizerHitWidth,
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.translucent,
+                                    onHorizontalDragStart: (_) =>
+                                        _startSidebarResize(settings, context),
+                                    onHorizontalDragUpdate: (details) =>
+                                        _updateSidebarResize(
+                                          settings,
+                                          context,
+                                          isLeftHandedMode,
+                                          details,
+                                        ),
+                                    onHorizontalDragEnd: (_) =>
+                                        _endSidebarResize(settings),
+                                  ),
                                 ),
-                              ),
-                          ],
+                              if (Platform.isIOS)
+                                Positioned(
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: _iosBackSwipeEdgeWidth,
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.translucent,
+                                    onHorizontalDragStart: _onIosBackSwipeStart,
+                                    onHorizontalDragUpdate:
+                                        _onIosBackSwipeUpdate,
+                                    onHorizontalDragEnd: _onIosBackSwipeEnd,
+                                  ),
+                                ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
-                  ),
+            ),
           ),
         );
       },
@@ -4832,9 +5249,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   Map<String, String> _buildSubtitleEditorGroups() {
     final Map<String, String> groups = <String, String>{};
-    final additional = _currentItem?.additionalSubtitles;
-    if (additional != null && additional.isNotEmpty) {
-      groups.addAll(additional);
+    final currentItem = _currentItem;
+    if (currentItem != null) {
+      groups.addAll(currentItem.downloadAssociatedSubtitles);
+      groups.addAll(currentItem.localSubtitleGroups);
     }
     if (_currentItem?.subtitlePath != null &&
         _currentItem!.subtitlePath!.isNotEmpty) {
@@ -4871,31 +5289,32 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   Future<String> _createManualSubtitleGroup(String desiredName) async {
     if (_currentItem == null) return '';
     final String groupName = _normalizeGroupName(desiredName);
-    final settings = Provider.of<SettingsService>(context, listen: false);
     final library = Provider.of<LibraryService>(context, listen: false);
-    final dataRoot = await settings.resolveLargeDataRootDir();
-    final Directory subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-    if (!await subDir.exists()) {
-      await subDir.create(recursive: true);
-    }
-    final String filePath = p.join(
-      subDir.path,
-      '${_currentItem!.id}.manual.${DateTime.now().millisecondsSinceEpoch}.srt',
-    );
+    final String filePath = await const TaskSubtitleStorageService()
+        .allocatePath(
+          _currentItem!.id,
+          'manual.${DateTime.now().millisecondsSinceEpoch}.srt',
+        );
     await _writeSubtitlesToSrt(filePath, _subtitles);
+    await library.registerManagedSubtitleAsset(
+      _currentItem!.id,
+      path: filePath,
+      kind: ManagedSubtitleAssetKind.manual,
+      displayName: groupName,
+    );
 
-    final Map<String, String> additional = Map<String, String>.from(
-      _currentItem!.additionalSubtitles ?? <String, String>{},
+    final Map<String, String> local = Map<String, String>.from(
+      _currentItem!.localSubtitles ?? <String, String>{},
     );
     String unique = groupName;
     int serial = 2;
-    while (additional.containsKey(unique)) {
+    while (local.containsKey(unique)) {
       unique = '$groupName $serial';
       serial++;
     }
-    additional[unique] = filePath;
-    _currentItem!.additionalSubtitles = additional;
-    await library.updateVideoAdditionalSubtitles(_currentItem!.id, additional);
+    local[unique] = filePath;
+    _currentItem!.localSubtitles = local;
+    await library.updateVideoLocalSubtitles(_currentItem!.id, local);
     await _applyPrimarySubtitlePath(filePath);
     return filePath;
   }
@@ -4904,21 +5323,40 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (_currentItem == null) return;
     final String normalized = _normalizeGroupName(newName);
     final library = Provider.of<LibraryService>(context, listen: false);
-    final Map<String, String> additional = Map<String, String>.from(
-      _currentItem!.additionalSubtitles ?? <String, String>{},
+    final associated = Map<String, String>.from(
+      _currentItem!.additionalSubtitles ?? const <String, String>{},
     );
-    if (!additional.containsKey(oldName)) {
+    final downloadAssociated = _currentItem!.downloadAssociatedSubtitles;
+    final local = Map<String, String>.from(
+      _currentItem!.localSubtitles ?? <String, String>{},
+    );
+    if (downloadAssociated.containsKey(oldName)) {
+      final path = associated.remove(oldName)!;
+      if (associated.containsKey(normalized) || local.containsKey(normalized)) {
+        return;
+      }
+      associated[normalized] = path;
+      _currentItem!.additionalSubtitles = associated;
+      await library.updateVideoAdditionalSubtitles(
+        _currentItem!.id,
+        associated,
+      );
+    } else if (!local.containsKey(oldName)) {
       final String? currentPath = _resolveActiveSubtitleEditorPath();
       if (currentPath == null || currentPath.isEmpty) return;
-      if (additional.containsKey(normalized)) return;
-      additional[normalized] = currentPath;
+      if (associated.containsKey(normalized) || local.containsKey(normalized)) {
+        return;
+      }
+      local[normalized] = currentPath;
     } else {
-      final String path = additional.remove(oldName)!;
-      if (additional.containsKey(normalized)) return;
-      additional[normalized] = path;
+      final String path = local.remove(oldName)!;
+      if (associated.containsKey(normalized) || local.containsKey(normalized)) {
+        return;
+      }
+      local[normalized] = path;
     }
-    _currentItem!.additionalSubtitles = additional;
-    await library.updateVideoAdditionalSubtitles(_currentItem!.id, additional);
+    _currentItem!.localSubtitles = local;
+    await library.updateVideoLocalSubtitles(_currentItem!.id, local);
     if (mounted) setState(() {});
   }
 
@@ -4995,10 +5433,66 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _updateSubtitle();
     final String? primaryPath = _resolveActiveSubtitleEditorPath();
     if (primaryPath == null || primaryPath.isEmpty) return;
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final videoId = _currentItem?.id;
+    final writablePath = await _ensureWritableSubtitleEditorPath(
+      primaryPath,
+      subtitles,
+    );
+    if (writablePath == null) return;
     _manualSubtitleWriteTimer?.cancel();
     _manualSubtitleWriteTimer = Timer(const Duration(milliseconds: 150), () {
-      _writeSubtitlesToSrt(primaryPath, subtitles);
+      unawaited(
+        _writeSubtitlesToSrt(writablePath, subtitles).then((_) {
+          library.notifySubtitleFilesChanged(videoId: videoId);
+        }),
+      );
     });
+  }
+
+  Future<String?> _ensureWritableSubtitleEditorPath(
+    String sourcePath,
+    List<SubtitleItem> subtitles,
+  ) async {
+    final item = _currentItem;
+    if (item == null) return null;
+    final storage = const TaskSubtitleStorageService();
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final isOwned = await storage.isTaskOwnedPath(sourcePath, item.id);
+    if (isOwned && p.extension(sourcePath).toLowerCase() == '.srt') {
+      return sourcePath;
+    }
+
+    final sourceAssetId = library
+        .managedSubtitleAssetForPath(item.id, sourcePath)
+        ?.assetId;
+    final outputPath = await storage.allocatePath(
+      item.id,
+      'edited.${DateTime.now().millisecondsSinceEpoch}.srt',
+    );
+    await _writeSubtitlesToSrt(outputPath, subtitles);
+    final baseLabel = '${p.basenameWithoutExtension(sourcePath)}（编辑副本）';
+    await library.registerManagedSubtitleAsset(
+      item.id,
+      path: outputPath,
+      kind: ManagedSubtitleAssetKind.manual,
+      displayName: baseLabel,
+      sourceAssetId: sourceAssetId,
+    );
+    final local = Map<String, String>.from(
+      item.localSubtitles ?? const <String, String>{},
+    );
+    var label = baseLabel;
+    var serial = 2;
+    while (local.containsKey(label)) {
+      label = '$baseLabel $serial';
+      serial++;
+    }
+    local[label] = outputPath;
+    item.localSubtitles = local;
+    await library.updateVideoLocalSubtitles(item.id, local);
+    await _applyPrimarySubtitlePath(outputPath);
+    return outputPath;
   }
 
   void _showSubtitleEditor() {
@@ -5008,16 +5502,52 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     });
   }
 
+  void _toggleChapterSidebar() {
+    setState(() {
+      if (_activeSidebar == SidebarType.chapters) {
+        _activeSidebar = _previousSidebarType != SidebarType.none
+            ? _previousSidebarType
+            : (_isSubtitleSidebarVisible
+                  ? SidebarType.subtitles
+                  : SidebarType.none);
+        _previousSidebarType = SidebarType.none;
+      } else {
+        _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
+        _activeSidebar = SidebarType.chapters;
+      }
+    });
+  }
+
   Widget? _buildSidebarContent(SettingsService settings) {
     if (!_isSidebarOpen) return null;
 
     switch (_activeSidebar) {
+      case SidebarType.chapters:
+        final item = _currentItem;
+        if (item == null) return null;
+        if (!_controllerAssigned || !_initialized) {
+          return const Center(
+            child: Text(
+              '播放器加载完成后可查看章节',
+              style: TextStyle(color: Colors.white54),
+            ),
+          );
+        }
+        return ChapterSidebar(
+          videoItem: item,
+          controller: _controller,
+          onSeek: _seekPlaybackPosition,
+          onClose: _toggleChapterSidebar,
+          playerFocusNode: _videoFocusNode,
+        );
+
       case SidebarType.subtitles:
         return SubtitleSidebar(
           key: _subtitleSidebarKey,
           subtitles: _subtitles,
           secondarySubtitles: _secondarySubtitles,
-          controller: _controller,
+          controller: _controllerAssigned ? _controller : null,
+          positionListenable: MediaPlaybackService().positionNotifier,
           onItemTap: _seekToSubtitleFast,
           onOpenSettings: () => setState(() {
             _previousSidebarType = SidebarType.subtitles;
@@ -5033,6 +5563,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onOpenSubtitleManager: _showSubtitleManager,
           onOpenSubtitleEditor: _showSubtitleEditor,
           onOpenVideoCompose: _showVideoCompose,
+          onOpenOcrSubtitle: _supportsOcrSubtitle ? _showOcrSubtitle : null,
           onClearSelection: () => _selectionKey.currentState?.clearSelection(),
           onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
           isCompact: true,
@@ -5052,7 +5583,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         final isLandscape =
             MediaQuery.of(context).orientation == Orientation.landscape;
         final canShowGhostControls = _canShowGhostSidebarControls(context);
-        final isGhostEditing = _canUseGhostSidebarEditing(context, settings);
+        final isGhostEditing =
+            !_subtitleStyleFromCompose &&
+            _canUseGhostSidebarEditing(context, settings);
         final SubtitleStyle sheetStyle = _isAudio
             ? (isLandscape
                   ? settings.audioSubtitleStyleLandscape
@@ -5167,7 +5700,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           activeGroupPath: activePath,
           subtitles: _subtitles,
           currentSubtitleIndex: _currentSubtitleIndex,
-          currentPlaybackPosition: _controller.value.isInitialized
+          currentPlaybackPosition:
+              _controllerAssigned && _controller.value.isInitialized
               ? _controller.value.position
               : Duration.zero,
           onSelectGroupPath: _applyPrimarySubtitlePath,
@@ -5230,11 +5764,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               : null,
           onSpeedChanged: (speed) =>
               unawaited(_handlePlaybackSpeedSelected(speed)),
-          onSpeedLongPress: (speed) =>
-              unawaited(_handlePlaybackSpeedLockToggle(speed)),
+          onSpeedLockChanged: _handlePlaybackSpeedLockChanged,
           longPressSpeed: settings.longPressSpeed,
           onLongPressSpeedChanged: (speed) =>
               settings.saveLongPressSpeed(speed),
+          showLongPressSpeedIndicator: settings.showLongPressSpeedIndicator,
+          onShowLongPressSpeedIndicatorChanged: (value) =>
+              settings.saveShowLongPressSpeedIndicator(value),
           onSubtitleToggle: (value) => _setFloatingSubtitles(value),
           onMirrorHChanged: (value) => unawaited(
             _updateCurrentVideoDisplayTransform(isMirroredH: value),
@@ -5279,6 +5815,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           autoPauseOnExit: settings.autoPauseOnExit,
           onAutoPauseOnExitChanged: (value) =>
               settings.saveAutoPauseOnExit(value),
+          avoidPlaybackControlsWithSubtitles:
+              settings.avoidPlaybackControlsWithSubtitles,
+          onAvoidPlaybackControlsWithSubtitlesChanged: (value) =>
+              settings.saveAvoidPlaybackControlsWithSubtitles(value),
           pausePlaybackWhenAppBackgrounded:
               settings.pausePlaybackWhenAppBackgrounded,
           onPausePlaybackWhenAppBackgroundedChanged: (value) =>
@@ -5286,6 +5826,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           allowConcurrentPlayback: settings.allowConcurrentPlayback,
           onAllowConcurrentPlaybackChanged: (value) =>
               settings.saveAllowConcurrentPlayback(value),
+          showVideoDecoderSetting:
+              !kIsWeb &&
+              (Platform.isAndroid ||
+                  Platform.isIOS ||
+                  Platform.isMacOS ||
+                  Platform.isWindows ||
+                  Platform.isLinux),
+          useHardwareVideoDecoding: settings.useHardwareVideoDecoding,
+          onVideoDecoderChanged: (useHardware) async {
+            await settings.saveUseHardwareVideoDecoding(useHardware);
+            await MediaPlaybackService().reloadCurrentVideoDecoder();
+          },
           enableHeadsetMediaControls: settings.enableHeadsetMediaControls,
           onEnableHeadsetMediaControlsChanged: (value) =>
               settings.saveEnableHeadsetMediaControls(value),
@@ -5306,6 +5858,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           enableSeekPreview: settings.enableSeekPreview,
           onEnableSeekPreviewChanged: (value) =>
               settings.saveEnableSeekPreview(value),
+          enableHapticFeedback: settings.enableHapticFeedback,
+          onEnableHapticFeedbackChanged: (value) =>
+              settings.saveEnableHapticFeedback(value),
           isLeftHandedMode: settings.isLeftHandedMode,
           onLeftHandedModeChanged: (value) =>
               settings.saveLeftHandedMode(value),
@@ -5372,19 +5927,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                     _currentItem!.secondarySubtitlePath!.isNotEmpty)
                   _currentItem!.secondarySubtitlePath!,
               ];
-        final associatedSubtitlesForSheet = Map<String, String>.from(
-          _currentItem?.additionalSubtitles ?? const <String, String>{},
-        );
+        final associatedSubtitlesForSheet =
+            _currentItem?.downloadAssociatedSubtitles ??
+            const <String, String>{};
+        final localSubtitlesForSheet =
+            _currentItem?.localSubtitleGroups ?? const <String, String>{};
 
         return SubtitleManagementSheet(
           key: ValueKey(path),
           videoPath: path,
           videoId: _currentItem?.id,
-          showEmbeddedSubtitles:
-              !(_currentItem?.prefersManagedAssociatedSubtitles ?? false),
-          additionalSubtitles: associatedSubtitlesForSheet,
-          preferAssociatedSubtitlesOnly:
-              _currentItem?.prefersManagedAssociatedSubtitles ?? false,
+          showEmbeddedSubtitles: true,
+          associatedSubtitles: associatedSubtitlesForSheet,
+          localSubtitles: localSubtitlesForSheet,
           initialSelectedPaths: selectedPathsForSheet,
           onSubtitleChanged: () {
             // Logic to refresh if needed
@@ -5482,6 +6037,46 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           videoItem: _currentItem!,
           currentSelectedPaths: List<String>.from(_currentSubtitlePaths),
           availableSubtitleMap: _buildAvailableSubtitleMap(),
+          onBack: () {
+            _clearVideoComposePreview();
+            setState(() {
+              _activeSidebar = _previousSidebarType != SidebarType.none
+                  ? _previousSidebarType
+                  : (_isSubtitleSidebarVisible
+                        ? SidebarType.subtitles
+                        : SidebarType.none);
+              _previousSidebarType = SidebarType.none;
+            });
+          },
+          onOpenSubtitleStyle: () =>
+              _toggleFloatingSubtitleSettingsSidebar(fromCompose: true),
+          onOpenSubtitleManager: _showSubtitleManager,
+          onPreviewChanged: _applyVideoComposePreview,
+        );
+
+      case SidebarType.ocrSubtitle:
+        if (_currentItem == null || _isAudio) return const SizedBox.shrink();
+        if (!_controllerAssigned || !_initialized) {
+          return const Center(
+            child: Text(
+              '播放器加载完成后可使用 OCR 字幕',
+              style: TextStyle(color: Colors.white54),
+            ),
+          );
+        }
+        return OcrSubtitlePanel(
+          key: ValueKey('ocr_subtitle_${_currentItem!.id}'),
+          videoItem: _currentItem!,
+          duration: _controller.value.duration,
+          currentPosition: () => _controller.value.position,
+          pauseForRegionSelection: () async {
+            final wasPlaying = _controller.value.isPlaying;
+            await _controller.pause();
+            return wasPlaying;
+          },
+          restorePlayback: (wasPlaying) async {
+            if (wasPlaying && mounted) await _controller.play();
+          },
           onBack: () => setState(() {
             _activeSidebar = _previousSidebarType != SidebarType.none
                 ? _previousSidebarType
@@ -5490,9 +6085,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                       : SidebarType.none);
             _previousSidebarType = SidebarType.none;
           }),
-          onOpenSubtitleStyle: () =>
-              _toggleFloatingSubtitleSettingsSidebar(fromCompose: true),
-          onOpenSubtitleManager: _showSubtitleManager,
+          onCompleted: _applyCompletedOcrSubtitles,
         );
 
       default:
@@ -5503,9 +6096,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   Map<String, String> _buildAvailableSubtitleMap() {
     final Map<String, String> map = <String, String>{};
     if (_currentItem == null) return map;
-    final additional = _currentItem!.additionalSubtitles;
+    final additional = <String, String>{
+      ..._currentItem!.downloadAssociatedSubtitles,
+      ..._currentItem!.localSubtitleGroups,
+    };
     final Map<String, String> nameByPath = <String, String>{};
-    if (additional != null && additional.isNotEmpty) {
+    if (additional.isNotEmpty) {
       for (final entry in additional.entries) {
         if (entry.value.isEmpty) continue;
         nameByPath[_subtitlePathKey(entry.value)] = entry.key;
@@ -5514,10 +6110,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     String embeddedFallbackName(String path, String fallback) {
       final normalized = p.basename(path);
       final match = RegExp(r'\.stream_(\d+)').firstMatch(normalized);
-      if (match == null) return fallback;
-      final index = match.group(1);
-      if (index == null || index.isEmpty) return fallback;
-      return '内嵌字幕 $index';
+      if (match != null) {
+        final index = match.group(1);
+        if (index != null && index.isNotEmpty) {
+          return '内嵌字幕 $index';
+        }
+      }
+      // 回退到文件名，避免显示"主字幕（主字幕）"这类冗余文本
+      final base = p.basenameWithoutExtension(path).trim();
+      return base.isNotEmpty ? base : fallback;
     }
 
     String nameForPath(String path, {String fallback = '未命名字幕'}) {
@@ -5544,7 +6145,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         map[path] = '$role（${nameForPath(path, fallback: role)}）';
       }
     }
-    if (additional != null && additional.isNotEmpty) {
+    if (additional.isNotEmpty) {
       for (final entry in additional.entries) {
         if (!map.containsKey(entry.value)) {
           map[entry.value] = entry.key;

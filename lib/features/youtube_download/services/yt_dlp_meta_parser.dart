@@ -1,4 +1,5 @@
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
+import 'yt_dlp_video_format_selector.dart';
 
 class YtDlpMetaParser {
   const YtDlpMetaParser();
@@ -162,12 +163,7 @@ class YtDlpMetaParser {
       );
     }
 
-    parsed.sort((a, b) {
-      final scoreA = _videoPriorityScore(a);
-      final scoreB = _videoPriorityScore(b);
-      return scoreB.compareTo(scoreA);
-    });
-    return _dedupeVideoFormats(parsed);
+    return YtDlpVideoFormatSelector.sortForDisplay(_dedupeVideoFormats(parsed));
   }
 
   List<AudioFormat> _parseAudioFormats(List<Map<String, dynamic>> formats) {
@@ -262,21 +258,7 @@ class YtDlpMetaParser {
   }
 
   String? _pickRecommendedVideoFormatId(List<VideoFormat> formats) {
-    if (formats.isEmpty) {
-      return null;
-    }
-    final sorted = [...formats]
-      ..sort((a, b) {
-        final aHeight = a.height ?? -1;
-        final bHeight = b.height ?? -1;
-        if (aHeight != bHeight) {
-          return bHeight.compareTo(aHeight);
-        }
-        final aScore = _recommendedVideoTieBreakerScore(a);
-        final bScore = _recommendedVideoTieBreakerScore(b);
-        return bScore.compareTo(aScore);
-      });
-    return sorted.first.formatId;
+    return YtDlpVideoFormatSelector.pickFormatId(formats);
   }
 
   String? _pickRecommendedAudioFormatId(List<AudioFormat> formats) {
@@ -705,33 +687,6 @@ class YtDlpMetaParser {
     'zh': '中文',
     'zu': 'isiZulu',
   };
-
-  int _videoPriorityScore(VideoFormat format) {
-    int score = 0;
-    score += format.height ?? 0;
-    if (format.ext == 'mp4') score += 3000;
-    final codec = (format.videoCodec ?? '').toLowerCase();
-    if (codec.contains('avc') || codec.contains('h264')) score += 2000;
-    if (codec.contains('vp9')) score += 1000;
-    if (codec.contains('av1') || codec.contains('av01')) score += 600;
-    if (format.hasAudio) score += 500;
-    if (format.isHdr) score -= 50;
-    score += format.bitrate ?? 0;
-    return score;
-  }
-
-  int _recommendedVideoTieBreakerScore(VideoFormat format) {
-    var score = 0;
-    if ((format.fps ?? 0) >= 50) score += 80;
-    if (format.hasAudio) score += 60;
-    if (format.ext == 'mp4') score += 40;
-    final codec = (format.videoCodec ?? '').toLowerCase();
-    if (codec.contains('avc') || codec.contains('h264')) score += 30;
-    if (codec.contains('vp9')) score += 20;
-    if (codec.contains('av1') || codec.contains('av01')) score += 15;
-    score += (format.bitrate ?? 0) ~/ 10;
-    return score;
-  }
 
   int _audioPriorityScore(AudioFormat format) {
     int score = 0;

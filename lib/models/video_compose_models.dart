@@ -12,6 +12,24 @@ enum VideoComposeStage {
 
 enum VideoComposeResolution { source, p360, p480, p720, p1080, p1440, p2160 }
 
+enum VideoComposeRenderMode {
+  precise,
+  approximate;
+
+  String get storageValue => name;
+
+  static VideoComposeRenderMode fromStorage(
+    Object? value, {
+    VideoComposeRenderMode fallback = VideoComposeRenderMode.approximate,
+  }) {
+    final String raw = value?.toString() ?? '';
+    return VideoComposeRenderMode.values.firstWhere(
+      (mode) => mode.storageValue == raw,
+      orElse: () => fallback,
+    );
+  }
+}
+
 class VideoComposeSoftSubtitleTrack {
   final String path;
   final String title;
@@ -22,10 +40,7 @@ class VideoComposeSoftSubtitleTrack {
   });
 
   Map<String, dynamic> toJson() {
-    return {
-      'path': path,
-      'title': title,
-    };
+    return {'path': path, 'title': title};
   }
 
   factory VideoComposeSoftSubtitleTrack.fromJson(Map<String, dynamic> json) {
@@ -49,8 +64,17 @@ class VideoComposeRequest {
   final bool softSubtitleUseSourceQuality;
   final List<VideoComposeSoftSubtitleTrack> softSubtitleTracks;
   final VideoComposeResolution resolution;
+  final VideoComposeRenderMode renderMode;
+
+  /// 普通（非幽灵）横屏字幕样式。保留 subtitleStyle 名称兼容旧任务。
   final SubtitleStyle subtitleStyle;
+
+  /// 普通（非幽灵）竖屏字幕样式。
+  final SubtitleStyle subtitleStylePortrait;
   final Alignment subtitleAlignment;
+  final bool splitSubtitleByLine;
+  final double subtitleItemGap;
+  final int subtitleRendererVersion;
   final String outputPath;
 
   const VideoComposeRequest({
@@ -66,10 +90,18 @@ class VideoComposeRequest {
     required this.softSubtitleUseSourceQuality,
     required this.softSubtitleTracks,
     required this.resolution,
+    this.renderMode = VideoComposeRenderMode.precise,
     required this.subtitleStyle,
+    SubtitleStyle? subtitleStylePortrait,
     required this.subtitleAlignment,
+    this.splitSubtitleByLine = true,
+    this.subtitleItemGap = 6.0,
+    this.subtitleRendererVersion = 1,
     required this.outputPath,
-  });
+  }) : subtitleStylePortrait = subtitleStylePortrait ?? subtitleStyle;
+
+  SubtitleStyle styleForCanvas({required int width, required int height}) =>
+      height > width ? subtitleStylePortrait : subtitleStyle;
 
   Map<String, dynamic> toJson() {
     return {
@@ -85,9 +117,15 @@ class VideoComposeRequest {
       'softSubtitleUseSourceQuality': softSubtitleUseSourceQuality,
       'softSubtitleTracks': softSubtitleTracks.map((e) => e.toJson()).toList(),
       'resolution': resolution.index,
+      'renderMode': renderMode.storageValue,
       'subtitleStyle': subtitleStyle.toJson(),
+      'subtitleStyleLandscape': subtitleStyle.toJson(),
+      'subtitleStylePortrait': subtitleStylePortrait.toJson(),
       'subtitleAlignmentX': subtitleAlignment.x,
       'subtitleAlignmentY': subtitleAlignment.y,
+      'splitSubtitleByLine': splitSubtitleByLine,
+      'subtitleItemGap': subtitleItemGap,
+      'subtitleRendererVersion': subtitleRendererVersion,
       'outputPath': outputPath,
     };
   }
@@ -113,12 +151,30 @@ class VideoComposeRequest {
                 ),
               )
               .toList(),
-      resolution: VideoComposeResolution.values[(json['resolution'] as int?) ?? 0],
-      subtitleStyle: json['subtitleStyle'] != null ? SubtitleStyle.fromJson(json['subtitleStyle']) : const SubtitleStyle(),
+      resolution:
+          VideoComposeResolution.values[(json['resolution'] as int?) ?? 0],
+      renderMode: VideoComposeRenderMode.fromStorage(json['renderMode']),
+      subtitleStyle: SubtitleStyle.fromJson(
+        (json['subtitleStyleLandscape'] ??
+                json['subtitleStyle'] ??
+                const <String, dynamic>{})
+            as Map<String, dynamic>,
+      ),
+      subtitleStylePortrait: SubtitleStyle.fromJson(
+        (json['subtitleStylePortrait'] ??
+                json['subtitleStyleLandscape'] ??
+                json['subtitleStyle'] ??
+                const <String, dynamic>{})
+            as Map<String, dynamic>,
+      ),
       subtitleAlignment: Alignment(
         (json['subtitleAlignmentX'] as num?)?.toDouble() ?? 0.0,
         (json['subtitleAlignmentY'] as num?)?.toDouble() ?? 0.8,
       ),
+      splitSubtitleByLine: json['splitSubtitleByLine'] as bool? ?? true,
+      subtitleItemGap: (json['subtitleItemGap'] as num?)?.toDouble() ?? 6.0,
+      subtitleRendererVersion:
+          (json['subtitleRendererVersion'] as num?)?.toInt() ?? 0,
       outputPath: json['outputPath'] as String? ?? '',
     );
   }
@@ -180,9 +236,15 @@ class VideoComposeTaskState {
   factory VideoComposeTaskState.fromJson(Map<String, dynamic> json) {
     return VideoComposeTaskState(
       taskId: json['taskId'] as String? ?? '',
-      request: VideoComposeRequest.fromJson(json['request'] as Map<String, dynamic>? ?? {}),
-      createdAt: DateTime.fromMillisecondsSinceEpoch(json['createdAt'] as int? ?? 0),
-      completedAt: json['completedAt'] != null ? DateTime.fromMillisecondsSinceEpoch(json['completedAt'] as int) : null,
+      request: VideoComposeRequest.fromJson(
+        json['request'] as Map<String, dynamic>? ?? {},
+      ),
+      createdAt: DateTime.fromMillisecondsSinceEpoch(
+        json['createdAt'] as int? ?? 0,
+      ),
+      completedAt: json['completedAt'] != null
+          ? DateTime.fromMillisecondsSinceEpoch(json['completedAt'] as int)
+          : null,
       stage: VideoComposeStage.values[(json['stage'] as int?) ?? 0],
       progress: (json['progress'] as num?)?.toDouble() ?? 0.0,
       message: json['message'] as String? ?? '',

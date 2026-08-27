@@ -57,24 +57,32 @@ void main() {
   });
 
   test('parseSrt strips html style tags', () {
-    final content = '1\n00:00:09,000 --> 00:00:10,000\n<font face="微软雅黑" size="54"><b>我是你们的陈 sir </b></font>\n\n';
+    final content =
+        '1\n00:00:09,000 --> 00:00:10,000\n<font face="微软雅黑" size="54"><b>我是你们的陈 sir </b></font>\n\n';
     final parsed = SubtitleParser.parse(content);
     expect(parsed.length, 1);
     expect(parsed.first.text, '我是你们的陈 sir');
   });
 
   test('parse sup file yields image data when available', () async {
-    final file = File(r'd:\1spbfq\字幕示例\58c06d2d-608c-435c-9af4-1dc77ae18ae5_main.sup');
+    final file = File(
+      r'd:\1spbfq\字幕示例\58c06d2d-608c-435c-9af4-1dc77ae18ae5_main.sup',
+    );
     if (!file.existsSync()) return;
     final parsed = await PgsParser.parse(file.path);
     expect(parsed.isNotEmpty, true);
-    final itemWithImage = parsed.firstWhere((item) => item.imageLoader != null, orElse: () => parsed.first);
+    final itemWithImage = parsed.firstWhere(
+      (item) => item.imageLoader != null,
+      orElse: () => parsed.first,
+    );
     final image = await itemWithImage.imageLoader?.call();
     expect(image != null && image.isNotEmpty, true);
   });
 
-  test('normalizes overlapping youtube auto captions into single active line', () {
-    const content = '''
+  test(
+    'normalizes overlapping youtube auto captions into single active line',
+    () {
+      const content = '''
 1
 00:00:00,210 --> 00:00:07,359
 [Applause]
@@ -95,39 +103,36 @@ three 11 16 St Curry coming up with the
 00:00:18,560 --> 00:00:22,840
 steel one-on-one on Parker behind the
 ''';
-    final parsed = SubtitleParser.parse(content);
-    final videoItem = VideoItem(
-      id: 'video-1',
-      path: r'D:\videos\sample.mkv',
-      title: 'sample',
-      durationMs: 0,
-      lastUpdated: 0,
-      subtitlePath: r'D:\subs\abc123_English_自动.srt',
-      additionalSubtitles: {
-        'English (自动)': r'D:\subs\abc123_English_自动.srt',
-      },
-      usesManagedAssociatedSubtitles: true,
-      sourceRef: const MediaSourceRef(
-        value: 'https://www.youtube.com/watch?v=test',
-        kind: MediaSourceKind.url,
-      ),
-    );
+      final parsed = SubtitleParser.parse(content);
+      final _ = VideoItem(
+        id: 'video-1',
+        path: r'D:\videos\sample.mkv',
+        title: 'sample',
+        durationMs: 0,
+        lastUpdated: 0,
+        subtitlePath: r'D:\subs\abc123_English_自动.srt',
+        additionalSubtitles: {'English (自动)': r'D:\subs\abc123_English_自动.srt'},
+        usesManagedAssociatedSubtitles: true,
+        sourceRef: const MediaSourceRef(
+          value: 'https://www.youtube.com/watch?v=test',
+          kind: MediaSourceKind.url,
+        ),
+      );
 
-    final shouldNormalize = YouTubeAutoCaptionNormalizer.shouldNormalize(
-      subtitles: parsed,
-      subtitlePath: videoItem.subtitlePath!,
-      videoItem: videoItem,
-    );
-    expect(shouldNormalize, isTrue);
+      final shouldNormalize = YouTubeAutoCaptionNormalizer.shouldNormalize(
+        parsed,
+      );
+      expect(shouldNormalize, isTrue);
 
-    final normalized = YouTubeAutoCaptionNormalizer.normalize(parsed);
-    expect(normalized.length, 5);
-    expect(normalized[0].endTime.inMilliseconds, 5680);
-    expect(normalized[1].endTime.inMilliseconds, 7359);
-    expect(normalized[2].endTime.inMilliseconds, 12360);
-    expect(normalized[3].endTime.inMilliseconds, 18560);
-    expect(normalized[4].endTime.inMilliseconds, 22840);
-  });
+      final normalized = YouTubeAutoCaptionNormalizer.normalize(parsed);
+      expect(normalized.length, 5);
+      expect(normalized[0].endTime.inMilliseconds, 5680);
+      expect(normalized[1].endTime.inMilliseconds, 7359);
+      expect(normalized[2].endTime.inMilliseconds, 12360);
+      expect(normalized[3].endTime.inMilliseconds, 18560);
+      expect(normalized[4].endTime.inMilliseconds, 22840);
+    },
+  );
 
   test('does not normalize regular subtitles without youtube auto markers', () {
     const content = '''
@@ -144,7 +149,7 @@ World
 Again
 ''';
     final parsed = SubtitleParser.parse(content);
-    final videoItem = VideoItem(
+    final _ = VideoItem(
       id: 'video-2',
       path: r'D:\videos\sample.mkv',
       title: 'sample',
@@ -159,11 +164,40 @@ Again
     );
 
     final shouldNormalize = YouTubeAutoCaptionNormalizer.shouldNormalize(
-      subtitles: parsed,
-      subtitlePath: videoItem.subtitlePath!,
-      videoItem: videoItem,
+      parsed,
     );
     expect(shouldNormalize, isFalse);
+  });
+
+  test('normalizes imported sliding captions without source metadata', () {
+    const content = '''
+1
+00:00:00,000 --> 00:00:04,000
+First
+
+2
+00:00:02,000 --> 00:00:06,000
+Second
+
+3
+00:00:04,000 --> 00:00:08,000
+Third
+
+4
+00:00:06,000 --> 00:00:10,000
+Fourth
+''';
+
+    final parsed = SubtitleParser.parse(content);
+    expect(YouTubeAutoCaptionNormalizer.shouldNormalize(parsed), isTrue);
+
+    final normalized = YouTubeAutoCaptionNormalizer.normalize(parsed);
+    expect(normalized.map((item) => item.endTime.inMilliseconds), [
+      2000,
+      4000,
+      6000,
+      10000,
+    ]);
   });
 
   test('does not normalize bilibili exported subtitles', () {
@@ -181,7 +215,7 @@ World
 Again
 ''';
     final parsed = SubtitleParser.parse(content);
-    final videoItem = VideoItem(
+    final _ = VideoItem(
       id: 'video-3',
       path: r'D:\videos\bilibili_sample.mkv',
       title: 'sample',
@@ -197,9 +231,7 @@ Again
     );
 
     final shouldNormalize = YouTubeAutoCaptionNormalizer.shouldNormalize(
-      subtitles: parsed,
-      subtitlePath: videoItem.subtitlePath!,
-      videoItem: videoItem,
+      parsed,
     );
     expect(shouldNormalize, isFalse);
   });

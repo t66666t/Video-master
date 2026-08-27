@@ -1,0 +1,95 @@
+cmake_minimum_required(VERSION 3.13)
+project(runner LANGUAGES CXX)
+
+set(BINARY_NAME "video_player_app")
+set(APPLICATION_ID "com.example.video_player_app")
+cmake_policy(SET CMP0063 NEW)
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
+
+if(FLUTTER_TARGET_PLATFORM_SYSROOT)
+  set(CMAKE_SYSROOT ${FLUTTER_TARGET_PLATFORM_SYSROOT})
+  set(CMAKE_FIND_ROOT_PATH ${CMAKE_SYSROOT})
+  set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+  set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+  set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Flutter build mode" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Profile" "Release")
+endif()
+
+function(APPLY_STANDARD_SETTINGS TARGET)
+  target_compile_features(${TARGET} PUBLIC cxx_std_14)
+  target_compile_options(${TARGET} PRIVATE -Wall -Werror)
+  target_compile_options(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O3>")
+  target_compile_definitions(${TARGET} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:NDEBUG>")
+endfunction()
+
+set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
+add_subdirectory(${FLUTTER_MANAGED_DIR})
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
+
+add_subdirectory("runner")
+add_dependencies(${BINARY_NAME} flutter_assemble)
+set_target_properties(${BINARY_NAME} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/intermediates_do_not_run")
+
+include(flutter/generated_plugins.cmake)
+
+set(BUILD_BUNDLE_DIR "${PROJECT_BINARY_DIR}/bundle")
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${BUILD_BUNDLE_DIR}" CACHE PATH "..." FORCE)
+endif()
+install(CODE "file(REMOVE_RECURSE \"${BUILD_BUNDLE_DIR}/\")" COMPONENT Runtime)
+
+set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
+set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib")
+set(INSTALL_YT_DLP_RESOURCE_DIR "${CMAKE_INSTALL_PREFIX}/resources/yt_dlp")
+
+install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}" COMPONENT Runtime)
+install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)
+install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+
+foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
+  install(FILES "${bundled_library}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+endforeach(bundled_library)
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" YT_DLP_LINUX_ARCH)
+if(YT_DLP_LINUX_ARCH MATCHES "aarch64|arm64")
+  set(YT_DLP_LINUX_SUFFIX "_aarch64")
+elseif(YT_DLP_LINUX_ARCH MATCHES "x86_64|amd64")
+  set(YT_DLP_LINUX_SUFFIX "")
+else()
+  message(FATAL_ERROR "No official standalone yt-dlp asset for Linux architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+execute_process(COMMAND ldd --version OUTPUT_VARIABLE LDD_STDOUT ERROR_VARIABLE LDD_STDERR)
+string(TOLOWER "${LDD_STDOUT}${LDD_STDERR}" LDD_VERSION_TEXT)
+if(LDD_VERSION_TEXT MATCHES "musl")
+  set(YT_DLP_LINUX_PREFIX "yt-dlp_musllinux")
+else()
+  set(YT_DLP_LINUX_PREFIX "yt-dlp_linux")
+endif()
+set(YT_DLP_LINUX_BINARY "${YT_DLP_LINUX_PREFIX}${YT_DLP_LINUX_SUFFIX}")
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../assets/binaries/linux/${YT_DLP_LINUX_BINARY}"
+  DESTINATION "${INSTALL_YT_DLP_RESOURCE_DIR}"
+  RENAME "yt-dlp"
+  PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
+  COMPONENT Runtime)
+
+set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/linux/")
+install(DIRECTORY "${NATIVE_ASSETS_DIR}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+
+set(FLUTTER_ASSET_DIR_NAME "flutter_assets")
+install(CODE "file(REMOVE_RECURSE \"${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")" COMPONENT Runtime)
+install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
+  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)
+
+if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
+  install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
+endif()

@@ -279,14 +279,32 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12.0),
         child: item.type == MediaType.audio
-            ? _buildAudioThumbnail(dimensions)
+            ? _buildAudioThumbnail(item, dimensions)
             : _buildVideoThumbnail(item, dimensions),
       ),
     );
   }
 
-  /// 构建音频缩略图
-  Widget _buildAudioThumbnail(PlaybackCardDimensions dimensions) {
+  /// 构建音频缩略图（优先显示封面图，无封面则显示占位图标）
+  Widget _buildAudioThumbnail(
+    VideoItem item,
+    PlaybackCardDimensions dimensions,
+  ) {
+    if (item.thumbnailPath != null && item.thumbnailPath!.isNotEmpty) {
+      return CachedThumbnailWidget(
+        videoId: item.id,
+        thumbnailPath: item.thumbnailPath,
+        fit: BoxFit.cover,
+        cacheWidth: (dimensions.thumbnailSize * 2).toInt(),
+        cacheHeight: (dimensions.thumbnailSize * 2).toInt(),
+        placeholder: _buildAudioThumbnailPlaceholder(dimensions),
+        errorWidget: _buildAudioThumbnailPlaceholder(dimensions),
+      );
+    }
+    return _buildAudioThumbnailPlaceholder(dimensions);
+  }
+
+  Widget _buildAudioThumbnailPlaceholder(PlaybackCardDimensions dimensions) {
     return Container(
       color: const Color(0xFF1E1E1E),
       child: Icon(
@@ -488,7 +506,13 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     return Row(
       children: [
         // 进度条
-        Expanded(child: _buildProgressBar(playbackService)),
+        Expanded(
+          child: ValueListenableBuilder<Duration>(
+            valueListenable: playbackService.coarsePositionNotifier,
+            builder: (_, position, _) =>
+                _buildProgressBar(playbackService, position),
+          ),
+        ),
 
         SizedBox(width: dimensions.padding),
 
@@ -499,8 +523,10 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   }
 
   /// 构建进度条
-  Widget _buildProgressBar(MediaPlaybackService playbackService) {
-    final position = playbackService.position;
+  Widget _buildProgressBar(
+    MediaPlaybackService playbackService,
+    Duration position,
+  ) {
     final duration = playbackService.duration;
 
     // 如果正在拖动，使用拖动的进度

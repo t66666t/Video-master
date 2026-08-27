@@ -56,5 +56,35 @@ void main() {
       expect(await otherId.exists(), isTrue);
       await tempDir.delete(recursive: true);
     });
+
+    test('自定义输出目录中的中文和空格路径可以精确删除', () async {
+      final cleaner = VideoComposeArtifactCleaner();
+      final tempDir = await Directory.systemTemp.createTemp(
+        'compose_custom_output_',
+      );
+      final customDir = Directory(
+        '${tempDir.path}${Platform.pathSeparator}用户目录 含空格',
+      );
+      await customDir.create(recursive: true);
+      final target = File(
+        '${customDir.path}${Platform.pathSeparator}测试视频_compose_30003.mp4',
+      );
+      final unrelated = File(
+        '${customDir.path}${Platform.pathSeparator}测试视频_compose_40004.mp4',
+      );
+      await target.writeAsString('target');
+      await unrelated.writeAsString('keep');
+
+      final ok = await cleaner.cleanupTaskArtifacts(
+        'custom-task',
+        deleteOutput: true,
+        outputPath: target.path,
+      );
+
+      expect(ok, isTrue);
+      expect(await target.exists(), isFalse);
+      expect(await unrelated.exists(), isTrue);
+      await tempDir.delete(recursive: true);
+    });
   });
 }

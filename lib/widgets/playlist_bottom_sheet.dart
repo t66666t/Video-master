@@ -220,14 +220,29 @@ class PlaylistBottomSheet extends StatelessWidget {
           ],
         ),
         child: item.type == MediaType.audio
-            ? _buildAudioThumbnail()
+            ? _buildAudioThumbnail(item)
             : _buildVideoThumbnail(item),
       ),
     );
   }
 
-  /// 构建音频缩略图
-  Widget _buildAudioThumbnail() {
+  /// 构建音频缩略图（优先显示封面图，无封面则显示占位图标）
+  Widget _buildAudioThumbnail(VideoItem item) {
+    if (item.thumbnailPath != null && item.thumbnailPath!.isNotEmpty) {
+      return CachedThumbnailWidget(
+        videoId: item.id,
+        thumbnailPath: item.thumbnailPath,
+        fit: BoxFit.cover,
+        cacheWidth: 120,
+        cacheHeight: 90,
+        placeholder: _buildAudioThumbnailPlaceholder(),
+        errorWidget: _buildAudioThumbnailPlaceholder(),
+      );
+    }
+    return _buildAudioThumbnailPlaceholder();
+  }
+
+  Widget _buildAudioThumbnailPlaceholder() {
     return Container(
       color: const Color(0xFF1E1E1E),
       child: const Icon(

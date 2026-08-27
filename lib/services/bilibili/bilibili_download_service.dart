@@ -18,11 +18,15 @@ import 'package:video_player_app/services/app_wakelock_coordinator.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_state_manager.dart';
 import 'package:video_player_app/services/bilibili/download_manager.dart';
+import 'package:video_player_app/services/bilibili/download_integrity.dart';
+import 'package:video_player_app/services/bilibili/post_process_task_queue.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/services/task_subtitle_storage_service.dart';
 import 'package:video_player_app/services/temporary_storage_cleanup_models.dart';
 import 'package:video_player_app/services/thumbnail_cache_service.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
+import 'package:video_player_app/utils/bilibili_danmaku_ass.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 
 class BilibiliDownloadService extends ChangeNotifier {
@@ -44,14 +48,29 @@ class BilibiliDownloadService extends ChangeNotifier {
   Timer? _progressNotifyTimer;
   bool _hasPendingTaskPersistence = false;
   bool _hasPendingProgressNotify = false;
+  List<String> _cachedTaskIds = const [];
+  final Map<String, int> _taskRevisions = <String, int>{};
+  final Map<BilibiliDownloadEpisode, int> _episodeRevisions =
+      Map<BilibiliDownloadEpisode, int>.identity();
+  final Map<BilibiliDownloadEpisode, String> _episodeOwnerTaskIds =
+      Map<BilibiliDownloadEpisode, String>.identity();
+  final Set<BilibiliDownloadEpisode> _pendingProgressEpisodes =
+      Set<BilibiliDownloadEpisode>.identity();
+  final Map<String, Map<String, dynamic>> _taskJsonSnapshots =
+      <String, Map<String, dynamic>>{};
+  final Set<String> _dirtyPersistenceTaskIds = <String>{};
+  int _listStructureRevision = 0;
+  int _coarseRenderRevision = 0;
 
   // State
   List<BilibiliDownloadTask> tasks = [];
   final Map<String, BilibiliDownloadTask> _taskIndex = {};
   int maxConcurrentDownloads = 1;
+  int maxConnectionsPerVideo = 2;
   int preferredQuality = 116;
   String preferredSubtitleLang = "zh";
   bool preferAiSubtitles = false;
+  bool downloadDanmaku = true;
   bool autoImportToLibrary = true;
   bool autoDeleteTaskAfterImport = false;
   bool sequentialExport = false;
@@ -62,10 +81,13 @@ class BilibiliDownloadService extends ChangeNotifier {
   final Set<String> _importingEpisodeKeys = <String>{};
   final Set<String> _sequentialImportFailedKeys = <String>{};
   final Map<String, DateTime> _lastResumePersistAt = <String, DateTime>{};
+  final Map<BilibiliDownloadEpisode, Future<void>> _runningEpisodeOperations =
+      Map<BilibiliDownloadEpisode, Future<void>>.identity();
   int _activeDownloads = 0;
   bool _isSequentialExportPumpRunning = false;
   int _taskCount = 0;
   int _selectedEpisodeCount = 0;
+  BilibiliSelectionSummary _selectionSummary = const BilibiliSelectionSummary();
   int _processingEpisodeCount = 0;
   bool _lastAppliedKeepAwakeActive = false;
   bool _metricsDirty = true;
@@ -79,6 +101,13 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   @override
   void notifyListeners() {
+    // Unknown/non-progress mutations invalidate mounted rows in O(1). The hot
+    // progress path bypasses this generation and invalidates only its episode.
+    _coarseRenderRevision++;
+    _notifyListenersWithoutRenderInvalidation();
+  }
+
+  void _notifyListenersWithoutRenderInvalidation() {
     if (_metricsDirty) {
       _refreshTaskMetrics();
       _metricsDirty = false;
@@ -96,7 +125,9 @@ class BilibiliDownloadService extends ChangeNotifier {
     if (!kDebugMode) return;
     try {
       final client = HttpClient();
-      final request = await client.postUrl(Uri.parse('http://127.0.0.1:7777/event'));
+      final request = await client.postUrl(
+        Uri.parse('http://127.0.0.1:7777/event'),
+      );
       request.headers.contentType = ContentType.json;
       request.write(
         jsonEncode({
@@ -120,6 +151,22 @@ class BilibiliDownloadService extends ChangeNotifier {
       return normalized;
     }
     return normalized.clamp(1, _windowsMaxConcurrentDownloadsCap);
+  }
+
+  int _sanitizeMaxConnectionsPerVideo(int value) {
+    if (value >= 4) return 4;
+    if (value >= 2) return 2;
+    return 1;
+  }
+
+  int get effectiveMaxConnectionsPerVideo {
+    // Keep newly-created media connections within an eight-connection budget.
+    // Existing task concurrency remains respected, and high task concurrency
+    // automatically turns per-video acceleration down to one connection.
+    final perTaskBudget = 8 ~/ maxConcurrentDownloads.clamp(1, 10);
+    return _sanitizeMaxConnectionsPerVideo(
+      maxConnectionsPerVideo.clamp(1, perTaskBudget.clamp(1, 4)),
+    );
   }
 
   Duration get _effectiveProgressNotifyInterval {
@@ -153,55 +200,187 @@ class BilibiliDownloadService extends ChangeNotifier {
     return const Duration(milliseconds: 1300);
   }
 
-  List<String> get taskIds =>
-      tasks.map((task) => task.taskId).toList(growable: false);
+  List<String> get taskIds => _cachedTaskIds;
+
+  int get listStructureRevision => _listStructureRevision;
+
+  int taskRevision(String taskId) =>
+      Object.hash(_coarseRenderRevision, _taskRevisions[taskId] ?? 0);
+
+  int episodeRevision(BilibiliDownloadEpisode episode) =>
+      Object.hash(_coarseRenderRevision, _episodeRevisions[episode] ?? 0);
+
+  String episodeKey(BilibiliDownloadEpisode episode) =>
+      '${episode.bvid}_${episode.page.cid}_${episode.page.page}';
 
   void _rebuildTaskIndex() {
     _taskIndex.clear();
+    _episodeOwnerTaskIds.clear();
+    final liveEpisodes = Set<BilibiliDownloadEpisode>.identity();
     for (final task in tasks) {
       _taskIndex[task.taskId] = task;
+      _taskRevisions.putIfAbsent(task.taskId, () => 0);
+      for (final video in task.videos) {
+        for (final episode in video.episodes) {
+          liveEpisodes.add(episode);
+          _episodeOwnerTaskIds[episode] = task.taskId;
+          _episodeRevisions.putIfAbsent(episode, () => 0);
+        }
+      }
     }
+    _taskRevisions.removeWhere((taskId, _) => !_taskIndex.containsKey(taskId));
+    _taskJsonSnapshots.removeWhere(
+      (taskId, _) => !_taskIndex.containsKey(taskId),
+    );
+    for (final taskId in _taskIndex.keys) {
+      if (!_taskJsonSnapshots.containsKey(taskId)) {
+        _dirtyPersistenceTaskIds.add(taskId);
+      }
+    }
+    _episodeRevisions.removeWhere(
+      (episode, _) => !liveEpisodes.contains(episode),
+    );
+    _cachedTaskIds = List<String>.unmodifiable(
+      tasks.map((task) => task.taskId),
+    );
+    _listStructureRevision++;
   }
 
   BilibiliDownloadTask? getTaskById(String taskId) {
     return _taskIndex[taskId];
   }
 
-  int taskRenderSignature(String taskId) {
-    final task = getTaskById(taskId);
-    if (task == null) {
-      return 0;
-    }
-    var hash = task.taskId.hashCode;
-    hash = _combineHash(hash, task.isExpanded.hashCode);
-    hash = _combineHash(hash, task.isSelected.hashCode);
-    for (final video in task.videos) {
-      hash = _combineHash(hash, video.videoInfo.bvid.hashCode);
-      hash = _combineHash(hash, video.isExpanded.hashCode);
-      hash = _combineHash(hash, video.isSelected.hashCode);
-      for (final ep in video.episodes) {
-        hash = _combineHash(hash, ep.page.cid.hashCode);
-        hash = _combineHash(hash, ep.isSelected.hashCode);
-        hash = _combineHash(hash, ep.status.index);
-        hash = _combineHash(hash, (ep.progress * 1000).round());
-        hash = _combineHash(hash, ep.selectedVideoQuality?.id ?? -1);
-        hash = _combineHash(hash, ep.selectedSubtitle?.id.hashCode ?? 0);
-        hash = _combineHash(hash, ep.downloadSpeed?.hashCode ?? 0);
-        hash = _combineHash(hash, ep.downloadSize?.hashCode ?? 0);
-        hash = _combineHash(hash, ep.error?.hashCode ?? 0);
-        hash = _combineHash(hash, ep.outputPath?.hashCode ?? 0);
-        hash = _combineHash(hash, ep.importedOutputPath?.hashCode ?? 0);
-        hash = _combineHash(hash, ep.isExported.hashCode);
-        hash = _combineHash(hash, ep.canResume.hashCode);
-        hash = _combineHash(hash, ep.resumeVersion.hashCode);
-      }
-    }
-    return hash;
+  @visibleForTesting
+  void replaceTasksForTesting(List<BilibiliDownloadTask> replacement) {
+    tasks = replacement;
+    _rebuildTaskIndex();
+    _metricsDirty = true;
   }
 
-  static int _combineHash(int current, int value) {
-    return current ^ (value * 0x9e3779b97f4a7c15).toInt() +
-        0x9e3779b9 + (current << 6) + (current >> 2);
+  @visibleForTesting
+  void markEpisodeProgressChangedForTesting(BilibiliDownloadEpisode episode) {
+    _episodeRevisions[episode] = (_episodeRevisions[episode] ?? 0) + 1;
+    _notifyListenersWithoutRenderInvalidation();
+  }
+
+  void _notifyTaskRows(
+    BilibiliDownloadTask task, {
+    Iterable<BilibiliDownloadEpisode> episodes = const [],
+    bool structureChanged = false,
+  }) {
+    _taskRevisions[task.taskId] = (_taskRevisions[task.taskId] ?? 0) + 1;
+    for (final episode in episodes) {
+      _episodeRevisions[episode] = (_episodeRevisions[episode] ?? 0) + 1;
+    }
+    if (structureChanged) {
+      _listStructureRevision++;
+    }
+    _notifyListenersWithoutRenderInvalidation();
+  }
+
+  void setTaskExpanded(BilibiliDownloadTask task, bool expanded) {
+    if (task.isExpanded == expanded) return;
+    task.isExpanded = expanded;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, structureChanged: true);
+  }
+
+  /// Moves one top-level Bilibili task to an insertion boundary.
+  ///
+  /// [insertionIndex] is in the unmodified task list and may range from zero
+  /// (before the first task) through [tasks.length] (after the last task).
+  /// Keeping the conversion here gives every UI the same stable semantics and
+  /// ensures collections and multipart videos always move as one unit.
+  bool moveTaskToInsertionIndex(String taskId, int insertionIndex) {
+    if (tasks.length < 2) return false;
+    final oldIndex = tasks.indexWhere((task) => task.taskId == taskId);
+    if (oldIndex < 0) return false;
+
+    final boundary = insertionIndex.clamp(0, tasks.length);
+    final newIndex = (boundary > oldIndex ? boundary - 1 : boundary).clamp(
+      0,
+      tasks.length - 1,
+    );
+    if (newIndex == oldIndex) return false;
+
+    final task = tasks.removeAt(oldIndex);
+    tasks.insert(newIndex, task);
+    _cachedTaskIds = List<String>.unmodifiable(
+      tasks.map((item) => item.taskId),
+    );
+    _listStructureRevision++;
+    _scheduleTaskOrderPersistence();
+    if (sequentialExport) {
+      _refreshCompletedEpisodeHints();
+    }
+    _notifyListenersWithoutRenderInvalidation();
+    return true;
+  }
+
+  void setTaskSelected(BilibiliDownloadTask task, bool selected) {
+    task.isSelected = selected;
+    final changedEpisodes = <BilibiliDownloadEpisode>[];
+    for (final video in task.videos) {
+      video.isSelected = selected;
+      for (final episode in video.episodes) {
+        episode.isSelected = selected;
+        changedEpisodes.add(episode);
+      }
+    }
+    _metricsDirty = true;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, episodes: changedEpisodes);
+  }
+
+  void setVideoSelected(
+    BilibiliDownloadTask task,
+    BilibiliVideoItem video,
+    bool selected,
+  ) {
+    video.isSelected = selected;
+    for (final episode in video.episodes) {
+      episode.isSelected = selected;
+    }
+    task.isSelected = task.videos.every((item) => item.isSelected);
+    _metricsDirty = true;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, episodes: video.episodes);
+  }
+
+  void setEpisodeSelected(
+    BilibiliDownloadTask task,
+    BilibiliVideoItem video,
+    BilibiliDownloadEpisode episode,
+    bool selected,
+  ) {
+    episode.isSelected = selected;
+    video.isSelected = video.episodes.every((item) => item.isSelected);
+    task.isSelected = task.videos.every((item) => item.isSelected);
+    _metricsDirty = true;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, episodes: [episode]);
+  }
+
+  void setEpisodeVideoQuality(
+    BilibiliDownloadTask task,
+    BilibiliDownloadEpisode episode,
+    StreamItem? quality,
+  ) {
+    if (identical(episode.selectedVideoQuality, quality)) return;
+    episode.selectedVideoQuality = quality;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, episodes: [episode]);
+  }
+
+  void setEpisodeSubtitle(
+    BilibiliDownloadTask task,
+    BilibiliDownloadEpisode episode,
+    BilibiliSubtitle? subtitle,
+  ) {
+    if (identical(episode.selectedSubtitle, subtitle)) return;
+    episode.selectedSubtitle = subtitle;
+    scheduleSaveTasks(task: task);
+    _notifyTaskRows(task, episodes: [episode]);
   }
 
   Future<void> init() {
@@ -222,10 +401,14 @@ class BilibiliDownloadService extends ChangeNotifier {
     maxConcurrentDownloads = _sanitizeMaxConcurrentDownloads(
       prefs.getInt('bilibili_max_concurrent') ?? 1,
     );
+    maxConnectionsPerVideo = _sanitizeMaxConnectionsPerVideo(
+      prefs.getInt('bilibili_connections_per_video') ?? 2,
+    );
     preferredQuality = prefs.getInt('bilibili_preferred_quality') ?? 116;
     preferredSubtitleLang =
         prefs.getString('bilibili_preferred_subtitle_lang') ?? "zh";
     preferAiSubtitles = prefs.getBool('bilibili_prefer_ai_subtitles') ?? false;
+    downloadDanmaku = prefs.getBool('bilibili_download_danmaku') ?? true;
     autoImportToLibrary = prefs.getBool('bilibili_auto_import') ?? true;
     autoDeleteTaskAfterImport =
         prefs.getBool('bilibili_auto_delete_import') ?? false;
@@ -239,12 +422,17 @@ class BilibiliDownloadService extends ChangeNotifier {
   Future<void> saveSettings() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt('bilibili_max_concurrent', maxConcurrentDownloads);
+    await prefs.setInt(
+      'bilibili_connections_per_video',
+      maxConnectionsPerVideo,
+    );
     await prefs.setInt('bilibili_preferred_quality', preferredQuality);
     await prefs.setString(
       'bilibili_preferred_subtitle_lang',
       preferredSubtitleLang,
     );
     await prefs.setBool('bilibili_prefer_ai_subtitles', preferAiSubtitles);
+    await prefs.setBool('bilibili_download_danmaku', downloadDanmaku);
     await prefs.setBool('bilibili_auto_import', autoImportToLibrary);
     await prefs.setBool(
       'bilibili_auto_delete_import',
@@ -275,8 +463,14 @@ class BilibiliDownloadService extends ChangeNotifier {
     bool autoDelete,
     bool seqExport, {
     String? customPath,
+    int? videoConnections,
   }) {
     maxConcurrentDownloads = _sanitizeMaxConcurrentDownloads(maxConcurrent);
+    if (videoConnections != null) {
+      maxConnectionsPerVideo = _sanitizeMaxConnectionsPerVideo(
+        videoConnections,
+      );
+    }
     preferredQuality = quality;
     preferredSubtitleLang = subLang;
     preferAiSubtitles = preferAi;
@@ -293,6 +487,14 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
   }
 
+  Future<void> setDownloadDanmaku(bool value) async {
+    if (downloadDanmaku == value) return;
+    downloadDanmaku = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('bilibili_download_danmaku', value);
+  }
+
   bool get supportsProcessingKeepAwakeToggle =>
       Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
 
@@ -303,6 +505,8 @@ class BilibiliDownloadService extends ChangeNotifier {
   int get taskCount => _taskCount;
 
   int get selectedEpisodeCount => _selectedEpisodeCount;
+
+  BilibiliSelectionSummary get selectionSummary => _selectionSummary;
 
   bool get isProcessingKeepAwakeActive =>
       supportsProcessingKeepAwakeToggle &&
@@ -326,15 +530,44 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
   }
 
-  Future<void> saveTasks() async {
+  Future<void> saveTasks({
+    BilibiliDownloadTask? task,
+    BilibiliDownloadEpisode? episode,
+  }) async {
+    final taskId =
+        task?.taskId ??
+        (episode == null ? null : _episodeOwnerTaskIds[episode]);
+    if (taskId == null) {
+      _dirtyPersistenceTaskIds.addAll(_cachedTaskIds);
+    } else {
+      _dirtyPersistenceTaskIds.add(taskId);
+    }
+    _hasPendingTaskPersistence = true;
     await _flushPendingTaskPersistence();
-    await BilibiliDownloadStateManager.saveTasks(tasks);
     notifyListeners();
   }
 
-  void scheduleSaveTasks({bool notifyNow = false}) {
+  Future<void> _saveAllTaskSnapshotsNow() async {
+    _dirtyPersistenceTaskIds.addAll(_cachedTaskIds);
+    _hasPendingTaskPersistence = true;
+    await _flushPendingTaskPersistence();
+  }
+
+  void scheduleSaveTasks({
+    bool notifyNow = false,
+    BilibiliDownloadTask? task,
+    BilibiliDownloadEpisode? episode,
+  }) {
     _hasPendingTaskPersistence = true;
     _metricsDirty = true;
+    final taskId =
+        task?.taskId ??
+        (episode == null ? null : _episodeOwnerTaskIds[episode]);
+    if (taskId == null) {
+      _dirtyPersistenceTaskIds.addAll(_cachedTaskIds);
+    } else {
+      _dirtyPersistenceTaskIds.add(taskId);
+    }
     _persistDebounceTimer?.cancel();
     _persistDebounceTimer = Timer(_effectiveTaskPersistDebounce, () {
       _persistDebounceTimer = null;
@@ -349,6 +582,19 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
   }
 
+  void _scheduleTaskOrderPersistence() {
+    // Reordering changes only the snapshot order. Existing task snapshots can
+    // be reused, avoiding an O(total episode count) JSON rebuild on every drop.
+    _hasPendingTaskPersistence = true;
+    _persistDebounceTimer?.cancel();
+    _persistDebounceTimer = Timer(_effectiveTaskPersistDebounce, () {
+      _persistDebounceTimer = null;
+      if (_hasPendingTaskPersistence) {
+        unawaited(_flushPendingTaskPersistence());
+      }
+    });
+  }
+
   Future<void> _flushPendingTaskPersistence() async {
     final hadPending = _hasPendingTaskPersistence;
     _persistDebounceTimer?.cancel();
@@ -357,11 +603,36 @@ class BilibiliDownloadService extends ChangeNotifier {
       return;
     }
     _hasPendingTaskPersistence = false;
-    await BilibiliDownloadStateManager.saveTasks(tasks);
+    _refreshDirtyTaskSnapshots();
+    final snapshots = <Map<String, dynamic>>[
+      for (final taskId in _cachedTaskIds) _taskJsonSnapshots[taskId]!,
+    ];
+    await BilibiliDownloadStateManager.saveTaskSnapshots(snapshots);
   }
 
-  void _scheduleProgressNotify() {
+  int _refreshDirtyTaskSnapshots() {
+    var refreshedCount = 0;
+    for (final taskId in _dirtyPersistenceTaskIds.toList(growable: false)) {
+      final task = _taskIndex[taskId];
+      if (task != null) {
+        _taskJsonSnapshots[taskId] = task.toJson();
+        refreshedCount++;
+      }
+    }
+    _dirtyPersistenceTaskIds.clear();
+    return refreshedCount;
+  }
+
+  @visibleForTesting
+  int refreshDirtyTaskSnapshotsForTesting() => _refreshDirtyTaskSnapshots();
+
+  @visibleForTesting
+  Map<String, dynamic>? taskSnapshotForTesting(String taskId) =>
+      _taskJsonSnapshots[taskId];
+
+  void _scheduleProgressNotify(BilibiliDownloadEpisode episode) {
     _hasPendingProgressNotify = true;
+    _pendingProgressEpisodes.add(episode);
     if (_progressNotifyTimer != null) {
       return;
     }
@@ -372,13 +643,25 @@ class BilibiliDownloadService extends ChangeNotifier {
         return;
       }
       _hasPendingProgressNotify = false;
-      notifyListeners();
+      for (final episode in _pendingProgressEpisodes) {
+        _episodeRevisions[episode] = (_episodeRevisions[episode] ?? 0) + 1;
+      }
+      _pendingProgressEpisodes.clear();
+      _notifyListenersWithoutRenderInvalidation();
     });
   }
 
   Future<void> shutdown() {
     _shutdownFuture ??= _shutdownInternal();
     return _shutdownFuture!;
+  }
+
+  @override
+  void dispose() {
+    _persistDebounceTimer?.cancel();
+    _progressNotifyTimer?.cancel();
+    _pendingProgressEpisodes.clear();
+    super.dispose();
   }
 
   Future<void> _shutdownInternal() async {
@@ -389,6 +672,14 @@ class BilibiliDownloadService extends ChangeNotifier {
     } catch (_) {}
 
     _downloadQueue.clear();
+
+    for (final episode in _runningEpisodeOperations.keys.toList()) {
+      episode.cancelToken?.cancel('App shutdown');
+    }
+    await Future.wait<void>([
+      for (final operation in _runningEpisodeOperations.values.toList())
+        operation.catchError((_) {}),
+    ]);
     _activeDownloads = 0;
 
     bool changed = false;
@@ -426,7 +717,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     if (changed) {
-      await BilibiliDownloadStateManager.saveTasks(tasks);
+      await _saveAllTaskSnapshotsNow();
     } else {
       await _flushPendingTaskPersistence();
     }
@@ -1050,10 +1341,11 @@ class BilibiliDownloadService extends ChangeNotifier {
       );
       final video = task.videos.firstWhere((v) => v.episodes.contains(episode));
 
-      final subtitles = await apiService.fetchSubtitles(
+      final playerMetadata = await apiService.fetchPlayerMetadata(
         episode.bvid,
         episode.page.cid,
         aid: episode.page.aid ?? video.videoInfo.aid,
+        durationSeconds: episode.page.duration,
       );
 
       episode.availableVideoQualities = streamInfo.videoStreams;
@@ -1073,8 +1365,9 @@ class BilibiliDownloadService extends ChangeNotifier {
         }
       }
 
-      episode.availableSubtitles = subtitles;
-      episode.selectedSubtitle = _selectBestSubtitle(subtitles);
+      episode.availableSubtitles = playerMetadata.subtitles;
+      episode.selectedSubtitle = _selectBestSubtitle(playerMetadata.subtitles);
+      episode.chapters = playerMetadata.chapters;
 
       if (!shouldPreserveState) {
         episode.status = DownloadStatus.pending;
@@ -1113,6 +1406,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     if (selectedEpisodes.isEmpty) return;
 
     for (var ep in selectedEpisodes) {
+      if (!await _waitForPreviousEpisodeOperation(ep)) continue;
       if (ep.selectedVideoQuality == null) {
         await fetchEpisodeInfo(ep);
         if (ep.selectedVideoQuality == null) continue;
@@ -1132,6 +1426,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     BilibiliDownloadEpisode ep, {
     bool toTop = false,
   }) async {
+    if (!await _waitForPreviousEpisodeOperation(ep)) return;
     if (ep.selectedVideoQuality == null) {
       await fetchEpisodeInfo(ep);
       if (ep.selectedVideoQuality == null) return;
@@ -1158,7 +1453,7 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   Future<void> pauseDownload(BilibiliDownloadEpisode ep) async {
     if (_pauseEpisodeState(ep)) {
-      await saveTasks();
+      await saveTasks(episode: ep);
     }
   }
 
@@ -1219,8 +1514,74 @@ class BilibiliDownloadService extends ChangeNotifier {
     while (_activeDownloads < maxConcurrentDownloads &&
         _downloadQueue.isNotEmpty) {
       final ep = _downloadQueue.removeAt(0);
+      if (_runningEpisodeOperations.containsKey(ep)) {
+        ep.status = DownloadStatus.pending;
+        ep.error = '上一次下载仍在停止中，请稍后重试';
+        continue;
+      }
       _activeDownloads++;
-      _processDownload(ep);
+      late final Future<void> operation;
+      operation = _processDownload(ep);
+      _runningEpisodeOperations[ep] = operation;
+      unawaited(
+        operation
+            .then<void>(
+              (_) {},
+              onError: (Object error, StackTrace stack) {
+                developer.log(
+                  'Unhandled Bilibili episode operation error',
+                  error: error,
+                  stackTrace: stack,
+                );
+              },
+            )
+            .whenComplete(() {
+              if (identical(_runningEpisodeOperations[ep], operation)) {
+                _runningEpisodeOperations.remove(ep);
+              }
+            }),
+      );
+    }
+  }
+
+  Future<bool> _waitForPreviousEpisodeOperation(
+    BilibiliDownloadEpisode episode,
+  ) async {
+    final operation = _runningEpisodeOperations[episode];
+    if (operation == null) return true;
+    if (_isEpisodeRunning(episode.status) &&
+        episode.cancelToken?.isCancelled != true) {
+      return false;
+    }
+    try {
+      await operation.timeout(const Duration(seconds: 20));
+      if (identical(_runningEpisodeOperations[episode], operation)) {
+        _runningEpisodeOperations.remove(episode);
+      }
+      return true;
+    } on TimeoutException {
+      episode.status = DownloadStatus.failed;
+      episode.error = '上一次下载未能及时停止，请稍后重试';
+      notifyListeners();
+      return false;
+    } catch (_) {
+      if (identical(_runningEpisodeOperations[episode], operation)) {
+        _runningEpisodeOperations.remove(episode);
+      }
+      return true;
+    }
+  }
+
+  Future<void> _awaitEpisodeOperationStopped(
+    BilibiliDownloadEpisode episode,
+  ) async {
+    final operation = _runningEpisodeOperations[episode];
+    if (operation == null) return;
+    try {
+      await operation;
+    } catch (_) {}
+    if (identical(_runningEpisodeOperations[episode], operation)) {
+      _runningEpisodeOperations.remove(episode);
     }
   }
 
@@ -1291,11 +1652,14 @@ class BilibiliDownloadService extends ChangeNotifier {
         }
 
         // Fetch Subtitles
-        ep.availableSubtitles = await apiService.fetchSubtitles(
+        final playerMetadata = await apiService.fetchPlayerMetadata(
           ep.bvid,
           ep.page.cid,
           aid: aid,
+          durationSeconds: ep.page.duration,
         );
+        ep.availableSubtitles = playerMetadata.subtitles;
+        ep.chapters = playerMetadata.chapters;
 
         // Restore Subtitle Logic
         if (hadSubtitle) {
@@ -1432,17 +1796,18 @@ class BilibiliDownloadService extends ChangeNotifier {
           videoResumeState: ep.videoResumeState,
           audioResumeState: ep.audioResumeState,
           cancelToken: ep.cancelToken,
+          maxVideoConnections: effectiveMaxConnectionsPerVideo,
           onProgress: (p) {
             ep.progress = p;
-            _scheduleProgressNotify();
+            _scheduleProgressNotify(ep);
           },
           onSpeedUpdate: (speed) {
             ep.downloadSpeed = speed;
-            _scheduleProgressNotify();
+            _scheduleProgressNotify(ep);
           },
           onSizeUpdate: (size) {
             ep.downloadSize = size;
-            _scheduleProgressNotify();
+            _scheduleProgressNotify(ep);
           },
           onStatusUpdate: (status) {
             ep.status = status;
@@ -1450,7 +1815,7 @@ class BilibiliDownloadService extends ChangeNotifier {
               ep.error = null;
             }
             notifyListeners();
-            scheduleSaveTasks();
+            scheduleSaveTasks(episode: ep);
           },
           onResumeStateChanged: (videoState, audioState) {
             _updateEpisodeResumeState(ep, videoState, audioState);
@@ -1458,8 +1823,9 @@ class BilibiliDownloadService extends ChangeNotifier {
               ep.error = null;
             }
             _persistResumeStateIfNeeded(ep);
-            _scheduleProgressNotify();
+            _scheduleProgressNotify(ep);
           },
+          chapters: ep.chapters,
           onDownloadPhaseFinished: () {
             if (!slotReleased) {
               slotReleased = true;
@@ -1471,6 +1837,29 @@ class BilibiliDownloadService extends ChangeNotifier {
 
         ep.status = DownloadStatus.completed;
         ep.outputPath = outputPath;
+        ep.downloadSpeed = "合成完成，正在处理附加内容...";
+        _scheduleProgressNotify(ep);
+        if (downloadDanmaku) {
+          try {
+            final xml = await apiService.fetchDanmakuXml(ep.page.cid);
+            final ass = BilibiliDanmakuAss.xmlToAss(xml);
+            final danmakuPath = '${p.withoutExtension(outputPath)}.danmaku.ass';
+            await File(danmakuPath).writeAsString(ass, flush: true);
+            ep.danmakuPath = danmakuPath;
+            ep.danmakuError = null;
+          } catch (e, stack) {
+            developer.log(
+              'Danmaku download failed for cid=${ep.page.cid}',
+              error: e,
+              stackTrace: stack,
+            );
+            ep.danmakuPath = null;
+            ep.danmakuError = 'download_failed';
+          }
+        } else {
+          ep.danmakuPath = null;
+          ep.danmakuError = null;
+        }
         _clearEpisodeResumeState(ep);
         await _removePendingTempCleanupKey(ep.tempArtifactKey!);
         ep.tempArtifactKey = null;
@@ -1478,13 +1867,13 @@ class BilibiliDownloadService extends ChangeNotifier {
         ep.downloadSpeed = "已合成";
         ep.downloadSize = null;
         ep.error = null;
-        await saveTasks();
+        await saveTasks(episode: ep);
 
         // Auto Import
         if (autoImportToLibrary && libraryService != null) {
           if (sequentialExport) {
             _refreshCompletedEpisodeHints();
-            await saveTasks();
+            await saveTasks(episode: ep);
             await _processSequentialAutoImports();
           } else {
             await importToLibrary(libraryService!, episode: ep);
@@ -1502,20 +1891,35 @@ class BilibiliDownloadService extends ChangeNotifier {
             ep.progress = ep.resumableProgress;
             _persistResumeStateIfNeeded(ep, force: true);
           }
-          await saveTasks();
+          await saveTasks(episode: ep);
           break; // Stop retrying if cancelled
         } else if (e is DownloadUrlExpiredException &&
             ep.hasResumeData &&
             preferSavedResumeUrls) {
           preferSavedResumeUrls = false;
           ep.error = "恢复中";
-          _scheduleProgressNotify();
+          _scheduleProgressNotify(ep);
           final shouldRetry = await _waitForRetryDelay(
             ep,
             const Duration(seconds: 1),
           );
           if (!shouldRetry) {
-            await saveTasks();
+            await saveTasks(episode: ep);
+            break;
+          }
+          continue;
+        } else if (e is DownloadUrlExpiredException &&
+            retryCount < _maxDownloadRetryCount) {
+          retryCount++;
+          preferSavedResumeUrls = false;
+          ep.error = '下载链接已刷新，正在继续下载';
+          _scheduleProgressNotify(ep);
+          final shouldRetry = await _waitForRetryDelay(
+            ep,
+            _buildRetryDelay(retryCount),
+          );
+          if (!shouldRetry) {
+            await saveTasks(episode: ep);
             break;
           }
           continue;
@@ -1531,7 +1935,7 @@ class BilibiliDownloadService extends ChangeNotifier {
             ep.downloadSize = _buildResumeSizeText(ep);
             _persistResumeStateIfNeeded(ep, force: true);
           }
-          _scheduleProgressNotify();
+          _scheduleProgressNotify(ep);
           if (retryCount < _maxDownloadRetryCount) {
             retryCount++;
             suppressRetryBannerForNextAttempt = true;
@@ -1540,7 +1944,7 @@ class BilibiliDownloadService extends ChangeNotifier {
               const Duration(milliseconds: 300),
             );
             if (!shouldRetry) {
-              await saveTasks();
+              await saveTasks(episode: ep);
               break;
             }
             continue;
@@ -1548,17 +1952,56 @@ class BilibiliDownloadService extends ChangeNotifier {
           ep.status = DownloadStatus.failed;
           ep.error = "下载错误，请重试";
           ep.downloadSize = null;
-          await saveTasks();
+          await saveTasks(episode: ep);
+          break;
+        } else if (e is PostProcessTimeoutException) {
+          ep.status = DownloadStatus.failed;
+          ep.error = '${e.phase}超时，已跳过以继续后续队列';
+          ep.downloadSpeed = null;
+          ep.downloadSize = null;
+          if (ep.hasResumeData) {
+            ep.progress = ep.resumableProgress;
+            _persistResumeStateIfNeeded(ep, force: true);
+          }
+          await saveTasks(episode: ep);
+          break;
+        } else if (e is DownloadIntegrityException) {
+          ep.status = DownloadStatus.failed;
+          ep.error = e.message;
+          ep.downloadSpeed = null;
+          ep.downloadSize = null;
+          if (ep.hasResumeData) {
+            ep.progress = ep.resumableProgress;
+            _persistResumeStateIfNeeded(ep, force: true);
+          }
+          await saveTasks(episode: ep);
+          break;
+        } else if (e is PostProcessFailureException) {
+          ep.status = DownloadStatus.failed;
+          ep.error = '${e.phase}失败，请重试';
+          ep.downloadSpeed = null;
+          ep.downloadSize = null;
+          if (ep.hasResumeData) {
+            ep.progress = ep.resumableProgress;
+            _persistResumeStateIfNeeded(ep, force: true);
+          }
+          await saveTasks(episode: ep);
           break;
         } else {
           bool isRetryable = false;
           if (e is DioException) {
+            final statusCode = e.response?.statusCode;
             isRetryable =
                 e.type == DioExceptionType.connectionTimeout ||
                 e.type == DioExceptionType.receiveTimeout ||
                 e.type == DioExceptionType.sendTimeout ||
                 e.type == DioExceptionType.connectionError ||
-                (e.error is SocketException);
+                (e.error is SocketException) ||
+                statusCode == 408 ||
+                statusCode == 412 ||
+                statusCode == 416 ||
+                statusCode == 429 ||
+                (statusCode != null && statusCode >= 500);
           }
           if (!isRetryable && e.toString().contains("Connection reset")) {
             isRetryable = true;
@@ -1569,11 +2012,11 @@ class BilibiliDownloadService extends ChangeNotifier {
             final retryDelay = _buildRetryDelay(retryCount);
             ep.error =
                 "${retryDelay.inSeconds}秒后重试 $retryCount/$_maxDownloadRetryCount";
-            _scheduleProgressNotify();
+            _scheduleProgressNotify(ep);
 
             final shouldRetry = await _waitForRetryDelay(ep, retryDelay);
             if (!shouldRetry) {
-              await saveTasks();
+              await saveTasks(episode: ep);
               break;
             }
             continue;
@@ -1587,7 +2030,7 @@ class BilibiliDownloadService extends ChangeNotifier {
             ep.progress = ep.resumableProgress;
             _persistResumeStateIfNeeded(ep, force: true);
           }
-          await saveTasks();
+          await saveTasks(episode: ep);
           break;
         }
       } finally {
@@ -1600,7 +2043,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       if (_activeDownloads > 0) _activeDownloads--;
       processQueue();
     }
-    _scheduleProgressNotify();
+    _scheduleProgressNotify(ep);
   }
 
   // --- Management ---
@@ -1679,14 +2122,11 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   void _refreshTaskMetrics() {
     var nextTaskCount = tasks.length;
-    var nextSelectedEpisodeCount = 0;
+    final nextSelectionSummary = BilibiliSelectionSummary.fromTasks(tasks);
     var nextProcessingEpisodeCount = _importingEpisodeKeys.length;
     for (final task in tasks) {
       for (final video in task.videos) {
         for (final episode in video.episodes) {
-          if (episode.isSelected) {
-            nextSelectedEpisodeCount++;
-          }
           if (_isEpisodeKeepingAwake(episode)) {
             nextProcessingEpisodeCount++;
           }
@@ -1694,7 +2134,8 @@ class BilibiliDownloadService extends ChangeNotifier {
       }
     }
     _taskCount = nextTaskCount;
-    _selectedEpisodeCount = nextSelectedEpisodeCount;
+    _selectionSummary = nextSelectionSummary;
+    _selectedEpisodeCount = nextSelectionSummary.selectedItemCount;
     _processingEpisodeCount = nextProcessingEpisodeCount;
   }
 
@@ -1717,23 +2158,29 @@ class BilibiliDownloadService extends ChangeNotifier {
   }
 
   Future<bool> _episodeResumeFilesExist(BilibiliDownloadEpisode ep) async {
-    final videoPath = ep.videoResumeState?.tempPath;
-    final audioPath = ep.audioResumeState?.tempPath;
+    for (final state in <DownloadPartResumeState?>[
+      ep.videoResumeState,
+      ep.audioResumeState,
+    ]) {
+      if (state == null || !state.hasData) continue;
+      for (final path in _resumeArtifactPaths(state)) {
+        if (await File(path).exists()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
 
-    bool hasAnyExpectedFile = false;
-    if (videoPath != null && videoPath.isNotEmpty) {
-      hasAnyExpectedFile = true;
-      if (await File(videoPath).exists()) {
-        return true;
-      }
+  Iterable<String> _resumeArtifactPaths(DownloadPartResumeState state) sync* {
+    if (state.tempPath.isNotEmpty) {
+      yield state.tempPath;
+      yield '${state.tempPath}.assembling';
     }
-    if (audioPath != null && audioPath.isNotEmpty) {
-      hasAnyExpectedFile = true;
-      if (await File(audioPath).exists()) {
-        return true;
-      }
+    for (final part in state.rangeParts) {
+      final path = part.tempPath;
+      if (path != null && path.isNotEmpty) yield path;
     }
-    return !hasAnyExpectedFile ? false : false;
   }
 
   Future<void> _invalidateMissingResumeStateIfNeeded(
@@ -1832,7 +2279,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       return;
     }
     _lastResumePersistAt[key] = now;
-    scheduleSaveTasks();
+    scheduleSaveTasks(episode: ep);
   }
 
   String _formatBytes(int bytes) {
@@ -1900,8 +2347,10 @@ class BilibiliDownloadService extends ChangeNotifier {
     final outputPath = p.join(tempDir.path, "${prefix}_output.mp4");
     return <String>[
       p.join(tempDir.path, "${prefix}_video.m4s"),
+      p.join(tempDir.path, "${prefix}_video.m4s.assembling"),
       p.join(tempDir.path, "${prefix}_audio.m4s"),
       p.join(tempDir.path, "${prefix}_subtitle.srt"),
+      p.join(tempDir.path, "${prefix}_chapters.ffmeta"),
       outputPath,
       _deriveSidecarPath(outputPath),
       p.join(tempDir.path, "repaired_${p.basename(outputPath)}"),
@@ -1914,6 +2363,20 @@ class BilibiliDownloadService extends ChangeNotifier {
       await _deleteFileIfExists(path);
       if (await File(path).exists()) {
         allCleared = false;
+      }
+    }
+    final tempDir = await getTemporaryDirectory();
+    final safeKey = key.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    final rangePrefix = 'bbdown_${safeKey}_video.m4s.range_';
+    if (await tempDir.exists()) {
+      await for (final entity in tempDir.list()) {
+        if (entity is! File) continue;
+        final name = entity.uri.pathSegments.last;
+        if (!name.startsWith(rangePrefix) || !name.endsWith('.part')) {
+          continue;
+        }
+        await _deleteFileIfExists(entity.path);
+        if (await entity.exists()) allCleared = false;
       }
     }
     if (allCleared) {
@@ -1944,6 +2407,15 @@ class BilibiliDownloadService extends ChangeNotifier {
       }
     }
 
+    if (deleteCompletedOutput && ep.danmakuPath != null) {
+      final danmakuPath = ep.danmakuPath!;
+      if (await _isWithinTempDir(danmakuPath)) {
+        await _deleteFileIfExists(danmakuPath);
+        ep.danmakuPath = null;
+      }
+      ep.danmakuError = null;
+    }
+
     if (clearResumeState) {
       _clearEpisodeResumeState(ep);
     }
@@ -1955,7 +2427,7 @@ class BilibiliDownloadService extends ChangeNotifier {
   }) async {
     if (preserveExisting && ep.tempArtifactKey != null) {
       ep.outputPath = null;
-      await BilibiliDownloadStateManager.saveTasks(tasks);
+      await _saveAllTaskSnapshotsNow();
       return;
     }
     if (ep.tempArtifactKey != null) {
@@ -1963,7 +2435,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
     ep.tempArtifactKey = _createTempArtifactKey(ep);
     ep.outputPath = null;
-    await BilibiliDownloadStateManager.saveTasks(tasks);
+    await _saveAllTaskSnapshotsNow();
   }
 
   Future<void> _cleanupPersistedTempArtifacts() async {
@@ -2011,7 +2483,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     if (changed) {
-      await BilibiliDownloadStateManager.saveTasks(tasks);
+      await _saveAllTaskSnapshotsNow();
     }
   }
 
@@ -2105,10 +2577,14 @@ class BilibiliDownloadService extends ChangeNotifier {
               }
             }
             if (ep.videoResumeState != null) {
-              activePaths.add(p.normalize(ep.videoResumeState!.tempPath));
+              activePaths.addAll(
+                _resumeArtifactPaths(ep.videoResumeState!).map(p.normalize),
+              );
             }
             if (ep.audioResumeState != null) {
-              activePaths.add(p.normalize(ep.audioResumeState!.tempPath));
+              activePaths.addAll(
+                _resumeArtifactPaths(ep.audioResumeState!).map(p.normalize),
+              );
             }
           }
         }
@@ -2250,10 +2726,14 @@ class BilibiliDownloadService extends ChangeNotifier {
             protectedPaths.add(p.normalize(_deriveSidecarPath(outputPath)));
           }
           if (ep.videoResumeState != null) {
-            protectedPaths.add(p.normalize(ep.videoResumeState!.tempPath));
+            protectedPaths.addAll(
+              _resumeArtifactPaths(ep.videoResumeState!).map(p.normalize),
+            );
           }
           if (ep.audioResumeState != null) {
-            protectedPaths.add(p.normalize(ep.audioResumeState!.tempPath));
+            protectedPaths.addAll(
+              _resumeArtifactPaths(ep.audioResumeState!).map(p.normalize),
+            );
           }
         }
       }
@@ -2346,8 +2826,9 @@ class BilibiliDownloadService extends ChangeNotifier {
       }
     }
 
-    // Wait a bit for cancellations to propagate (optional but safer)
-    await Future.delayed(const Duration(milliseconds: 50));
+    await Future.wait<void>([
+      for (final ep in selectedEpisodes) _awaitEpisodeOperationStopped(ep),
+    ]);
 
     for (var ep in selectedEpisodes) {
       await _cleanupEpisodeArtifacts(
@@ -2384,8 +2865,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       _downloadQueue.remove(ep);
     }
 
-    // Wait a bit
-    await Future.delayed(const Duration(milliseconds: 50));
+    await _awaitEpisodeOperationStopped(ep);
 
     await _cleanupEpisodeArtifacts(
       ep,
@@ -2403,9 +2883,9 @@ class BilibiliDownloadService extends ChangeNotifier {
     task.videos.removeWhere((v) => v.episodes.isEmpty);
     if (task.videos.isEmpty) {
       tasks.remove(task);
-      _rebuildTaskIndex();
-      _metricsDirty = true;
     }
+    _rebuildTaskIndex();
+    _metricsDirty = true;
     await saveTasks();
   }
 
@@ -2426,8 +2906,11 @@ class BilibiliDownloadService extends ChangeNotifier {
       }
     }
 
+    await Future.wait<void>([
+      for (final operation in _runningEpisodeOperations.values.toList())
+        operation.catchError((_) {}),
+    ]);
     _activeDownloads = 0;
-    await Future.delayed(const Duration(milliseconds: 100)); // Wait for cancels
 
     for (var task in tasks) {
       for (var video in task.videos) {
@@ -2653,8 +3136,8 @@ class BilibiliDownloadService extends ChangeNotifier {
     final dataRoot = await SettingsService().resolveLargeDataRootDir();
     final thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
     if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
-    final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-    if (!await subDir.exists()) await subDir.create(recursive: true);
+    final danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
+    if (!await danmakuDir.exists()) await danmakuDir.create(recursive: true);
 
     int count = 0;
     final ensuredCollectionIds = <String>{};
@@ -2735,6 +3218,8 @@ class BilibiliDownloadService extends ChangeNotifier {
         // --- End Hierarchy Logic ---
 
         final uuid = const Uuid().v4();
+        final taskSubtitleDir = await const TaskSubtitleStorageService()
+            .taskDirectory(uuid, create: true);
         final extension = file.path.split('.').last;
 
         // Sanitize and truncate for filename to avoid OS limits (max 255 bytes)
@@ -2806,7 +3291,7 @@ class BilibiliDownloadService extends ChangeNotifier {
 
         final hasLocalSubtitle = await srtFile.exists();
         if (hasLocalSubtitle) {
-          final finalSrtPath = "${subDir.path}/${uuid}_default.srt";
+          final finalSrtPath = p.join(taskSubtitleDir.path, 'downloaded.srt');
           await srtFile.copy(finalSrtPath);
           defaultSubtitlePath = finalSrtPath;
           await _deleteTempArtifacts(srtFile.path);
@@ -2848,13 +3333,32 @@ class BilibiliDownloadService extends ChangeNotifier {
               final srtContent = SubtitleUtil.convertJsonToSrt(resp.data);
 
               if (srtContent.isNotEmpty) {
-                final subPath = "${subDir.path}/${uuid}_$lang.srt";
+                final safeLanguage = lang.replaceAll(
+                  RegExp(r'[^A-Za-z0-9_-]'),
+                  '_',
+                );
+                final subPath = await const TaskSubtitleStorageService()
+                    .allocatePath(uuid, 'downloaded.$safeLanguage.srt');
                 await File(subPath).writeAsString(srtContent);
                 extraSubtitles[sub.lanDoc] = subPath;
               }
             } catch (e) {
               debugPrint("Failed to download subtitle ${sub.lanDoc}: $e");
             }
+          }
+        }
+
+        String? finalDanmakuPath;
+        final sourceDanmakuPath = ep.danmakuPath;
+        if (sourceDanmakuPath != null) {
+          final sourceDanmaku = File(sourceDanmakuPath);
+          if (await sourceDanmaku.exists()) {
+            finalDanmakuPath = p.join(danmakuDir.path, '${uuid}_danmaku.ass');
+            await sourceDanmaku.copy(finalDanmakuPath);
+            if (await _isWithinTempDir(sourceDanmakuPath)) {
+              await _deleteFileIfExists(sourceDanmakuPath);
+            }
+            ep.danmakuPath = finalDanmakuPath;
           }
         }
 
@@ -2893,9 +3397,13 @@ class BilibiliDownloadService extends ChangeNotifier {
           parentId: targetParentId,
           subtitlePath: defaultSubtitlePath,
           additionalSubtitles: extraSubtitles,
+          danmakuPath: finalDanmakuPath,
+          usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
           codec: codec,
           isBilibiliExported: true,
           sourceRef: video.sourceRef,
+          chapters: ep.chapters,
+          hasProbedChapters: true,
         );
 
         // #region debug-point B:import-before-library-add

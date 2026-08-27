@@ -9,22 +9,41 @@ class AppToastAction {
   final String label;
   final VoidCallback onPressed;
 
-  const AppToastAction({
-    required this.label,
-    required this.onPressed,
-  });
+  const AppToastAction({required this.label, required this.onPressed});
+}
+
+/// A reference to one specific toast presentation.
+///
+/// Dismissing the handle is intentionally a no-op after another toast has
+/// replaced it. This lets asynchronous work clean up its own loading toast
+/// without accidentally removing a newer success or error message.
+class AppToastHandle {
+  final int _presentationId;
+
+  const AppToastHandle._(this._presentationId);
+
+  Future<void> dismiss({bool immediate = false, bool fromSwipe = false}) {
+    return AppToast._dismissIfCurrent(
+      _presentationId,
+      immediate: immediate,
+      fromSwipe: fromSwipe,
+    );
+  }
 }
 
 class AppToast {
-  static final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+  static final GlobalKey<NavigatorState> navigatorKey =
+      GlobalKey<NavigatorState>();
   static final NavigatorObserver observer = _ToastNavigatorObserver();
-  static final RouteObserver<PageRoute<dynamic>> routeObserver = RouteObserver<PageRoute<dynamic>>();
+  static final RouteObserver<PageRoute<dynamic>> routeObserver =
+      RouteObserver<PageRoute<dynamic>>();
 
   static OverlayEntry? _entry;
   static Timer? _dismissTimer;
   static _ToastOverlayController? _controller;
   static ValueNotifier<_ToastViewData>? _contentNotifier;
-  static bool _isLoading = false;
+  static int _nextPresentationId = 0;
+  static int? _currentPresentationId;
 
   static void show(
     String message, {
@@ -32,7 +51,6 @@ class AppToast {
     Duration duration = const Duration(milliseconds: 1500),
     AppToastAction? action,
   }) {
-    _isLoading = false;
     _showEntry(
       _ToastContent(
         message: message,
@@ -44,9 +62,8 @@ class AppToast {
     );
   }
 
-  static void showLoading(String message) {
-    _isLoading = true;
-    _showEntryData(
+  static AppToastHandle showLoading(String message) {
+    final presentationId = _showEntryData(
       const _ToastViewData(
         message: '',
         type: AppToastType.info,
@@ -54,15 +71,15 @@ class AppToast {
       ).copyWith(message: message),
       autoDismissAfter: const Duration(seconds: 8),
     );
+    return AppToastHandle._(presentationId);
   }
 
-  static void showProgress(
+  static AppToastHandle showProgress(
     String message, {
     double? progress,
     AppToastType type = AppToastType.info,
   }) {
-    _isLoading = true;
-    _showEntryData(
+    final presentationId = _showEntryData(
       _ToastViewData(
         message: message,
         type: type,
@@ -71,6 +88,7 @@ class AppToast {
       ),
       autoDismissAfter: const Duration(seconds: 8),
     );
+    return AppToastHandle._(presentationId);
   }
 
   static void updateProgress({
@@ -91,11 +109,12 @@ class AppToast {
       return;
     }
 
-    _isLoading = true;
     _dismissTimer?.cancel();
+    final presentationId = _currentPresentationId;
     _dismissTimer = Timer(const Duration(seconds: 8), () {
-      if (_isLoading) return;
-      dismiss();
+      if (presentationId != null) {
+        _dismissIfCurrent(presentationId);
+      }
     });
     notifier.value = current.copyWith(
       message: message,
@@ -119,10 +138,10 @@ class AppToast {
     _entry = null;
     final contentNotifier = _contentNotifier;
     _contentNotifier = null;
+    _currentPresentationId = null;
 
     if (entry == null) {
       contentNotifier?.dispose();
-      _isLoading = false;
       return;
     }
 
@@ -131,7 +150,6 @@ class AppToast {
         entry.remove();
       }
       contentNotifier?.dispose();
-      _isLoading = false;
       return;
     }
 
@@ -140,7 +158,17 @@ class AppToast {
       entry.remove();
     }
     contentNotifier?.dispose();
-    _isLoading = false;
+  }
+
+  static Future<void> _dismissIfCurrent(
+    int presentationId, {
+    bool immediate = false,
+    bool fromSwipe = false,
+  }) async {
+    if (_currentPresentationId != presentationId) {
+      return;
+    }
+    await dismiss(immediate: immediate, fromSwipe: fromSwipe);
   }
 
   static bool isCurrentRoute(String routeName) {
@@ -148,8 +176,11 @@ class AppToast {
         (observer as _ToastNavigatorObserver).currentRouteName == routeName;
   }
 
-  static void _showEntry(_ToastContent content, {Duration? autoDismissAfter}) {
-    _showEntryData(
+  static AppToastHandle _showEntry(
+    _ToastContent content, {
+    Duration? autoDismissAfter,
+  }) {
+    final presentationId = _showEntryData(
       _ToastViewData(
         message: content.message,
         type: content.type,
@@ -159,29 +190,34 @@ class AppToast {
       ),
       autoDismissAfter: autoDismissAfter,
     );
+    return AppToastHandle._(presentationId);
   }
 
-  static void _showEntryData(
+  static int _showEntryData(
     _ToastViewData content, {
     Duration? autoDismissAfter,
   }) {
+    final presentationId = ++_nextPresentationId;
     final overlay = navigatorKey.currentState?.overlay;
-    if (overlay == null) return;
+    if (overlay == null) return presentationId;
+
+    _currentPresentationId = presentationId;
 
     _dismissTimer?.cancel();
     _dismissTimer = null;
 
     final existingNotifier = _contentNotifier;
     final existingEntry = _entry;
-    if (existingNotifier != null && existingEntry != null && existingEntry.mounted) {
+    if (existingNotifier != null &&
+        existingEntry != null &&
+        existingEntry.mounted) {
       existingNotifier.value = content;
       if (autoDismissAfter != null) {
         _dismissTimer = Timer(autoDismissAfter, () {
-          if (_isLoading) return;
-          dismiss();
+          _dismissIfCurrent(presentationId);
         });
       }
-      return;
+      return presentationId;
     }
 
     final oldEntry = _entry;
@@ -227,10 +263,10 @@ class AppToast {
 
     if (autoDismissAfter != null) {
       _dismissTimer = Timer(autoDismissAfter, () {
-        if (_isLoading) return;
-        dismiss();
+        _dismissIfCurrent(presentationId);
       });
     }
+    return presentationId;
   }
 }
 
@@ -312,13 +348,12 @@ class _ToastAnimatedContainer extends StatefulWidget {
   });
 
   @override
-  State<_ToastAnimatedContainer> createState() => _ToastAnimatedContainerState();
+  State<_ToastAnimatedContainer> createState() =>
+      _ToastAnimatedContainerState();
 }
 
 class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
     with SingleTickerProviderStateMixin {
-  static const Duration _dragReleaseDuration = Duration(milliseconds: 180);
-
   late final AnimationController _controller;
   late final Animation<double> _opacity;
   late final Animation<double> _scale;
@@ -328,6 +363,7 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
   double _toastHeight = 0;
   bool _isDragging = false;
   bool _isHiding = false;
+  bool _hasUpwardDrag = false;
 
   @override
   void initState() {
@@ -381,20 +417,26 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
     if (!mounted || _isHiding) return;
     _isHiding = true;
 
+    // Keep a swiped toast near the release point and fade it away. It is
+    // removed from the overlay immediately after the reverse animation, so it
+    // cannot remain invisibly attached to the top edge of the screen.
     if (animateSwipeAway) {
       setState(() {
         _isDragging = false;
-        _dragOffsetY = _dismissTargetOffset();
       });
-      await Future<void>.delayed(_dragReleaseDuration);
     }
-
     await _controller.reverse();
   }
 
   void _handleVerticalDragUpdate(DragUpdateDetails details) {
     if (_isHiding) return;
-    final nextOffset = (_dragOffsetY + details.delta.dy).clamp(-160.0, 0.0);
+    if (details.delta.dy < 0) {
+      _hasUpwardDrag = true;
+    }
+    // 以 toast 实际高度作为向上拖动的上限，保证整条通知都能被完整拖出
+    // 屏幕，而不是只有上半部分能划出去、下半部分卡在屏幕顶端。
+    final maxUpward = _dismissTargetOffset();
+    final nextOffset = (_dragOffsetY + details.delta.dy).clamp(maxUpward, 0.0);
     if (nextOffset == _dragOffsetY) return;
     setState(() {
       _isDragging = true;
@@ -405,11 +447,14 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
   void _handleVerticalDragEnd(DragEndDetails details) {
     if (_isHiding) return;
     final velocity = details.primaryVelocity ?? 0;
-    final shouldDismiss = _dragOffsetY <= -36 || velocity <= -700;
+    // Any intentional upward movement dismisses every AppToast variant. Do
+    // not require a distance/velocity threshold that can leave a toast stuck.
+    final shouldDismiss = _hasUpwardDrag || velocity < 0;
     if (shouldDismiss) {
       AppToast.dismiss(fromSwipe: true);
       return;
     }
+    _hasUpwardDrag = false;
     if (_dragOffsetY == 0 && !_isDragging) return;
     setState(() {
       _isDragging = false;
@@ -419,6 +464,7 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
 
   void _handleVerticalDragCancel() {
     if (_isHiding || (!_isDragging && _dragOffsetY == 0)) return;
+    _hasUpwardDrag = false;
     setState(() {
       _isDragging = false;
       _dragOffsetY = 0;
@@ -448,10 +494,7 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
             child: Transform.scale(
               scale: animatedScale,
               alignment: Alignment.topCenter,
-              child: Opacity(
-                opacity: animatedOpacity,
-                child: child,
-              ),
+              child: Opacity(opacity: animatedOpacity, child: child),
             ),
           );
         },
@@ -462,10 +505,7 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
             child: ScaleTransition(
               scale: _scale,
               alignment: Alignment.topCenter,
-              child: KeyedSubtree(
-                key: _toastKey,
-                child: widget.child,
-              ),
+              child: KeyedSubtree(key: _toastKey, child: widget.child),
             ),
           ),
         ),
@@ -561,7 +601,9 @@ class _ToastContent extends StatelessWidget {
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withValues(alpha: isDark ? 0.18 : 0.08),
+                      color: Colors.black.withValues(
+                        alpha: isDark ? 0.18 : 0.08,
+                      ),
                       blurRadius: 18,
                       offset: const Offset(0, 8),
                     ),
@@ -597,8 +639,13 @@ class _ToastContent extends StatelessWidget {
                                         child: CircularProgressIndicator(
                                           value: progressValue,
                                           strokeWidth: 2.1,
-                                          backgroundColor: accent.withValues(alpha: 0.18),
-                                          valueColor: AlwaysStoppedAnimation<Color>(accent),
+                                          backgroundColor: accent.withValues(
+                                            alpha: 0.18,
+                                          ),
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                                accent,
+                                              ),
                                         ),
                                       ),
                                       Text(
@@ -612,19 +659,21 @@ class _ToastContent extends StatelessWidget {
                                     ],
                                   )
                                 : showSpinner
-                                    ? SizedBox(
-                                        width: iconSize,
-                                        height: iconSize,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2.1,
-                                          valueColor: AlwaysStoppedAnimation<Color>(accent),
-                                        ),
-                                      )
-                                    : Icon(
-                                        _iconData(),
-                                        size: iconSize,
-                                        color: accent,
+                                ? SizedBox(
+                                    width: iconSize,
+                                    height: iconSize,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.1,
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        accent,
                                       ),
+                                    ),
+                                  )
+                                : Icon(
+                                    _iconData(),
+                                    size: iconSize,
+                                    color: accent,
+                                  ),
                           ),
                           SizedBox(width: gap),
                           Flexible(

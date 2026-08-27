@@ -25,7 +25,9 @@ class SubtitleTextStyle {
   final bool isUnderline;
 
   // Helper getter for backward compatibility or simple UI
-  bool get isBold => fontWeightChinese.index >= FontWeight.bold.index || fontWeightEnglish.index >= FontWeight.bold.index;
+  bool get isBold =>
+      fontWeightChinese.value >= FontWeight.bold.value ||
+      fontWeightEnglish.value >= FontWeight.bold.value;
 
   // Backward compatibility getter
   String get fontFamily => fontFamilyChinese;
@@ -67,7 +69,8 @@ class SubtitleTextStyle {
     FontWeight? fontWeight, // Sets both
     FontWeight? fontWeightChinese,
     FontWeight? fontWeightEnglish,
-    bool? isBold, // kept for convenience, maps to fontWeight (sets both to bold/normal)
+    bool?
+    isBold, // kept for convenience, maps to fontWeight (sets both to bold/normal)
     bool? isItalic,
     bool? isUnderline,
   }) {
@@ -75,8 +78,10 @@ class SubtitleTextStyle {
     // If generic fontWeight passed, use it for both.
     // If isBold passed, override both.
 
-    FontWeight newWeightChinese = fontWeightChinese ?? (fontWeight ?? this.fontWeightChinese);
-    FontWeight newWeightEnglish = fontWeightEnglish ?? (fontWeight ?? this.fontWeightEnglish);
+    FontWeight newWeightChinese =
+        fontWeightChinese ?? (fontWeight ?? this.fontWeightChinese);
+    FontWeight newWeightEnglish =
+        fontWeightEnglish ?? (fontWeight ?? this.fontWeightEnglish);
 
     if (isBold != null) {
       newWeightChinese = isBold ? FontWeight.bold : FontWeight.normal;
@@ -84,8 +89,10 @@ class SubtitleTextStyle {
     }
 
     return SubtitleTextStyle(
-      fontFamilyChinese: fontFamilyChinese ?? fontFamily ?? this.fontFamilyChinese,
-      fontFamilyEnglish: fontFamilyEnglish ?? fontFamily ?? this.fontFamilyEnglish,
+      fontFamilyChinese:
+          fontFamilyChinese ?? fontFamily ?? this.fontFamilyChinese,
+      fontFamilyEnglish:
+          fontFamilyEnglish ?? fontFamily ?? this.fontFamilyEnglish,
       textColor: textColor ?? this.textColor,
       backgroundColor: backgroundColor ?? this.backgroundColor,
       hasBorder: hasBorder ?? this.hasBorder,
@@ -106,18 +113,34 @@ class SubtitleTextStyle {
   // Helper to resolve font family name to actual font family string
   String? _resolveFontFamily(String familyName) {
     switch (familyName) {
-      case 'Sans Serif': return 'Arial';
-      case 'Serif': return 'Times New Roman';
-      case 'Monospace': return 'Courier New';
-      case 'Cursive': return 'Comic Sans MS';
-      case 'OPPO Sans 4.0': return 'OPPO Sans 4.0';
-      case '方正黑体': return '方正黑体';
-      case 'MiSans': return 'MiSans';
-      case 'Noto Serif CJK SC': return 'Noto Serif CJK SC';
-      case 'Swei Gothic CJK SC': return 'Swei Gothic CJK SC';
-      case '方正楷体': return '方正楷体';
-      case 'Comic Relief': return 'Comic Relief';
-      case 'Roboto': return 'Roboto';
+      case 'Sans Serif':
+        return 'Arial';
+      case 'Serif':
+        return 'Times New Roman';
+      case 'Monospace':
+        return 'Courier New';
+      case 'Cursive':
+        return 'Comic Sans MS';
+      case 'OPPO Sans 4.0':
+        return 'OPPO Sans 4.0';
+      case '方正黑体':
+        return '方正黑体';
+      case 'MiSans':
+        return 'MiSans';
+      case 'Noto Sans SC':
+        return 'Noto Sans SC';
+      case 'Noto Serif CJK SC':
+        return 'Noto Serif CJK SC';
+      case 'Swei Gothic CJK SC':
+        return 'Swei Gothic CJK SC';
+      case '方正楷体':
+        return '方正楷体';
+      case 'Inter':
+        return 'Inter';
+      case 'Comic Relief':
+        return 'Comic Relief';
+      case 'Roboto':
+        return 'Roboto';
       case 'System':
       default:
         return null; // Default system font
@@ -125,15 +148,19 @@ class SubtitleTextStyle {
   }
 
   // Helper to get TextStyle with specific font family override
-  TextStyle getTextStyle({String? overrideFontFamily, double? fontSize, double? letterSpacing}) {
+  TextStyle getTextStyle({
+    String? overrideFontFamily,
+    double? fontSize,
+    double? letterSpacing,
+  }) {
     final family = _resolveFontFamily(overrideFontFamily ?? fontFamilyChinese);
 
     // Determine which weight to use based on family
     FontWeight weight;
     if (overrideFontFamily == fontFamilyEnglish) {
-       weight = fontWeightEnglish;
+      weight = fontWeightEnglish;
     } else {
-       weight = fontWeightChinese;
+      weight = fontWeightChinese;
     }
 
     return TextStyle(
@@ -207,8 +234,9 @@ class SubtitleTextStyle {
       'shadowOffsetDx': shadowOffset.dx,
       'shadowOffsetDy': shadowOffset.dy,
       'backgroundOpacity': backgroundOpacity,
-      'fontWeightChinese': fontWeightChinese.index,
-      'fontWeightEnglish': fontWeightEnglish.index,
+      // Keep the persisted 0-8 representation for backward compatibility.
+      'fontWeightChinese': FontWeight.values.indexOf(fontWeightChinese),
+      'fontWeightEnglish': FontWeight.values.indexOf(fontWeightEnglish),
       'isItalic': isItalic,
       'isUnderline': isUnderline,
     };
@@ -219,25 +247,41 @@ class SubtitleTextStyle {
     // Support legacy "fontWeight" field for backward compatibility
     final legacyWeightIndex = json['fontWeight'] as int?;
     final legacyWeight = legacyWeightIndex != null
-        ? (FontWeight.values.length > legacyWeightIndex ? FontWeight.values[legacyWeightIndex] : FontWeight.normal)
+        ? (FontWeight.values.length > legacyWeightIndex
+              ? FontWeight.values[legacyWeightIndex]
+              : FontWeight.normal)
         : null;
 
     final wChineseIndex = json['fontWeightChinese'] as int? ?? 3;
     final wEnglishIndex = json['fontWeightEnglish'] as int? ?? 3;
 
-    final fwChinese = legacyWeight ?? (FontWeight.values.length > wChineseIndex ? FontWeight.values[wChineseIndex] : FontWeight.normal);
-    final fwEnglish = legacyWeight ?? (FontWeight.values.length > wEnglishIndex ? FontWeight.values[wEnglishIndex] : FontWeight.normal);
+    final fwChinese =
+        legacyWeight ??
+        (FontWeight.values.length > wChineseIndex
+            ? FontWeight.values[wChineseIndex]
+            : FontWeight.normal);
+    final fwEnglish =
+        legacyWeight ??
+        (FontWeight.values.length > wEnglishIndex
+            ? FontWeight.values[wEnglishIndex]
+            : FontWeight.normal);
 
     return SubtitleTextStyle(
       fontFamilyChinese: json['fontFamilyChinese'] as String? ?? 'System',
       fontFamilyEnglish: json['fontFamilyEnglish'] as String? ?? 'System',
       textColor: Color(json['textColor'] as int? ?? Colors.white.toARGB32()),
-      backgroundColor: Color(json['backgroundColor'] as int? ?? Colors.black54.toARGB32()),
+      backgroundColor: Color(
+        json['backgroundColor'] as int? ?? Colors.black54.toARGB32(),
+      ),
       hasBorder: json['hasBorder'] as bool? ?? true,
-      borderColor: Color(json['borderColor'] as int? ?? Colors.black.toARGB32()),
+      borderColor: Color(
+        json['borderColor'] as int? ?? Colors.black.toARGB32(),
+      ),
       borderWidth: (json['borderWidth'] as num?)?.toDouble() ?? 3.0,
       hasShadow: json['hasShadow'] as bool? ?? true,
-      shadowColor: Color(json['shadowColor'] as int? ?? Colors.black.toARGB32()),
+      shadowColor: Color(
+        json['shadowColor'] as int? ?? Colors.black.toARGB32(),
+      ),
       shadowBlur: (json['shadowBlur'] as num?)?.toDouble() ?? 2.0,
       shadowOffset: Offset(
         (json['shadowOffsetDx'] as num?)?.toDouble() ?? 1.0,
@@ -373,33 +417,37 @@ class SubtitleStyle {
     bool? isUnderline,
   }) {
     return SubtitleStyle(
-      textStyle: textStyle ?? this.textStyle.copyWith(
-        fontFamily: fontFamily,
-        fontFamilyChinese: fontFamilyChinese,
-        fontFamilyEnglish: fontFamilyEnglish,
-        textColor: textColor,
-        backgroundColor: backgroundColor,
-        hasBorder: hasBorder,
-        borderColor: borderColor,
-        borderWidth: borderWidth,
-        hasShadow: hasShadow,
-        shadowColor: shadowColor,
-        shadowBlur: shadowBlur,
-        shadowOffset: shadowOffset,
-        backgroundOpacity: backgroundOpacity,
-        fontWeight: fontWeight,
-        fontWeightChinese: fontWeightChinese,
-        fontWeightEnglish: fontWeightEnglish,
-        isBold: isBold,
-        isItalic: isItalic,
-        isUnderline: isUnderline,
-      ),
-      layoutStyle: layoutStyle ?? this.layoutStyle.copyWith(
-        fontSize: fontSize,
-        secondaryFontSize: secondaryFontSize,
-        lineSpacing: lineSpacing,
-        letterSpacing: letterSpacing,
-      ),
+      textStyle:
+          textStyle ??
+          this.textStyle.copyWith(
+            fontFamily: fontFamily,
+            fontFamilyChinese: fontFamilyChinese,
+            fontFamilyEnglish: fontFamilyEnglish,
+            textColor: textColor,
+            backgroundColor: backgroundColor,
+            hasBorder: hasBorder,
+            borderColor: borderColor,
+            borderWidth: borderWidth,
+            hasShadow: hasShadow,
+            shadowColor: shadowColor,
+            shadowBlur: shadowBlur,
+            shadowOffset: shadowOffset,
+            backgroundOpacity: backgroundOpacity,
+            fontWeight: fontWeight,
+            fontWeightChinese: fontWeightChinese,
+            fontWeightEnglish: fontWeightEnglish,
+            isBold: isBold,
+            isItalic: isItalic,
+            isUnderline: isUnderline,
+          ),
+      layoutStyle:
+          layoutStyle ??
+          this.layoutStyle.copyWith(
+            fontSize: fontSize,
+            secondaryFontSize: secondaryFontSize,
+            lineSpacing: lineSpacing,
+            letterSpacing: letterSpacing,
+          ),
     );
   }
 
@@ -414,10 +462,7 @@ class SubtitleStyle {
 
   // JSON Serialization - 保持向后兼容
   Map<String, dynamic> toJson() {
-    return {
-      ...textStyle.toJson(),
-      ...layoutStyle.toJson(),
-    };
+    return {...textStyle.toJson(), ...layoutStyle.toJson()};
   }
 
   factory SubtitleStyle.fromJson(Map<String, dynamic> json) {

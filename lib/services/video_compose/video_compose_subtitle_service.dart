@@ -1,6 +1,10 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
+
 import '../../models/subtitle_model.dart';
+import '../../utils/pgs_parser.dart';
+import '../../utils/subtitle_converter.dart';
 import '../../utils/subtitle_parser.dart';
 
 class VideoComposeSubtitleService {
@@ -10,11 +14,30 @@ class VideoComposeSubtitleService {
     if (path == null || path.isEmpty) return const <SubtitleItem>[];
     final File file = File(path);
     if (!await file.exists()) return const <SubtitleItem>[];
+    final String extension = p.extension(path).toLowerCase();
+    if (extension == '.sup') {
+      final List<SubtitleItem> parsed = await PgsParser.parse(path);
+      parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+      return parsed;
+    }
+    if (extension == '.idx' || extension == '.sub') {
+      final String? converted = await SubtitleConverter.convert(
+        inputPath: path,
+        targetExtension: '.sup',
+      );
+      if (converted != null) {
+        final List<SubtitleItem> parsed = await PgsParser.parse(converted);
+        parsed.sort((a, b) => a.startTime.compareTo(b.startTime));
+        return parsed;
+      }
+    }
     final List<int> bytes = await file.readAsBytes();
     final String content = SubtitleParser.decodeBytes(bytes);
     if (content.isEmpty) return const <SubtitleItem>[];
     final List<SubtitleItem> parsed = SubtitleParser.parse(content);
-    parsed.sort((SubtitleItem a, SubtitleItem b) => a.startTime.compareTo(b.startTime));
+    parsed.sort(
+      (SubtitleItem a, SubtitleItem b) => a.startTime.compareTo(b.startTime),
+    );
     return parsed;
   }
 
@@ -41,6 +64,7 @@ class VideoComposeSubtitleService {
           startTime: item.startTime,
           endTime: end,
           text: item.text,
+          imageLoader: item.imageLoader,
         ),
       );
     }
@@ -70,8 +94,9 @@ class VideoComposeSubtitleService {
   }
 
   String _toSrtTime(Duration duration) {
-    final int totalMs =
-        duration.inMilliseconds < 0 ? 0 : duration.inMilliseconds;
+    final int totalMs = duration.inMilliseconds < 0
+        ? 0
+        : duration.inMilliseconds;
     final int h = totalMs ~/ 3600000;
     final int m = (totalMs % 3600000) ~/ 60000;
     final int s = (totalMs % 60000) ~/ 1000;

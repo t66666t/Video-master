@@ -2,6 +2,7 @@
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <ShellScalingApi.h>
 
 #include "resource.h"
 
@@ -134,6 +135,9 @@ bool Win32Window::Create(const std::wstring& title,
                          const Size& size) {
   Destroy();
 
+  // Enable high DPI support (Per Monitor V2)
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
   const wchar_t* window_class =
       WindowClassRegistrar::GetInstance()->GetWindowClass();
 
@@ -152,6 +156,11 @@ bool Win32Window::Create(const std::wstring& title,
   if (!window) {
     return false;
   }
+
+  // Enable dark mode title bar
+  BOOL use_dark_mode = TRUE;
+  DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                        &use_dark_mode, sizeof(use_dark_mode));
 
   UpdateTheme(window);
 

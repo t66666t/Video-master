@@ -4,10 +4,11 @@ import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'dart:io';
 import 'package:window_manager/window_manager.dart';
-import 'package:media_kit/media_kit.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_download_service.dart';
 import 'package:video_player_app/platform/windows_video_player_media_kit.dart';
 import 'screens/home_screen.dart';
@@ -23,90 +24,31 @@ import 'services/playback_navigation_service.dart';
 import 'services/progress_tracker.dart';
 import 'services/thumbnail_cache_service.dart';
 import 'services/video_compose_manager.dart';
+import 'services/ocr_subtitle_manager.dart';
 import 'services/system_media_session_service.dart';
 import 'utils/app_toast.dart';
+import 'widgets/library_persistence_notification_bridge.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   _configureImageCaches();
 
-  // Initialize media_kit for Windows platform only
-  // This replaces video_player_win with media_kit for better codec support
-  // and smoother playback speed changes
-  if (Platform.isWindows) {
-    try {
-      // Force Windows player instances to start with subtitle output disabled.
-      debugPrint('MediaKit initialized successfully');
-
-      WindowsVideoPlayerMediaKit.ensureInitialized();
-      debugPrint('WindowsVideoPlayerMediaKit initialized successfully');
-    } catch (e) {
-      debugPrint('MediaKit initialization failed: $e');
-      // Continue without MediaKit - will fall back to default video player
-    }
-  }
-
-  // Initialize Services
+  // Create a stable provider graph synchronously. Disk-backed and plugin
+  // initialization starts only after the lightweight startup frame is visible.
   final settings = SettingsService();
-  try {
-    // 允许 SettingsService 初始化失败，避免阻塞启动
-    await settings.init().timeout(const Duration(seconds: 2));
-  } catch (e) {
-    debugPrint('SettingsService init failed or timed out: $e');
-  }
-
-  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-    await windowManager.ensureInitialized();
-
-    WindowOptions windowOptions = const WindowOptions(
-      size: Size(1280, 720),
-      center: true,
-      backgroundColor: Colors.transparent,
-      skipTaskbar: false,
-      titleBarStyle: TitleBarStyle.normal,
-    );
-
-    await windowManager.waitUntilReadyToShow(windowOptions, () async {
-      await windowManager.show();
-      await windowManager.maximize();
-      await windowManager.focus();
-    });
-  }
-
   final library = LibraryService();
   ThumbnailCacheService().setMissingThumbnailResolver(
     (videoId) => library.ensureThumbnailForVideo(videoId),
   );
-  // Start library initialization but don't await it to prevent blocking app startup
-  // We capture the future to use it for playback restoration later
-  final libraryInitFuture = library.init().catchError((e) {
-    debugPrint('LibraryService init failed: $e');
-  });
-
   final batch = BatchImportService();
-  // Don't await batch import service initialization
-  batch.init().catchError((e) {
-    debugPrint('BatchImportService init failed: $e');
-  });
 
   // Register Services
   final transcriptionManager = TranscriptionManager();
-  try {
-    await transcriptionManager.initialize().timeout(const Duration(seconds: 3));
-  } catch (e) {
-    debugPrint('TranscriptionManager init failed or timed out: $e');
-  }
   final embeddedSubtitleService = EmbeddedSubtitleService();
   final bilibiliService = BilibiliDownloadService();
   final ytDlpService = YtDlpDownloadService();
   final videoComposeManager = VideoComposeManager();
-  // Don't await bilibili service initialization
-  bilibiliService.init().catchError((e) {
-    debugPrint('BilibiliDownloadService init failed: $e');
-  });
-  ytDlpService.init().catchError((e) {
-    debugPrint('YtDlpDownloadService init failed: $e');
-  });
+  final ocrSubtitleManager = OcrSubtitleManager(library: library);
 
   // Initialize media playback services
   final playlistManager = PlaylistManager();
@@ -116,20 +58,11 @@ void main() async {
   progressTracker.initialize(libraryService: library);
 
   final mediaPlaybackService = MediaPlaybackService();
-  await mediaPlaybackService.initialize(
-    playlistManager: playlistManager,
-    progressTracker: progressTracker,
-    libraryService: library,
-    embeddedSubtitleService: embeddedSubtitleService,
-  );
-  await SystemMediaSessionService.instance.initialize(
-    playbackService: mediaPlaybackService,
-    playlistManager: playlistManager,
-  );
+  final deferredServicesReady = Completer<void>();
 
   // 恢复上次的播放状态 - 等待 library 初始化完成后执行
   // 这样既不会阻塞启动，又能保证有数据可恢复
-  libraryInitFuture.then((_) {
+  deferredServicesReady.future.then((_) {
     _restorePlaybackState(
       mediaPlaybackService: mediaPlaybackService,
       progressTracker: progressTracker,
@@ -139,6 +72,36 @@ void main() async {
       debugPrint('恢复播放状态失败: $e');
     });
   });
+
+  // 初始化崩溃日志路径，供 FlutterError.onError 和 runZonedGuarded 使用。
+  // 必须在 runZonedGuarded 之前完成，确保错误处理器可用。
+  unawaited(_initCrashLogPath());
+
+  // 捕获框架级异常（渲染/布局/Widget 错误）。
+  // runZonedGuarded 无法捕获此类异常，需单独处理，否则直接导致崩溃无日志。
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    _writeCrashLog(
+      '[FlutterError] ${details.exception}\n${details.stack ?? ''}',
+    );
+  };
+
+  Future<void> initializeStartupServices() => _initializeStartupServices(
+    settings: settings,
+    mediaPlaybackService: mediaPlaybackService,
+    playlistManager: playlistManager,
+    progressTracker: progressTracker,
+    library: library,
+    embeddedSubtitleService: embeddedSubtitleService,
+  );
+
+  // Android already owns a native launch surface. Keep that single cover on
+  // screen until the core state is ready, so the first Flutter frame is the
+  // real home page instead of a second, differently scaled copy of the logo.
+  final useNativeAndroidLaunchSurface = Platform.isAndroid;
+  if (useNativeAndroidLaunchSurface) {
+    await initializeStartupServices();
+  }
 
   runZonedGuarded(
     () {
@@ -153,12 +116,35 @@ void main() async {
             ChangeNotifierProvider.value(value: bilibiliService),
             ChangeNotifierProvider.value(value: ytDlpService),
             ChangeNotifierProvider.value(value: videoComposeManager),
+            ChangeNotifierProvider.value(value: ocrSubtitleManager),
             ChangeNotifierProvider.value(value: playlistManager),
             ChangeNotifierProvider.value(value: mediaPlaybackService),
           ],
-          child: MyApp(
-            bilibiliService: bilibiliService,
-            transcriptionManager: transcriptionManager,
+          child: AppStartupGate(
+            initialize: initializeStartupServices,
+            initiallyReady: useNativeAndroidLaunchSurface,
+            onReadyFirstFrame: () {
+              unawaited(
+                _initializeDeferredServices(
+                  library: library,
+                  batch: batch,
+                  transcriptionManager: transcriptionManager,
+                  ocrSubtitleManager: ocrSubtitleManager,
+                  bilibiliService: bilibiliService,
+                  ytDlpService: ytDlpService,
+                  mediaPlaybackService: mediaPlaybackService,
+                  playlistManager: playlistManager,
+                ).whenComplete(() {
+                  if (!deferredServicesReady.isCompleted) {
+                    deferredServicesReady.complete();
+                  }
+                }),
+              );
+            },
+            child: MyApp(
+              bilibiliService: bilibiliService,
+              transcriptionManager: transcriptionManager,
+            ),
           ),
         ),
       );
@@ -166,9 +152,230 @@ void main() async {
     (error, stack) {
       debugPrint('Uncaught error: $error');
       debugPrint(stack.toString());
+      _writeCrashLog('[ZoneError] $error\n$stack');
       unawaited(transcriptionManager.shutdown());
     },
   );
+}
+
+Future<void> _initializeStartupServices({
+  required SettingsService settings,
+  required MediaPlaybackService mediaPlaybackService,
+  required PlaylistManager playlistManager,
+  required ProgressTracker progressTracker,
+  required LibraryService library,
+  required EmbeddedSubtitleService embeddedSubtitleService,
+}) async {
+  Future<void> safely(String name, Future<void> Function() operation) async {
+    try {
+      await operation();
+    } catch (e) {
+      debugPrint('$name init failed: $e');
+    }
+  }
+
+  // Window setup is independent of persisted settings, so it can run in
+  // parallel. This function starts after the startup frame, which prevents
+  // show() from exposing an unpainted Flutter view.
+  final desktopWindowFuture = safely(
+    'Desktop window',
+    _initializeDesktopWindow,
+  );
+
+  await safely(
+    'SettingsService',
+    () => settings.init().timeout(const Duration(seconds: 2)),
+  );
+
+  // Preserve the original dependency order: playback reads persisted mute
+  // state only after settings have had an opportunity to load.
+  await safely(
+    'MediaPlaybackService',
+    () => mediaPlaybackService.initialize(
+      playlistManager: playlistManager,
+      progressTracker: progressTracker,
+      libraryService: library,
+      embeddedSubtitleService: embeddedSubtitleService,
+    ),
+  );
+
+  await desktopWindowFuture;
+}
+
+Future<void> _initializeDesktopWindow() async {
+  if (!(Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
+    return;
+  }
+
+  await windowManager.ensureInitialized();
+
+  const windowOptions = WindowOptions(
+    size: Size(1280, 720),
+    center: true,
+    backgroundColor: Color(0xFF121212),
+    skipTaskbar: false,
+    titleBarStyle: TitleBarStyle.normal,
+  );
+
+  await windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.show();
+    await windowManager.maximize();
+    await windowManager.focus();
+  });
+}
+
+/// Paints a minimal first frame before any plugin or disk-backed startup work.
+///
+/// The real application is mounted only after its existing startup dependencies
+/// are ready, so users cannot interact with partially initialized services.
+@visibleForTesting
+class AppStartupGate extends StatefulWidget {
+  const AppStartupGate({
+    super.key,
+    required this.initialize,
+    required this.onReadyFirstFrame,
+    required this.child,
+    this.initiallyReady = false,
+  });
+
+  final Future<void> Function() initialize;
+  final VoidCallback onReadyFirstFrame;
+  final Widget child;
+  final bool initiallyReady;
+
+  @override
+  State<AppStartupGate> createState() => _AppStartupGateState();
+}
+
+class _AppStartupGateState extends State<AppStartupGate> {
+  late bool _isReady;
+  bool _initializationStarted = false;
+  bool _readyFirstFrameReported = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _isReady = widget.initiallyReady;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_isReady) {
+        _reportReadyFirstFrame();
+        return;
+      }
+      if (_initializationStarted) return;
+      _initializationStarted = true;
+      unawaited(_initialize());
+    });
+  }
+
+  Future<void> _initialize() async {
+    try {
+      await widget.initialize();
+    } catch (e, stack) {
+      debugPrint('App startup initialization failed: $e');
+      debugPrintStack(stackTrace: stack);
+    }
+
+    if (!mounted) return;
+    setState(() => _isReady = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _reportReadyFirstFrame();
+    });
+  }
+
+  void _reportReadyFirstFrame() {
+    if (_readyFirstFrameReported) return;
+    _readyFirstFrameReported = true;
+    widget.onReadyFirstFrame();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isReady) return widget.child;
+    return const _StartupSurface();
+  }
+}
+
+class _StartupSurface extends StatelessWidget {
+  const _StartupSurface();
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Fluent Player',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF121212),
+        colorScheme: const ColorScheme.dark(primary: Color(0xFF6EA8FF)),
+      ),
+      home: Scaffold(
+        body: Center(
+          child: Semantics(
+            image: true,
+            label: 'Fluent Player',
+            child: Image.asset(
+              'android/app/src/main/res/mipmap-xxxhdpi/launcher_icon.png',
+              key: const ValueKey<String>('startup-cover'),
+              width: 112,
+              height: 112,
+              fit: BoxFit.contain,
+              filterQuality: FilterQuality.medium,
+              gaplessPlayback: true,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _initializeDeferredServices({
+  required LibraryService library,
+  required BatchImportService batch,
+  required TranscriptionManager transcriptionManager,
+  required OcrSubtitleManager ocrSubtitleManager,
+  required BilibiliDownloadService bilibiliService,
+  required YtDlpDownloadService ytDlpService,
+  required MediaPlaybackService mediaPlaybackService,
+  required PlaylistManager playlistManager,
+}) async {
+  Future<void> safely(String name, Future<void> Function() operation) async {
+    try {
+      await operation();
+    } catch (e) {
+      debugPrint('$name init failed: $e');
+    }
+  }
+
+  // Native codec discovery and video_player registration can load shared
+  // libraries. Do it after the first frame, but before library restoration can
+  // create any player controller.
+  try {
+    NativeVideoPlayerMediaKit.ensureInitialized();
+    debugPrint('Cross-platform MediaKit video backend initialized');
+  } catch (e) {
+    debugPrint('Cross-platform MediaKit initialization failed: $e');
+  }
+
+  final libraryFuture = safely('LibraryService', library.init);
+  final mediaSessionFuture = safely(
+    'SystemMediaSessionService',
+    () => SystemMediaSessionService.instance.initialize(
+      playbackService: mediaPlaybackService,
+      playlistManager: playlistManager,
+    ),
+  );
+
+  unawaited(safely('BatchImportService', batch.init));
+  unawaited(safely('TranscriptionManager', transcriptionManager.initialize));
+  unawaited(safely('OcrSubtitleManager', ocrSubtitleManager.initialize));
+  unawaited(safely('BilibiliDownloadService', bilibiliService.init));
+  unawaited(safely('YtDlpDownloadService', ytDlpService.init));
+
+  // Playback restoration needs the library and Android media session, but
+  // neither is allowed to delay the first Flutter frame.
+  await Future.wait<void>(<Future<void>>[libraryFuture, mediaSessionFuture]);
 }
 
 void _configureImageCaches() {
@@ -192,6 +399,43 @@ void _configureImageCaches() {
   final targetThumbnailEntryCount = isDesktop ? 800 : 400;
   if (thumbnailCache.maxCacheSize < targetThumbnailEntryCount) {
     thumbnailCache.setMaxCacheSize(targetThumbnailEntryCount);
+  }
+}
+
+/// 崩溃日志文件路径，由 [_initCrashLogPath] 初始化。
+String? _crashLogPath;
+
+/// 初始化崩溃日志路径。
+///
+/// 在 [main] 早期调用，确保后续错误处理器可用。路径获取失败时静默处理，
+/// 仅丢失日志能力，不影响应用启动。
+Future<void> _initCrashLogPath() async {
+  try {
+    final dir = await getApplicationSupportDirectory();
+    _crashLogPath = p.join(dir.path, 'crash_log.txt');
+  } catch (e) {
+    debugPrint('初始化崩溃日志路径失败: $e');
+  }
+}
+
+/// 将崩溃信息写入日志文件（追加模式）。
+///
+/// 日志文件限制为 1MB，超出时清空重写，避免无限增长。
+/// 写入失败时静默处理，防止日志机制本身导致二次崩溃。
+void _writeCrashLog(String message) {
+  if (_crashLogPath == null) return;
+  try {
+    final file = File(_crashLogPath!);
+    final timestamp = DateTime.now().toIso8601String();
+    final entry = '[$timestamp] $message\n';
+    // 限制日志文件大小为 1MB，超出时清空重来
+    if (file.existsSync() && file.lengthSync() > 1024 * 1024) {
+      file.writeAsStringSync('');
+    }
+    file.writeAsStringSync(entry, mode: FileMode.append, flush: true);
+  } catch (e) {
+    // 写入失败静默处理
+    debugPrint('崩溃日志写入失败: $e');
   }
 }
 
@@ -260,7 +504,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
     MediaPlaybackService().handleAppLifecycleState(
       WidgetsBinding.instance.lifecycleState,
     );
-    _notificationClickedSubscription = audio_service.AudioService
+    _notificationClickedSubscription = audio_service
+        .AudioService
         .notificationClicked
         .listen(_handleNotificationClicked);
   }
@@ -268,7 +513,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     MediaPlaybackService().handleAppLifecycleState(state);
-    if (_isForegroundState(state) && MediaPlaybackService().currentItem != null) {
+    if (_isForegroundState(state) &&
+        MediaPlaybackService().currentItem != null) {
       unawaited(
         SystemMediaSessionService.instance.refreshNow(
           ensureNotificationVisible: true,
@@ -355,7 +601,6 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           LogicalKeySet(LogicalKeyboardKey.f11): const ToggleFullScreenIntent(),
           LogicalKeySet(LogicalKeyboardKey.escape):
               const ExitFullScreenIntent(),
-          LogicalKeySet(LogicalKeyboardKey.space): const VideoPlayPauseIntent(),
           LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyR):
               const RefreshAppIntent(),
         },
@@ -379,13 +624,6 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 return null;
               },
             ),
-            VideoPlayPauseIntent: CallbackAction<VideoPlayPauseIntent>(
-              onInvoke: (intent) {
-                // This is a fallback. Real logic is in VideoControlsOverlay.
-                // We only need this if focus is completely lost.
-                return null;
-              },
-            ),
             RefreshAppIntent: CallbackAction<RefreshAppIntent>(
               onInvoke: (intent) {
                 RestartWidget.restartApp(context);
@@ -403,6 +641,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               AppToast.routeObserver,
               PlaybackNavigationService.instance.observer,
             ],
+            builder: (context, child) {
+              return LibraryPersistenceNotificationBridge(
+                child: child ?? const SizedBox.shrink(),
+              );
+            },
             theme: ThemeData(
               brightness: Brightness.dark,
               primarySwatch: Colors.blue,
@@ -482,10 +725,6 @@ class ExitFullScreenIntent extends Intent {
 
 class ToggleFullScreenIntent extends Intent {
   const ToggleFullScreenIntent();
-}
-
-class VideoPlayPauseIntent extends Intent {
-  const VideoPlayPauseIntent();
 }
 
 /// 恢复上次的播放状态

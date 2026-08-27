@@ -3,7 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
-import '../services/transcription_manager.dart';
+import 'package:video_player_app/services/transcription_manager.dart';
+import '../models/transcription_status.dart';
 
 class AiTranscriptionPanel extends StatefulWidget {
   final String videoPath;
@@ -58,16 +59,12 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
       videoId: widget.videoId,
     );
     if (srtPath != null &&
-        manager.hasUnconsumedResultForVideo(
+        manager.consumeResultNotificationForVideo(
           widget.videoPath,
           videoId: widget.videoId,
         )) {
       _terminalStatusForCurrentVideo = TranscriptionStatus.completed;
       _terminalMessageForCurrentVideo = "转录完成";
-      manager.markResultConsumedForVideo(
-        widget.videoPath,
-        videoId: widget.videoId,
-      );
       widget.onCompleted(srtPath);
     }
   }
@@ -76,7 +73,7 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
     final manager = Provider.of<TranscriptionManager>(context, listen: false);
     final settings = Provider.of<SettingsService>(context, listen: false);
     final library = Provider.of<LibraryService>(context, listen: false);
-    
+
     try {
       if (mounted) {
         setState(() {
@@ -89,7 +86,8 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
         widget.videoPath,
         videoId: widget.videoId,
         libraryService: library,
-        autoCache: settings.autoCacheSubtitles
+        autoCache: settings.autoCacheSubtitles,
+        autoStart: true,
       );
     } catch (e) {
       if (mounted) {
@@ -108,7 +106,8 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
       builder: (context, manager, child) {
         final bool samePath = manager.currentVideoPath == widget.videoPath;
         final String? trimmedVideoId = widget.videoId?.trim();
-        final bool sameVideoId = trimmedVideoId == null ||
+        final bool sameVideoId =
+            trimmedVideoId == null ||
             trimmedVideoId.isEmpty ||
             manager.currentVideoId == trimmedVideoId;
         final bool isJobForThisVideo = samePath && sameVideoId;
@@ -138,16 +137,18 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
         final String actionLabel = isProcessing
             ? "转录中..."
             : isQueued
-                ? "已加入队列"
-                : (manager.status == TranscriptionStatus.completed && isJobForThisVideo
-                    ? "重新转录"
-                    : (isBusyWithOther ? "加入队列" : "开始智能转录"));
+            ? "已加入队列"
+            : (manager.status == TranscriptionStatus.completed &&
+                      isJobForThisVideo
+                  ? "重新转录"
+                  : (isBusyWithOther ? "加入队列" : "开始智能转录"));
 
         return Focus(
           autofocus: true,
           onKeyEvent: (node, event) {
             if (event is KeyRepeatEvent) return KeyEventResult.handled;
-            if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) {
+            if (event is KeyDownEvent &&
+                event.logicalKey == LogicalKeyboardKey.escape) {
               widget.onBack?.call();
               return KeyEventResult.handled;
             }
@@ -174,14 +175,21 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
                     const Expanded(
                       child: Text(
                         "AI 智能字幕 (B接口)",
-                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
                       ),
                     ),
                     if (isProcessing)
                       const SizedBox(
                         width: 20,
                         height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.blueAccent,
+                        ),
                       ),
                   ],
                 ),
@@ -191,18 +199,26 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
                   decoration: BoxDecoration(
                     color: Colors.blueGrey.withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.blueGrey.withValues(alpha: 0.45)),
+                    border: Border.all(
+                      color: Colors.blueGrey.withValues(alpha: 0.45),
+                    ),
                   ),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text(
                         "后台转录队列",
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
                       Text(
                         "处理中 $processingCount / 排队 $queueCount / 总计 $pendingCount",
-                        style: const TextStyle(color: Colors.white70, fontSize: 12),
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                        ),
                       ),
                     ],
                   ),
@@ -268,16 +284,14 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
       final String message = manager.statusMessage.trim().isEmpty
           ? "正在处理，请稍候..."
           : manager.statusMessage;
-      return _buildProgressCard(
-        progress: progress,
-        statusMessage: message,
-      );
+      return _buildProgressCard(progress: progress, statusMessage: message);
     }
 
     if (manager.status == TranscriptionStatus.error && isJobForThisVideo) {
       _terminalStatusForCurrentVideo = TranscriptionStatus.error;
-      _terminalMessageForCurrentVideo =
-          manager.statusMessage.trim().isEmpty ? "转录失败" : manager.statusMessage;
+      _terminalMessageForCurrentVideo = manager.statusMessage.trim().isEmpty
+          ? "转录失败"
+          : manager.statusMessage;
     }
 
     if (hasGeneratedSrt) {

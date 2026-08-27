@@ -1,5 +1,6 @@
 import Cocoa
 import FlutterMacOS
+import Darwin
 
 @main
 class AppDelegate: FlutterAppDelegate {
@@ -9,6 +10,8 @@ class AppDelegate: FlutterAppDelegate {
   private let ytDlpQueue = DispatchQueue(label: "com.example.video_player_app.macos.yt_dlp")
   fileprivate var ytDlpEventSink: FlutterEventSink?
   private var ytDlpTasks: [String: MacYtDlpTask] = [:]
+  private var configuredYtDlpPath: String?
+  private var configuredFfmpegPath: String?
 
   override func applicationDidFinishLaunching(_ notification: Notification) {
     if let controller = mainFlutterWindow?.contentViewController as? FlutterViewController {
@@ -36,8 +39,23 @@ class AppDelegate: FlutterAppDelegate {
         return
       }
       switch call.method {
+      case "configureYtDlpBinaryPaths":
+        let args = call.arguments as? [String: Any]
+        self.configuredYtDlpPath = (args?["ytDlpPath"] as? String)?.nilIfEmpty
+        self.configuredFfmpegPath = (args?["ffmpegPath"] as? String)?.nilIfEmpty
+        result(
+          self.configuredYtDlpPath.map {
+            FileManager.default.isExecutableFile(atPath: $0)
+          } ?? false
+        )
       case "getYtDlpBinaryStatus":
-        result(self.getYtDlpBinaryStatus())
+        self.ytDlpQueue.async { [weak self] in
+          guard let self else { return }
+          let status = self.getYtDlpBinaryStatus()
+          DispatchQueue.main.async {
+            result(status)
+          }
+        }
       case "importYoutubeCookies":
         let args = call.arguments as? [String: Any]
         result(self.importYoutubeCookies(args?["filePath"] as? String))
@@ -89,7 +107,13 @@ class AppDelegate: FlutterAppDelegate {
         }
       case "pauseYoutubeDownload":
         let args = call.arguments as? [String: Any]
-        result(self.pauseYoutubeDownload(args?["taskId"] as? String))
+        let stopped = self.pauseYoutubeDownload(args?["taskId"] as? String)
+        let response: [String: Any] = [
+          "accepted": stopped,
+          "stopped": stopped,
+          "reason": stopped ? NSNull() : "running task not found",
+        ]
+        result(response)
       case "cancelYoutubeDownload":
         let args = call.arguments as? [String: Any]
         result(self.cancelYoutubeDownload(args?["taskId"] as? String))
@@ -242,7 +266,7 @@ class AppDelegate: FlutterAppDelegate {
     ytDlpQueue.sync {
       if let existing = ytDlpTasks[taskId] {
         existing.terminationReason = "cancel"
-        existing.process.terminate()
+        terminateProcessTree(existing.process)
       }
       ytDlpTasks[taskId] = task
     }
@@ -292,7 +316,9 @@ class AppDelegate: FlutterAppDelegate {
         process = task.process
       }
     }
-    process?.terminate()
+    if let process {
+      terminateProcessTree(process)
+    }
     return process != nil
   }
 
@@ -307,32 +333,28 @@ class AppDelegate: FlutterAppDelegate {
         process = task.process
       }
     }
-    process?.terminate()
+    if let process {
+      terminateProcessTree(process)
+    }
     return process != nil
   }
 
   private func removeYoutubeTask(_ taskId: String?) -> Bool {
     guard let taskId else { return false }
-    var outputPath: String?
-    var producedPaths: [String] = []
     var process: Process?
     ytDlpQueue.sync {
       if let task = ytDlpTasks[taskId] {
         task.terminationReason = "cancel"
         task.status = "cancelled"
         task.message = "Removed"
-        outputPath = task.outputPath
-        producedPaths = task.producedPaths
         process = task.process
       }
     }
-    process?.terminate()
-    if let outputPath {
-      try? FileManager.default.removeItem(atPath: outputPath)
+    if let process {
+      terminateProcessTree(process)
     }
-    for producedPath in producedPaths where !producedPath.isEmpty && producedPath != outputPath {
-      try? FileManager.default.removeItem(atPath: producedPath)
-    }
+    // Task removal must never unlink final media. The file may already be the
+    // source of a media-library card. Flutter cleans task-scoped temp files.
     return true
   }
 
@@ -504,6 +526,16 @@ class AppDelegate: FlutterAppDelegate {
       }
       if task.terminationReason == "pause" {
         task.status = "paused"
+        payload = [
+          "taskId": task.taskId,
+          "type": "task_paused",
+          "progress": task.progress,
+          "speedText": task.speedText,
+          "etaText": task.etaText,
+          "outputPath": task.outputPath,
+          "producedPaths": task.producedPaths,
+          "message": task.message.isEmpty ? "Paused" : task.message,
+        ]
         return
       }
       if task.terminationReason == "cancel" {
@@ -581,8 +613,36 @@ class AppDelegate: FlutterAppDelegate {
     }
   }
 
+  private func terminateProcessTree(_ process: Process) {
+    let pid = process.processIdentifier
+    guard pid > 0 else { return }
+
+    // Terminate direct helper processes (notably ffmpeg) before their parent
+    // can exit and they are re-parented.
+    let childTerminator = Process()
+    childTerminator.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    childTerminator.arguments = ["-TERM", "-P", String(pid)]
+    try? childTerminator.run()
+    process.terminate()
+
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(150)) {
+      guard process.isRunning else { return }
+      let childKiller = Process()
+      childKiller.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+      childKiller.arguments = ["-KILL", "-P", String(pid)]
+      try? childKiller.run()
+      kill(pid, SIGKILL)
+    }
+  }
+
   private func findExecutable(candidates: [String]) -> String? {
     let fileManager = FileManager.default
+    let configuredPath = candidates.contains(where: { $0.hasPrefix("yt-dlp") })
+      ? configuredYtDlpPath
+      : configuredFfmpegPath
+    if let configuredPath {
+      return fileManager.isExecutableFile(atPath: configuredPath) ? configuredPath : nil
+    }
     let appSupportYtDir = appSupportDirectory().appendingPathComponent("yt_dlp", isDirectory: true)
     let bundleResourceDir = Bundle.main.resourceURL
     let bundleExecutableDir = Bundle.main.executableURL?.deletingLastPathComponent()
@@ -590,6 +650,7 @@ class AppDelegate: FlutterAppDelegate {
     let searchRoots: [URL?] = [
       appSupportYtDir,
       bundleExecutableDir,
+      bundleResourceDir?.appendingPathComponent("yt_dlp", isDirectory: true),
       bundleResourceDir,
     ]
     for root in searchRoots {

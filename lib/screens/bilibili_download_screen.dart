@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
@@ -12,7 +13,9 @@ import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/screens/portrait_video_screen.dart';
+import 'package:video_player_app/screens/bilibili_download_list_projection.dart';
 import 'package:video_player_app/screens/video_player_screen.dart';
+import 'package:video_player_app/services/app_haptics.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
@@ -38,7 +41,13 @@ class BilibiliDownloadScreen extends StatefulWidget {
 class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     with SingleTickerProviderStateMixin {
   static const int _windowsMaxConcurrentDownloadsCap = 2;
+  static const Duration _taskCollapseDuration = Duration(milliseconds: 190);
+  static const Duration _taskRestoreDuration = Duration(milliseconds: 220);
   final TextEditingController _inputController = TextEditingController();
+  final ScrollController _taskListScrollController = ScrollController();
+  final GlobalKey _taskListViewportKey = GlobalKey(
+    debugLabel: 'BilibiliTaskListViewport',
+  );
   int? _previousImageCacheMaxSize;
   int? _previousImageCacheMaxBytes;
   final FocusNode _shortcutFocusNode = FocusNode(
@@ -50,6 +59,18 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   late final Animation<Offset> _keepAwakeBannerSlide;
   bool? _keepAwakeBannerVisible;
   bool _cachedKeepAwakeBannerActive = false;
+  String? _draggingTaskId;
+  int? _taskDragInsertionIndex;
+  bool _collapseTaskDescendantsForDrag = false;
+  bool _taskDragProjectionCollapsed = false;
+  bool _taskDragFinishing = false;
+  bool _taskDragRecoveryScheduled = false;
+  int? _pendingTaskDropBoundary;
+  double _draggedTaskExtent = 90;
+  double _taskDragAutoScrollVelocity = 0;
+  Timer? _taskDragCollapseTimer;
+  Timer? _taskDragAutoScrollTimer;
+  int _taskDragSession = 0;
 
   // Dialog helpers need access to API service, which is now in BilibiliDownloadService
 
@@ -85,6 +106,9 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }
 
   String? _episodeStatusText(BilibiliDownloadEpisode ep) {
+    if (ep.status == DownloadStatus.completed && ep.danmakuError != null) {
+      return '弹幕下载失败';
+    }
     final error = ep.error?.trim();
     if (error == null || error.isEmpty) return null;
 
@@ -328,6 +352,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
 
   @override
   void dispose() {
+    _taskDragCollapseTimer?.cancel();
+    _taskDragAutoScrollTimer?.cancel();
     final cache = PaintingBinding.instance.imageCache;
     if (_previousImageCacheMaxSize != null) {
       cache.maximumSize = _previousImageCacheMaxSize!;
@@ -336,6 +362,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
       cache.maximumSizeBytes = _previousImageCacheMaxBytes!;
     }
     _keepAwakeBannerController.dispose();
+    _taskListScrollController.dispose();
     _shortcutFocusNode.dispose();
     _inputController.dispose();
     super.dispose();
@@ -426,7 +453,9 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }
 
   Future<void> _showDownloadSettings(BilibiliDownloadService service) async {
+    bool tempDownloadDanmaku = service.downloadDanmaku;
     int tempMax = service.maxConcurrentDownloads;
+    int tempVideoConnections = service.maxConnectionsPerVideo;
     int tempQuality = service.preferredQuality;
     String tempSubLang = service.preferredSubtitleLang;
     bool tempAi = service.preferAiSubtitles;
@@ -458,190 +487,234 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
         builder: (context, setState) {
           return AlertDialog(
             title: const Text("下载设置"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  children: [
-                    const Text("最大并发下载数: "),
-                    DropdownButton<int>(
-                      value: tempMax,
-                      items:
-                          List.generate(
-                                Platform.isWindows
-                                    ? _windowsMaxConcurrentDownloadsCap
-                                    : 10,
-                                (i) => i + 1,
-                              )
-                              .map(
-                                (e) => DropdownMenuItem(
-                                  value: e,
-                                  child: Text("$e"),
-                                ),
-                              )
-                              .toList(),
-                      onChanged: (val) {
-                        if (val != null) setState(() => tempMax = val);
-                      },
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    const Text("首选清晰度: "),
-                    DropdownButton<int>(
-                      value: tempQuality,
-                      items: const [
-                        DropdownMenuItem(value: 127, child: Text("8K")),
-                        DropdownMenuItem(value: 120, child: Text("4K")),
-                        DropdownMenuItem(value: 116, child: Text("1080P 60帧")),
-                        DropdownMenuItem(value: 80, child: Text("1080P")),
-                        DropdownMenuItem(value: 64, child: Text("720P")),
-                        DropdownMenuItem(value: 32, child: Text("480P")),
-                      ],
-                      onChanged: (val) {
-                        if (val != null) setState(() => tempQuality = val);
-                      },
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    const Text("字幕偏好: "),
-                    DropdownButton<String>(
-                      value: tempSubLang,
-                      items: const [
-                        DropdownMenuItem(value: "none", child: Text("无")),
-                        DropdownMenuItem(value: "zh", child: Text("中文")),
-                        DropdownMenuItem(value: "en", child: Text("English")),
-                        DropdownMenuItem(value: "ja", child: Text("日本語")),
-                      ],
-                      onChanged: (val) {
-                        if (val != null) setState(() => tempSubLang = val);
-                      },
-                    ),
-                  ],
-                ),
-                CheckboxListTile(
-                  title: const Text("AI 字幕优先"),
-                  value: tempAi,
-                  onChanged: (val) {
-                    if (val != null) setState(() => tempAi = val);
-                  },
-                  contentPadding: EdgeInsets.zero,
-                ),
-                CheckboxListTile(
-                  title: const Text("下载完成后自动导入媒体库"),
-                  value: tempAutoImport,
-                  onChanged: (val) {
-                    if (val != null) setState(() => tempAutoImport = val);
-                  },
-                  contentPadding: EdgeInsets.zero,
-                ),
-                CheckboxListTile(
-                  title: const Text("导入媒体库后自动删除任务"),
-                  value: tempAutoDelete,
-                  onChanged: (val) {
-                    if (val != null) setState(() => tempAutoDelete = val);
-                  },
-                  contentPadding: EdgeInsets.zero,
-                ),
-                CheckboxListTile(
-                  title: Text(
-                    "批量合成并导出时按顺序导出",
-                    style: TextStyle(
-                      color: tempAutoImport ? Colors.white : Colors.white38,
-                    ),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SwitchListTile(
+                    title: const Text('下载弹幕'),
+                    subtitle: const Text('下载后自动绑定到对应的 B 站视频'),
+                    value: tempDownloadDanmaku,
+                    onChanged: (value) {
+                      setState(() => tempDownloadDanmaku = value);
+                      unawaited(service.setDownloadDanmaku(value));
+                    },
+                    contentPadding: EdgeInsets.zero,
                   ),
-                  subtitle: Text(
-                    "等待前置任务导出后再进行当前任务导出",
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: tempAutoImport ? Colors.white54 : Colors.white24,
-                    ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      const Text("最大并发下载数: "),
+                      DropdownButton<int>(
+                        value: tempMax,
+                        items:
+                            List.generate(
+                                  Platform.isWindows
+                                      ? _windowsMaxConcurrentDownloadsCap
+                                      : 10,
+                                  (i) => i + 1,
+                                )
+                                .map(
+                                  (e) => DropdownMenuItem(
+                                    value: e,
+                                    child: Text("$e"),
+                                  ),
+                                )
+                                .toList(),
+                        onChanged: (val) {
+                          if (val != null) setState(() => tempMax = val);
+                        },
+                      ),
+                    ],
                   ),
-                  value: tempSeqExport,
-                  onChanged: tempAutoImport
-                      ? (val) {
-                          if (val != null) setState(() => tempSeqExport = val);
-                        }
-                      : null,
-                  contentPadding: EdgeInsets.zero,
-                ),
-                if (!Platform.isAndroid && !Platform.isIOS) ...[
                   const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Expanded(child: Text('单视频连接数:')),
+                      DropdownButton<int>(
+                        value: tempVideoConnections,
+                        items: const [
+                          DropdownMenuItem(value: 1, child: Text('1（稳定）')),
+                          DropdownMenuItem(value: 2, child: Text('2（推荐）')),
+                          DropdownMenuItem(value: 4, child: Text('4（高速）')),
+                        ],
+                        onChanged: (value) {
+                          if (value != null) {
+                            setState(() => tempVideoConnections = value);
+                          }
+                        },
+                      ),
+                    ],
+                  ),
                   const Align(
                     alignment: Alignment.centerLeft,
                     child: Text(
-                      "下载保存目录",
-                      style: TextStyle(fontWeight: FontWeight.bold),
+                      '按文件大小和任务并发数自动降级；CDN 不支持分片时会回退单连接。',
+                      style: TextStyle(fontSize: 10, color: Colors.white54),
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.05),
-                      borderRadius: BorderRadius.circular(6),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Text("首选清晰度: "),
+                      DropdownButton<int>(
+                        value: tempQuality,
+                        items: const [
+                          DropdownMenuItem(value: 127, child: Text("8K")),
+                          DropdownMenuItem(value: 120, child: Text("4K")),
+                          DropdownMenuItem(
+                            value: 116,
+                            child: Text("1080P 60帧"),
+                          ),
+                          DropdownMenuItem(value: 80, child: Text("1080P")),
+                          DropdownMenuItem(value: 64, child: Text("720P")),
+                          DropdownMenuItem(value: 32, child: Text("480P")),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) setState(() => tempQuality = val);
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      const Text("字幕偏好: "),
+                      DropdownButton<String>(
+                        value: tempSubLang,
+                        items: const [
+                          DropdownMenuItem(value: "none", child: Text("无")),
+                          DropdownMenuItem(value: "zh", child: Text("中文")),
+                          DropdownMenuItem(value: "en", child: Text("English")),
+                          DropdownMenuItem(value: "ja", child: Text("日本語")),
+                        ],
+                        onChanged: (val) {
+                          if (val != null) setState(() => tempSubLang = val);
+                        },
+                      ),
+                    ],
+                  ),
+                  CheckboxListTile(
+                    title: const Text("AI 字幕优先"),
+                    value: tempAi,
+                    onChanged: (val) {
+                      if (val != null) setState(() => tempAi = val);
+                    },
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  CheckboxListTile(
+                    title: const Text("下载完成后自动导入媒体库"),
+                    value: tempAutoImport,
+                    onChanged: (val) {
+                      if (val != null) setState(() => tempAutoImport = val);
+                    },
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  CheckboxListTile(
+                    title: const Text("导入媒体库后自动删除任务"),
+                    value: tempAutoDelete,
+                    onChanged: (val) {
+                      if (val != null) setState(() => tempAutoDelete = val);
+                    },
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  CheckboxListTile(
+                    title: Text(
+                      "批量合成并导出时按顺序导出",
+                      style: TextStyle(
+                        color: tempAutoImport ? Colors.white : Colors.white38,
+                      ),
                     ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          _formatPath(
-                            tempCustomPath?.isNotEmpty == true
-                                ? tempCustomPath!
-                                : defaultDownloadDir,
+                    subtitle: Text(
+                      "等待前置任务导出后再进行当前任务导出",
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: tempAutoImport ? Colors.white54 : Colors.white24,
+                      ),
+                    ),
+                    value: tempSeqExport,
+                    onChanged: tempAutoImport
+                        ? (val) {
+                            if (val != null) {
+                              setState(() => tempSeqExport = val);
+                            }
+                          }
+                        : null,
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                  if (!Platform.isAndroid && !Platform.isIOS) ...[
+                    const SizedBox(height: 16),
+                    const Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        "下载保存目录",
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.05),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _formatPath(
+                              tempCustomPath?.isNotEmpty == true
+                                  ? tempCustomPath!
+                                  : defaultDownloadDir,
+                            ),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Colors.white70,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                           ),
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: Colors.white70,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            ElevatedButton(
-                              onPressed: () async {
-                                try {
-                                  final path = await FilePicker.platform
-                                      .getDirectoryPath(
-                                        dialogTitle: "选择下载保存目录",
-                                        lockParentWindow: true,
-                                      );
-                                  if (path != null && path.isNotEmpty) {
-                                    setState(() => tempCustomPath = path);
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              ElevatedButton(
+                                onPressed: () async {
+                                  try {
+                                    final path = await FilePicker.platform
+                                        .getDirectoryPath(
+                                          dialogTitle: "选择下载保存目录",
+                                          lockParentWindow: true,
+                                        );
+                                    if (path != null && path.isNotEmpty) {
+                                      setState(() => tempCustomPath = path);
+                                    }
+                                  } catch (e) {
+                                    AppToast.show(
+                                      "打开目录选择失败，请重试",
+                                      type: AppToastType.error,
+                                    );
                                   }
-                                } catch (e) {
-                                  AppToast.show(
-                                    "打开目录选择失败，请重试",
-                                    type: AppToastType.error,
+                                },
+                                child: const Text("选择目录"),
+                              ),
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: () {
+                                  setState(
+                                    () => tempCustomPath = defaultDownloadDir,
                                   );
-                                }
-                              },
-                              child: const Text("选择目录"),
-                            ),
-                            const SizedBox(width: 8),
-                            TextButton(
-                              onPressed: () {
-                                setState(
-                                  () => tempCustomPath = defaultDownloadDir,
-                                );
-                              },
-                              child: const Text("使用默认"),
-                            ),
-                          ],
-                        ),
-                      ],
+                                },
+                                child: const Text("使用默认"),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
+                  ],
                 ],
-              ],
+              ),
             ),
             actions: [
               TextButton(
@@ -659,6 +732,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     tempAutoDelete,
                     tempSeqExport,
                     customPath: tempCustomPath,
+                    videoConnections: tempVideoConnections,
                   );
                   Navigator.pop(ctx);
                   AppToast.show("设置已保存", type: AppToastType.success);
@@ -911,6 +985,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
         RegExp(r'\.[a-zA-Z0-9]+$'),
         '.srt',
       ),
+      chapters: ep.chapters,
+      hasProbedChapters: true,
     );
 
     await _openVideoPlayer(videoItem);
@@ -1172,7 +1248,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     return ClipRect(
       child: SizeTransition(
         sizeFactor: _keepAwakeBannerSize,
-        axisAlignment: -1,
+        alignment: Alignment.topCenter,
         child: FadeTransition(
           opacity: _keepAwakeBannerFade,
           child: SlideTransition(
@@ -1389,6 +1465,517 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
   }
 
+  List<BilibiliDownloadListRow> _buildVirtualRows(
+    BilibiliDownloadService service,
+  ) => BilibiliDownloadListProjection.build(
+    service.taskIds.map(service.getTaskById).whereType<BilibiliDownloadTask>(),
+    forceTasksCollapsed: _taskDragProjectionCollapsed,
+  );
+
+  Key _virtualRowKey(
+    BilibiliDownloadService service,
+    BilibiliDownloadListRow row,
+  ) => switch (row) {
+    BilibiliTaskHeaderRow() => ValueKey('bb-task-${row.task.taskId}'),
+    BilibiliVideoHeaderRow(:final video) => ValueKey(
+      'bb-video-${row.task.taskId}-${video.videoInfo.bvid}',
+    ),
+    BilibiliEpisodeRow(:final episode) => ValueKey(
+      'bb-episode-${row.task.taskId}-${service.episodeKey(episode)}',
+    ),
+  };
+
+  void _beginTaskDrag(
+    BilibiliDownloadService service,
+    BilibiliDownloadTask task,
+    double measuredExtent,
+  ) {
+    if (!mounted ||
+        _draggingTaskId != null ||
+        _taskDragFinishing ||
+        service.taskIds.length < 2) {
+      return;
+    }
+    final oldIndex = service.taskIds.indexOf(task.taskId);
+    if (oldIndex < 0) return;
+
+    final session = ++_taskDragSession;
+    _taskDragCollapseTimer?.cancel();
+    setState(() {
+      _draggingTaskId = task.taskId;
+      _taskDragInsertionIndex = oldIndex;
+      _collapseTaskDescendantsForDrag = true;
+      _taskDragProjectionCollapsed = false;
+      _pendingTaskDropBoundary = null;
+      _draggedTaskExtent = measuredExtent.clamp(76.0, 140.0);
+    });
+    unawaited(AppHaptics.reorderDragStarted(context.read<SettingsService>()));
+
+    // First animate visible descendants to zero. Removing their virtual rows
+    // only after that animation prevents the tasks below from snapping upward.
+    _taskDragCollapseTimer = Timer(_taskCollapseDuration, () {
+      if (!mounted || session != _taskDragSession || _draggingTaskId == null) {
+        return;
+      }
+      setState(() => _taskDragProjectionCollapsed = true);
+    });
+  }
+
+  void _updateTaskDragInsertionIndex(int boundary) {
+    if (_draggingTaskId == null ||
+        boundary == _taskDragInsertionIndex ||
+        _taskDragFinishing) {
+      return;
+    }
+    setState(() => _taskDragInsertionIndex = boundary);
+    unawaited(AppHaptics.reorderTargetChanged(context.read<SettingsService>()));
+  }
+
+  int _taskBoundaryForPointer(
+    BuildContext targetContext,
+    Offset globalPosition,
+    int taskIndex,
+  ) {
+    final renderObject = targetContext.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) {
+      return taskIndex;
+    }
+    final local = renderObject.globalToLocal(globalPosition);
+    return local.dy < renderObject.size.height / 2 ? taskIndex : taskIndex + 1;
+  }
+
+  void _commitTaskDrop(String taskId, int boundary) {
+    if (taskId != _draggingTaskId || _taskDragFinishing) return;
+    _taskDragInsertionIndex = boundary;
+    _pendingTaskDropBoundary = boundary;
+  }
+
+  Future<void> _finishTaskDrag(
+    BilibiliDownloadService service,
+    String taskId,
+  ) async {
+    if (!mounted || _taskDragFinishing || _draggingTaskId == null) return;
+    final session = ++_taskDragSession;
+    final pendingBoundary = taskId == _draggingTaskId
+        ? _pendingTaskDropBoundary
+        : null;
+    _taskDragCollapseTimer?.cancel();
+    _stopTaskDragAutoScroll();
+    setState(() {
+      _draggingTaskId = null;
+      _taskDragInsertionIndex = null;
+      _taskDragFinishing = true;
+      _pendingTaskDropBoundary = null;
+    });
+    // Commit only after Draggable has reached onDragEnd. Reordering from the
+    // DragTarget callback itself can dispose the drag source before it receives
+    // this cleanup callback, leaving the page permanently folded.
+    final didReorder =
+        pendingBoundary != null &&
+        service.moveTaskToInsertionIndex(taskId, pendingBoundary);
+    if (didReorder) {
+      unawaited(
+        AppHaptics.reorderDragCompleted(context.read<SettingsService>()),
+      );
+    }
+
+    if (_taskDragProjectionCollapsed) {
+      // Reinsert descendants at zero height, wait one frame, then expand them.
+      // Their persisted expansion flags were never changed, so each task
+      // returns to precisely its pre-drag expanded/collapsed state.
+      await Future<void>.delayed(_taskCollapseDuration);
+      if (!mounted || session != _taskDragSession) return;
+      setState(() => _taskDragProjectionCollapsed = false);
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    if (!mounted || session != _taskDragSession) return;
+    setState(() => _collapseTaskDescendantsForDrag = false);
+    await Future<void>.delayed(_taskRestoreDuration);
+    if (!mounted || session != _taskDragSession) return;
+    setState(() => _taskDragFinishing = false);
+  }
+
+  void _handleTaskDragUpdate(DragUpdateDetails details) {
+    if (_draggingTaskId == null) return;
+    final renderObject = _taskListViewportKey.currentContext
+        ?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return;
+    final local = renderObject.globalToLocal(details.globalPosition);
+    final edge = (renderObject.size.height * 0.18).clamp(56.0, 88.0);
+    double velocity = 0;
+    if (local.dy < edge) {
+      final intensity = ((edge - local.dy) / edge).clamp(0.0, 1.0);
+      velocity = -720 * intensity;
+    } else if (local.dy > renderObject.size.height - edge) {
+      final intensity = ((local.dy - (renderObject.size.height - edge)) / edge)
+          .clamp(0.0, 1.0);
+      velocity = 720 * intensity;
+    }
+    _taskDragAutoScrollVelocity = velocity;
+    if (velocity == 0) {
+      _stopTaskDragAutoScroll();
+      return;
+    }
+    if (_taskDragAutoScrollTimer != null) return;
+    _taskDragAutoScrollTimer = Timer.periodic(
+      const Duration(milliseconds: 16),
+      (_) => _tickTaskDragAutoScroll(),
+    );
+  }
+
+  void _tickTaskDragAutoScroll() {
+    if (!mounted ||
+        _draggingTaskId == null ||
+        !_taskListScrollController.hasClients) {
+      _stopTaskDragAutoScroll();
+      return;
+    }
+    final position = _taskListScrollController.position;
+    final next = (position.pixels + _taskDragAutoScrollVelocity * 0.016).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    if ((next - position.pixels).abs() > 0.1) {
+      _taskListScrollController.jumpTo(next);
+    } else {
+      _stopTaskDragAutoScroll();
+    }
+  }
+
+  void _stopTaskDragAutoScroll() {
+    _taskDragAutoScrollVelocity = 0;
+    _taskDragAutoScrollTimer?.cancel();
+    _taskDragAutoScrollTimer = null;
+  }
+
+  Widget _buildTaskDragFeedback(BilibiliDownloadTask task, double width) {
+    final episodeCount = task.videos.fold<int>(
+      0,
+      (total, video) => total + video.episodes.length,
+    );
+    final unitLabel = task.isCollection
+        ? '合集 · ${task.videos.length} 个视频'
+        : episodeCount > 1
+        ? '分P视频 · $episodeCount P'
+        : '独立视频';
+    return Transform.scale(
+      scale: 1.015,
+      child: Material(
+        color: Colors.transparent,
+        elevation: 18,
+        shadowColor: Colors.black87,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          width: width,
+          constraints: const BoxConstraints(minHeight: 76),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF383838),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: Colors.pinkAccent.withValues(alpha: 0.9),
+              width: 1.5,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                task.isCollection
+                    ? Icons.video_collection_outlined
+                    : Icons.drag_indicator_rounded,
+                color: Colors.pinkAccent,
+                size: 26,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      task.title,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        decoration: TextDecoration.none,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      unitLabel,
+                      style: const TextStyle(
+                        color: Colors.white60,
+                        fontSize: 11,
+                        decoration: TextDecoration.none,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVirtualRow(
+    BilibiliDownloadService service,
+    BilibiliDownloadListRow row, {
+    required int taskIndex,
+    required int taskCount,
+  }) {
+    final child = switch (row) {
+      BilibiliTaskHeaderRow() => _buildTaskCard(service, row.task),
+      BilibiliVideoHeaderRow(:final video) => _buildVirtualVideoHeader(
+        service,
+        row.task,
+        video,
+      ),
+      BilibiliEpisodeRow(
+        :final video,
+        :final episode,
+        :final useSingleControls,
+      ) =>
+        useSingleControls
+            ? _buildSingleEpisodeControls(service, episode, video, row.task)
+            : _buildEpisodeRow(service, episode, video, row.task),
+    };
+    final isHeader = row is BilibiliTaskHeaderRow;
+    final isVisuallyCollapsedHeader =
+        isHeader && _collapseTaskDescendantsForDrag;
+    final isLastInTask = row.isLastInTask || isVisuallyCollapsedHeader;
+    final content = Container(
+      margin: EdgeInsets.fromLTRB(16, 0, 16, isLastInTask ? 16 : 0),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2C2C2C),
+        borderRadius: BorderRadius.vertical(
+          top: isHeader ? const Radius.circular(12) : Radius.zero,
+          bottom: isLastInTask ? const Radius.circular(12) : Radius.zero,
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: RepaintBoundary(child: child),
+    );
+
+    if (row is BilibiliTaskHeaderRow) {
+      return _buildDraggableTaskHeader(
+        service,
+        row.task,
+        content,
+        taskIndex: taskIndex,
+        taskCount: taskCount,
+      );
+    }
+    return AnimatedSize(
+      duration: _collapseTaskDescendantsForDrag
+          ? _taskCollapseDuration
+          : _taskRestoreDuration,
+      curve: _collapseTaskDescendantsForDrag
+          ? Curves.easeOutCubic
+          : Curves.easeInOutCubic,
+      alignment: Alignment.topCenter,
+      clipBehavior: Clip.hardEdge,
+      child: _collapseTaskDescendantsForDrag
+          ? const SizedBox(width: double.infinity)
+          : content,
+    );
+  }
+
+  Widget _buildTaskInsertionSlot(
+    BilibiliDownloadService service,
+    int boundary,
+  ) {
+    final isActive =
+        _draggingTaskId != null && _taskDragInsertionIndex == boundary;
+    return DragTarget<String>(
+      onWillAcceptWithDetails: (details) =>
+          details.data == _draggingTaskId && service.taskIds.length > 1,
+      onAcceptWithDetails: (details) {
+        _commitTaskDrop(details.data, boundary);
+      },
+      builder: (context, candidateData, rejectedData) {
+        final highlighted = isActive || candidateData.isNotEmpty;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOutCubic,
+          height: isActive ? _draggedTaskExtent : 0,
+          margin: EdgeInsets.fromLTRB(16, 0, 16, isActive ? 10 : 0),
+          clipBehavior: Clip.hardEdge,
+          decoration: BoxDecoration(
+            color: Colors.pinkAccent.withValues(alpha: highlighted ? 0.10 : 0),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: Colors.pinkAccent.withValues(alpha: highlighted ? 0.8 : 0),
+              width: 1.5,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: isActive
+              ? const Text(
+                  '释放以放置任务',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                )
+              : null,
+        );
+      },
+    );
+  }
+
+  Widget _buildDraggableTaskHeader(
+    BilibiliDownloadService service,
+    BilibiliDownloadTask task,
+    Widget header, {
+    required int taskIndex,
+    required int taskCount,
+  }) {
+    Widget buildDropTarget(Widget draggable) {
+      return Builder(
+        builder: (targetContext) => DragTarget<String>(
+          onWillAcceptWithDetails: (details) =>
+              details.data == _draggingTaskId && taskCount > 1,
+          onMove: (details) {
+            _updateTaskDragInsertionIndex(
+              _taskBoundaryForPointer(targetContext, details.offset, taskIndex),
+            );
+          },
+          onAcceptWithDetails: (details) {
+            final boundary = _taskBoundaryForPointer(
+              targetContext,
+              details.offset,
+              taskIndex,
+            );
+            _commitTaskDrop(details.data, boundary);
+          },
+          builder: (context, candidateData, rejectedData) {
+            final hovering = candidateData.isNotEmpty;
+            return AnimatedScale(
+              scale: hovering ? 1.008 : 1,
+              duration: const Duration(milliseconds: 120),
+              curve: Curves.easeOutCubic,
+              child: Stack(
+                children: [
+                  draggable,
+                  if (hovering)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Container(
+                          margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color: Colors.pinkAccent,
+                              width: 1.5,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    final canStartDrag =
+        taskCount > 1 && _draggingTaskId == null && !_taskDragFinishing;
+    final draggable = LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.hasBoundedWidth
+            ? constraints.maxWidth
+            : MediaQuery.sizeOf(context).width;
+        return AnimatedSize(
+          duration: const Duration(milliseconds: 155),
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          clipBehavior: Clip.hardEdge,
+          child: LongPressDraggable<String>(
+            data: task.taskId,
+            delay: const Duration(milliseconds: 420),
+            maxSimultaneousDrags: canStartDrag ? 1 : 0,
+            hapticFeedbackOnStart: false,
+            rootOverlay: true,
+            feedback: _buildTaskDragFeedback(task, width),
+            feedbackOffset: const Offset(0, -8),
+            childWhenDragging: SizedBox(width: width),
+            onDragStarted: () {
+              final renderObject = context.findRenderObject();
+              final extent = renderObject is RenderBox && renderObject.hasSize
+                  ? renderObject.size.height
+                  : 90.0;
+              _beginTaskDrag(service, task, extent);
+            },
+            onDragUpdate: _handleTaskDragUpdate,
+            onDragEnd: (_) => unawaited(_finishTaskDrag(service, task.taskId)),
+            child: MouseRegion(
+              cursor: canStartDrag
+                  ? SystemMouseCursors.grab
+                  : MouseCursor.defer,
+              child: header,
+            ),
+          ),
+        );
+      },
+    );
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _buildTaskInsertionSlot(service, taskIndex),
+        buildDropTarget(draggable),
+        if (taskIndex == taskCount - 1)
+          _buildTaskInsertionSlot(service, taskCount),
+      ],
+    );
+  }
+
+  Widget _buildVirtualVideoHeader(
+    BilibiliDownloadService service,
+    BilibiliDownloadTask task,
+    BilibiliVideoItem video,
+  ) {
+    return InkWell(
+      onTap: () => service.setVideoSelected(task, video, !video.isSelected),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            _buildCheckboxWithSmallThumbnail(
+              value: video.isSelected,
+              onChanged: (value) =>
+                  service.setVideoSelected(task, video, value ?? false),
+              thumbnailUrl: video.videoInfo.pic,
+              thumbnailWidth: 44,
+              thumbnailHeight: 28,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                video.videoInfo.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final service = Provider.of<BilibiliDownloadService>(
@@ -1473,10 +2060,21 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                   ),
                   backgroundColor: const Color(0xFF1E1E1E),
                   actions: [
-                    Consumer<BilibiliDownloadService>(
-                      builder: (context, currentService, _) {
+                    Selector<
+                      BilibiliDownloadService,
+                      ({bool supported, bool enabled, bool active})
+                    >(
+                      selector: (_, currentService) => (
+                        supported:
+                            currentService.supportsProcessingKeepAwakeToggle,
+                        enabled: currentService.keepScreenAwakeDuringProcessing,
+                        active: currentService.isProcessingKeepAwakeActive,
+                      ),
+                      builder: (context, state, _) {
+                        final currentService = context
+                            .read<BilibiliDownloadService>();
                         _syncKeepAwakeBannerVisibility(currentService);
-                        if (!currentService.supportsProcessingKeepAwakeToggle) {
+                        if (!state.supported) {
                           return const SizedBox.shrink();
                         }
                         return _buildProcessingKeepAwakeAction(
@@ -1624,8 +2222,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                               Selector<BilibiliDownloadService, bool>(
                                 selector: (_, s) => s.isParsing,
                                 builder: (context, isParsing, _) {
-                                  final service =
-                                      context.read<BilibiliDownloadService>();
+                                  final service = context
+                                      .read<BilibiliDownloadService>();
                                   return ElevatedButton(
                                     onPressed: isParsing
                                         ? null
@@ -1681,76 +2279,154 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                         );
                       },
                     ),
-                    Consumer<BilibiliDownloadService>(
-                      builder: (context, service, _) {
+                    Selector<
+                      BilibiliDownloadService,
+                      ({bool enabled, bool active})
+                    >(
+                      selector: (_, service) => (
+                        enabled: service.keepScreenAwakeDuringProcessing,
+                        active: service.isProcessingKeepAwakeActive,
+                      ),
+                      builder: (context, _, _) {
+                        final service = context.read<BilibiliDownloadService>();
                         _syncKeepAwakeBannerVisibility(service);
                         return _buildProcessingKeepAwakeBanner(service);
                       },
                     ),
                     Expanded(
-                      child: Selector<BilibiliDownloadService, List<String>>(
-                        selector: (_, service) => service.taskIds,
-                        builder: (context, taskIds, _) {
-                          if (taskIds.isEmpty) {
-                            return const Center(
-                              child: Text(
-                                "请输入链接并解析",
-                                style: TextStyle(color: Colors.white30),
-                              ),
-                            );
-                          }
-                          final service = context
-                              .read<BilibiliDownloadService>();
-                          return ListView.builder(
-                            padding: const EdgeInsets.all(16),
-                            itemCount: taskIds.length,
-                            cacheExtent: 800,
-                            addAutomaticKeepAlives: false,
-                            addRepaintBoundaries: true,
-                            addSemanticIndexes: false,
-                            itemBuilder: (context, index) {
-                              final taskId = taskIds[index];
-                              return Selector<BilibiliDownloadService, int>(
-                                selector: (_, service) =>
-                                    service.taskRenderSignature(taskId),
-                                builder: (context, _, _) {
-                                  final task = context
-                                      .read<BilibiliDownloadService>()
-                                      .getTaskById(taskId);
-                                  if (task == null) {
-                                    return const SizedBox.shrink();
+                      child:
+                          Selector<
+                            BilibiliDownloadService,
+                            ({List<String> ids, int structureRevision})
+                          >(
+                            selector: (_, service) => (
+                              ids: service.taskIds,
+                              structureRevision: service.listStructureRevision,
+                            ),
+                            builder: (context, snapshot, _) {
+                              if (snapshot.ids.isEmpty) {
+                                return const Center(
+                                  child: Text(
+                                    "请输入链接并解析",
+                                    style: TextStyle(color: Colors.white30),
+                                  ),
+                                );
+                              }
+                              final service = context
+                                  .read<BilibiliDownloadService>();
+                              final activeDragTaskId = _draggingTaskId;
+                              if (activeDragTaskId != null &&
+                                  (snapshot.ids.length < 2 ||
+                                      !snapshot.ids.contains(
+                                        activeDragTaskId,
+                                      )) &&
+                                  !_taskDragRecoveryScheduled) {
+                                _taskDragRecoveryScheduled = true;
+                                WidgetsBinding.instance.addPostFrameCallback((
+                                  _,
+                                ) {
+                                  _taskDragRecoveryScheduled = false;
+                                  if (mounted &&
+                                      _draggingTaskId == activeDragTaskId) {
+                                    unawaited(
+                                      _finishTaskDrag(
+                                        service,
+                                        activeDragTaskId,
+                                      ),
+                                    );
                                   }
-                                  return RepaintBoundary(
-                                    key: ValueKey(task.taskId),
-                                    child: _buildTaskCard(service, task),
+                                });
+                              }
+                              final rows = _buildVirtualRows(service);
+                              final taskIndexById = <String, int>{
+                                for (
+                                  var index = 0;
+                                  index < snapshot.ids.length;
+                                  index++
+                                )
+                                  snapshot.ids[index]: index,
+                              };
+                              final rowIndexByKey = <Key, int>{
+                                for (
+                                  var index = 0;
+                                  index < rows.length;
+                                  index++
+                                )
+                                  _virtualRowKey(service, rows[index]): index,
+                              };
+                              return ListView.builder(
+                                key: _taskListViewportKey,
+                                controller: _taskListScrollController,
+                                padding: const EdgeInsets.only(top: 16),
+                                itemCount: rows.length,
+                                findChildIndexCallback: (key) =>
+                                    rowIndexByKey[key],
+                                scrollCacheExtent:
+                                    const ScrollCacheExtent.viewport(1),
+                                addAutomaticKeepAlives: false,
+                                addRepaintBoundaries: true,
+                                addSemanticIndexes: false,
+                                itemBuilder: (context, index) {
+                                  final row = rows[index];
+                                  if (row case BilibiliEpisodeRow(
+                                    :final episode,
+                                  )) {
+                                    return Selector<
+                                      BilibiliDownloadService,
+                                      int
+                                    >(
+                                      key: _virtualRowKey(service, row),
+                                      selector: (_, current) =>
+                                          current.episodeRevision(episode),
+                                      builder: (context, _, _) =>
+                                          _buildVirtualRow(
+                                            service,
+                                            row,
+                                            taskIndex:
+                                                taskIndexById[row
+                                                    .task
+                                                    .taskId] ??
+                                                0,
+                                            taskCount: snapshot.ids.length,
+                                          ),
+                                    );
+                                  }
+                                  return Selector<BilibiliDownloadService, int>(
+                                    key: _virtualRowKey(service, row),
+                                    selector: (_, current) =>
+                                        current.taskRevision(row.task.taskId),
+                                    builder: (context, _, _) =>
+                                        _buildVirtualRow(
+                                          service,
+                                          row,
+                                          taskIndex:
+                                              taskIndexById[row.task.taskId] ??
+                                              0,
+                                          taskCount: snapshot.ids.length,
+                                        ),
                                   );
                                 },
                               );
                             },
-                          );
-                        },
-                      ),
+                          ),
                     ),
                   ],
                 ),
                 bottomNavigationBar:
                     Selector<
                       BilibiliDownloadService,
-                      ({int taskCount, int selectedEpisodeCount})
+                      ({int taskCount, BilibiliSelectionSummary selection})
                     >(
                       selector: (_, service) => (
                         taskCount: service.taskCount,
-                        selectedEpisodeCount: service.selectedEpisodeCount,
+                        selection: service.selectionSummary,
                       ),
                       builder: (context, summary, _) {
                         final service = context.read<BilibiliDownloadService>();
                         if (summary.taskCount == 0) {
                           return const SizedBox.shrink();
                         }
-                        return _buildBottomBar(
-                          service,
-                          summary.selectedEpisodeCount,
-                        );
+                        return _buildBottomBar(service, summary.selection);
                       },
                     ),
               );
@@ -1765,41 +2441,26 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     BilibiliDownloadService service,
     BilibiliDownloadTask task,
   ) {
-    final int originalEpisodeCount =
-        (!task.isCollection && task.videos.length == 1)
-        ? task.videos.first.videoInfo.pages.length
-        : 0;
     bool isSingle =
         !task.isCollection &&
         task.videos.length == 1 &&
-        task.videos.first.episodes.length == 1 &&
-        originalEpisodeCount <= 1;
+        task.videos.first.episodes.length == 1;
     final media = MediaQuery.of(context);
     final isCompactTitle =
         media.orientation == Orientation.portrait && media.size.width < 600;
 
     return Card(
       color: const Color(0xFF2C2C2C),
-      margin: const EdgeInsets.only(bottom: 16),
+      margin: EdgeInsets.zero,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: Column(
         children: [
           InkWell(
-            onTap: () {
-              task.isExpanded = !task.isExpanded;
-              service.scheduleSaveTasks(notifyNow: true);
-            },
-            onLongPress: () {
-              bool newVal = !task.isSelected;
-              task.isSelected = newVal;
-              for (var v in task.videos) {
-                v.isSelected = newVal;
-                for (var e in v.episodes) {
-                  e.isSelected = newVal;
-                }
-              }
-              service.scheduleSaveTasks(notifyNow: true);
-            },
+            onTap: _collapseTaskDescendantsForDrag
+                ? null
+                : () {
+                    service.setTaskExpanded(task, !task.isExpanded);
+                  },
             borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
             child: Padding(
               padding: const EdgeInsets.all(12),
@@ -1809,14 +2470,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     value: task.isSelected,
                     activeColor: Colors.pinkAccent,
                     onChanged: (val) {
-                      task.isSelected = val ?? false;
-                      for (var video in task.videos) {
-                        video.isSelected = task.isSelected;
-                        for (var ep in video.episodes) {
-                          ep.isSelected = task.isSelected;
-                        }
-                      }
-                      service.scheduleSaveTasks(notifyNow: true);
+                      service.setTaskSelected(task, val ?? false);
                     },
                   ),
                   ClipRRect(
@@ -1861,8 +2515,19 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       ),
                     ),
                   ),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 4),
+                    child: Icon(
+                      Icons.drag_handle_rounded,
+                      color: Colors.white38,
+                      size: 20,
+                      semanticLabel: '长按拖动排序',
+                    ),
+                  ),
                   Icon(
-                    task.isExpanded ? Icons.expand_less : Icons.expand_more,
+                    task.isExpanded && !_collapseTaskDescendantsForDrag
+                        ? Icons.expand_less
+                        : Icons.expand_more,
                     color: Colors.white70,
                   ),
                   IconButton(
@@ -1884,20 +2549,6 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
               ),
             ),
           ),
-
-          if (task.isExpanded)
-            isSingle
-                ? _buildSingleEpisodeControls(
-                    service,
-                    task.videos.first.episodes.first,
-                    task.videos.first,
-                    task,
-                  )
-                : Column(
-                    children: task.videos
-                        .map((v) => _buildVideoItem(service, v, task))
-                        .toList(),
-                  ),
         ],
       ),
     );
@@ -2028,8 +2679,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                 );
                               }).toList(),
                               onChanged: (val) {
-                                ep.selectedVideoQuality = val;
-                                service.scheduleSaveTasks(notifyNow: true);
+                                service.setEpisodeVideoQuality(task, ep, val);
                               },
                               hint: const Text(
                                 "清晰度",
@@ -2084,8 +2734,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                 ),
                               ],
                               onChanged: (val) {
-                                ep.selectedSubtitle = val;
-                                service.scheduleSaveTasks(notifyNow: true);
+                                service.setEpisodeSubtitle(task, ep, val);
                               },
                               hint: const Text(
                                 "字幕",
@@ -2369,94 +3018,6 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
   }
 
-  Widget _buildVideoItem(
-    BilibiliDownloadService service,
-    BilibiliVideoItem video,
-    BilibiliDownloadTask task,
-  ) {
-    // Determine if we should show a flat list or a grouped list
-    // If it's a collection, we want to show all videos clearly.
-    // If a video has only 1 episode, we can just show that episode row (simplification).
-    // If a video has multiple episodes, we show a header + episodes.
-
-    // The user requested: "I don't want to click to see function keys."
-    // So we avoid ExpansionTile which hides content by default.
-    // We will render everything expanded.
-
-    // FIX: Avoid redundant header if it's a single video task
-    // If task is NOT a collection, the Task Header already shows the video info.
-    bool showHeader = task.isCollection;
-
-    if (video.episodes.length == 1) {
-      // Single episode video: Just render the episode row.
-      // Note: We need to ensure the checkbox logic in _buildEpisodeRow handles the video selection state too.
-      // _buildEpisodeRow already does: video.isSelected = video.episodes.every(...)
-      return _buildEpisodeRow(service, video.episodes.first, video, task);
-    } else {
-      // Multi-episode video: Show Header + List of Episodes
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Video Header (Select All for this video)
-          if (showHeader)
-            InkWell(
-              onTap: () {
-                // Toggle all episodes
-                bool newVal = !video.isSelected;
-                video.isSelected = newVal;
-                for (var ep in video.episodes) {
-                  ep.isSelected = newVal;
-                }
-                service.scheduleSaveTasks(notifyNow: true);
-              },
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 8,
-                ),
-                child: Row(
-                  children: [
-                    _buildCheckboxWithSmallThumbnail(
-                      value: video.isSelected,
-                      onChanged: (val) {
-                        video.isSelected = val ?? false;
-                        for (var ep in video.episodes) {
-                          ep.isSelected = video.isSelected;
-                        }
-                        service.scheduleSaveTasks(notifyNow: true);
-                      },
-                      thumbnailUrl: video.videoInfo.pic,
-                      thumbnailWidth: 44,
-                      thumbnailHeight: 28,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        video.videoInfo.title,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          // Episodes
-          Column(
-            children: video.episodes
-                .map((ep) => _buildEpisodeRow(service, ep, video, task))
-                .toList(),
-          ),
-        ],
-      );
-    }
-  }
-
   Widget _buildEpisodeRow(
     BilibiliDownloadService service,
     BilibiliDownloadEpisode ep,
@@ -2495,12 +3056,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
 
     return InkWell(
       onTap: () {
-        ep.isSelected = !ep.isSelected;
-        video.isSelected = video.episodes.every((e) => e.isSelected);
-        if (!task.isCollection) {
-          task.isSelected = video.isSelected;
-        }
-        service.scheduleSaveTasks(notifyNow: true);
+        service.setEpisodeSelected(task, video, ep, !ep.isSelected);
       },
       child: Container(
         padding: EdgeInsets.fromLTRB(
@@ -2523,11 +3079,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                   _buildCheckboxWithSmallThumbnail(
                     value: ep.isSelected,
                     onChanged: (val) {
-                      ep.isSelected = val ?? false;
-                      video.isSelected = video.episodes.every(
-                        (e) => e.isSelected,
-                      );
-                      service.scheduleSaveTasks(notifyNow: true);
+                      service.setEpisodeSelected(task, video, ep, val ?? false);
                     },
                     thumbnailUrl: video.videoInfo.pic,
                     thumbnailWidth: 40,
@@ -2538,14 +3090,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     value: ep.isSelected,
                     activeColor: Colors.pinkAccent,
                     onChanged: (val) {
-                      ep.isSelected = val ?? false;
-                      video.isSelected = video.episodes.every(
-                        (e) => e.isSelected,
-                      );
-                      if (!task.isCollection) {
-                        task.isSelected = video.isSelected;
-                      }
-                      service.scheduleSaveTasks(notifyNow: true);
+                      service.setEpisodeSelected(task, video, ep, val ?? false);
                     },
                   ),
 
@@ -2902,9 +3447,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                         );
                                       }).toList(),
                                       onChanged: (val) {
-                                        ep.selectedVideoQuality = val;
-                                        service.scheduleSaveTasks(
-                                          notifyNow: true,
+                                        service.setEpisodeVideoQuality(
+                                          task,
+                                          ep,
+                                          val,
                                         );
                                       },
                                       hint: const Text(
@@ -2963,9 +3509,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                         ),
                                       ],
                                       onChanged: (val) {
-                                        ep.selectedSubtitle = val;
-                                        service.scheduleSaveTasks(
-                                          notifyNow: true,
+                                        service.setEpisodeSubtitle(
+                                          task,
+                                          ep,
+                                          val,
                                         );
                                       },
                                       hint: const Text(
@@ -3112,19 +3659,23 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
   }
 
-  Widget _buildBottomBar(BilibiliDownloadService service, int selectedCount) {
+  Widget _buildBottomBar(
+    BilibiliDownloadService service,
+    BilibiliSelectionSummary selection,
+  ) {
     return BottomAppBar(
       color: const Color(0xFF1E1E1E),
+      padding: EdgeInsets.zero,
       child: SizedBox(
         height: 64,
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
-            _buildBottomAction(
+            _buildSelectionAction(
               Icons.select_all,
               "全选",
               service.selectAll,
-              subtitle: "已选 $selectedCount 项",
+              selection,
             ),
             _buildBottomAction(
               Icons.download,
@@ -3149,6 +3700,73 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
   }
 
+  Widget _buildSelectionAction(
+    IconData icon,
+    String label,
+    VoidCallback onTap,
+    BilibiliSelectionSummary selection,
+  ) {
+    final isSmallScreen = MediaQuery.sizeOf(context).width < 400;
+    final detailText =
+        '独立视频 ${selection.standaloneVideoCount} 个\n'
+        '分P视频 ${selection.multipartVideoCount} 个，已选 ${selection.multipartPartCount} 个分P\n'
+        '合集 ${selection.collectionCount} 个，合集内视频 ${selection.collectionVideoCount} 个'
+        '${selection.collectionItemCount == selection.collectionVideoCount ? '' : '，已选 ${selection.collectionItemCount} 项'}';
+
+    return Expanded(
+      child: Tooltip(
+        message: detailText,
+        triggerMode: TooltipTriggerMode.longPress,
+        child: InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: isSmallScreen ? 2 : 4,
+              vertical: 4,
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, color: Colors.white, size: isSmallScreen ? 18 : 20),
+                const SizedBox(height: 1),
+                Text(
+                  '$label · ${selection.selectedItemCount}项',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: isSmallScreen ? 9 : 10,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  '单${selection.standaloneVideoCount}  分P${selection.multipartVideoCount}/${selection.multipartPartCount}',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: isSmallScreen ? 8.5 : 9,
+                    height: 1.05,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  '合集${selection.collectionCount}/${selection.collectionVideoCount}',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: isSmallScreen ? 8.5 : 9,
+                    height: 1.05,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildBottomAction(
     IconData icon,
     String label,
@@ -3158,47 +3776,49 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }) {
     final isSmallScreen = MediaQuery.of(context).size.width < 400;
 
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: isSmallScreen ? 4.0 : 8.0,
-          vertical: 8.0,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              icon,
-              color: isDestructive ? Colors.redAccent : Colors.white,
-              size: isSmallScreen ? 20 : 24,
-            ),
-            const SizedBox(height: 2),
-            Text(
-              label,
-              style: TextStyle(
+    return Expanded(
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: isSmallScreen ? 4.0 : 8.0,
+            vertical: 8.0,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
                 color: isDestructive ? Colors.redAccent : Colors.white,
-                fontSize: isSmallScreen ? 9 : 10,
+                size: isSmallScreen ? 20 : 24,
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            if (subtitle != null) ...[
               const SizedBox(height: 2),
               Text(
-                subtitle,
+                label,
                 style: TextStyle(
-                  color: isDestructive
-                      ? Colors.redAccent.withValues(alpha: 0.7)
-                      : Colors.white70,
-                  fontSize: isSmallScreen ? 8 : 9,
+                  color: isDestructive ? Colors.redAccent : Colors.white,
+                  fontSize: isSmallScreen ? 9 : 10,
                 ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
+              if (subtitle != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  style: TextStyle(
+                    color: isDestructive
+                        ? Colors.redAccent.withValues(alpha: 0.7)
+                        : Colors.white70,
+                    fontSize: isSmallScreen ? 8 : 9,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );

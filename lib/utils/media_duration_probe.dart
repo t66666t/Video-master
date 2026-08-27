@@ -4,6 +4,7 @@ import 'dart:developer' as developer;
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/media_information_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/foundation.dart';
 import 'package:video_player/video_player.dart';
@@ -20,7 +21,9 @@ class MediaDurationProbe {
     if (!kDebugMode) return;
     try {
       final client = HttpClient();
-      final request = await client.postUrl(Uri.parse('http://127.0.0.1:7777/event'));
+      final request = await client.postUrl(
+        Uri.parse('http://127.0.0.1:7777/event'),
+      );
       request.headers.contentType = ContentType.json;
       request.write(
         jsonEncode({
@@ -38,7 +41,10 @@ class MediaDurationProbe {
     } catch (_) {}
   }
 
-  static Future<int> probeDurationMs(String mediaPath) async {
+  static Future<int> probeDurationMs(
+    String mediaPath, {
+    bool allowVideoPlayerFallback = true,
+  }) async {
     try {
       final file = File(mediaPath);
       if (!await file.exists()) {
@@ -77,6 +83,10 @@ class MediaDurationProbe {
         }
       }
 
+      if (!allowVideoPlayerFallback) {
+        return 0;
+      }
+
       // #region debug-point D:probe-fallback-videoplayer
       unawaited(
         _reportDebugEvent(
@@ -104,10 +114,26 @@ class MediaDurationProbe {
       Platform.isWindows || Platform.isMacOS || Platform.isLinux;
 
   static Future<int> _probeWithFfprobeKit(String mediaPath) async {
+    MediaInformationSession? runningSession;
+    var timedOut = false;
     try {
-      final session = await FFprobeKit.getMediaInformation(
-        mediaPath,
-      ).timeout(const Duration(seconds: 12));
+      final completer = Completer<MediaInformationSession>();
+      runningSession = await FFprobeKit.getMediaInformationAsync(mediaPath, (
+        session,
+      ) {
+        if (!timedOut && !completer.isCompleted) {
+          completer.complete(session);
+        }
+      });
+      late MediaInformationSession session;
+      try {
+        session = await completer.future.timeout(const Duration(seconds: 12));
+      } on TimeoutException {
+        timedOut = true;
+        await runningSession.cancel();
+        developer.log('FFprobeKit duration probe timed out: $mediaPath');
+        return 0;
+      }
       final info = session.getMediaInformation();
       final returnCode = await session.getReturnCode();
       if (!ReturnCode.isSuccess(returnCode) || info == null) {
@@ -129,7 +155,7 @@ class MediaDurationProbe {
   static Future<int> _probeWithFfprobeCli(String mediaPath) async {
     try {
       final ffprobePath = await FFmpegUtils.ffprobePath;
-      final result = await Process.run(ffprobePath, [
+      final process = await Process.start(ffprobePath, [
         '-v',
         'error',
         '-show_entries',
@@ -137,11 +163,34 @@ class MediaDurationProbe {
         '-of',
         'default=noprint_wrappers=1:nokey=1',
         mediaPath,
-      ]).timeout(const Duration(seconds: 12));
-      if (result.exitCode != 0) {
+      ]);
+      final stdoutFuture = process.stdout.transform(utf8.decoder).join();
+      final stderrFuture = process.stderr.transform(utf8.decoder).join();
+      late int exitCode;
+      try {
+        exitCode = await process.exitCode.timeout(const Duration(seconds: 12));
+      } on TimeoutException {
+        process.kill();
+        try {
+          await process.exitCode.timeout(const Duration(seconds: 2));
+        } catch (_) {}
+        await stdoutFuture.timeout(
+          const Duration(seconds: 1),
+          onTimeout: () => '',
+        );
+        await stderrFuture.timeout(
+          const Duration(seconds: 1),
+          onTimeout: () => '',
+        );
+        developer.log('CLI ffprobe duration probe timed out: $mediaPath');
         return 0;
       }
-      final durationSec = double.tryParse(result.stdout.toString().trim());
+      final stdoutText = await stdoutFuture;
+      await stderrFuture;
+      if (exitCode != 0) {
+        return 0;
+      }
+      final durationSec = double.tryParse(stdoutText.trim());
       if (durationSec == null || durationSec <= 0) {
         return 0;
       }

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -13,13 +14,24 @@ Future<void> showBilibiliLoginDialog(BuildContext context) async {
   // Check if we already have cookies
   final hasCookie = await service.apiService.hasCookie();
   // Double check with online validation if hasCookie is true
-  bool isValid = false;
+  var loginStatus = BilibiliLoginStatus.loggedOut;
   if (hasCookie) {
-     isValid = await service.apiService.checkLoginStatus();
+    loginStatus = await service.apiService.checkLoginStatusDetailed();
   }
-  
-  String statusText = isValid ? "已登录" : (hasCookie ? "已失效" : "未登录");
-  Color statusColor = isValid ? Colors.green : (hasCookie ? Colors.orange : Colors.grey);
+
+  final String statusText;
+  final Color statusColor;
+  switch (loginStatus) {
+    case BilibiliLoginStatus.loggedIn:
+      statusText = "已登录";
+      statusColor = Colors.green;
+    case BilibiliLoginStatus.loggedOut:
+      statusText = hasCookie ? "已失效" : "未登录";
+      statusColor = hasCookie ? Colors.orange : Colors.grey;
+    case BilibiliLoginStatus.unavailable:
+      statusText = "已保存（当前无法联网验证）";
+      statusColor = Colors.orange;
+  }
 
   if (!context.mounted) return;
 
@@ -33,7 +45,13 @@ Future<void> showBilibiliLoginDialog(BuildContext context) async {
           Row(
             children: [
               const Text("状态: "),
-              Text(statusText, style: TextStyle(color: statusColor, fontWeight: FontWeight.bold)),
+              Text(
+                statusText,
+                style: TextStyle(
+                  color: statusColor,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 20),
@@ -47,7 +65,10 @@ Future<void> showBilibiliLoginDialog(BuildContext context) async {
           ),
           const SizedBox(height: 20),
           const Divider(),
-          const Text("或手动输入 SESSDATA:", style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const Text(
+            "或手动输入 SESSDATA:",
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
           const SizedBox(height: 10),
           TextField(
             controller: cookieController,

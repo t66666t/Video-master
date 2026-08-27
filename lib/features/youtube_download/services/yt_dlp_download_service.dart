@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/level.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -11,25 +12,74 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
 import 'package:video_player_app/features/youtube_download/platform/yt_dlp_native_bridge.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_android_post_process_policy.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_installer.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_location_store.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_updater.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_platform_asset.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_version.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_request_builder.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
+import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/app_wakelock_coordinator.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/services/task_subtitle_storage_service.dart';
 import 'package:video_player_app/services/temporary_storage_cleanup_models.dart';
 
-/// 后台 Isolate 中执行的 JSON 编码，避免主线程卡顿
-String _encodeJsonMaps(List<Map<String, dynamic>> maps) => jsonEncode(maps);
+/// 任务状态的 JSON 编解码全部在后台 Isolate 中完成，避免任务较多时阻塞 UI。
+@visibleForTesting
+String encodeYtDlpTaskStateV2(List<YtDlpTaskRecord> tasks) => jsonEncode({
+  'version': 2,
+  'tasks': tasks.map((task) => task.toJson()).toList(growable: false),
+});
+
+@visibleForTesting
+List<YtDlpTaskRecord> decodeYtDlpTaskState(String raw) {
+  final decoded = jsonDecode(raw);
+  final rawTasks = decoded is Map
+      ? (decoded['tasks'] as List? ?? const [])
+      : (decoded as List? ?? const []);
+  return rawTasks
+      .whereType<Map>()
+      .map((item) => YtDlpTaskRecord.fromJson(Map<String, dynamic>.from(item)))
+      .toList(growable: false);
+}
+
+/// Task removal may delete resumable/intermediate artifacts only. Final media,
+/// subtitles, thumbnails copied to the library, and any unrelated file are
+/// never eligible, even when their name contains the task marker.
+@visibleForTesting
+bool isSafeYtDlpTaskRemovalArtifact(String filePath, String taskId) {
+  final name = p.basename(filePath);
+  if (!name.contains('__$taskId.')) {
+    return false;
+  }
+  final lower = name.toLowerCase();
+  return lower.endsWith('.part') ||
+      lower.endsWith('.ytdl') ||
+      lower.endsWith('.tmp') ||
+      lower.endsWith('.temp') ||
+      lower.endsWith('.frag') ||
+      RegExp(r'\.f\d+\.[^.]+$').hasMatch(lower);
+}
+
+class _YtDlpPauseCancellation implements Exception {
+  const _YtDlpPauseCancellation();
+
+  @override
+  String toString() => '任务已暂停';
+}
 
 class YtDlpDownloadService extends ChangeNotifier {
   static const String _tasksPrefsKey = 'yt_dlp_tasks_v1';
-  static const String _completedTasksPrefsKey = 'yt_dlp_completed_tasks_v1';
-  static const String _failedTasksPrefsKey = 'yt_dlp_failed_tasks_v1';
+  static const String _taskStateV2PrefsKey = 'yt_dlp_state_v2';
   static const String _sessionPrefsKey = 'yt_dlp_session_config_v1';
+  static const String _speedAndRetryDefaultsV2PrefsKey =
+      'yt_dlp_speed_and_retry_defaults_v2';
   static const String _downloadPreferencesPrefsKey =
       'yt_dlp_download_preferences_v1';
   static const String _pendingAndroidTempCleanupPrefsKey =
@@ -38,8 +88,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   static const String _selectedContainerPrefsKey =
       'yt_dlp_last_output_container';
   static const String _audioOnlyPrefsKey = 'yt_dlp_last_audio_only';
-  static const int _maxFallbackAttempts = 10;
-  static const int _maxHistoryItems = 30;
+  static const int _maxFallbackAttempts = 2;
   static const Duration _thumbnailRequestTimeout = Duration(seconds: 8);
   static const Duration _thumbnailResponseTimeout = Duration(seconds: 12);
   static const Duration _thumbnailImageConvertTimeout = Duration(seconds: 10);
@@ -47,11 +96,8 @@ class YtDlpDownloadService extends ChangeNotifier {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
   static const List<String> _fallbackPlayerClientCandidates = [
-    'tv_embedded',
-    'mweb',
-    'web',
-    'ios',
     'android',
+    'visionos',
   ];
 
   final Uuid _uuid = const Uuid();
@@ -63,28 +109,42 @@ class YtDlpDownloadService extends ChangeNotifier {
   final Map<String, int> _taskIndexById = {};
   // 缓存的任务 ID 列表，仅在任务结构变更时更新，避免 Selector 每次 notify 都重建列表
   List<String> _cachedTaskIds = const [];
-  final List<YtDlpTaskRecord> recentCompletedTasks = [];
-  final List<YtDlpTaskRecord> recentFailedTasks = [];
 
   Future<void>? _initFuture;
+  Future<void>? _runtimePrepareFuture;
   StreamSubscription<DownloadTaskEvent>? _taskEventSub;
   Timer? _persistDebounceTimer;
   Timer? _progressNotifyTimer;
+  Future<void>? _persistenceDrainFuture;
+  int _taskStateRevision = 0;
+  int _persistedTaskStateRevision = 0;
+  bool _persistenceDrainRequested = false;
   DownloadSessionConfig _sessionConfig = DownloadSessionConfig.defaults();
   YtDlpDownloadPreferences _downloadPreferences =
       YtDlpDownloadPreferences.defaults();
   YtDlpBinaryStatus _binaryStatus = const YtDlpBinaryStatus();
+  YtDlpBinaryLocationSettings? _binaryLocationSettings;
   YtDlpBinaryReleaseInfo? _latestYtDlpRelease;
   final Map<String, DateTime> _lastTaskEventAt = <String, DateTime>{};
+  final Set<String> _pauseRequestedTaskIds = <String>{};
+  final Map<String, Completer<void>> _pauseConfirmationCompleters =
+      <String, Completer<void>>{};
+  final Map<String, int> _executionGenerations = <String, int>{};
+  final Set<String> _androidFinalizeCancellationRequested = <String>{};
+  final Map<String, int> _androidFfmpegSessionIds = <String, int>{};
   bool _isInitialized = false;
   bool _runtimePrepared = false;
   bool _isPageActive = false;
-  bool _hasPendingProgressPersistence = false;
   bool _hasPendingProgressUiRefresh = false;
   bool _isUpdatingYtDlp = false;
   double? _ytDlpUpdateProgress;
   String _ytDlpUpdateStage = '准备更新';
   String? _ytDlpUpdateError;
+  String? _managedYtDlpVersion;
+  String? _customYtDlpVersion;
+  String? _managedYtDlpPathError;
+  String? _customYtDlpPathError;
+  bool _isApplyingYtDlpPath = false;
   bool keepScreenAwakeDuringProcessing = false;
   bool isResolving = false;
   String? resolvingStatus;
@@ -106,17 +166,34 @@ class YtDlpDownloadService extends ChangeNotifier {
   DownloadSessionConfig get sessionConfig => _sessionConfig;
   YtDlpDownloadPreferences get downloadPreferences => _downloadPreferences;
   YtDlpBinaryStatus get binaryStatus => _binaryStatus;
+  YtDlpBinaryLocationSettings? get binaryLocationSettings =>
+      _binaryLocationSettings;
   YtDlpBinaryReleaseInfo? get latestYtDlpRelease => _latestYtDlpRelease;
-  bool get supportsOnlineYtDlpUpdate => YtDlpBinaryUpdater.supportsOnlineUpdate;
+  bool get supportsOnlineYtDlpUpdate =>
+      YtDlpBinaryUpdater.supportsOnlineUpdate &&
+      (!supportsDesktopYtDlpPaths || usesManagedYtDlp);
+  bool get supportsLatestYtDlpReleaseCheck =>
+      YtDlpBinaryUpdater.supportsLatestReleaseCheck;
   bool get isUpdatingYtDlp => _isUpdatingYtDlp;
   double? get ytDlpUpdateProgress => _ytDlpUpdateProgress;
   String get ytDlpUpdateStage => _ytDlpUpdateStage;
   String? get ytDlpUpdateError => _ytDlpUpdateError;
+  String? get managedYtDlpVersion => _managedYtDlpVersion;
+  String? get customYtDlpVersion => _customYtDlpVersion;
+  String? get managedYtDlpPathError => _managedYtDlpPathError;
+  String? get customYtDlpPathError => _customYtDlpPathError;
+  bool get isApplyingYtDlpPath => _isApplyingYtDlpPath;
+  bool get supportsDesktopYtDlpPaths =>
+      !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+  bool get usesManagedYtDlp =>
+      _binaryLocationSettings?.source != YtDlpBinarySource.custom;
   String get bundledYtDlpVersion => YtDlpBinaryInstaller.bundledYtDlpVersion;
   bool get hasNewerYtDlpRelease {
     final latest = _normalizeBinaryVersion(_latestYtDlpRelease?.version);
     final current = _normalizeBinaryVersion(_binaryStatus.ytDlpVersion);
-    return latest != null && current != null && latest != current;
+    return latest != null &&
+        current != null &&
+        YtDlpBinaryUpdater.compareVersions(latest, current) > 0;
   }
 
   bool get isInitialized => _isInitialized;
@@ -167,10 +244,14 @@ class YtDlpDownloadService extends ChangeNotifier {
   Future<void> deactivatePage() async {
     _isPageActive = false;
     await _syncTaskEventBinding();
+    await _flushTaskStatePersistence();
   }
 
   Future<void> _initInternal() async {
     final prefs = await SharedPreferences.getInstance();
+    if (supportsDesktopYtDlpPaths) {
+      _binaryLocationSettings = await YtDlpBinaryLocationStore.load();
+    }
     keepScreenAwakeDuringProcessing =
         prefs.getBool('yt_dlp_keep_screen_awake_during_processing') ?? false;
     await _loadPersistedState(prefs);
@@ -179,7 +260,15 @@ class YtDlpDownloadService extends ChangeNotifier {
     _syncKeepAwake();
     _metricsDirty = true;
     notifyListeners();
-    unawaited(_restoreTaskThumbnailArtifacts());
+    // 维护型磁盘与网络工作不得与页面首帧竞争。
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 1), () async {
+        if (Platform.isAndroid) {
+          await _cleanupAndroidTempOrphans();
+        }
+        await _restoreTaskThumbnailArtifacts();
+      }),
+    );
   }
 
   Future<void> _loadPersistedState(SharedPreferences prefs) async {
@@ -202,6 +291,10 @@ class YtDlpDownloadService extends ChangeNotifier {
         Map<String, dynamic>.from(_safeDecodeMap(rawDownloadPreferences)),
       );
     }
+    if (prefs.getBool(_speedAndRetryDefaultsV2PrefsKey) != true) {
+      _sessionConfig = _migrateSpeedAndRetryDefaults(_sessionConfig);
+      await prefs.setBool(_speedAndRetryDefaultsV2PrefsKey, true);
+    }
     final normalizedSessionConfig = _normalizeLoadedSessionConfig(
       _sessionConfig,
     );
@@ -218,39 +311,24 @@ class YtDlpDownloadService extends ChangeNotifier {
       await _nativeBridge.saveYoutubeSessionConfig(_sessionConfig);
     }
 
-    final rawTasks = prefs.getString(_tasksPrefsKey);
+    final rawV2State = prefs.getString(_taskStateV2PrefsKey);
+    final rawLegacyTasks = prefs.getString(_tasksPrefsKey);
+    final rawTasks = rawV2State?.isNotEmpty == true
+        ? rawV2State!
+        : rawLegacyTasks;
+    var needsTaskStateMigration = rawV2State?.isNotEmpty != true;
     if (rawTasks != null && rawTasks.isNotEmpty) {
       try {
+        final restoredTasks = await compute(decodeYtDlpTaskState, rawTasks);
         tasks
           ..clear()
-          ..addAll(decodeTaskList(rawTasks));
+          ..addAll(restoredTasks);
       } catch (_) {
         tasks.clear();
       }
     }
 
-    final rawCompleted = prefs.getString(_completedTasksPrefsKey);
-    if (rawCompleted != null && rawCompleted.isNotEmpty) {
-      try {
-        recentCompletedTasks
-          ..clear()
-          ..addAll(decodeTaskList(rawCompleted));
-      } catch (_) {
-        recentCompletedTasks.clear();
-      }
-    }
-
-    final rawFailed = prefs.getString(_failedTasksPrefsKey);
-    if (rawFailed != null && rawFailed.isNotEmpty) {
-      try {
-        recentFailedTasks
-          ..clear()
-          ..addAll(decodeTaskList(rawFailed));
-      } catch (_) {
-        recentFailedTasks.clear();
-      }
-    }
-
+    var recoveredInterruptedTask = false;
     for (var i = 0; i < tasks.length; i++) {
       final task = tasks[i];
       if (task.status == YtDlpTaskStatus.downloading ||
@@ -263,31 +341,22 @@ class YtDlpDownloadService extends ChangeNotifier {
           errorMessage: '应用重启后可继续',
           lastFailedAtIso: DateTime.now().toIso8601String(),
         );
+        recoveredInterruptedTask = true;
       }
     }
 
-    if (Platform.isAndroid) {
-      await _cleanupAndroidTempOrphans();
-    }
-
-    _refreshHistorySnapshots();
-    await _persistTaskState(prefs: prefs);
     _rebuildTaskIndex();
+    if (needsTaskStateMigration || recoveredInterruptedTask) {
+      _taskStateRevision++;
+      _scheduleTaskStatePersistence(delay: Duration.zero);
+    }
   }
 
   Future<void> _restoreTaskThumbnailArtifacts() async {
     try {
-      var changed = false;
-      for (var i = 0; i < tasks.length; i++) {
-        final updated = await _withEnsuredTaskThumbnail(tasks[i]);
-        if (updated != tasks[i]) {
-          tasks[i] = updated;
-          changed = true;
-        }
-      }
-      if (changed) {
-        await saveTasks();
-      }
+      // Historical thumbnails are intentionally restored lazily by each card.
+      // Eagerly probing/downloading every thumbnail here made page entry and
+      // scrolling contend with filesystem and network work.
       await _cleanupOrphanTaskThumbnailArtifacts();
     } catch (e) {
       debugPrint('恢复 yt-dlp 任务缩略图失败: $e');
@@ -401,14 +470,236 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
   }
 
-  Future<void> _ensureRuntimeReady({bool forceRefresh = false}) async {
+  Future<void> _ensureRuntimeReady({bool forceRefresh = false}) {
     if (_runtimePrepared && !forceRefresh) {
-      return;
+      return Future<void>.value();
     }
+    final active = _runtimePrepareFuture;
+    if (active != null) return active;
+    final future = _prepareRuntime();
+    _runtimePrepareFuture = future;
+    return future.whenComplete(() {
+      if (identical(_runtimePrepareFuture, future)) {
+        _runtimePrepareFuture = null;
+      }
+    });
+  }
+
+  Future<void> _prepareRuntime() async {
     await YtDlpBinaryInstaller.ensureInstalled();
+    if (supportsDesktopYtDlpPaths) {
+      await _configureDesktopBinaryPaths();
+    }
     _binaryStatus = await _nativeBridge.getBinaryStatus();
     _runtimePrepared = true;
     notifyListeners();
+  }
+
+  Future<void> _configureDesktopBinaryPaths() async {
+    _binaryLocationSettings ??= await YtDlpBinaryLocationStore.load();
+    final platformAsset = await YtDlpPlatformAsset.current();
+    final managedPath = platformAsset == null
+        ? null
+        : await YtDlpBinaryInstaller.resolveInstalledBinaryPath(
+            platformAsset.installedFileName,
+          );
+    final configuredCustomPath =
+        _binaryLocationSettings?.customBinaryPath.trim() ?? '';
+    final ytDlpPath =
+        _binaryLocationSettings?.source == YtDlpBinarySource.custom
+        ? (configuredCustomPath.isEmpty ? null : configuredCustomPath)
+        : managedPath;
+    final ffmpegPath = await YtDlpBinaryInstaller.resolveInstalledBinaryPath(
+      Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg',
+    );
+    await _nativeBridge.configureBinaryPaths(
+      ytDlpPath: ytDlpPath,
+      ffmpegPath: ffmpegPath,
+    );
+  }
+
+  Future<String?> _resolveActiveDesktopYtDlpPath() async {
+    _binaryLocationSettings ??= await YtDlpBinaryLocationStore.load();
+    if (_binaryLocationSettings?.source == YtDlpBinarySource.custom) {
+      final customPath = _binaryLocationSettings!.customBinaryPath.trim();
+      return customPath.isEmpty ? null : customPath;
+    }
+    return YtDlpBinaryInstaller.resolveManagedYtDlpPath();
+  }
+
+  Future<void> refreshDesktopYtDlpPaths() async {
+    if (!supportsDesktopYtDlpPaths) return;
+    _binaryLocationSettings = await YtDlpBinaryLocationStore.load();
+    await _refreshDesktopBinaryPathVersions();
+    notifyListeners();
+  }
+
+  Future<bool> selectYtDlpBinarySource(YtDlpBinarySource source) async {
+    if (!supportsDesktopYtDlpPaths || _isApplyingYtDlpPath) return false;
+    if (isResolving || hasProcessingTasks) {
+      final message = '请等待当前解析或下载任务结束后再切换 yt-dlp';
+      if (source == YtDlpBinarySource.managed) {
+        _managedYtDlpPathError = message;
+      } else {
+        _customYtDlpPathError = message;
+      }
+      notifyListeners();
+      return false;
+    }
+    _isApplyingYtDlpPath = true;
+    notifyListeners();
+    try {
+      _binaryLocationSettings ??= await YtDlpBinaryLocationStore.load();
+      await _refreshDesktopBinaryPathVersions();
+      if (source == YtDlpBinarySource.managed && _managedYtDlpVersion == null) {
+        _managedYtDlpPathError ??= '软件管理的 yt-dlp 不可用，请迁移到可写目录或重新安装';
+        return false;
+      }
+      if (source == YtDlpBinarySource.custom && _customYtDlpVersion == null) {
+        _customYtDlpPathError ??= '请先选择有效的 yt-dlp 文件';
+        return false;
+      }
+      _binaryLocationSettings = _binaryLocationSettings!.copyWith(
+        source: source,
+      );
+      await YtDlpBinaryLocationStore.save(_binaryLocationSettings!);
+      _runtimePrepared = false;
+      await _ensureRuntimeReady(forceRefresh: true);
+      return true;
+    } finally {
+      _isApplyingYtDlpPath = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> applyCustomYtDlpPath(String path) async {
+    if (!supportsDesktopYtDlpPaths || _isApplyingYtDlpPath) return false;
+    if (isResolving || hasProcessingTasks) {
+      _customYtDlpPathError = '请等待当前解析或下载任务结束后再更改 yt-dlp';
+      notifyListeners();
+      return false;
+    }
+    _isApplyingYtDlpPath = true;
+    _customYtDlpPathError = null;
+    notifyListeners();
+    try {
+      final normalized = path.trim();
+      final probe = await _probeDesktopYtDlp(normalized);
+      if (probe.error != null) {
+        _customYtDlpVersion = null;
+        _customYtDlpPathError = probe.error;
+        return false;
+      }
+      _binaryLocationSettings ??= await YtDlpBinaryLocationStore.load();
+      _binaryLocationSettings = _binaryLocationSettings!.copyWith(
+        customBinaryPath: p.normalize(normalized),
+      );
+      _customYtDlpVersion = probe.version;
+      await YtDlpBinaryLocationStore.save(_binaryLocationSettings!);
+      if (_binaryLocationSettings!.source == YtDlpBinarySource.custom) {
+        _runtimePrepared = false;
+        await _ensureRuntimeReady(forceRefresh: true);
+      }
+      return true;
+    } finally {
+      _isApplyingYtDlpPath = false;
+      notifyListeners();
+    }
+  }
+
+  Future<bool> migrateManagedYtDlpDirectory(String path) async {
+    if (!supportsDesktopYtDlpPaths || _isApplyingYtDlpPath) return false;
+    if (isResolving || hasProcessingTasks) {
+      _managedYtDlpPathError = '请等待当前解析或下载任务结束后再迁移 yt-dlp';
+      notifyListeners();
+      return false;
+    }
+    _isApplyingYtDlpPath = true;
+    _managedYtDlpPathError = null;
+    notifyListeners();
+    try {
+      await YtDlpBinaryInstaller.migrateInstallDirectory(path);
+      _binaryLocationSettings = await YtDlpBinaryLocationStore.load();
+      await YtDlpBinaryInstaller.ensureInstalled();
+      await _refreshDesktopBinaryPathVersions();
+      if (_managedYtDlpVersion == null) {
+        _managedYtDlpPathError ??= '迁移后未能运行 yt-dlp';
+        return false;
+      }
+      _runtimePrepared = false;
+      await _ensureRuntimeReady(forceRefresh: true);
+      return true;
+    } catch (error) {
+      _managedYtDlpPathError = _cleanBinaryPathError(error);
+      return false;
+    } finally {
+      _isApplyingYtDlpPath = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _refreshDesktopBinaryPathVersions() async {
+    if (!supportsDesktopYtDlpPaths) return;
+    _binaryLocationSettings ??= await YtDlpBinaryLocationStore.load();
+    final platformAsset = await YtDlpPlatformAsset.current();
+    if (platformAsset == null) {
+      _managedYtDlpVersion = null;
+      _managedYtDlpPathError = '当前处理器架构没有对应的官方 yt-dlp 稳定版';
+      return;
+    }
+    final managedPath = p.join(
+      _binaryLocationSettings!.managedDirectory,
+      platformAsset.installedFileName,
+    );
+    final managedProbe = await _probeDesktopYtDlp(managedPath);
+    _managedYtDlpVersion = managedProbe.version;
+    _managedYtDlpPathError = managedProbe.error;
+
+    final customPath = _binaryLocationSettings!.customBinaryPath.trim();
+    if (customPath.isEmpty) {
+      _customYtDlpVersion = null;
+      _customYtDlpPathError =
+          _binaryLocationSettings!.source == YtDlpBinarySource.custom
+          ? '请选择有效的 yt-dlp 文件'
+          : null;
+      return;
+    }
+    final customProbe = await _probeDesktopYtDlp(customPath);
+    _customYtDlpVersion = customProbe.version;
+    _customYtDlpPathError = customProbe.error;
+  }
+
+  Future<({String? version, String? error})> _probeDesktopYtDlp(
+    String path,
+  ) async {
+    final trimmed = path.trim();
+    if (trimmed.isEmpty) {
+      return (version: null, error: '路径不能为空');
+    }
+    if (!p.isAbsolute(trimmed)) {
+      return (version: null, error: '必须使用绝对文件路径');
+    }
+    final file = File(trimmed);
+    if (!await file.exists()) {
+      return (version: null, error: '文件不存在，请重新选择');
+    }
+    try {
+      final result = await Process.run(file.path, const [
+        '--version',
+      ]).timeout(const Duration(seconds: 15));
+      final output = '${result.stdout}\n${result.stderr}'.trim();
+      final version = YtDlpVersions.extractStableVersion(output);
+      if (result.exitCode != 0 || version == null) {
+        return (version: null, error: '所选文件不是可用的 yt-dlp，请重新选择');
+      }
+      return (version: version, error: null);
+    } catch (error) {
+      return (version: null, error: '无法运行所选文件：${_cleanBinaryPathError(error)}');
+    }
+  }
+
+  String _cleanBinaryPathError(Object error) {
+    return error.toString().replaceFirst(RegExp(r'^\w+(?:Exception)?:\s*'), '');
   }
 
   Future<void> _bindTaskEventsIfNeeded() async {
@@ -442,33 +733,68 @@ class YtDlpDownloadService extends ChangeNotifier {
     await _unbindTaskEventsIfIdle();
   }
 
-  Future<void> _flushPendingProgressPersistence() async {
-    final hadPending = _hasPendingProgressPersistence;
-    _persistDebounceTimer?.cancel();
-    _persistDebounceTimer = null;
-    if (!hadPending) {
-      return;
-    }
-    _hasPendingProgressPersistence = false;
-    final prefs = await SharedPreferences.getInstance();
-    await _persistTaskState(prefs: prefs);
+  void _markTaskStateDirty({Duration delay = const Duration(seconds: 1)}) {
+    _taskStateRevision++;
+    _scheduleTaskStatePersistence(delay: delay);
   }
 
-  void _scheduleProgressPersistence() {
-    _hasPendingProgressPersistence = true;
+  void _scheduleTaskStatePersistence({required Duration delay}) {
+    _persistenceDrainRequested = true;
     _persistDebounceTimer?.cancel();
-    _persistDebounceTimer = Timer(const Duration(seconds: 1), () {
+    _persistDebounceTimer = Timer(delay, () {
       _persistDebounceTimer = null;
-      if (!_hasPendingProgressPersistence) {
-        return;
-      }
-      unawaited(_flushPendingProgressPersistence());
+      unawaited(_drainTaskStatePersistence());
     });
+  }
+
+  Future<void> _drainTaskStatePersistence() {
+    final active = _persistenceDrainFuture;
+    if (active != null) {
+      _persistenceDrainRequested = true;
+      return active;
+    }
+    final future = _drainTaskStatePersistenceInternal();
+    _persistenceDrainFuture = future;
+    return future.whenComplete(() {
+      _persistenceDrainFuture = null;
+      if (_persistenceDrainRequested ||
+          _persistedTaskStateRevision < _taskStateRevision) {
+        unawaited(_drainTaskStatePersistence());
+      }
+    });
+  }
+
+  Future<void> _drainTaskStatePersistenceInternal() async {
+    while (_persistenceDrainRequested ||
+        _persistedTaskStateRevision < _taskStateRevision) {
+      _persistenceDrainRequested = false;
+      final revision = _taskStateRevision;
+      final snapshot = List<YtDlpTaskRecord>.of(tasks, growable: false);
+      final encoded = await compute(encodeYtDlpTaskStateV2, snapshot);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_taskStateV2PrefsKey, encoded);
+      _persistedTaskStateRevision = revision;
+    }
+  }
+
+  Future<void> _flushTaskStatePersistence() async {
+    _persistDebounceTimer?.cancel();
+    _persistDebounceTimer = null;
+    if (_persistedTaskStateRevision >= _taskStateRevision &&
+        !_persistenceDrainRequested) {
+      return;
+    }
+    _persistenceDrainRequested = true;
+    await _drainTaskStatePersistence();
+    final inFlight = _persistenceDrainFuture;
+    if (inFlight != null) {
+      await inFlight;
+    }
   }
 
   void _notifyProgressUpdate() {
     _syncKeepAwake();
-    _scheduleProgressPersistence();
+    _markTaskStateDirty();
     _hasPendingProgressUiRefresh = true;
     if (_progressNotifyTimer != null) {
       return;
@@ -478,8 +804,8 @@ class YtDlpDownloadService extends ChangeNotifier {
         ? (tasks.length >= 60
               ? const Duration(milliseconds: 500)
               : tasks.length >= 25 && Platform.isWindows
-                  ? const Duration(milliseconds: 380)
-                  : _activeTaskProgressThrottle)
+              ? const Duration(milliseconds: 380)
+              : _activeTaskProgressThrottle)
         : (tasks.length >= 60
               ? const Duration(milliseconds: 900)
               : _backgroundTaskProgressThrottle);
@@ -502,23 +828,23 @@ class YtDlpDownloadService extends ChangeNotifier {
   Future<void> shutdown() async {
     _isPageActive = false;
     _clearPendingProgressUiRefresh();
-    await _flushPendingProgressPersistence();
+    await _flushTaskStatePersistence();
     await _taskEventSub?.cancel();
     _taskEventSub = null;
-    await saveTasks();
+    await saveTasks(flush: true);
   }
 
-  Future<void> saveTasks() async {
+  Future<void> saveTasks({bool flush = false}) async {
     _clearPendingProgressUiRefresh();
-    await _flushPendingProgressPersistence();
     _rebuildTaskIndex();
     _metricsDirty = true;
-    final prefs = await SharedPreferences.getInstance();
-    _refreshHistorySnapshots();
-    await _persistTaskState(prefs: prefs);
     _syncKeepAwake();
-    await _syncTaskEventBinding();
     notifyListeners();
+    _markTaskStateDirty(delay: const Duration(milliseconds: 250));
+    unawaited(_syncTaskEventBinding());
+    if (flush) {
+      await _flushTaskStatePersistence();
+    }
   }
 
   Future<void> saveSessionConfig(DownloadSessionConfig config) async {
@@ -789,9 +1115,27 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (index < 0) return;
     final current = tasks[index];
     if (current.meta == null || !current.canStart) return;
+    final pauseConfirmation = _pauseConfirmationCompleters[task.taskId];
+    if (_pauseRequestedTaskIds.contains(task.taskId) &&
+        pauseConfirmation != null &&
+        !pauseConfirmation.isCompleted) {
+      try {
+        await pauseConfirmation.future.timeout(
+          const Duration(milliseconds: 500),
+        );
+      } catch (_) {
+        // Native pause already reported a stopped result. The execution fence
+        // below still rejects any late paused event from the previous run.
+      }
+    }
+    _pauseRequestedTaskIds.remove(task.taskId);
+    _pauseConfirmationCompleters.remove(task.taskId);
+    _androidFinalizeCancellationRequested.remove(task.taskId);
     final previousTempArtifactKey = current.tempArtifactKey;
+    final isResumingPausedTask = current.status == YtDlpTaskStatus.paused;
 
     if (Platform.isAndroid &&
+        !isResumingPausedTask &&
         previousTempArtifactKey != null &&
         previousTempArtifactKey.isNotEmpty) {
       await _cleanupAndroidTempArtifactsByKey(previousTempArtifactKey);
@@ -808,7 +1152,7 @@ class YtDlpDownloadService extends ChangeNotifier {
       lastFailedAtIso: null,
       executionSessionConfig: current.executionSessionConfig ?? _sessionConfig,
       request: null,
-      tempArtifactKey: null,
+      tempArtifactKey: isResumingPausedTask ? previousTempArtifactKey : null,
       progress: 0,
       downloadedBytes: null,
       totalBytes: null,
@@ -888,11 +1232,16 @@ class YtDlpDownloadService extends ChangeNotifier {
     String? tempArtifactKey;
     var launchRequest = request;
     if (_shouldUseAndroidStagedFallback) {
-      tempArtifactKey = _createAndroidTempArtifactKey(task);
+      final reusableKey = task.tempArtifactKey?.trim();
+      final resolvedTempArtifactKey = reusableKey?.isNotEmpty == true
+          ? reusableKey!
+          : _createAndroidTempArtifactKey(task);
+      tempArtifactKey = resolvedTempArtifactKey;
       launchRequest = await _buildAndroidStagedRequest(
         task: task,
         baseRequest: request,
-        tempArtifactKey: tempArtifactKey,
+        tempArtifactKey: resolvedTempArtifactKey,
+        resumePartial: reusableKey?.isNotEmpty == true,
       );
     }
     tasks[index] = tasks[index].copyWith(
@@ -909,7 +1258,12 @@ class YtDlpDownloadService extends ChangeNotifier {
     await saveTasks();
     await _bindTaskEventsIfNeeded();
 
-    final started = await _nativeBridge.startYoutubeDownload(launchRequest);
+    final generation = (_executionGenerations[taskId] ?? 0) + 1;
+    _executionGenerations[taskId] = generation;
+    final started = await _nativeBridge.startYoutubeDownload(
+      launchRequest,
+      generation: generation,
+    );
     if (!started) {
       if (Platform.isAndroid && tempArtifactKey != null) {
         await _cleanupAndroidTempArtifactsByKey(tempArtifactKey);
@@ -926,7 +1280,6 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   Future<void> pauseTask(YtDlpTaskRecord task) async {
-    await ensureReady(requireRuntime: true);
     final index = _indexOfTask(task.taskId);
     if (index < 0) return;
     final current = tasks[index];
@@ -944,18 +1297,96 @@ class YtDlpDownloadService extends ChangeNotifier {
       await saveTasks();
       return;
     }
+    _pauseRequestedTaskIds.add(task.taskId);
+    _pauseConfirmationCompleters[task.taskId] = Completer<void>();
     tasks[index] = current.copyWith(
       status: YtDlpTaskStatus.pausing,
       errorMessage: '正在暂停...',
     );
-    await saveTasks();
-    final paused = await _nativeBridge.pauseYoutubeDownload(task.taskId);
+    // 先让 UI 在当前事件循环中得到反馈，再发原生命令；持久化在后台合并。
+    _rebuildTaskIndex();
+    _metricsDirty = true;
+    _syncKeepAwake();
+    notifyListeners();
+    _markTaskStateDirty(delay: const Duration(milliseconds: 250));
+
+    if (Platform.isAndroid &&
+        current.status == YtDlpTaskStatus.postProcessing) {
+      _androidFinalizeCancellationRequested.add(task.taskId);
+      final sessionId = _androidFfmpegSessionIds[task.taskId];
+      if (sessionId != null) {
+        try {
+          await FFmpegKit.cancel(sessionId);
+        } catch (_) {}
+      }
+      final latestIndex = _indexOfTask(task.taskId);
+      if (latestIndex >= 0) {
+        tasks[latestIndex] = tasks[latestIndex].copyWith(
+          status: YtDlpTaskStatus.paused,
+          speedText: null,
+          etaText: null,
+          errorMessage: '已暂停，可继续下载',
+        );
+        await saveTasks();
+        await _tryStartNextQueuedTask(excludingTaskId: task.taskId);
+      }
+      return;
+    }
+
+    YtDlpPauseResult pauseResult;
+    try {
+      pauseResult = await _nativeBridge
+          .pauseYoutubeDownload(task.taskId)
+          .timeout(
+            const Duration(milliseconds: 500),
+            onTimeout: () => const YtDlpPauseResult.rejected('暂停确认超时'),
+          );
+    } catch (error) {
+      pauseResult = YtDlpPauseResult.rejected(error.toString());
+    }
     final latestIndex = _indexOfTask(task.taskId);
     if (latestIndex < 0) return;
-    if (!paused) {
+    if (pauseResult.accepted && pauseResult.stopped) {
+      final latest = tasks[latestIndex];
+      tasks[latestIndex] = latest.copyWith(
+        status: YtDlpTaskStatus.paused,
+        speedText: null,
+        etaText: null,
+        errorMessage: '已暂停，可继续下载',
+      );
+      await saveTasks();
+      await _tryStartNextQueuedTask(excludingTaskId: task.taskId);
+      return;
+    }
+
+    final platformStatus = await _nativeBridge.getYoutubeTaskStatus(
+      task.taskId,
+    );
+    final nativeStatus = platformStatus?['status']?.toString();
+    if (nativeStatus == 'paused' ||
+        (nativeStatus == null && pauseResult.reason == '暂停确认超时')) {
+      tasks[latestIndex] = tasks[latestIndex].copyWith(
+        status: YtDlpTaskStatus.paused,
+        speedText: null,
+        etaText: null,
+        errorMessage: '已暂停，可继续下载',
+      );
+      await saveTasks();
+      await _tryStartNextQueuedTask(excludingTaskId: task.taskId);
+      return;
+    }
+
+    if (!pauseResult.accepted) {
+      _pauseRequestedTaskIds.remove(task.taskId);
+      final confirmation = _pauseConfirmationCompleters.remove(task.taskId);
+      if (confirmation != null && !confirmation.isCompleted) {
+        confirmation.complete();
+      }
       tasks[latestIndex] = tasks[latestIndex].copyWith(
         status: current.status,
-        errorMessage: '暂停失败，请稍后重试',
+        errorMessage: pauseResult.reason?.isNotEmpty == true
+            ? '暂停失败：${pauseResult.reason}'
+            : '暂停失败，请稍后重试',
       );
       await saveTasks();
     }
@@ -1011,6 +1442,7 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (!current.canRetry) {
       return;
     }
+    await _cleanupArtifactsBeforeRetry(current);
     tasks[index] = tasks[index].copyWith(
       status: YtDlpTaskStatus.pending,
       statusMessage: null,
@@ -1038,10 +1470,7 @@ class YtDlpDownloadService extends ChangeNotifier {
     await startTask(tasks[index]);
   }
 
-  Future<void> removeTask(
-    YtDlpTaskRecord task, {
-    bool deleteCompletedOutput = true,
-  }) async {
+  Future<void> removeTask(YtDlpTaskRecord task) async {
     await ensureReady(requireRuntime: true);
     final isProcessing =
         task.status == YtDlpTaskStatus.queued ||
@@ -1054,11 +1483,9 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
     await _nativeBridge.removeYoutubeTask(task.taskId);
     if (Platform.isAndroid) {
-      await _cleanupAndroidArtifactsForTask(
-        task,
-        deleteCompletedOutput: deleteCompletedOutput,
-        forgetTrackedKey: true,
-      );
+      await _cleanupAndroidArtifactsForTask(task, forgetTrackedKey: true);
+    } else {
+      await _cleanupDesktopTaskArtifacts(task, deleteAllTaskArtifacts: false);
     }
     await _deleteTaskThumbnailArtifact(task.localThumbnailPath);
     tasks.removeWhere((item) => item.taskId == task.taskId);
@@ -1108,13 +1535,11 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   Future<void> pauseSelected() async {
-    await ensureReady(activatePage: true, requireRuntime: true);
+    await ensureReady(activatePage: true);
     final selected = tasks
         .where((item) => item.isSelected && item.canPause)
         .toList();
-    for (final task in selected) {
-      await pauseTask(task);
-    }
+    await Future.wait(selected.map(pauseTask));
   }
 
   Future<void> cancelSelected() async {
@@ -1164,7 +1589,8 @@ class YtDlpDownloadService extends ChangeNotifier {
         failureContext: null,
         completedAtIso: null,
         lastFailedAtIso: null,
-        executionSessionConfig: current.executionSessionConfig ?? _sessionConfig,
+        executionSessionConfig:
+            current.executionSessionConfig ?? _sessionConfig,
         request: null,
         tempArtifactKey: null,
         progress: 0,
@@ -1239,7 +1665,6 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   void _persistSelectionState() {
-    notifyListeners();
     unawaited(saveTasks());
   }
 
@@ -1372,7 +1797,6 @@ class YtDlpDownloadService extends ChangeNotifier {
       return 0;
     }
 
-    final subtitleDir = await _resolveLibrarySubtitleDirectory();
     final thumbnailDir = await _resolveLibraryThumbnailDirectory();
     var importedCount = 0;
     for (var ci = 0; ci < candidates.length; ci++) {
@@ -1392,6 +1816,9 @@ class YtDlpDownloadService extends ChangeNotifier {
         continue;
       }
 
+      final itemId = _uuid.v4();
+      final subtitleDir = await const TaskSubtitleStorageService()
+          .taskDirectory(itemId, create: true);
       final copiedSubtitles = await _copyLibrarySubtitleArtifacts(
         task: candidate,
         outputPath: outputPath,
@@ -1412,8 +1839,19 @@ class YtDlpDownloadService extends ChangeNotifier {
             )
           : null;
 
+      final mediaChapters = MediaChapter.normalize(
+        (candidate.meta?.chapters ?? const <ChapterInfo>[]).map(
+          (chapter) => MediaChapter(
+            title: chapter.title,
+            startMs: ((chapter.startTimeSeconds ?? 0) * 1000).round(),
+            endMs: ((chapter.endTimeSeconds ?? 0) * 1000).round(),
+          ),
+        ),
+        durationMs: (candidate.meta?.durationSeconds ?? 0) * 1000,
+      );
+
       final item = VideoItem(
-        id: _uuid.v4(),
+        id: itemId,
         path: outputPath,
         title: _resolveLibraryItemTitle(candidate, outputPath),
         thumbnailPath: thumbnailPath,
@@ -1426,6 +1864,8 @@ class YtDlpDownloadService extends ChangeNotifier {
         codec: _inferLibraryCodec(candidate),
         type: _resolveLibraryMediaType(candidate, outputPath),
         sourceRef: candidate.sourceRef,
+        chapters: mediaChapters,
+        hasProbedChapters: mediaChapters.isNotEmpty,
       );
       final videoId = await library.addSingleVideo(item, useOriginalPath: true);
       if (videoId != null && videoId.isNotEmpty) {
@@ -1527,7 +1967,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   Future<YtDlpBinaryReleaseInfo?> refreshLatestYtDlpRelease() async {
-    if (!supportsOnlineYtDlpUpdate) {
+    if (!supportsLatestYtDlpReleaseCheck) {
       _latestYtDlpRelease = null;
       _ytDlpUpdateError = null;
       notifyListeners();
@@ -1540,6 +1980,7 @@ class YtDlpDownloadService extends ChangeNotifier {
       notifyListeners();
       return release;
     } catch (error) {
+      _latestYtDlpRelease = null;
       _ytDlpUpdateError = error.toString();
       notifyListeners();
       rethrow;
@@ -1560,13 +2001,15 @@ class YtDlpDownloadService extends ChangeNotifier {
 
     _isUpdatingYtDlp = true;
     _ytDlpUpdateProgress = 0;
-    _ytDlpUpdateStage = '正在检查最新版本';
+    _ytDlpUpdateStage = '正在检查最新稳定版';
     _ytDlpUpdateError = null;
     notifyListeners();
     try {
       final result = await _binaryUpdater.updateToLatest(
         currentVersion: _binaryStatus.ytDlpVersion,
-        currentBinaryPath: _binaryStatus.ytDlpPath,
+        validateBinary: Platform.isAndroid
+            ? _nativeBridge.reloadAndroidRuntime
+            : null,
         onProgress: (progress) {
           _ytDlpUpdateStage = '正在下载 yt-dlp';
           _ytDlpUpdateProgress = progress;
@@ -1579,6 +2022,15 @@ class YtDlpDownloadService extends ChangeNotifier {
       _latestYtDlpRelease = result.release;
       _runtimePrepared = false;
       await _ensureRuntimeReady(forceRefresh: true);
+      final activeVersion = _normalizeBinaryVersion(_binaryStatus.ytDlpVersion);
+      final expectedVersion = _normalizeBinaryVersion(result.currentVersion);
+      if (!_binaryStatus.ytDlpReady || activeVersion != expectedVersion) {
+        throw StateError(
+          'yt-dlp 已写入 ${result.currentVersion}，但运行环境未加载该版本。'
+          '当前路径: ${_binaryStatus.ytDlpPath ?? '未找到'}，'
+          '当前版本: ${_binaryStatus.ytDlpVersion ?? 'unknown'}',
+        );
+      }
       return result;
     } catch (error) {
       _ytDlpUpdateError = error.toString();
@@ -1607,12 +2059,28 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (index < 0) return;
 
     final current = tasks[index];
+    final activeGeneration = _executionGenerations[event.taskId];
+    if (event.generation != null &&
+        activeGeneration != null &&
+        event.generation != activeGeneration) {
+      return;
+    }
+    if (event.type == 'task_paused' &&
+        !_pauseRequestedTaskIds.contains(event.taskId) &&
+        current.status != YtDlpTaskStatus.pausing &&
+        current.status != YtDlpTaskStatus.paused) {
+      // A terminal event from the previous native execution must never pause
+      // a newly resumed generation of the same task.
+      return;
+    }
     final normalizedStatusMessage = _normalizeTaskStatusMessage(event);
     final updatedStepMessages = _appendTaskStepMessage(
       current.stepMessages,
       normalizedStatusMessage,
     );
-    final isPauseTransition = current.status == YtDlpTaskStatus.pausing;
+    final isPauseTransition =
+        _pauseRequestedTaskIds.contains(event.taskId) ||
+        current.status == YtDlpTaskStatus.pausing;
     final isLateActiveEvent =
         event.type == 'task_queued' ||
         event.type == 'task_started' ||
@@ -1629,7 +2097,9 @@ class YtDlpDownloadService extends ChangeNotifier {
         outputPath: event.outputPath ?? current.outputPath,
         statusMessage: normalizedStatusMessage ?? current.statusMessage,
         stepMessages: updatedStepMessages,
-        errorMessage: '正在暂停...',
+        errorMessage: current.status == YtDlpTaskStatus.paused
+            ? '已暂停，可继续下载'
+            : '正在暂停...',
       );
       if (event.type == 'task_progress') {
         _notifyProgressUpdate();
@@ -1678,20 +2148,46 @@ class YtDlpDownloadService extends ChangeNotifier {
           : current.lastFailedAtIso,
     );
     tasks[index] = updated;
-    if (Platform.isAndroid &&
-        (event.type == 'task_failed' || event.type == 'task_cancelled')) {
-      await _cleanupAndroidArtifactsForTask(updated, forgetTrackedKey: true);
-      tasks[index] = tasks[index].copyWith(
-        tempArtifactKey: null,
-        outputPath: await _isAndroidTempPath(updated.outputPath)
-            ? null
-            : tasks[index].outputPath,
-      );
+    if (event.type == 'task_paused' ||
+        event.type == 'task_completed' ||
+        event.type == 'task_failed' ||
+        event.type == 'task_cancelled') {
+      _pauseRequestedTaskIds.remove(event.taskId);
+      final confirmation = _pauseConfirmationCompleters.remove(event.taskId);
+      if (confirmation != null && !confirmation.isCompleted) {
+        confirmation.complete();
+      }
+    }
+    if (event.type == 'task_failed' || event.type == 'task_cancelled') {
+      if (Platform.isAndroid) {
+        await _cleanupAndroidArtifactsForTask(updated, forgetTrackedKey: true);
+        tasks[index] = tasks[index].copyWith(
+          tempArtifactKey: null,
+          outputPath: await _isAndroidTempPath(updated.outputPath)
+              ? null
+              : tasks[index].outputPath,
+        );
+      } else {
+        await _cleanupDesktopTaskArtifacts(
+          updated,
+          deleteAllTaskArtifacts: true,
+        );
+        tasks[index] = tasks[index].copyWith(
+          outputPath: null,
+          producedPaths: const [],
+        );
+      }
     }
     if (event.type == 'task_progress') {
       _notifyProgressUpdate();
     } else {
-      await saveTasks();
+      final isDurableTerminalEvent =
+          event.type == 'task_paused' ||
+          event.type == 'task_failed' ||
+          event.type == 'task_cancelled' ||
+          (event.type == 'task_completed' &&
+              !(Platform.isAndroid && current.tempArtifactKey != null));
+      await saveTasks(flush: isDurableTerminalEvent);
     }
     if (Platform.isAndroid &&
         event.type == 'task_completed' &&
@@ -1725,6 +2221,11 @@ class YtDlpDownloadService extends ChangeNotifier {
         await saveTasks();
         if (finalized.status == YtDlpTaskStatus.completed) {
           await _handleCompletedTaskAutomation(finalized);
+        } else if (finalized.status == YtDlpTaskStatus.failed) {
+          final didFallback = await _tryAutoFallback(finalized);
+          if (didFallback) {
+            return;
+          }
         }
       }
       await _tryStartNextQueuedTask(excludingTaskId: event.taskId);
@@ -1769,7 +2270,7 @@ class YtDlpDownloadService extends ChangeNotifier {
       if (current == null) {
         return;
       }
-      await removeTask(current, deleteCompletedOutput: false);
+      await removeTask(current);
     } catch (e) {
       final message = '自动导入失败: $e';
       debugPrint(message);
@@ -1907,6 +2408,11 @@ class YtDlpDownloadService extends ChangeNotifier {
     DownloadSessionConfig config,
   ) {
     var normalized = config;
+    normalized = normalized.copyWith(
+      retries: (normalized.retries ?? 2).clamp(0, 2),
+      fragmentRetries: (normalized.fragmentRetries ?? 2).clamp(0, 2),
+      concurrentFragments: (normalized.concurrentFragments ?? 4).clamp(1, 16),
+    );
     final hasLegacyForcedClients =
         _sameStringList(normalized.enabledPlayerClients, const [
           'tv_embedded',
@@ -1942,6 +2448,25 @@ class YtDlpDownloadService extends ChangeNotifier {
       normalized = normalized.copyWith(outputDirectory: null);
     }
     return normalized;
+  }
+
+  DownloadSessionConfig _migrateSpeedAndRetryDefaults(
+    DownloadSessionConfig config,
+  ) {
+    final oldConcurrentFragments = config.concurrentFragments;
+    return config.copyWith(
+      retries: config.retries == null || config.retries! > 2
+          ? 2
+          : config.retries,
+      fragmentRetries:
+          config.fragmentRetries == null || config.fragmentRetries! > 2
+          ? 2
+          : config.fragmentRetries,
+      concurrentFragments:
+          oldConcurrentFragments == null || oldConcurrentFragments == 1
+          ? 4
+          : oldConcurrentFragments,
+    );
   }
 
   bool _sameSessionConfig(
@@ -2019,13 +2544,13 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   bool get _shouldUseAndroidStagedFallback =>
-      Platform.isAndroid && !_binaryStatus.ffmpegReady;
+      Platform.isAndroid && !_binaryStatus.ffmpegCliReady;
 
   static const Duration _activeTaskProgressThrottle = Duration(
-    milliseconds: 250,
+    milliseconds: 50,
   );
   static const Duration _backgroundTaskProgressThrottle = Duration(
-    milliseconds: 500,
+    milliseconds: 350,
   );
 
   Duration _effectiveTaskEventThrottleWindow() {
@@ -2036,17 +2561,17 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
     if (tasks.length >= 60) {
       return _isPageActive
-          ? const Duration(milliseconds: 650)
-          : const Duration(milliseconds: 1200);
+          ? const Duration(milliseconds: 240)
+          : const Duration(milliseconds: 800);
     }
     if (tasks.length >= 25) {
       return _isPageActive
-          ? const Duration(milliseconds: 450)
-          : const Duration(milliseconds: 900);
+          ? const Duration(milliseconds: 160)
+          : const Duration(milliseconds: 600);
     }
     return _isPageActive
-        ? const Duration(milliseconds: 320)
-        : const Duration(milliseconds: 650);
+        ? const Duration(milliseconds: 80)
+        : const Duration(milliseconds: 400);
   }
 
   void _rebuildTaskIndex() {
@@ -2070,39 +2595,19 @@ class YtDlpDownloadService extends ChangeNotifier {
     return idx != null ? tasks[idx] : null;
   }
 
-  /// 计算任务卡片的渲染签名（整数哈希），仅在渲染相关属性变更时变化
-  /// 用于 Selector 的 shouldRebuild 判断，避免不必要的 UI 重建
-  int taskRenderSignature(String taskId) {
-    final task = getTaskById(taskId);
-    if (task == null) return 0;
-    var hash = task.taskId.hashCode;
-    hash = _combineHash(hash, task.status.index);
-    hash = _combineHash(hash, task.isSelected.hashCode);
-    hash = _combineHash(hash, (task.progress * 1000).round());
-    hash = _combineHash(hash, task.speedText?.hashCode ?? 0);
-    hash = _combineHash(hash, task.etaText?.hashCode ?? 0);
-    hash = _combineHash(hash, task.statusMessage?.hashCode ?? 0);
-    hash = _combineHash(hash, task.errorMessage?.hashCode ?? 0);
-    hash = _combineHash(hash, task.outputPath?.hashCode ?? 0);
-    hash = _combineHash(hash, task.failureType.index);
-    hash = _combineHash(hash, task.meta?.title.hashCode ?? 0);
-    hash = _combineHash(hash, task.selection.hashCode);
-    hash = _combineHash(hash, task.stepMessages.length);
-    hash = _combineHash(hash, task.taskThumbnailPath?.hashCode ?? 0);
-    return hash;
-  }
-
-  static int _combineHash(int current, int value) {
-    return current ^ (value * 0x9e3779b97f4a7c15).toInt() +
-        0x9e3779b9 + (current << 6) + (current >> 2);
-  }
-
   bool _shouldThrottleTaskEvent(DownloadTaskEvent event) {
     if (event.type != 'task_progress') {
       _lastTaskEventAt[event.taskId] = DateTime.now();
       return false;
     }
     final now = DateTime.now();
+    // The Android Python bridge already limits a task to about 20 progress
+    // events per second. Do not throw away another layer of foreground events;
+    // the UI notifier below will coalesce rebuilds at frame-friendly intervals.
+    if (Platform.isAndroid && _isPageActive && tasks.length < 10) {
+      _lastTaskEventAt[event.taskId] = now;
+      return false;
+    }
     final last = _lastTaskEventAt[event.taskId];
     final throttleWindow = _effectiveTaskEventThrottleWindow();
     if (last != null && now.difference(last) < throttleWindow) {
@@ -2275,69 +2780,9 @@ class YtDlpDownloadService extends ChangeNotifier {
     await _launchQueuedTask(nextTask.taskId);
   }
 
-  Future<void> _persistTaskState({SharedPreferences? prefs}) async {
-    final targetPrefs = prefs ?? await SharedPreferences.getInstance();
-    // 先在主线程转换为 JSON 基本类型
-    final tasksMaps = tasks.map((t) => t.toJson()).toList();
-    final completedMaps =
-        recentCompletedTasks.map((t) => t.toJson()).toList();
-    final failedMaps = recentFailedTasks.map((t) => t.toJson()).toList();
-    // 在后台 Isolate 中并行执行 JSON 编码，避免主线程卡顿
-    final results = await Future.wait([
-      compute(_encodeJsonMaps, tasksMaps),
-      compute(_encodeJsonMaps, completedMaps),
-      compute(_encodeJsonMaps, failedMaps),
-    ]);
-    // 顺序写入 SharedPreferences
-    await targetPrefs.setString(_tasksPrefsKey, results[0]);
-    await targetPrefs.setString(
-      _completedTasksPrefsKey,
-      results[1],
-    );
-    await targetPrefs.setString(
-      _failedTasksPrefsKey,
-      results[2],
-    );
-  }
-
-  void _refreshHistorySnapshots() {
-    for (final task in tasks) {
-      if (task.status == YtDlpTaskStatus.completed ||
-          task.status == YtDlpTaskStatus.exported) {
-        _upsertHistoryRecord(
-          recentCompletedTasks,
-          task,
-          sortKey: (item) => item.completedAtIso ?? item.createdAtIso,
-        );
-      }
-      if (task.status == YtDlpTaskStatus.failed ||
-          task.status == YtDlpTaskStatus.cancelled) {
-        _upsertHistoryRecord(
-          recentFailedTasks,
-          task,
-          sortKey: (item) => item.lastFailedAtIso ?? item.createdAtIso,
-        );
-      }
-    }
-  }
-
-  void _upsertHistoryRecord(
-    List<YtDlpTaskRecord> target,
-    YtDlpTaskRecord task, {
-    required String Function(YtDlpTaskRecord item) sortKey,
-  }) {
-    final existingIndex = target.indexWhere(
-      (item) => item.taskId == task.taskId,
-    );
-    if (existingIndex >= 0) {
-      target[existingIndex] = task;
-    } else {
-      target.add(task);
-    }
-    target.sort((a, b) => sortKey(b).compareTo(sortKey(a)));
-    if (target.length > _maxHistoryItems) {
-      target.removeRange(_maxHistoryItems, target.length);
-    }
+  Future<void> _persistTaskState() async {
+    _markTaskStateDirty(delay: Duration.zero);
+    await _flushTaskStatePersistence();
   }
 
   Future<bool> _tryAutoFallback(YtDlpTaskRecord task) async {
@@ -2347,6 +2792,8 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (task.fallbackAttemptCount >= _maxFallbackAttempts) {
       return false;
     }
+
+    await _cleanupArtifactsBeforeRetry(task);
 
     final fallbackTask = _buildFallbackTask(task);
     if (fallbackTask == null) {
@@ -2430,6 +2877,10 @@ class YtDlpDownloadService extends ChangeNotifier {
         fallbackAttemptCount: attempt,
         appliedFallbackSteps: applied,
         request: null,
+        tempArtifactKey: null,
+        outputPath: null,
+        producedPaths: const [],
+        progress: 0,
         downloadedBytes: null,
         totalBytes: null,
         speedText: null,
@@ -2601,13 +3052,15 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (lower.contains('requested format') ||
         lower.contains('no video formats') ||
         lower.contains('no suitable format') ||
-        lower.contains('formats not available')) {
+        lower.contains('formats not available') ||
+        lower.contains('without a usable media artifact') ||
+        lower.contains('no media artifact')) {
       return YtDlpFailureType.noFormatAvailable;
     }
     if (lower.contains('未产出可用媒体文件') ||
         lower.contains('no media artifact') ||
         lower.contains('未找到 yt-dlp 生成的媒体临时文件')) {
-      return YtDlpFailureType.postProcessingFailed;
+      return YtDlpFailureType.noFormatAvailable;
     }
     if (lower.contains('permission denied') ||
         lower.contains('access is denied') ||
@@ -2714,15 +3167,18 @@ class YtDlpDownloadService extends ChangeNotifier {
     required YtDlpTaskRecord task,
     required NativeDownloadRequest baseRequest,
     required String tempArtifactKey,
+    bool resumePartial = false,
   }) async {
     final tempDir = await getTemporaryDirectory();
     if (!await tempDir.exists()) {
       await tempDir.create(recursive: true);
     }
-    await _cleanupAndroidTempArtifactsByKey(
-      tempArtifactKey,
-      removePendingKey: false,
-    );
+    if (!resumePartial) {
+      await _cleanupAndroidTempArtifactsByKey(
+        tempArtifactKey,
+        removePendingKey: false,
+      );
+    }
     await _addPendingAndroidTempCleanupKey(tempArtifactKey);
 
     final prefix = _androidArtifactPrefix(tempArtifactKey);
@@ -2755,8 +3211,11 @@ class YtDlpDownloadService extends ChangeNotifier {
     required String outputTemplate,
   }) {
     final args = <String>[];
-    for (var i = 0; i < originalArgs.length; i++) {
-      final arg = originalArgs[i];
+    final sourceArgs = YtDlpAndroidPostProcessPolicy.withoutThumbnailOutputArgs(
+      originalArgs,
+    );
+    for (var i = 0; i < sourceArgs.length; i++) {
+      final arg = sourceArgs[i];
       switch (arg) {
         case '--paths':
         case '-o':
@@ -2767,6 +3226,7 @@ class YtDlpDownloadService extends ChangeNotifier {
           i += 1;
           continue;
         case '--embed-metadata':
+        case '--embed-chapters':
         case '--embed-subs':
         case '--extract-audio':
           continue;
@@ -2807,7 +3267,16 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (task.selection.removeAudio) {
       return ['-f', resolvedVideoId ?? 'bestvideo/best'];
     }
-    if (resolvedVideoId != null && resolvedAudioIds.isNotEmpty) {
+    final selectedVideoHasAudio =
+        task.meta?.videoFormats.any(
+          (format) => format.formatId == resolvedVideoId && format.hasAudio,
+        ) ==
+        true;
+    final shouldMergeAudio =
+        resolvedAudioIds.isNotEmpty &&
+        (!selectedVideoHasAudio ||
+            task.selection.selectedAudioFormatIds.isNotEmpty);
+    if (resolvedVideoId != null && shouldMergeAudio) {
       return ['-f', '$resolvedVideoId+${resolvedAudioIds.first}'];
     }
     if (resolvedVideoId != null) {
@@ -2844,6 +3313,7 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
     String? finalOutputPath;
     try {
+      _throwIfAndroidFinalizeCancelled(task.taskId);
       final tempFiles = await _collectAndroidFinalizeFiles(
         task,
         hintedProducedPaths: hintedProducedPaths,
@@ -2854,9 +3324,12 @@ class YtDlpDownloadService extends ChangeNotifier {
         selectedSubtitleTracks,
         task.selection.subtitleLanguages,
       );
-      final mediaFiles =
-          tempFiles.where((file) => !_isSubtitleFile(file)).toList()
-            ..sort((a, b) => b.lengthSync().compareTo(a.lengthSync()));
+      final mediaFiles = tempFiles.where(_isPossibleMediaContainer).toList()
+        ..sort((a, b) => b.lengthSync().compareTo(a.lengthSync()));
+      debugPrint(
+        '[Android Finalize] 收集到${tempFiles.length}个临时文件: '
+        '${tempFiles.map((f) => '${p.basename(f.path)}(${f.lengthSync()}B)').toList()}',
+      );
       if (mediaFiles.isEmpty) {
         final hint = task.outputPath?.trim();
         final hintText = (hint != null && hint.isNotEmpty)
@@ -2869,12 +3342,19 @@ class YtDlpDownloadService extends ChangeNotifier {
         task.executionSessionConfig,
       );
       final targetExtension = _resolveAndroidTargetExtension(task, mediaFiles);
+      debugPrint(
+        '[Android Finalize] 目标扩展名: $targetExtension, '
+        'audioOnly=${task.selection.audioOnly}, '
+        'embedSubtitles=${task.selection.embedSubtitles}, '
+        'removeAudio=${task.selection.removeAudio}',
+      );
       final outputBaseName = _sanitizeOutputBaseName(task.title);
       finalOutputPath = await _buildUniqueOutputPath(
         outputDir,
         outputBaseName,
         targetExtension,
       );
+      _throwIfAndroidFinalizeCancelled(task.taskId);
 
       final selectedSubtitleFiles = _pickAndroidSubtitleInputs(
         subtitleFiles,
@@ -2893,12 +3373,13 @@ class YtDlpDownloadService extends ChangeNotifier {
           outputPath: finalOutputPath,
         );
         if (!usedFfmpeg) {
-          await _moveFileToPath(source, finalOutputPath);
+          await _moveFileToPath(source, finalOutputPath, taskId: task.taskId);
         }
       } else {
         final source = videoInput ?? mediaFiles.first;
         final needsFfmpeg =
             task.selection.embedSubtitles ||
+            (task.meta?.chapters.isNotEmpty ?? false) ||
             task.selection.removeAudio ||
             audioInput != null ||
             shouldEmbedSubtitles ||
@@ -2907,6 +3388,15 @@ class YtDlpDownloadService extends ChangeNotifier {
             _needsVideoTranscodeForMp4(task, targetExtension) ||
             _needsAudioTranscodeForMp4(task, targetExtension);
         if (needsFfmpeg) {
+          debugPrint(
+            '[Android Finalize] 需要FFmpeg处理: '
+            'videoInput=${videoInput != null ? p.basename(videoInput.path) : "null"}'
+            '(${videoInput != null ? videoInput.lengthSync() : 0}B), '
+            'audioInput=${audioInput != null ? p.basename(audioInput.path) : "null"}'
+            '(${audioInput != null ? audioInput.lengthSync() : 0}B), '
+            'subtitleInputs=${selectedSubtitleFiles.map((f) => p.basename(f.path)).toList()}, '
+            'outputPath=${p.basename(finalOutputPath)}',
+          );
           await _runAndroidVideoFinalizeFfmpeg(
             task: task,
             videoInput: source,
@@ -2920,11 +3410,16 @@ class YtDlpDownloadService extends ChangeNotifier {
           );
           usedFfmpeg = true;
         } else {
-          await _moveFileToPath(source, finalOutputPath);
+          await _moveFileToPath(source, finalOutputPath, taskId: task.taskId);
         }
       }
 
-      await _copyAndroidSubtitleOutputs(subtitleFiles, finalOutputPath);
+      _throwIfAndroidFinalizeCancelled(task.taskId);
+      await _copyAndroidSubtitleOutputs(
+        subtitleFiles,
+        finalOutputPath,
+        taskId: task.taskId,
+      );
       await _cleanupAndroidTempArtifactsByKey(key);
       return task.copyWith(
         status: YtDlpTaskStatus.completed,
@@ -2938,6 +3433,16 @@ class YtDlpDownloadService extends ChangeNotifier {
         completedAtIso: DateTime.now().toIso8601String(),
         tempArtifactKey: null,
       );
+    } on _YtDlpPauseCancellation {
+      if (finalOutputPath != null) {
+        await _deleteAndroidFinalOutputArtifacts(finalOutputPath);
+      }
+      return task.copyWith(
+        status: YtDlpTaskStatus.paused,
+        speedText: null,
+        etaText: null,
+        errorMessage: '已暂停，可继续下载',
+      );
     } catch (e) {
       if (finalOutputPath != null) {
         await _deleteAndroidFinalOutputArtifacts(finalOutputPath);
@@ -2945,11 +3450,17 @@ class YtDlpDownloadService extends ChangeNotifier {
       await _cleanupAndroidTempArtifactsByKey(key);
       return task.copyWith(
         status: YtDlpTaskStatus.failed,
-        failureType: YtDlpFailureType.postProcessingFailed,
+        failureType: _mapFailureText(e.toString()),
         errorMessage: 'Android 本地 FFmpeg 后处理失败: $e',
         lastFailedAtIso: DateTime.now().toIso8601String(),
         tempArtifactKey: null,
       );
+    }
+  }
+
+  void _throwIfAndroidFinalizeCancelled(String taskId) {
+    if (_androidFinalizeCancellationRequested.contains(taskId)) {
+      throw const _YtDlpPauseCancellation();
     }
   }
 
@@ -3286,8 +3797,49 @@ class YtDlpDownloadService extends ChangeNotifier {
         return matched;
       }
     }
-    final remaining = mediaFiles.where((file) => file.path != videoInput?.path);
+    // 兜底：只从可能是音频/视频的扩展名中选取，避免把 jpg/json/info 等非媒体文件当音频输入
+    final remaining = mediaFiles
+        .where((file) => file.path != videoInput?.path)
+        .where(_isPossibleMediaContainer)
+        .toList();
     return remaining.isEmpty ? null : remaining.first;
+  }
+
+  /// 扩展名是否可能是音频/视频容器（排除图片、JSON、纯字幕等）。
+  bool _isPossibleMediaContainer(File file) {
+    final ext = p.extension(file.path).replaceFirst('.', '').toLowerCase();
+    if (!YtDlpAndroidPostProcessPolicy.isMediaContainerPath(file.path)) {
+      return false;
+    }
+    // Thumbnail files use the same format-id output template as their source
+    // video. Keep them out of candidate selection even when their name matches.
+    // 注意：.webm 可能同时包含视频和音频，应归入音频候选
+    return {
+      'm4a',
+      'mp3',
+      'aac',
+      'opus',
+      'ogg',
+      'oga',
+      'wav',
+      'flac',
+      'wma',
+      'mp4',
+      'mkv',
+      'mka',
+      'webm',
+      'avi',
+      'mov',
+      'flv',
+      '3gp',
+      'ts',
+      'm2ts',
+      'mpeg',
+      'mpg',
+      'wmv',
+      'm4v',
+      'ogv',
+    }.contains(ext);
   }
 
   File? _matchAndroidFileByFormatId(List<File> files, String? formatId) {
@@ -3408,7 +3960,7 @@ class YtDlpDownloadService extends ChangeNotifier {
         break;
     }
     args.add(outputPath);
-    await _runAndroidFfmpeg(args);
+    await _runAndroidFfmpeg(args, task: task, stageLabel: '正在本地转换音频');
     return true;
   }
 
@@ -3423,28 +3975,43 @@ class YtDlpDownloadService extends ChangeNotifier {
   }) async {
     final args = <String>['-y', '-i', videoInput.path];
     final subtitleStreamIndexes = <int>[];
+    var nextInputIndex = 1;
     if (audioInput != null && audioInput.path != videoInput.path) {
       args.addAll(['-i', audioInput.path]);
+      nextInputIndex++;
     }
     for (final subtitleInput in subtitleInputs) {
-      final inputIndex =
-          1 +
-          (audioInput != null && audioInput.path != videoInput.path ? 1 : 0) +
-          subtitleStreamIndexes.length;
+      final inputIndex = nextInputIndex++;
       subtitleStreamIndexes.add(inputIndex);
       args.addAll(['-i', subtitleInput.path]);
     }
+    final chapterMetadataFile = await _createAndroidChapterMetadataFile(task);
+    final chapterInputIndex = chapterMetadataFile == null
+        ? null
+        : nextInputIndex++;
+    if (chapterMetadataFile != null) {
+      args.addAll(['-f', 'ffmetadata', '-i', chapterMetadataFile.path]);
+    }
 
-    args.addAll(['-map', '0:v:0']);
+    // Upper-case V excludes attached pictures/cover-art streams. Mapping
+    // 0:v:0 can pick an embedded WebP cover and break Matroska muxing.
+    args.addAll([
+      '-map',
+      YtDlpAndroidPostProcessPolicy.primaryVideoStreamSpecifier,
+    ]);
     if (!task.selection.removeAudio) {
       if (audioInput != null && audioInput.path != videoInput.path) {
-        args.addAll(['-map', '1:a:0']);
+        // ? 可选映射：如果音频文件不含音频流也不报错，兜底保护
+        args.addAll(['-map', '1:a?']);
       } else {
         args.addAll(['-map', '0:a?']);
       }
     }
     for (final subtitleIndex in subtitleStreamIndexes) {
       args.addAll(['-map', '$subtitleIndex:0']);
+    }
+    if (chapterInputIndex != null) {
+      args.addAll(['-map_chapters', '$chapterInputIndex']);
     }
 
     final targetIsMp4 = targetExtension.toLowerCase() == 'mp4';
@@ -3506,7 +4073,55 @@ class YtDlpDownloadService extends ChangeNotifier {
       args.addAll(['-movflags', '+faststart']);
     }
     args.add(outputPath);
-    await _runAndroidFfmpeg(args);
+    try {
+      await _runAndroidFfmpeg(
+        args,
+        task: task,
+        stageLabel: needsVideoTranscode || needsAudioTranscode
+            ? '正在本地转码并合成'
+            : '正在本地合并音视频',
+      );
+    } finally {
+      if (chapterMetadataFile != null && await chapterMetadataFile.exists()) {
+        await chapterMetadataFile.delete();
+      }
+    }
+  }
+
+  Future<File?> _createAndroidChapterMetadataFile(YtDlpTaskRecord task) async {
+    final chapters = task.meta?.chapters ?? const <ChapterInfo>[];
+    if (chapters.isEmpty) return null;
+    final buffer = StringBuffer(';FFMETADATA1\n');
+    var chapterCount = 0;
+    for (final chapter in chapters) {
+      final startMs = ((chapter.startTimeSeconds ?? 0) * 1000).round();
+      final endMs = ((chapter.endTimeSeconds ?? 0) * 1000).round();
+      if (endMs <= startMs) continue;
+      chapterCount++;
+      buffer
+        ..writeln('[CHAPTER]')
+        ..writeln('TIMEBASE=1/1000')
+        ..writeln('START=$startMs')
+        ..writeln('END=$endMs')
+        ..writeln('title=${_escapeAndroidFfmetadata(chapter.title)}');
+    }
+    if (chapterCount == 0) return null;
+    final tempDirectory = await getTemporaryDirectory();
+    final safeTaskId = task.taskId.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    final file = File(
+      p.join(tempDirectory.path, 'ytdlp_${safeTaskId}_chapters.ffmeta'),
+    );
+    await file.writeAsString(buffer.toString(), flush: true);
+    return file;
+  }
+
+  String _escapeAndroidFfmetadata(String value) {
+    return value
+        .replaceAll('\\', '\\\\')
+        .replaceAll('\n', r'\n')
+        .replaceAll('=', r'\=')
+        .replaceAll(';', r'\;')
+        .replaceAll('#', r'\#');
   }
 
   String _ffmpegLanguageTag(String languageCode) {
@@ -3596,17 +4211,223 @@ class YtDlpDownloadService extends ChangeNotifier {
         codec.contains('eac3');
   }
 
-  Future<void> _runAndroidFfmpeg(List<String> args) async {
-    final session = await FFmpegKit.executeWithArguments(args);
+  Future<void> _runAndroidFfmpeg(
+    List<String> args, {
+    required YtDlpTaskRecord task,
+    required String stageLabel,
+  }) async {
+    final cmdSummary = args.length > 20
+        ? [...args.take(20), '...(共${args.length}个参数)'].join(' ')
+        : args.join(' ');
+    debugPrint('[Android FFmpeg] 执行: $cmdSummary');
+
+    _throwIfAndroidFinalizeCancelled(task.taskId);
+    _updateAndroidFinalizeProgress(task, 0.92, stageLabel);
+    final completedSession = Completer<dynamic>();
+    final startedSession = await FFmpegKit.executeWithArgumentsAsync(
+      args,
+      (session) {
+        if (!completedSession.isCompleted) {
+          completedSession.complete(session);
+        }
+      },
+      null,
+      (statistics) {
+        final durationSeconds = task.meta?.durationSeconds;
+        if (durationSeconds == null || durationSeconds <= 0) {
+          return;
+        }
+        final fraction = (statistics.getTime() / (durationSeconds * 1000))
+            .clamp(0.0, 1.0);
+        final progress = 0.92 + fraction * 0.07;
+        final speed = statistics.getSpeed();
+        final detail = speed > 0
+            ? '$stageLabel · ${speed.toStringAsFixed(1)}×'
+            : stageLabel;
+        _updateAndroidFinalizeProgress(task, progress, detail);
+      },
+    );
+    final sessionId = startedSession.getSessionId();
+    if (sessionId != null) {
+      _androidFfmpegSessionIds[task.taskId] = sessionId;
+    }
+    if (_androidFinalizeCancellationRequested.contains(task.taskId)) {
+      await startedSession.cancel();
+    }
+    final session = await completedSession.future;
+    _androidFfmpegSessionIds.remove(task.taskId);
+    _throwIfAndroidFinalizeCancelled(task.taskId);
     final returnCode = await session.getReturnCode();
     if (ReturnCode.isSuccess(returnCode)) {
+      debugPrint('[Android FFmpeg] 成功');
       return;
     }
-    final logs = await session.getAllLogsAsString();
-    throw Exception(logs ?? 'FFmpeg 退出码异常');
+
+    // 先检查 failTrace（仅 state=FAILED 时有）
+    final failTrace = await session.getFailStackTrace();
+    debugPrint(
+      '[Android FFmpeg] 失败, returnCode=$returnCode, failTrace=$failTrace',
+    );
+
+    // getAllLogsAsString 带 timeout 等待异步日志全部到达；
+    // 注意：getLogs() 明确不等待，不可依赖它做错误过滤。
+    final allLogs = await session.getAllLogsAsString(5000) ?? '';
+    // 补充用 getLogs() 再取一次（此时大概率已到齐），做分级过滤
+    final logs = await session.getLogs();
+
+    debugPrint('[Android FFmpeg] 完整日志(${allLogs.length}chars): $allLogs');
+
+    final shortMessage = _extractFfmpegErrorSummary(
+      allLogs: allLogs,
+      logs: logs,
+      returnCode: returnCode,
+      failTrace: failTrace,
+    );
+    throw Exception(shortMessage);
   }
 
-  Future<void> _moveFileToPath(File source, String targetPath) async {
+  void _updateAndroidFinalizeProgress(
+    YtDlpTaskRecord task,
+    double progress,
+    String message,
+  ) {
+    final index = _indexOfTask(task.taskId);
+    if (index < 0) {
+      return;
+    }
+    final current = tasks[index];
+    if (current.status != YtDlpTaskStatus.postProcessing) {
+      return;
+    }
+    tasks[index] = current.copyWith(
+      progress: progress.clamp(0.92, 0.99),
+      statusMessage: message,
+      speedText: null,
+      etaText: null,
+    );
+    _notifyProgressUpdate();
+  }
+
+  /// 从 FFmpeg 大量日志中提取简短有效的错误摘要。
+  ///
+  /// 策略：
+  /// 1) failStackTrace（FFmpegKit 内置错误栈）
+  /// 2) 从 getLogs() 按级别过滤 ERROR/FATAL/PANIC/STDERR
+  /// 3) 取 getAllyLogsAsString() 末尾 60 行 + 关键错误过滤
+  /// 4) 末尾 1500 字符兜底
+  String _extractFfmpegErrorSummary({
+    required String allLogs,
+    required List<dynamic>? logs,
+    required dynamic returnCode,
+    String? failTrace,
+  }) {
+    final rcStr = returnCode?.toString() ?? '?';
+
+    // 1) failStackTrace
+    if (failTrace != null && failTrace.trim().isNotEmpty) {
+      final short = failTrace.length > 1500
+          ? failTrace.substring(failTrace.length - 1500)
+          : failTrace;
+      return 'FFmpeg 退出码=$rcStr\n$short';
+    }
+
+    // 2) 分级日志：ERROR / FATAL / PANIC / STDERR
+    final errorLines = <String>[];
+    final warningLines = <String>[];
+    if (logs != null && logs.isNotEmpty) {
+      for (final log in logs) {
+        try {
+          final lv = (log as dynamic).getLevel() as int;
+          final msg = (log as dynamic).getMessage()?.toString() ?? '';
+          if (lv == Level.avLogError ||
+              lv == Level.avLogFatal ||
+              lv == Level.avLogPanic ||
+              lv == Level.avLogStderr) {
+            errorLines.add(msg);
+          } else if (lv == Level.avLogWarning) {
+            warningLines.add(msg);
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (errorLines.isNotEmpty) {
+      var result = 'FFmpeg 退出码=$rcStr';
+      final tail = errorLines.length > 12
+          ? errorLines.sublist(errorLines.length - 12)
+          : errorLines;
+      result += '\n${tail.join('\n')}';
+      if (warningLines.isNotEmpty) {
+        final warnTail = warningLines.length > 5
+            ? warningLines.sublist(warningLines.length - 5)
+            : warningLines;
+        result += '\n[警告]\n${warnTail.join('\n')}';
+      }
+      return result;
+    }
+
+    // 3) 取全部日志末尾（部分 FFmpeg 错误不用 ERROR 级别）
+    final lines = allLogs
+        .split('\n')
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
+
+    if (lines.isEmpty) {
+      return 'FFmpeg 退出码=$rcStr（无日志输出）';
+    }
+
+    final tailCount = lines.length > 60 ? 60 : lines.length;
+    final tail = lines.sublist(lines.length - tailCount);
+
+    // 过滤可能的错误行
+    final tailErrors = tail.where((l) {
+      final lower = l.toLowerCase();
+      return lower.contains('error') ||
+          lower.contains('fatal') ||
+          lower.contains('invalid') ||
+          lower.contains('failed') ||
+          lower.contains('cannot') ||
+          lower.contains('unable') ||
+          lower.contains('no such') ||
+          lower.contains('permission') ||
+          lower.contains('denied') ||
+          lower.contains('not found') ||
+          lower.contains('could not') ||
+          lower.contains('conversion failed') ||
+          lower.contains('output file') ||
+          lower.contains('does not contain') ||
+          (lower.startsWith('[') && lower.contains(' @ '));
+    }).toList();
+
+    if (tailErrors.isNotEmpty) {
+      final show = tailErrors.length > 15
+          ? tailErrors.sublist(tailErrors.length - 15)
+          : tailErrors;
+      return 'FFmpeg 退出码=$rcStr\n${show.join('\n')}';
+    }
+
+    // 4) 兜底：末尾 1500 字符
+    final tailText = tail.join('\n');
+    final snippet = tailText.length > 1500
+        ? '..(截断)..\n${tailText.substring(tailText.length - 1500)}'
+        : tailText;
+
+    if (warningLines.isNotEmpty) {
+      final warnTail = warningLines.length > 5
+          ? warningLines.sublist(warningLines.length - 5)
+          : warningLines;
+      return 'FFmpeg 退出码=$rcStr\n[警告]\n${warnTail.join('\n')}\n---\n$snippet';
+    }
+    return 'FFmpeg 退出码=$rcStr\n$snippet';
+  }
+
+  Future<void> _moveFileToPath(
+    File source,
+    String targetPath, {
+    required String taskId,
+  }) async {
+    _throwIfAndroidFinalizeCancelled(taskId);
     final targetFile = File(targetPath);
     if (!await targetFile.parent.exists()) {
       await targetFile.parent.create(recursive: true);
@@ -3624,6 +4445,7 @@ class YtDlpDownloadService extends ChangeNotifier {
         int offset = 0;
         const chunkSize = 1024 * 1024 * 4; // 4MB
         while (offset < length) {
+          _throwIfAndroidFinalizeCancelled(taskId);
           final bytes = await rafSource.read(chunkSize);
           await rafTarget.writeFrom(bytes);
           offset += bytes.length;
@@ -3641,13 +4463,15 @@ class YtDlpDownloadService extends ChangeNotifier {
 
   Future<void> _copyAndroidSubtitleOutputs(
     List<File> subtitleFiles,
-    String finalOutputPath,
-  ) async {
+    String finalOutputPath, {
+    required String taskId,
+  }) async {
     if (subtitleFiles.isEmpty) {
       return;
     }
     final base = p.withoutExtension(finalOutputPath);
     for (var i = 0; i < subtitleFiles.length; i++) {
+      _throwIfAndroidFinalizeCancelled(taskId);
       final source = subtitleFiles[i];
       final ext = p.extension(source.path);
       final targetPath = i == 0 ? '$base$ext' : '$base.subtitle${i + 1}$ext';
@@ -3659,9 +4483,59 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
   }
 
+  Future<void> _cleanupArtifactsBeforeRetry(YtDlpTaskRecord task) async {
+    if (Platform.isAndroid) {
+      await _cleanupAndroidArtifactsForTask(task, forgetTrackedKey: true);
+      return;
+    }
+    await _cleanupDesktopTaskArtifacts(task, deleteAllTaskArtifacts: true);
+  }
+
+  Future<void> _cleanupDesktopTaskArtifacts(
+    YtDlpTaskRecord task, {
+    required bool deleteAllTaskArtifacts,
+  }) async {
+    if (kIsWeb || Platform.isAndroid || Platform.isIOS) {
+      return;
+    }
+    final marker = '__${task.taskId}.';
+    final candidates = <String>{
+      ...task.producedPaths,
+      if (task.outputPath != null) task.outputPath!,
+    };
+    final outputDirPath = task.request?.outputDir.trim();
+    if (outputDirPath != null && outputDirPath.isNotEmpty) {
+      final outputDir = Directory(outputDirPath);
+      if (await outputDir.exists()) {
+        try {
+          await for (final entity in outputDir.list()) {
+            if (entity is File && p.basename(entity.path).contains(marker)) {
+              candidates.add(entity.path);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    for (final path in candidates) {
+      if (!isSafeYtDlpTaskRemovalArtifact(path, task.taskId) &&
+          !deleteAllTaskArtifacts) {
+        continue;
+      }
+      final name = p.basename(path);
+      if (!name.contains(marker)) {
+        continue;
+      }
+      try {
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (_) {}
+    }
+  }
+
   Future<void> _cleanupAndroidArtifactsForTask(
     YtDlpTaskRecord task, {
-    bool deleteCompletedOutput = false,
     bool forgetTrackedKey = false,
   }) async {
     final key = task.tempArtifactKey;
@@ -3671,9 +4545,6 @@ class YtDlpDownloadService extends ChangeNotifier {
       if (!cleared && !forgetTrackedKey) {
         await _addPendingAndroidTempCleanupKey(key);
       }
-    }
-    if (deleteCompletedOutput && task.outputPath != null) {
-      await _deleteAndroidFinalOutputArtifacts(task.outputPath!);
     }
   }
 
@@ -4016,15 +4887,6 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
   }
 
-  Future<Directory> _resolveLibrarySubtitleDirectory() async {
-    final dataRoot = await SettingsService().resolveLargeDataRootDir();
-    final dir = Directory(p.join(dataRoot.path, 'subtitles'));
-    if (!await dir.exists()) {
-      await dir.create(recursive: true);
-    }
-    return dir;
-  }
-
   Future<Directory> _resolveTaskThumbnailDirectory() async {
     final dataRoot = await SettingsService().resolveLargeDataRootDir();
     final dir = Directory(p.join(dataRoot.path, 'yt_dlp_task_thumbnails'));
@@ -4178,20 +5040,20 @@ class YtDlpDownloadService extends ChangeNotifier {
     required String baseFileName,
     DownloadSessionConfig? sessionConfig,
   }) async {
-    if (!kIsWeb && !Platform.isWindows && !Platform.isMacOS) {
+    if (!supportsDesktopYtDlpPaths) {
       return null; // 仅桌面端需要此后备
     }
     try {
-      final ytDlpPath = await YtDlpBinaryInstaller.resolveInstalledBinaryPath(
-        Platform.isWindows ? 'yt-dlp.exe' : 'yt-dlp',
-      );
+      final ytDlpPath = await _resolveActiveDesktopYtDlpPath();
       if (ytDlpPath == null || ytDlpPath.isEmpty) {
         debugPrint('yt-dlp 二进制未安装，无法下载缩略图');
         return null;
       }
       await targetDirectory.create(recursive: true);
-      final outputTemplate =
-          p.join(targetDirectory.path, '$baseFileName.%(ext)s');
+      final outputTemplate = p.join(
+        targetDirectory.path,
+        '$baseFileName.%(ext)s',
+      );
       final config = sessionConfig ?? DownloadSessionConfig.defaults();
       final args = <String>[
         '--write-thumbnail',
@@ -4224,8 +5086,10 @@ class YtDlpDownloadService extends ChangeNotifier {
         workingDirectory: targetDirectory.path,
       ).timeout(const Duration(seconds: 25));
       if (result.exitCode != 0) {
-        debugPrint('yt-dlp 缩略图下载失败 (exit=${result.exitCode}): '
-            '${result.stderr}');
+        debugPrint(
+          'yt-dlp 缩略图下载失败 (exit=${result.exitCode}): '
+          '${result.stderr}',
+        );
         return null;
       }
       // 扫描目标目录，查找 yt-dlp 生成的缩略图文件
@@ -4845,17 +5709,11 @@ DownloadSelection _buildSelectionFromPreferences({
 }
 
 String? _pickPreferredVideoFormatId(VideoMeta meta, String preferredQuality) {
-  if (meta.videoFormats.isEmpty) {
-    return meta.recommendedVideoFormatId;
-  }
-  final targetHeight = _preferredQualityTargetHeight(preferredQuality);
-  final sorted = [...meta.videoFormats]
-    ..sort((a, b) {
-      final aScore = _scorePreferredVideoFormat(a, targetHeight: targetHeight);
-      final bScore = _scorePreferredVideoFormat(b, targetHeight: targetHeight);
-      return bScore.compareTo(aScore);
-    });
-  return sorted.first.formatId;
+  return YtDlpVideoFormatSelector.pickFormatId(
+        meta.videoFormats,
+        preferredQuality: preferredQuality,
+      ) ??
+      meta.recommendedVideoFormatId;
 }
 
 String? _pickPreferredAudioFormatId(VideoMeta meta) {
@@ -4869,62 +5727,6 @@ String? _pickPreferredAudioFormatId(VideoMeta meta) {
       return bScore.compareTo(aScore);
     });
   return sorted.first.formatId;
-}
-
-int? _preferredQualityTargetHeight(String rawPreference) {
-  switch (rawPreference.trim().toLowerCase()) {
-    case '2160p':
-      return 2160;
-    case '1440p':
-      return 1440;
-    case '1080p':
-      return 1080;
-    case '720p':
-      return 720;
-    case '480p':
-      return 480;
-    case '360p':
-      return 360;
-    default:
-      return null;
-  }
-}
-
-int _scorePreferredVideoFormat(
-  VideoFormat format, {
-  required int? targetHeight,
-}) {
-  var score = 0;
-  final height = format.height ?? 0;
-  if (targetHeight != null && height > 0) {
-    if (height == targetHeight) {
-      score += 1000000;
-    } else if (height < targetHeight) {
-      score += 800000 - (targetHeight - height);
-    } else {
-      score += 500000 - (height - targetHeight);
-    }
-  } else {
-    score += height * 100;
-  }
-  final codec = (format.videoCodec ?? '').toLowerCase();
-  if (format.hasAudio) {
-    score += 400;
-  }
-  if (format.ext.toLowerCase() == 'mp4') {
-    score += 200;
-  }
-  if (codec.contains('avc') || codec.contains('h264')) {
-    score += 120;
-  } else if (codec.contains('vp9')) {
-    score += 90;
-  } else if (codec.contains('av01') || codec.contains('av1')) {
-    score += 80;
-  }
-  if ((format.fps ?? 0) >= 50) {
-    score += 40;
-  }
-  return score;
 }
 
 int _scorePreferredAudioFormat(AudioFormat format) {

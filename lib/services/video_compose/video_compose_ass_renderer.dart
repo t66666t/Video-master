@@ -56,8 +56,9 @@ class VideoComposeAssRenderer {
     final double outline = textStyle.hasBorder
         ? textStyle.resolveBorderWidthForFontSize(fontSize)
         : 0;
-    final String defaultFont =
-        _fontService.resolveSystemFont(textStyle.fontFamilyChinese);
+    final String defaultFont = _fontService.resolveSystemFont(
+      textStyle.fontFamilyChinese,
+    );
 
     final double baseX = (((alignment.x + 1) / 2.0) * width).clamp(
       0.0,
@@ -83,9 +84,8 @@ class VideoComposeAssRenderer {
     );
     final double bgPaddingX = (12.0 * scale).clamp(2.0, 80.0);
     final double bgPaddingY = (6.0 * scale).clamp(2.0, 80.0);
-    final double bgRadius = (8.0 * scale).clamp(0.0, 40.0);
     sb.writeln(
-      'Style: Background,$defaultFont,${fontSize.toStringAsFixed(2)},$backColor,$backColor,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,5,0,0,0,1',
+      'Style: Background,$defaultFont,${fontSize.toStringAsFixed(2)},$backColor,$backColor,$backColor,$backColor,0,0,0,0,100,100,0,0,3,0,0,5,0,0,0,1',
     );
     sb.writeln('[Events]');
     sb.writeln(
@@ -100,8 +100,9 @@ class VideoComposeAssRenderer {
         secondaryFontSize: secondaryFontSize,
         maxWidth: width.toDouble(),
       );
-      final double effectiveContentWidth =
-          _toAssBackgroundContentWidth(contentSize.width);
+      final double effectiveContentWidth = _toAssBackgroundContentWidth(
+        contentSize.width,
+      );
       final double wChild = effectiveContentWidth + bgPaddingX * 2;
       final double hChild = contentSize.height + bgPaddingY * 2;
 
@@ -116,7 +117,21 @@ class VideoComposeAssRenderer {
           r')}';
       if (textStyle.backgroundOpacity > 0.01 &&
           textStyle.backgroundColor.a > 0.0) {
-        final String bgAss = _buildRoundedRectAss(wChild, hChild, bgRadius);
+        final String bgAss =
+            _buildCombinedAssText(
+              primaryText: cue.primaryText,
+              secondaryText: cue.secondaryText,
+              style: resolvedStyle,
+              primaryFontSize: fontSize,
+              secondaryFontSize: secondaryFontSize,
+              applyBorder: false,
+              applyShadow: false,
+              fillAlpha: 255,
+            ).replaceAll(
+              r'\bord0.00',
+              '\\bord0\\xbord${bgPaddingX.toStringAsFixed(2)}'
+                  '\\ybord${bgPaddingY.toStringAsFixed(2)}',
+            );
         sb.writeln(
           'Dialogue: 0,${_toAssTime(cue.startTime)},${_toAssTime(cue.endTime)},Background,,0,0,0,,$posTag$bgAss',
         );
@@ -205,7 +220,9 @@ class VideoComposeAssRenderer {
     required double secondaryFontSize,
   }) {
     final List<InlineSpan> spans = <InlineSpan>[];
-    final SubtitleStyle primaryStyle = style.copyWith(fontSize: primaryFontSize);
+    final SubtitleStyle primaryStyle = style.copyWith(
+      fontSize: primaryFontSize,
+    );
     final SubtitleStyle secondaryStyle = style.copyWith(
       fontSize: secondaryFontSize,
       secondaryFontSize: secondaryFontSize,
@@ -290,33 +307,19 @@ class VideoComposeAssRenderer {
     return TextSpan(
       text: text,
       style: style.getTextStyle(
-        overrideFontFamily:
-            isChinese ? style.fontFamilyChinese : style.fontFamilyEnglish,
+        overrideFontFamily: isChinese
+            ? style.fontFamilyChinese
+            : style.fontFamilyEnglish,
       ),
     );
   }
 
   int _toAssBoldFlag(FontWeight weight) {
-    return weight.index >= FontWeight.w600.index ? 1 : 0;
+    return weight.value >= FontWeight.w600.value ? 1 : 0;
   }
 
   double _toAssBackgroundContentWidth(double measuredWidth) {
     return measuredWidth;
-  }
-
-  String _buildRoundedRectAss(double w, double h, double r) {
-    final double k = 0.55228 * r;
-    return '{\\p1}'
-        'm $r 0 '
-        'l ${w - r} 0 '
-        'b ${w - r + k} 0 $w ${r - k} $w $r '
-        'l $w ${h - r} '
-        'b $w ${h - r + k} ${w - r + k} $h ${w - r} $h '
-        'l $r $h '
-        'b ${r - k} $h 0 ${h - r + k} 0 ${h - r} '
-        'l 0 $r '
-        'b 0 ${r - k} ${r - k} 0 $r 0 '
-        '{\\p0}';
   }
 
   String _buildCombinedAssText({
@@ -329,9 +332,12 @@ class VideoComposeAssRenderer {
     required bool applyShadow,
     int fillAlpha = 0,
   }) {
-    final String primaryRaw = _cleanAssText(primaryText).replaceAll('\n', r'\N');
-    final String secondaryRaw =
-        _cleanAssText(secondaryText ?? '').replaceAll('\n', r'\N');
+    final String primaryRaw = _cleanAssText(
+      primaryText,
+    ).replaceAll('\n', r'\N');
+    final String secondaryRaw = _cleanAssText(
+      secondaryText ?? '',
+    ).replaceAll('\n', r'\N');
     final StringBuffer content = StringBuffer();
     if (primaryRaw.trim().isNotEmpty) {
       content.write(
@@ -436,11 +442,13 @@ class VideoComposeAssRenderer {
     required int fillAlpha,
   }) {
     final SubtitleTextStyle textStyle = style.textStyle;
-    final String fontFamily =
-        isChinese ? textStyle.fontFamilyChinese : textStyle.fontFamilyEnglish;
+    final String fontFamily = isChinese
+        ? textStyle.fontFamilyChinese
+        : textStyle.fontFamilyEnglish;
     final String fontName = _fontService.resolveSystemFont(fontFamily);
-    final FontWeight weight =
-        isChinese ? textStyle.fontWeightChinese : textStyle.fontWeightEnglish;
+    final FontWeight weight = isChinese
+        ? textStyle.fontWeightChinese
+        : textStyle.fontWeightEnglish;
     final int boldFlag = _toAssBoldFlag(weight);
 
     final int italic = textStyle.isItalic ? 1 : 0;
@@ -466,10 +474,12 @@ class VideoComposeAssRenderer {
       ..write('\\u$underline')
       ..write('\\fsp${letterSpacing.toStringAsFixed(2)}')
       ..write('\\fs${fontSize.toStringAsFixed(2)}');
-    final double strokeBlur =
-        applyBorder && outline > 0 ? outline.clamp(0.6, 1.2) : 0.0;
-    final double blurValue =
-        applyShadow ? shadowBlur : (applyBorder ? strokeBlur : 0.0);
+    final double strokeBlur = applyBorder && outline > 0
+        ? outline.clamp(0.6, 1.2)
+        : 0.0;
+    final double blurValue = applyShadow
+        ? shadowBlur
+        : (applyBorder ? strokeBlur : 0.0);
     tags
       ..write('\\bord${(applyBorder ? outline : 0).toStringAsFixed(2)}')
       ..write('\\xshad${(applyShadow ? shadowOffsetX : 0).toStringAsFixed(2)}')

@@ -3,34 +3,34 @@ import 'package:flutter/material.dart';
 import '../services/thumbnail_cache_service.dart';
 
 /// 缓存缩略图组件
-/// 
+///
 /// 提供带占位符、淡入动画和错误处理的缩略图显示功能。
 /// 使用 ThumbnailCacheService 进行缓存管理，优化内存使用。
 class CachedThumbnailWidget extends StatefulWidget {
   /// 视频的唯一标识符
   final String videoId;
-  
+
   /// 缩略图文件路径，可为null
   final String? thumbnailPath;
-  
+
   /// 图片填充方式
   final BoxFit fit;
-  
+
   /// 加载时显示的占位符组件
   final Widget? placeholder;
-  
+
   /// 加载失败时显示的错误组件
   final Widget? errorWidget;
-  
+
   /// 缩略图目标宽度（用于ResizeImage优化内存）
   final int? cacheWidth;
-  
+
   /// 缩略图目标高度（用于ResizeImage优化内存）
   final int? cacheHeight;
-  
+
   /// 淡入动画持续时间
   final Duration fadeInDuration;
-  
+
   /// 淡入动画曲线
   final Curve fadeInCurve;
 
@@ -54,24 +54,26 @@ class CachedThumbnailWidget extends StatefulWidget {
 class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
   /// 缓存服务实例
   final ThumbnailCacheService _cacheService = ThumbnailCacheService();
-  
+
   /// 当前加载的ImageProvider
   ImageProvider? _imageProvider;
-  
+
   /// 加载状态
   _LoadingState _loadingState = _LoadingState.loading;
-  
+
   /// 是否已dispose
   bool _isDisposed = false;
-  
+
   /// 当前加载任务的Completer，用于取消操作
   Completer<void>? _loadCompleter;
 
   @override
   void initState() {
     super.initState();
-    final cachedProvider =
-        _cacheService.getThumbnailFromMemory(widget.videoId, widget.thumbnailPath);
+    final cachedProvider = _cacheService.getThumbnailFromMemory(
+      widget.videoId,
+      widget.thumbnailPath,
+    );
     if (cachedProvider != null) {
       _imageProvider = _applyResizeOptimization(cachedProvider);
       _loadingState = _LoadingState.loaded;
@@ -84,11 +86,13 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
   void didUpdateWidget(CachedThumbnailWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
     // 如果videoId或thumbnailPath变化，重新加载
-    if (oldWidget.videoId != widget.videoId || 
+    if (oldWidget.videoId != widget.videoId ||
         oldWidget.thumbnailPath != widget.thumbnailPath) {
       _cancelPendingLoad();
-      final cachedProvider =
-          _cacheService.getThumbnailFromMemory(widget.videoId, widget.thumbnailPath);
+      final cachedProvider = _cacheService.getThumbnailFromMemory(
+        widget.videoId,
+        widget.thumbnailPath,
+      );
       if (cachedProvider != null) {
         setState(() {
           _imageProvider = _applyResizeOptimization(cachedProvider);
@@ -116,19 +120,21 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
   /// 加载缩略图
   Future<void> _loadThumbnail() async {
     if (_isDisposed) return;
-    
+
     // 创建新的Completer用于跟踪此次加载
     _loadCompleter = Completer<void>();
     final currentCompleter = _loadCompleter;
-    
+
     setState(() {
       _loadingState = _LoadingState.loading;
       _imageProvider = null;
     });
 
     try {
-      final cachedProvider =
-          _cacheService.getThumbnailFromMemory(widget.videoId, widget.thumbnailPath);
+      final cachedProvider = _cacheService.getThumbnailFromMemory(
+        widget.videoId,
+        widget.thumbnailPath,
+      );
       if (cachedProvider != null) {
         if (_isDisposed || currentCompleter != _loadCompleter) {
           return;
@@ -146,16 +152,16 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
         widget.videoId,
         widget.thumbnailPath,
       );
-      
+
       // 检查是否已被取消或dispose
       if (_isDisposed || currentCompleter != _loadCompleter) {
         return;
       }
-      
+
       if (provider != null) {
         // 应用ResizeImage优化内存
         final optimizedProvider = _applyResizeOptimization(provider);
-        
+
         setState(() {
           _imageProvider = optimizedProvider;
           _loadingState = _LoadingState.loaded;
@@ -170,7 +176,7 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
       if (_isDisposed || currentCompleter != _loadCompleter) {
         return;
       }
-      
+
       debugPrint('CachedThumbnailWidget 加载失败: $e');
       setState(() {
         _loadingState = _LoadingState.error;
@@ -185,6 +191,7 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
         provider,
         width: widget.cacheWidth,
         height: widget.cacheHeight,
+        policy: ResizeImagePolicy.fit,
         allowUpscaling: false,
       );
     }
@@ -210,21 +217,21 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
 
   /// 构建占位符
   Widget _buildPlaceholder() {
-    return widget.placeholder ?? 
-      Container(
-        key: const ValueKey('placeholder'),
-        color: Colors.grey[800],
-        child: const Center(
-          child: SizedBox(
-            width: 24,
-            height: 24,
-            child: CircularProgressIndicator(
-              strokeWidth: 2,
-              valueColor: AlwaysStoppedAnimation<Color>(Colors.white54),
+    return widget.placeholder ??
+        Container(
+          key: const ValueKey('placeholder'),
+          color: Colors.grey[800],
+          child: const Center(
+            child: SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.white54),
+              ),
             ),
           ),
-        ),
-      );
+        );
   }
 
   /// 构建图片
@@ -232,7 +239,7 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
     if (_imageProvider == null) {
       return _buildErrorWidget();
     }
-    
+
     final placeholder = _buildPlaceholder();
 
     return Stack(
@@ -267,23 +274,19 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
   /// 构建错误显示组件
   Widget _buildErrorWidget() {
     return widget.errorWidget ??
-      Container(
-        key: const ValueKey('error'),
-        color: Colors.grey[900],
-        child: const Center(
-          child: Icon(
-            Icons.broken_image_outlined,
-            color: Colors.white38,
-            size: 32,
+        Container(
+          key: const ValueKey('error'),
+          color: Colors.grey[900],
+          child: const Center(
+            child: Icon(
+              Icons.broken_image_outlined,
+              color: Colors.white38,
+              size: 32,
+            ),
           ),
-        ),
-      );
+        );
   }
 }
 
 /// 加载状态枚举
-enum _LoadingState {
-  loading,
-  loaded,
-  error,
-}
+enum _LoadingState { loading, loaded, error }

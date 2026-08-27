@@ -1,75 +1,56 @@
-# 二进制文件和可执行文件
-assets/binaries/
-*.exe
-*.dll
-*.so
-*.dylib
-
-# 字体文件（太大）
-assets/fonts/
-
-# 依赖包（应该在 pubspec.yaml 中定义）
-packages/
-**/packages/
-
-# 构建输出
+# Flutter / Dart 构建产物
 build/
-**/build/
-
-# Dart 工具目录
 .dart_tool/
-.dbg/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+pubspec.lock
 
-# 临时文件和输出
-*.lock
-*.tmp
+# IDE 配置
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# macOS
+.DS_Store
+
+# 临时文件
 *.log
-*.txt
+*.tmp
 out.txt
-.metadata
+
+# 分析报告（可选保留）
 analyze_*.txt
 dart_analyze_*.txt
 
 # 临时测试文件
 temp_*
 dummy*.mkv
-temp_*.srt
-test_bg*.png
 test_draw*.png
 test_draw*.ass
+test_bg*.png
+test_bg*.ass
 
-# ffmpeg 相关
-ffmpeg*.zip
+# ffmpeg 临时解压目录
 ffmpeg_temp/
+ffmpeg*.zip
 
-# IDE 文件
-.vscode/
-.idea/
-*.iml
-
-# 其他不需要的文件
+# 其他工具目录
 .qoder/
 .kiro/
 .trae/
-*.iss
-*.ps1
-*.png
-*.mkv
+.dbg/
+.uploads/
+.workbuddy/
 
-# 排除特定的大文件目录
-android/gradle/
-ios/Pods/
-macos/Pods/
-linux/build/
-windows/build/
+# Python bytecode caches
+__pycache__/
+*.py[cod]
 
-# Flutter 自动生成的文件
-.flutter-plugins-dependencies
-
-# 测试字幕文件
-test_*.ass
-
-# 保留必要的文件
-!pubspec.yaml
-!pubspec.lock
-!.gitignore
+# Large local/runtime artifacts not suitable for regular Git hosting
+*.hprof
+assets/binaries/windows/ffprobe.exe

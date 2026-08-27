@@ -25,8 +25,8 @@ android {
     ndkVersion = "28.2.13676358"
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     // kotlinOptions has been removed, using jvmToolchain instead
@@ -87,7 +87,9 @@ chaquopy {
         version = "3.11"
         buildPython("py", "-3.11")
         pip {
-            install("yt-dlp")
+            // Keep the embedded Android runtime reproducible and in sync with
+            // YtDlpVersions.androidBundled in Dart.
+            install("yt-dlp==2026.8.19")
         }
     }
 }

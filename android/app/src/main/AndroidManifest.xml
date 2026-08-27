@@ -107,6 +107,12 @@
             </intent-filter>
         </service>
 
+        <service
+            android:name=".YtDlpWorkerService"
+            android:exported="false"
+            android:process=":ytdlp_worker"
+            android:stopWithTask="false" />
+
         <receiver
             android:name="com.ryanheise.audioservice.MediaButtonReceiver"
             android:exported="true"

@@ -1,11 +1,177 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
+import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
 
 void main() {
   group('BilibiliDownloadTask', () {
+    BilibiliVideoItem videoItem({
+      required String bvid,
+      required int episodeCount,
+      required Set<int> selectedEpisodes,
+    }) {
+      final pages = List.generate(
+        episodeCount,
+        (index) => BilibiliPage(
+          cid: index + 1,
+          page: index + 1,
+          part: 'P${index + 1}',
+          duration: 60,
+          bvid: bvid,
+          aid: bvid,
+        ),
+      );
+      return BilibiliVideoItem(
+        videoInfo: BilibiliVideoInfo(
+          title: bvid,
+          desc: '',
+          pic: '',
+          bvid: bvid,
+          aid: bvid,
+          ownerName: 'up',
+          ownerMid: '1',
+          pubDate: 0,
+          pages: pages,
+        ),
+        episodes: [
+          for (var index = 0; index < pages.length; index++)
+            BilibiliDownloadEpisode(
+              page: pages[index],
+              bvid: bvid,
+              isSelected: selectedEpisodes.contains(index),
+            ),
+        ],
+      );
+    }
+
+    test('episode round trip keeps chapter times in milliseconds', () {
+      final episode = BilibiliDownloadEpisode(
+        page: BilibiliPage(
+          cid: 40391282161,
+          page: 1,
+          part: 'P1',
+          duration: 941,
+          bvid: 'BV1Zx3k6yEFn',
+          aid: '1',
+        ),
+        bvid: 'BV1Zx3k6yEFn',
+        chapters: const <MediaChapter>[
+          MediaChapter(title: '前言', startMs: 0, endMs: 99000),
+          MediaChapter(title: '第二章', startMs: 99000, endMs: 152000),
+        ],
+      );
+
+      final decoded = BilibiliDownloadEpisode.fromJson(episode.toJson());
+
+      expect(decoded.chapters, hasLength(2));
+      expect(decoded.chapters.first.endMs, 99000);
+      expect(decoded.chapters.last.startMs, 99000);
+      expect(decoded.chapters.last.endMs, 152000);
+    });
+
+    test('并行分片断点状态可完整序列化并兼容数字字符串', () {
+      const state = DownloadPartResumeState(
+        tempPath: r'D:\temp\video.m4s',
+        url: 'https://cdn.example/video',
+        downloadedBytes: 75,
+        totalBytes: 200,
+        streamId: 80,
+        codecid: 7,
+        codecs: 'avc1',
+        mimeType: 'video/mp4',
+        supportsRange: true,
+        rangeParts: <DownloadRangePartState>[
+          DownloadRangePartState(
+            start: 0,
+            endInclusive: 99,
+            downloadedBytes: 75,
+            tempPath: r'D:\temp\video.m4s.range_0_99.part',
+          ),
+          DownloadRangePartState(
+            start: 100,
+            endInclusive: 199,
+            tempPath: r'D:\temp\video.m4s.range_100_199.part',
+          ),
+        ],
+      );
+
+      final json = state.toJson()
+        ..['downloadedBytes'] = '75'
+        ..['totalBytes'] = '200';
+      final decoded = DownloadPartResumeState.fromJson(json);
+
+      expect(decoded.downloadedBytes, 75);
+      expect(decoded.totalBytes, 200);
+      expect(decoded.rangeParts, hasLength(2));
+      expect(decoded.rangeParts.first.downloadedBytes, 75);
+      expect(decoded.rangeParts.first.tempPath, contains('range_0_99'));
+    });
+
+    test('选择摘要准确区分独立视频、分P视频和合集层级', () {
+      final standalone = videoItem(
+        bvid: 'standalone',
+        episodeCount: 1,
+        selectedEpisodes: {0},
+      );
+      final multipart = videoItem(
+        bvid: 'multipart',
+        episodeCount: 3,
+        selectedEpisodes: {0, 2},
+      );
+      final collectionVideoA = videoItem(
+        bvid: 'collection-a',
+        episodeCount: 1,
+        selectedEpisodes: {0},
+      );
+      final collectionVideoB = videoItem(
+        bvid: 'collection-b',
+        episodeCount: 2,
+        selectedEpisodes: {1},
+      );
+      final unselectedCollectionVideo = videoItem(
+        bvid: 'collection-c',
+        episodeCount: 1,
+        selectedEpisodes: {},
+      );
+
+      final summary = BilibiliSelectionSummary.fromTasks([
+        BilibiliDownloadTask(
+          singleVideoInfo: standalone.videoInfo,
+          videos: [standalone],
+        ),
+        BilibiliDownloadTask(
+          singleVideoInfo: multipart.videoInfo,
+          videos: [multipart],
+        ),
+        BilibiliDownloadTask(
+          collectionInfo: BilibiliCollectionInfo(
+            title: '合集',
+            cover: '',
+            videos: [
+              collectionVideoA.videoInfo,
+              collectionVideoB.videoInfo,
+              unselectedCollectionVideo.videoInfo,
+            ],
+          ),
+          videos: [
+            collectionVideoA,
+            collectionVideoB,
+            unselectedCollectionVideo,
+          ],
+        ),
+      ]);
+
+      expect(summary.selectedItemCount, 5);
+      expect(summary.standaloneVideoCount, 1);
+      expect(summary.multipartVideoCount, 1);
+      expect(summary.multipartPartCount, 2);
+      expect(summary.collectionCount, 1);
+      expect(summary.collectionVideoCount, 2);
+      expect(summary.collectionItemCount, 2);
+    });
+
     test('fromJson 为旧任务补齐 taskId 且可再次序列化', () {
       final legacyJson = {
         'singleVideoInfo': {
@@ -236,11 +402,18 @@ void main() {
         },
       });
 
-      expect(info.videoStreams.map((stream) => stream.id).toList(), [64, 64, 32, 16]);
-      expect(
-        info.videoStreams.map((stream) => stream.qualityName).toList(),
-        ['720P 高清', '720P 高清', '清晰 480P', '流畅 360P'],
-      );
+      expect(info.videoStreams.map((stream) => stream.id).toList(), [
+        64,
+        64,
+        32,
+        16,
+      ]);
+      expect(info.videoStreams.map((stream) => stream.qualityName).toList(), [
+        '720P 高清',
+        '720P 高清',
+        '清晰 480P',
+        '流畅 360P',
+      ]);
     });
   });
 }

@@ -9,6 +9,25 @@ allprojects {
     }
 }
 
+// 统一所有模块（含第三方插件）的 JVM 目标版本，解决 photo_manager、desktop_drop 等插件编译冲突
+subprojects {
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+            }
+        }
+        project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+            kotlinOptions {
+                jvmTarget = "17"
+            }
+        }
+    }
+}
+
 // Expose SDK versions for Android subprojects (Flutter plugins usually read these)
 ext {
     compileSdkVersion = 34

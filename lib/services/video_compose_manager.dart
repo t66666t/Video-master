@@ -12,6 +12,7 @@ import 'video_compose/video_compose_font_service.dart';
 import 'video_compose/video_compose_orchestrator.dart';
 import 'video_compose/video_compose_output_path_service.dart';
 import 'video_compose/video_compose_probe_service.dart';
+import 'video_compose/video_compose_precise_renderer.dart';
 import 'video_compose/video_compose_subtitle_service.dart';
 import 'video_compose/video_compose_task_store.dart';
 
@@ -51,6 +52,7 @@ class VideoComposeManager extends ChangeNotifier {
             subtitleService:
                 subtitleService ?? const VideoComposeSubtitleService(),
             assRenderer: VideoComposeAssRenderer(resolvedFontService),
+            preciseRenderer: VideoComposePreciseRenderer(),
             fontService: resolvedFontService,
             executor: executor ?? VideoComposeExecutor(),
             outputPathService:
@@ -72,7 +74,8 @@ class VideoComposeManager extends ChangeNotifier {
   }
 
   Future<void> _loadTasks() async {
-    final List<VideoComposeTaskState> storedTasks = await _taskStore.loadTasks();
+    final List<VideoComposeTaskState> storedTasks = await _taskStore
+        .loadTasks();
     for (final VideoComposeTaskState state in storedTasks) {
       if (_isIncompleteStage(state.stage)) {
         _taskMap[state.taskId] = state.copyWith(
@@ -114,6 +117,17 @@ class VideoComposeManager extends ChangeNotifier {
       deleteOutput: deleteOutput,
       outputPath: task.request.outputPath,
     );
+    if (deleteOutput && !outputDeleted) {
+      if (isRunningTask) {
+        _runningTaskId = null;
+      }
+      notifyListeners();
+      await _saveTasks();
+      if (!_isProcessing && _queueTaskIds.isNotEmpty) {
+        unawaited(_processQueue());
+      }
+      return false;
+    }
     _taskMap.remove(taskId);
     if (isRunningTask) {
       _runningTaskId = null;
@@ -179,17 +193,17 @@ class VideoComposeManager extends ChangeNotifier {
     required bool softSubtitleUseSourceQuality,
     required List<VideoComposeSoftSubtitleTrack> softSubtitleTracks,
     required VideoComposeResolution resolution,
+    required VideoComposeRenderMode renderMode,
     required SubtitleStyle subtitleStyle,
+    required SubtitleStyle subtitleStylePortrait,
     required Alignment subtitleAlignment,
+    required bool splitSubtitleByLine,
     String? customOutputPath,
   }) async {
     final String outputPath;
     if (customOutputPath != null && customOutputPath.isNotEmpty) {
       final String fileName = _outputPathService.buildOutputFileName(title);
-      outputPath = p.join(
-        customOutputPath,
-        fileName,
-      );
+      outputPath = p.join(customOutputPath, fileName);
     } else {
       outputPath = await _outputPathService.buildOutputPath(title);
     }
@@ -206,8 +220,11 @@ class VideoComposeManager extends ChangeNotifier {
       softSubtitleUseSourceQuality: softSubtitleUseSourceQuality,
       softSubtitleTracks: softSubtitleTracks,
       resolution: resolution,
+      renderMode: renderMode,
       subtitleStyle: subtitleStyle,
+      subtitleStylePortrait: subtitleStylePortrait,
       subtitleAlignment: subtitleAlignment,
+      splitSubtitleByLine: splitSubtitleByLine,
       outputPath: outputPath,
     );
     return _enqueueRequest(request: request);
@@ -222,8 +239,9 @@ class VideoComposeManager extends ChangeNotifier {
     if (old == null) {
       throw StateError('任务不存在');
     }
-    final String newOutput =
-        await _outputPathService.buildOutputPath(old.request.title);
+    final String newOutput = await _outputPathService.buildOutputPath(
+      old.request.title,
+    );
     final VideoComposeRequest request = VideoComposeRequest(
       videoId: old.request.videoId,
       videoPath: old.request.videoPath,
@@ -237,8 +255,13 @@ class VideoComposeManager extends ChangeNotifier {
       softSubtitleUseSourceQuality: old.request.softSubtitleUseSourceQuality,
       softSubtitleTracks: old.request.softSubtitleTracks,
       resolution: old.request.resolution,
+      renderMode: old.request.renderMode,
       subtitleStyle: subtitleStyle,
+      subtitleStylePortrait: old.request.subtitleStylePortrait,
       subtitleAlignment: subtitleAlignment,
+      splitSubtitleByLine: old.request.splitSubtitleByLine,
+      subtitleItemGap: old.request.subtitleItemGap,
+      subtitleRendererVersion: old.request.subtitleRendererVersion,
       outputPath: newOutput,
     );
     return _enqueueRequest(request: request);
@@ -353,20 +376,21 @@ class VideoComposeManager extends ChangeNotifier {
         onArtifact: (String filePath) {
           _artifactCleaner.trackTaskArtifact(taskId, filePath);
         },
-        onStatus: ({
-          VideoComposeStage? stage,
-          double? progress,
-          String? message,
-          String? error,
-        }) {
-          _setTask(
-            taskId,
-            stage: stage,
-            progress: progress,
-            message: message,
-            error: error,
-          );
-        },
+        onStatus:
+            ({
+              VideoComposeStage? stage,
+              double? progress,
+              String? message,
+              String? error,
+            }) {
+              _setTask(
+                taskId,
+                stage: stage,
+                progress: progress,
+                message: message,
+                error: error,
+              );
+            },
       );
     } finally {
       await _artifactCleaner.cleanupTaskArtifacts(taskId);

@@ -51,7 +51,11 @@ class BilibiliUrlParser {
 
     final type = determineType(cleanedInput);
     final id = extractId(cleanedInput, type);
-    if (type == BilibiliUrlType.unknown || id == null) {
+    // A short link does not contain a BV/AV/EP/SS id until its redirect is
+    // resolved by BilibiliApiService. Keep it as a valid normalized input so
+    // the download service gets a chance to resolve it.
+    if (type == BilibiliUrlType.unknown ||
+        (type != BilibiliUrlType.shortLink && id == null)) {
       return null;
     }
     return BilibiliNormalizedInput(
@@ -60,15 +64,21 @@ class BilibiliUrlParser {
       id: id,
     );
   }
-  
+
   static BilibiliUrlType determineType(String input) {
     if (input.contains("b23.tv") || input.contains("bili2233.cn")) {
       return BilibiliUrlType.shortLink;
     }
     if (RegExp(_bvPattern).hasMatch(input)) return BilibiliUrlType.videoBv;
-    if (RegExp(_avPattern, caseSensitive: false).hasMatch(input)) return BilibiliUrlType.videoAv;
-    if (RegExp(_epPattern, caseSensitive: false).hasMatch(input)) return BilibiliUrlType.bangumiEp;
-    if (RegExp(_ssPattern, caseSensitive: false).hasMatch(input)) return BilibiliUrlType.bangumiSs;
+    if (RegExp(_avPattern, caseSensitive: false).hasMatch(input)) {
+      return BilibiliUrlType.videoAv;
+    }
+    if (RegExp(_epPattern, caseSensitive: false).hasMatch(input)) {
+      return BilibiliUrlType.bangumiEp;
+    }
+    if (RegExp(_ssPattern, caseSensitive: false).hasMatch(input)) {
+      return BilibiliUrlType.bangumiSs;
+    }
     
     return BilibiliUrlType.unknown;
   }

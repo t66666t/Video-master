@@ -49,6 +49,22 @@ void main() {
     expect(settings.mediaListCrossAxisCount, 1);
   });
 
+  test('媒体列表允许极小行高、零间距和极小标题字号', () async {
+    final settings = SettingsService();
+    settings.resetForTest();
+    await settings.init();
+
+    await settings.updateSetting('mediaListItemHeightScale', 0.001);
+    await settings.updateSetting('mediaListMainSpacingScale', 0.0);
+    await settings.updateSetting('mediaListCrossSpacingScale', 0.0);
+    await settings.updateSetting('mediaListTitleScale', 0.001);
+
+    expect(settings.mediaListItemHeightScale, 0.001);
+    expect(settings.mediaListMainSpacingScale, 0.0);
+    expect(settings.mediaListCrossSpacingScale, 0.0);
+    expect(settings.mediaListTitleScale, 0.001);
+  });
+
   test('结构化导入排序设置可恢复并持久化更新', () async {
     final settings = SettingsService();
     settings.resetForTest();
@@ -98,15 +114,9 @@ void main() {
     final names = ['张三10.mp4', 'A02.mp4', '李四2.mp4', 'A1.mp4', '陈一.mp4'];
     names.sort(LibraryService.compareStructuredImportNames);
 
-    expect(
-      names,
-      ['A1.mp4', 'A02.mp4', '陈一.mp4', '李四2.mp4', '张三10.mp4'],
-    );
+    expect(names, ['A1.mp4', 'A02.mp4', '陈一.mp4', '李四2.mp4', '张三10.mp4']);
 
     final reversed = [...names.reversed];
-    expect(
-      reversed,
-      ['张三10.mp4', '李四2.mp4', '陈一.mp4', 'A02.mp4', 'A1.mp4'],
-    );
+    expect(reversed, ['张三10.mp4', '李四2.mp4', '陈一.mp4', 'A02.mp4', 'A1.mp4']);
   });
 }

@@ -2,12 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/models/subtitle_model.dart';
 import 'package:video_player_app/services/subtitle_timeline_resolver.dart';
 
-SubtitleItem _subtitle(
-  int index,
-  int startMs,
-  int endMs,
-  String text,
-) {
+SubtitleItem _subtitle(int index, int startMs, int endMs, String text) {
   return SubtitleItem(
     index: index,
     startTime: Duration(milliseconds: startMs),
@@ -66,6 +61,51 @@ void main() {
         resolver.nextBoundaryAfter(const Duration(milliseconds: 5200)),
         isNull,
       );
+    });
+
+    test('continuous display fills gaps without shortening overlaps', () {
+      final resolver = SubtitleTimelineResolver(<SubtitleItem>[
+        _subtitle(1, 1000, 5000, 'narration'),
+        _subtitle(2, 3000, 4000, 'on-screen translation'),
+        _subtitle(3, 6000, 7000, 'next'),
+      ]);
+
+      expect(resolver.activeIndicesAtMs(3500, extendToNextStart: true), <int>[
+        0,
+        1,
+      ]);
+      expect(resolver.activeIndicesAtMs(5500, extendToNextStart: true), <int>[
+        0,
+      ]);
+      expect(resolver.activeIndicesAtMs(4500, extendToNextStart: true), <int>[
+        0,
+      ]);
+    });
+
+    test('finds a long cue across already-ended cues between it and now', () {
+      final resolver = SubtitleTimelineResolver(<SubtitleItem>[
+        _subtitle(1, 0, 10000, 'long narration'),
+        _subtitle(2, 1000, 2000, 'short one'),
+        _subtitle(3, 3000, 4000, 'short two'),
+      ]);
+
+      expect(resolver.activeIndicesAtMs(3500), <int>[0, 2]);
+      expect(resolver.activeIndicesAtMs(5000), <int>[0]);
+    });
+
+    test('continuous display extends only across a real gap', () {
+      final resolver = SubtitleTimelineResolver(<SubtitleItem>[
+        _subtitle(1, 1000, 2000, 'first'),
+        _subtitle(2, 4000, 5000, 'second'),
+      ]);
+
+      expect(resolver.activeIndicesAtMs(3000), isEmpty);
+      expect(resolver.activeIndicesAtMs(3000, extendToNextStart: true), <int>[
+        0,
+      ]);
+      expect(resolver.activeIndicesAtMs(4000, extendToNextStart: true), <int>[
+        1,
+      ]);
     });
   });
 }

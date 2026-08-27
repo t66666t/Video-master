@@ -90,7 +90,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
     // Adaptive sizes
     final double titleFontSize = isSmallScreen ? 11 : 12;
 
-    final fonts = ['System', 'OPPO Sans 4.0', '方正黑体', 'MiSans', 'Noto Serif CJK SC', 'Swei Gothic CJK SC', '方正楷体', 'Comic Relief', 'Roboto'];
+    final fonts = ['System', 'OPPO Sans 4.0', '方正黑体', 'MiSans', 'Noto Sans SC', 'Noto Serif CJK SC', 'Swei Gothic CJK SC', '方正楷体', 'Inter', 'Comic Relief', 'Roboto'];
 
     return Container(
       color: const Color(0xFF1E1E1E), // 深色背景
@@ -580,10 +580,8 @@ class SubtitleSettingsSheet extends StatelessWidget {
   bool _hasMultipleWeights(String fontFamily) {
     if (fontFamily == 'MiSans') return true;
     if (fontFamily == 'Roboto') return true;
-    // Comic Relief has Regular and Bold (implied), but user might want to choose between them explicitly if we treat them as weights.
-    // However, our UI strategy is: If >2 weights, use Slider. If 2 weights (Normal/Bold), use Toggle.
-    // So _hasMultipleWeights returns true ONLY for >2 weights (Slider UI).
-    // Actually, let's keep it simple: MiSans is the only one needing a slider.
+    if (fontFamily == 'Inter') return true;
+    if (fontFamily == 'Noto Sans SC') return true;
     return false;
   }
 
@@ -620,6 +618,33 @@ class SubtitleSettingsSheet extends StatelessWidget {
         FontWeight.w900,
       ];
       labels = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"];
+    } else if (fontFamily == 'Inter') {
+      // Inter 字体字重：Thin(100), ExtraLight(200), Light(300), Regular(400), Medium(500), SemiBold(600), Bold(700), ExtraBold(800), Black(900)
+      weights = [
+        FontWeight.w100,
+        FontWeight.w200,
+        FontWeight.w300,
+        FontWeight.w400,
+        FontWeight.w500,
+        FontWeight.w600,
+        FontWeight.w700,
+        FontWeight.w800,
+        FontWeight.w900,
+      ];
+      labels = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"];
+    } else if (fontFamily == 'Noto Sans SC') {
+      // Noto Sans SC 字体字重：Thin(100), DemiLight(200), Light(300), Regular(400), Medium(500), Bold(700), Black(900)
+      // 注意：Noto Sans SC 没有 w600, w800，只有 100, 200, 300, 400, 500, 700, 900
+      weights = [
+        FontWeight.w100,
+        FontWeight.w200,
+        FontWeight.w300,
+        FontWeight.w400,
+        FontWeight.w500,
+        FontWeight.w700,
+        FontWeight.w900,
+      ];
+      labels = ["Thin", "DemiLight", "Light", "Regular", "Medium", "Bold", "Black"];
     } else {
       // Fallback (shouldn't happen given logic)
       weights = [FontWeight.normal, FontWeight.bold];

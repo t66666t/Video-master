@@ -52,10 +52,7 @@ class SystemMediaSessionService {
   Uri? _artworkCacheValue;
   bool _artworkCacheValid = false;
 
-  void _logMediaSessionEvent(
-    String message, {
-    Map<String, Object?>? data,
-  }) {
+  void _logMediaSessionEvent(String message, {Map<String, Object?>? data}) {
     if (!kDebugMode) return;
     final buffer = StringBuffer('SystemMediaSessionService: $message');
     if (data != null && data.isNotEmpty) {
@@ -75,22 +72,26 @@ class SystemMediaSessionService {
     return Platform.isAndroid || Platform.isIOS;
   }
 
-  bool get headsetControlsEnabled => _settingsService.enableHeadsetMediaControls;
+  bool get headsetControlsEnabled =>
+      _settingsService.enableHeadsetMediaControls;
 
   Future<void> _configureAudioSession() async {
     if (!isSupportedPlatform) {
       return;
     }
     final session = await AudioSession.instance;
-    final bool allowConcurrentPlayback = _settingsService.allowConcurrentPlayback;
+    final bool allowConcurrentPlayback =
+        _settingsService.allowConcurrentPlayback;
     await session.configure(
-      const AudioSessionConfiguration.music().copyWith(
-        avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.none,
-      ).copyWith(
-        avAudioSessionCategoryOptions: allowConcurrentPlayback
-            ? AVAudioSessionCategoryOptions.mixWithOthers
-            : AVAudioSessionCategoryOptions.none,
-      ),
+      const AudioSessionConfiguration.music()
+          .copyWith(
+            avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.none,
+          )
+          .copyWith(
+            avAudioSessionCategoryOptions: allowConcurrentPlayback
+                ? AVAudioSessionCategoryOptions.mixWithOthers
+                : AVAudioSessionCategoryOptions.none,
+          ),
     );
     _logMediaSessionEvent(
       'audio session configured',
@@ -103,8 +104,10 @@ class SystemMediaSessionService {
   }
 
   void _handleSettingsChanged() {
-    final bool allowConcurrentPlayback = _settingsService.allowConcurrentPlayback;
-    final bool headsetControlsEnabled = _settingsService.enableHeadsetMediaControls;
+    final bool allowConcurrentPlayback =
+        _settingsService.allowConcurrentPlayback;
+    final bool headsetControlsEnabled =
+        _settingsService.enableHeadsetMediaControls;
     if (_lastAllowConcurrentPlayback != allowConcurrentPlayback) {
       _lastAllowConcurrentPlayback = allowConcurrentPlayback;
       unawaited(_configureAudioSession());
@@ -131,20 +134,19 @@ class SystemMediaSessionService {
       _settingsService.addListener(_handleSettingsChanged);
       await _configureAudioSession();
 
-      _handler =
-          await audio_service.AudioService.init(
-                builder: _SystemMediaAudioHandler.new,
-                config: audio_service.AudioServiceConfig(
-                  androidNotificationChannelId:
-                      'com.example.video_player_app.media_playback',
-                  androidNotificationChannelName: '媒体播放',
-                  androidNotificationIcon: 'drawable/ic_notification_icon',
-                  androidShowNotificationBadge: false,
-                  androidNotificationOngoing: true,
-                  androidStopForegroundOnPause: false,
-                  preloadArtwork: true,
-                ),
-              );
+      _handler = await audio_service.AudioService.init(
+        builder: _SystemMediaAudioHandler.new,
+        config: audio_service.AudioServiceConfig(
+          androidNotificationChannelId:
+              'com.example.video_player_app.media_playback',
+          androidNotificationChannelName: '媒体播放',
+          androidNotificationIcon: 'drawable/ic_notification_icon',
+          androidShowNotificationBadge: false,
+          androidNotificationOngoing: true,
+          androidStopForegroundOnPause: false,
+          preloadArtwork: true,
+        ),
+      );
 
       _interruptionSubscription = session.interruptionEventStream.listen((
         event,
@@ -190,6 +192,9 @@ class SystemMediaSessionService {
     _scheduledSubtitleBoundaryTimer = null;
     _settingsService.removeListener(_handleSettingsChanged);
     _playbackService?.removeListener(_onPlaybackServiceChanged);
+    _playbackService?.coarsePositionNotifier.removeListener(
+      _onPlaybackPositionChanged,
+    );
     _playlistManager?.removeListener(_onPlaylistChanged);
     _playbackService = null;
     _playlistManager = null;
@@ -204,9 +209,17 @@ class SystemMediaSessionService {
       return;
     }
     _playbackService?.removeListener(_onPlaybackServiceChanged);
+    _playbackService?.coarsePositionNotifier.removeListener(
+      _onPlaybackPositionChanged,
+    );
     _playbackService = playbackService;
     _playbackService?.addListener(_onPlaybackServiceChanged);
+    _playbackService?.coarsePositionNotifier.addListener(
+      _onPlaybackPositionChanged,
+    );
   }
+
+  void _onPlaybackPositionChanged() => _onPlaybackServiceChanged();
 
   void _bindPlaylistManager(PlaylistManager playlistManager) {
     if (identical(_playlistManager, playlistManager)) {
@@ -234,10 +247,7 @@ class SystemMediaSessionService {
         },
       );
     }
-    _schedulePublish(
-      immediate: shouldPublishImmediately,
-      snapshot: snapshot,
-    );
+    _schedulePublish(immediate: shouldPublishImmediately, snapshot: snapshot);
   }
 
   void _onPlaylistChanged() {
@@ -277,9 +287,7 @@ class SystemMediaSessionService {
       _scheduledSyncTimer = null;
       _logMediaSessionEvent(
         'throttled publish triggered',
-        data: <String, Object?>{
-          'waitMs': wait.inMilliseconds,
-        },
+        data: <String, Object?>{'waitMs': wait.inMilliseconds},
       );
       unawaited(_publishSnapshot());
     });
@@ -338,7 +346,8 @@ class SystemMediaSessionService {
     audio_service.MediaItem? mediaItem;
     if (force || _shouldRefreshMediaItem(previous, resolvedSnapshot)) {
       mediaItem = await _buildCurrentMediaItem();
-    } else if (_lastPublishedMediaItem == null && resolvedSnapshot.itemId != null) {
+    } else if (_lastPublishedMediaItem == null &&
+        resolvedSnapshot.itemId != null) {
       mediaItem = await _buildCurrentMediaItem();
     }
     if (publishRevision != _publishRevision) {
@@ -401,7 +410,9 @@ class SystemMediaSessionService {
     }
   }
 
-  Future<void> _ensureAndroidNotificationVisible(_PlaybackSnapshot snapshot) async {
+  Future<void> _ensureAndroidNotificationVisible(
+    _PlaybackSnapshot snapshot,
+  ) async {
     if (!Platform.isAndroid || _handler == null) {
       return;
     }
@@ -471,8 +482,9 @@ class SystemMediaSessionService {
       position: resolvedPosition,
       duration: playbackService?.duration ?? Duration.zero,
       bufferedPosition: resolvedBufferedPosition,
-      queueIndex:
-          currentIndex != null && currentIndex >= 0 ? currentIndex : null,
+      queueIndex: currentIndex != null && currentIndex >= 0
+          ? currentIndex
+          : null,
       isPlaying: playbackService?.isPlaying ?? false,
       hasPrevious: canCircularNavigateQueue,
       hasNext: canCircularNavigateQueue,
@@ -487,29 +499,28 @@ class SystemMediaSessionService {
       playbackService: playbackService,
     );
     return playlist
-        .map(
-          (item) {
-            final secondaryText = _resolveSecondaryText(
-              playbackService: playbackService,
-              item: item,
-              currentSubtitleText: currentSubtitleText,
-            );
-            return audio_service.MediaItem(
-              id: item.id,
-              title: item.title,
-              album: item.type == MediaType.audio ? '音频' : '视频',
-              artist: secondaryText,
-              duration: item.id == playbackService?.currentItem?.id &&
-                      playbackService != null &&
-                      playbackService.duration > Duration.zero
-                  ? playbackService.duration
-                  : _durationFromItem(item),
-              displayTitle: item.title,
-              displaySubtitle: secondaryText,
-              displayDescription: secondaryText,
-            );
-          },
-        )
+        .map((item) {
+          final secondaryText = _resolveSecondaryText(
+            playbackService: playbackService,
+            item: item,
+            currentSubtitleText: currentSubtitleText,
+          );
+          return audio_service.MediaItem(
+            id: item.id,
+            title: item.title,
+            album: item.type == MediaType.audio ? '音频' : '视频',
+            artist: secondaryText,
+            duration:
+                item.id == playbackService?.currentItem?.id &&
+                    playbackService != null &&
+                    playbackService.duration > Duration.zero
+                ? playbackService.duration
+                : _durationFromItem(item),
+            displayTitle: item.title,
+            displaySubtitle: secondaryText,
+            displayDescription: secondaryText,
+          );
+        })
         .toList(growable: false);
   }
 
@@ -605,9 +616,7 @@ class SystemMediaSessionService {
     return snapshot.itemId != null && snapshot.duration > Duration.zero;
   }
 
-  audio_service.AudioProcessingState _mapProcessingState(
-    PlaybackState state,
-  ) {
+  audio_service.AudioProcessingState _mapProcessingState(PlaybackState state) {
     switch (state) {
       case PlaybackState.idle:
         return audio_service.AudioProcessingState.idle;
@@ -684,7 +693,9 @@ class SystemMediaSessionService {
     }
   }
 
-  Duration? _resolveLiveBufferedPosition(MediaPlaybackService? playbackService) {
+  Duration? _resolveLiveBufferedPosition(
+    MediaPlaybackService? playbackService,
+  ) {
     final controller = playbackService?.controller;
     if (controller == null) {
       return null;
@@ -771,8 +782,7 @@ class SystemMediaSessionService {
   }
 
   Future<Uri?> _resolveArtworkUri(VideoItem item) async {
-    final cacheKey =
-        '${item.id}|${item.type.name}|${item.thumbnailPath ?? ''}';
+    final cacheKey = '${item.id}|${item.type.name}|${item.thumbnailPath ?? ''}';
     if (_artworkCacheValid && _artworkCacheKey == cacheKey) {
       return _artworkCacheValue;
     }
@@ -809,7 +819,9 @@ class SystemMediaSessionService {
 
     try {
       final directory = await getTemporaryDirectory();
-      final file = File('${directory.path}${Platform.pathSeparator}media_audio_placeholder.png');
+      final file = File(
+        '${directory.path}${Platform.pathSeparator}media_audio_placeholder.png',
+      );
       if (!await file.exists()) {
         final recorder = ui.PictureRecorder();
         final canvas = Canvas(recorder);
@@ -858,10 +870,7 @@ class SystemMediaSessionService {
         if (pngBytes == null) {
           return null;
         }
-        await file.writeAsBytes(
-          pngBytes.buffer.asUint8List(),
-          flush: true,
-        );
+        await file.writeAsBytes(pngBytes.buffer.asUint8List(), flush: true);
       }
 
       _audioPlaceholderArtworkPath = file.path;
@@ -876,6 +885,8 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     with audio_service.QueueHandler, audio_service.SeekHandler {
   MediaPlaybackService? _playbackService;
   PlaylistManager? _playlistManager;
+  bool? _pendingQueueSkipAutoPlay;
+  int _queueSkipRequestId = 0;
 
   bool _shouldHandleRemoteCommand(String command) {
     final enabled = SystemMediaSessionService.instance.headsetControlsEnabled;
@@ -901,9 +912,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     if (!_shouldHandleRemoteCommand('play')) return;
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote play command received',
-      data: <String, Object?>{
-        'itemId': _playbackService?.currentItem?.id,
-      },
+      data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
     await _playbackService?.resume();
   }
@@ -913,9 +922,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     if (!_shouldHandleRemoteCommand('pause')) return;
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote pause command received',
-      data: <String, Object?>{
-        'itemId': _playbackService?.currentItem?.id,
-      },
+      data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
     await _playbackService?.pause();
   }
@@ -959,9 +966,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     if (!_shouldHandleRemoteCommand('skipToNext')) return;
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote next command received',
-      data: <String, Object?>{
-        'itemId': _playbackService?.currentItem?.id,
-      },
+      data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
     await _handleQueueSkip(isNext: true);
   }
@@ -971,9 +976,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     if (!_shouldHandleRemoteCommand('skipToPrevious')) return;
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote previous command received',
-      data: <String, Object?>{
-        'itemId': _playbackService?.currentItem?.id,
-      },
+      data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
     await _handleQueueSkip(isNext: false);
   }
@@ -992,10 +995,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     }
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote queue item command received',
-      data: <String, Object?>{
-        'index': index,
-        'itemId': playlist[index].id,
-      },
+      data: <String, Object?>{'index': index, 'itemId': playlist[index].id},
     );
     await playbackService.playPlaylistItem(playlist[index], autoPlay: true);
   }
@@ -1014,10 +1014,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     }
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote media item command received',
-      data: <String, Object?>{
-        'index': index,
-        'itemId': mediaItem.id,
-      },
+      data: <String, Object?>{'index': index, 'itemId': mediaItem.id},
     );
     await playbackService.playPlaylistItem(
       playlistManager.playlist[index],
@@ -1034,7 +1031,8 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     }
     final settings = SettingsService();
     final bool useSubtitleStep =
-        settings.enableDoubleTapSubtitleSeek && playbackService.subtitles.isNotEmpty;
+        settings.enableDoubleTapSubtitleSeek &&
+        playbackService.subtitles.isNotEmpty;
     final direction = isBackward ? 'backward' : 'forward';
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote step command received',
@@ -1060,28 +1058,43 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     if (playbackService == null || playlistManager == null) {
       return;
     }
-    playlistManager.reloadPlaylist();
-    final playlist = playlistManager.playlist;
-    if (playlist.isEmpty) {
-      return;
-    }
-    if (playlist.length == 1) {
-      await playbackService.play(
-        playlist.first,
-        autoPlay: playbackService.isPlaying,
-        startPosition: playbackService.position,
+    final int requestId = ++_queueSkipRequestId;
+    // Preserve the user's play/pause intent across an overlapping controller
+    // hand-off. Loading temporarily reports isPlaying=false, so a second
+    // notification action must inherit the first action's intent instead of
+    // loading the final item paused.
+    final bool autoPlay = playbackService.state == PlaybackState.loading
+        ? (_pendingQueueSkipAutoPlay ?? false)
+        : playbackService.isPlaying;
+    _pendingQueueSkipAutoPlay = autoPlay;
+    try {
+      playlistManager.reloadPlaylist();
+      final playlist = playlistManager.playlist;
+      if (playlist.isEmpty) {
+        return;
+      }
+      if (playlist.length == 1) {
+        await playbackService.play(
+          playlist.first,
+          autoPlay: autoPlay,
+          startPosition: playbackService.position,
+        );
+        return;
+      }
+      final currentIndex = playlistManager.currentIndex;
+      final fallbackIndex = currentIndex >= 0 ? currentIndex : 0;
+      final targetIndex = isNext
+          ? (fallbackIndex + 1) % playlist.length
+          : (fallbackIndex - 1 + playlist.length) % playlist.length;
+      await playbackService.playPlaylistItem(
+        playlist[targetIndex],
+        autoPlay: autoPlay,
       );
-      return;
+    } finally {
+      if (requestId == _queueSkipRequestId) {
+        _pendingQueueSkipAutoPlay = null;
+      }
     }
-    final currentIndex = playlistManager.currentIndex;
-    final fallbackIndex = currentIndex >= 0 ? currentIndex : 0;
-    final targetIndex = isNext
-        ? (fallbackIndex + 1) % playlist.length
-        : (fallbackIndex - 1 + playlist.length) % playlist.length;
-    await playbackService.playPlaylistItem(
-      playlist[targetIndex],
-      autoPlay: playbackService.isPlaying,
-    );
   }
 }
 

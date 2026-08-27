@@ -8,11 +8,61 @@ import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
 import '../services/embedded_subtitle_service.dart';
+import '../models/subtitle_source_type.dart';
+import '../models/subtitle_classification.dart';
 import '../services/settings_service.dart';
+import '../services/library_service.dart';
+import '../services/task_subtitle_storage_service.dart';
+import '../models/managed_subtitle_asset.dart';
 import '../services/subtitle_translation_service.dart';
+import '../services/subtitle_discovery_service.dart';
 import '../utils/app_toast.dart';
+import '../utils/subtitle_parser.dart';
+import '../utils/subtitle_file_matcher.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
+
+@visibleForTesting
+Future<bool> showSubtitleDeletionConfirmationDialog(
+  BuildContext context, {
+  required String fileName,
+  required bool isSidecar,
+  required bool isExternal,
+  required int dependentAssetCount,
+}) async {
+  return await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          backgroundColor: const Color(0xFF2C2C2C),
+          title: Text(
+            isExternal ? '删除外部字幕文件' : '删除字幕',
+            style: const TextStyle(color: Colors.white),
+          ),
+          content: Text(
+            isSidecar
+                ? '这是视频同目录下的伴随字幕。删除磁盘文件后，所有使用该视频的任务都将无法再看到它。\n\n确定删除 $fileName 吗？'
+                : isExternal
+                ? '这是任务目录之外的外部字幕。删除会直接移除原始磁盘文件，其他引用该文件的地方也会受影响。\n\n确定删除 $fileName 吗？'
+                : dependentAssetCount == 0
+                ? '确定要删除 $fileName 吗？'
+                : '确定要删除 $fileName 吗？\n同时会删除 $dependentAssetCount 个由它生成的任务字幕。',
+            style: const TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      ) ??
+      false;
+}
 
 class SubtitleManagementSheet extends StatefulWidget {
   final String videoPath;
@@ -22,10 +72,10 @@ class SubtitleManagementSheet extends StatefulWidget {
   final Function(List<String> paths)? onSubtitleSelected;
   final Function(String path)? onSubtitlePreview; // New callback
   final VoidCallback? onClose;
-  final Map<String, String>? additionalSubtitles;
+  final Map<String, String>? associatedSubtitles;
+  final Map<String, String>? localSubtitles;
   final List<String> initialSelectedPaths;
   final bool showEmbeddedSubtitles;
-  final bool preferAssociatedSubtitlesOnly;
 
   const SubtitleManagementSheet({
     super.key,
@@ -36,10 +86,10 @@ class SubtitleManagementSheet extends StatefulWidget {
     this.onSubtitleSelected,
     this.onSubtitlePreview,
     this.onClose,
-    this.additionalSubtitles,
+    this.associatedSubtitles,
+    this.localSubtitles,
     this.initialSelectedPaths = const [],
     this.showEmbeddedSubtitles = true,
-    this.preferAssociatedSubtitlesOnly = false,
   });
 
   @override
@@ -54,7 +104,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   );
   List<File> _subtitleFiles = [];
   List<EmbeddedSubtitleTrack> _embeddedTracks = [];
-  bool _isLoading = true;
+  bool _isScanningFiles = true;
+  bool _isScanningEmbedded = false;
+  int _scanGeneration = 0;
+  final Map<String, int> _subtitleFileSizes = <String, int>{};
+  final Set<String> _sidecarSubtitlePaths = <String>{};
+  final Set<String> _taskSubtitlePaths = <String>{};
   int? _extractingTrackIndex;
   List<String> _selectedPaths = []; // Track selected items
   String? _customDownloadPath;
@@ -64,14 +119,64 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       {}; // Map track index to extracted path
 
   final SubtitleTranslationService _subtitleTranslationService =
-      SubtitleTranslationService();
+      SubtitleTranslationService.instance;
   String? _expandedTranslatePath;
-  String? _translatingPath;
-  bool _isTranslating = false;
-  double _translateProgress = 0;
+  // 翻译状态由服务（单例）持有，UI 通过监听器刷新，跨页面重建可恢复进度。
+  // _translateSourceLanguage / _translateTargetLanguage / _translateProvider
+  // 仅是 UI 选择器偏好，保留在本地。
   String _translateSourceLanguage = 'en';
   String _translateTargetLanguage = 'zh-CN';
-  SubtitleTranslateProvider _translateProvider = SubtitleTranslateProvider.bing;
+  SubtitleTranslateProvider _translateProvider =
+      SubtitleTranslateProvider.mymemory;
+
+  /// 中英方向的翻译服务（默认 MyMemory）。
+  SubtitleTranslateProvider _translateProviderEnZh =
+      SubtitleTranslateProvider.mymemory;
+
+  /// 其他语言方向的翻译服务（默认 MyMemory）。
+  SubtitleTranslateProvider _translateProviderOther =
+      SubtitleTranslateProvider.mymemory;
+
+  /// 当前是否有针对 [path] 的翻译任务在进行。
+  bool _isPathTranslating(String? path) {
+    return path != null &&
+        _subtitleTranslationService.isTranslatingPathForVideo(
+          videoPath: widget.videoPath,
+          inputPath: path,
+        );
+  }
+
+  bool _isActiveTranslationForCurrentVideo() {
+    return _subtitleTranslationService.isTranslatingForVideo(widget.videoPath);
+  }
+
+  bool _isTranslationPanelExpandedFor(String path) {
+    final expandedPath = _expandedTranslatePath;
+    return expandedPath != null &&
+        _normalizePath(expandedPath) == _normalizePath(path);
+  }
+
+  void _restoreActiveTranslationUi() {
+    if (!_isActiveTranslationForCurrentVideo()) return;
+    final activeInputPath = _subtitleTranslationService.activeInputPath;
+    if (activeInputPath == null || activeInputPath.isEmpty) return;
+
+    // Restore the panel as well as the service state so progress is visible as
+    // soon as the fresh subtitle scan renders the active source file.
+    _expandedTranslatePath = p.normalize(activeInputPath);
+    final sourceLanguage = _subtitleTranslationService.activeSourceLanguage;
+    final targetLanguage = _subtitleTranslationService.activeTargetLanguage;
+    final provider = _subtitleTranslationService.activeProvider;
+    if (sourceLanguage != null && _containsSourceLanguage(sourceLanguage)) {
+      _translateSourceLanguage = sourceLanguage;
+    }
+    if (targetLanguage != null && _containsTargetLanguage(targetLanguage)) {
+      _translateTargetLanguage = targetLanguage;
+    }
+    if (provider != null) {
+      _translateProvider = provider;
+    }
+  }
 
   bool _manualTranslateMode = false;
   bool _manualPromptSubtitleFirst = true;
@@ -99,6 +204,10 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   static const String _prefKeyTranslateMode =
       'subtitle_translate_manual_mode_enabled';
   static const String _prefKeyTranslateProvider = 'subtitle_translate_provider';
+  static const String _prefKeyTranslateProviderEnZh =
+      'subtitle_translate_provider_enzh';
+  static const String _prefKeyTranslateProviderOther =
+      'subtitle_translate_provider_other';
   static const String _prefKeyManualPromptOrder =
       'subtitle_translate_manual_prompt_first';
   static const String _prefKeyManualPromptEditable =
@@ -185,6 +294,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     super.initState();
     _selectedPaths = _normalizeSelectedPaths(widget.initialSelectedPaths);
     _manualPromptController.addListener(_onManualPromptChanged);
+    _subtitleTranslationService.addListener(_onTranslationChanged);
+    _subtitleTranslationService.addCompletionCallback(_onTranslationComplete);
+    _restoreActiveTranslationUi();
     _loadSubtitles();
     _initDefaultPath();
     _loadCustomDownloadPath();
@@ -195,10 +307,89 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   void dispose() {
     _translatePrefsSaveDebounce?.cancel();
     _saveTranslatePanelPreferences();
+    _subtitleTranslationService.removeListener(_onTranslationChanged);
+    _subtitleTranslationService.removeCompletionCallback(
+      _onTranslationComplete,
+    );
     _manualPromptController.removeListener(_onManualPromptChanged);
     _manualSourceController.dispose();
     _manualPromptController.dispose();
     super.dispose();
+  }
+
+  void _onTranslationChanged() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// 翻译完成回调。即便发起翻译的 UI 已销毁，只要重开后重新注册即可接收。
+  void _onTranslationComplete(SubtitleTranslationCompletion completion) {
+    if (!mounted) return;
+    if (!_sameVideoPath(completion.videoPath)) return;
+    // A previous player route can remain mounted underneath the video that is
+    // currently being watched. Refresh its data, but never let that hidden
+    // route publish a global toast over the new video.
+    final routeIsCurrent = ModalRoute.of(context)?.isCurrent ?? true;
+    if (completion.isSuccess && completion.result != null) {
+      _loadSubtitles();
+      _notifySubtitleFilesChanged();
+      setState(() {
+        _expandedTranslatePath = null;
+      });
+      if (routeIsCurrent) {
+        AppToast.show(
+          "翻译完成：${p.basename(completion.result!.outputPath)}\n保存位置：${completion.result!.outputPath}",
+          type: AppToastType.success,
+        );
+      }
+    } else if (completion.error != null && routeIsCurrent) {
+      AppToast.show("翻译失败：${completion.error}", type: AppToastType.error);
+    }
+  }
+
+  bool _sameVideoPath(String path) =>
+      _normalizePath(path) == _normalizePath(widget.videoPath);
+
+  void _notifySubtitleFilesChanged() {
+    try {
+      Provider.of<LibraryService>(
+        context,
+        listen: false,
+      ).notifySubtitleFilesChanged(videoId: widget.videoId);
+    } catch (_) {
+      // Isolated previews/tests may host the sheet without LibraryService.
+    }
+    widget.onSubtitleChanged();
+  }
+
+  String _requireVideoId() {
+    final videoId = widget.videoId?.trim() ?? '';
+    if (videoId.isEmpty) {
+      throw StateError('当前媒体没有任务 ID，无法创建任务字幕');
+    }
+    return videoId;
+  }
+
+  Future<void> _registerManagedSubtitle(
+    String path,
+    ManagedSubtitleAssetKind kind,
+    String displayName, {
+    String? sourcePath,
+    String? language,
+  }) async {
+    final videoId = _requireVideoId();
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final sourceAssetId = sourcePath == null
+        ? null
+        : library.managedSubtitleAssetForPath(videoId, sourcePath)?.assetId;
+    await library.registerManagedSubtitleAsset(
+      videoId,
+      path: path,
+      kind: kind,
+      displayName: displayName,
+      sourceAssetId: sourceAssetId,
+      language: language,
+    );
   }
 
   void _initDefaultPath() {
@@ -286,6 +477,32 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     if (has(RegExp(r'(^|[._\-\s])(en|eng|english)([._\-\s]|$)'))) {
       return 'en';
     }
+    if (has(
+      RegExp(r'(^|[._\-\s])(pt|por|portuguese|pt-br|pt-pt)([._\-\s]|$)'),
+    )) {
+      return 'pt';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(fr|fra|french)([._\-\s]|$)'))) {
+      return 'fr';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(de|ger|deu|german)([._\-\s]|$)'))) {
+      return 'de';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(es|spa|spanish)([._\-\s]|$)'))) {
+      return 'es';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(it|ita|italian)([._\-\s]|$)'))) {
+      return 'it';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(ru|rus|russian)([._\-\s]|$)'))) {
+      return 'ru';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(th|tha|thai)([._\-\s]|$)'))) {
+      return 'th';
+    }
+    if (has(RegExp(r'(^|[._\-\s])(ar|ara|arabic)([._\-\s]|$)'))) {
+      return 'ar';
+    }
 
     return null;
   }
@@ -294,34 +511,101 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     try {
       final text = await File(path).readAsString();
       final sample = text.length > 8000 ? text.substring(0, 8000) : text;
+      final lower = sample.toLowerCase();
 
+      // ===== 非拉丁文字系检测 =====
       final chinese = RegExp(r'[\u4E00-\u9FFF]').allMatches(sample).length;
       final kana = RegExp(r'[\u3040-\u30FF]').allMatches(sample).length;
       final hangul = RegExp(r'[\uAC00-\uD7AF]').allMatches(sample).length;
-      final latin = RegExp(r'[A-Za-z]').allMatches(sample).length;
+      final cyrillic = RegExp(r'[\u0400-\u04FF]').allMatches(sample).length;
+      final thai = RegExp(r'[\u0E00-\u0E7F]').allMatches(sample).length;
+      final arabic = RegExp(r'[\u0600-\u06FF]').allMatches(sample).length;
 
-      final maxCount = [
-        chinese,
-        kana,
-        hangul,
-        latin,
-      ].reduce((a, b) => a > b ? a : b);
-      if (maxCount < 12) return null;
-
-      if (kana >= chinese && kana >= hangul && kana >= latin ~/ 2) {
-        return 'ja';
-      }
-      if (hangul >= chinese && hangul >= kana && hangul >= latin ~/ 2) {
-        return 'ko';
-      }
-      if (chinese >= latin && chinese >= 12) {
+      if (chinese >= 8 && chinese >= kana && chinese >= hangul) {
         return 'zh-CN';
       }
-      if (latin >= 16) {
-        return 'en';
+      if (kana >= chinese && kana >= 8) {
+        return 'ja';
+      }
+      if (hangul >= chinese && hangul >= 8) {
+        return 'ko';
+      }
+      if (cyrillic >= 8) {
+        return 'ru';
+      }
+      if (thai >= 8) {
+        return 'th';
+      }
+      if (arabic >= 8) {
+        return 'ar';
       }
 
-      return null;
+      final latin = RegExp(r'[A-Za-z]').allMatches(sample).length;
+      if (latin < 12) return null;
+
+      // ===== 拉丁文字系检测（综合评分法）=====
+      // 每种语言一组「特征字符(权重) + 高频词」，总分最高者为结果。
+      // 特征字符：葡萄牙语鼻元音 ã/õ、德语变音 äöüß、西班牙语 ñ 权重最高；
+      // 法语/意大利语重音字符区分度较弱，辅以高频词。
+      final features = <String, (RegExp, int, RegExp)>{
+        'pt': (
+          RegExp(r'[ãõ]'),
+          3,
+          RegExp(r'\b(de|que|o|a|em|para|um|não|os|as|do|da|uma|com|você)\b'),
+        ),
+        'de': (
+          RegExp(r'[äöüß]'),
+          3,
+          RegExp(r'\b(der|die|das|und|ist|ein|nicht|mit|sie|ich|zu|wir)\b'),
+        ),
+        'es': (
+          RegExp(r'[ñ¿¡]'),
+          3,
+          RegExp(r'\b(el|la|los|las|que|con|para|por|es|una|y|en|no)\b'),
+        ),
+        'fr': (
+          RegExp(r'[çéèêëàâîïôûùœ]'),
+          1,
+          RegExp(
+            r'\b(le|de|la|et|les|des|en|un|une|que|est|pour|avec|vous|nous)\b',
+          ),
+        ),
+        'it': (
+          RegExp(r'[àèéìíîòóùú]'),
+          1,
+          RegExp(r'\b(il|lo|la|di|che|e|in|un|per|sono|è|non|mi|ci)\b'),
+        ),
+        'en': (
+          RegExp(r'[qxz]k'),
+          0,
+          RegExp(r'\b(the|and|of|to|is|in|that|it|you|for|this|with|we|she)\b'),
+        ),
+      };
+
+      final scores = <String, int>{};
+      features.forEach((lang, feat) {
+        final (charRe, charWeight, stopRe) = feat;
+        var score = 0;
+        score += charRe.allMatches(lower).length * charWeight;
+        score += stopRe.allMatches(lower).length;
+        scores[lang] = score;
+      });
+
+      // 取非英语语言中的最高分
+      String? best;
+      int bestScore = 0;
+      scores.forEach((lang, score) {
+        if (lang != 'en' && score > bestScore) {
+          best = lang;
+          bestScore = score;
+        }
+      });
+      final enScore = scores['en'] ?? 0;
+      // 非英语语言得分必须 >= 4 且显著高于英语（1.3 倍）才判定为对应语言
+      if (best != null && bestScore >= 4 && bestScore > enScore * 1.3) {
+        return best;
+      }
+      return 'en';
     } catch (_) {
       return null;
     }
@@ -348,6 +632,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       _translateTargetLanguage = _containsTargetLanguage(target)
           ? target
           : 'zh-CN';
+      // 语言自动检测后同步切换对应的翻译服务
+      _syncProviderWithDirection();
     });
   }
 
@@ -357,6 +643,18 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       if (provider.name == name) return provider;
     }
     return _translateProvider;
+  }
+
+  /// 根据当前语言方向自动切换 UI 上显示的翻译服务：
+  /// 中英方向显示 [_translateProviderEnZh]，其他语言方向显示 [_translateProviderOther]。
+  void _syncProviderWithDirection() {
+    final isEnZh = _subtitleTranslationService.isEnZhDirection(
+      _translateSourceLanguage,
+      _translateTargetLanguage,
+    );
+    _translateProvider = isEnZh
+        ? _translateProviderEnZh
+        : _translateProviderOther;
   }
 
   void _onManualPromptChanged() {
@@ -375,7 +673,16 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefKeyTranslateMode, _manualTranslateMode);
+      // 保存当前方向对应的服务（同时保存旧键兼容，及双方向键）
       await prefs.setString(_prefKeyTranslateProvider, _translateProvider.name);
+      await prefs.setString(
+        _prefKeyTranslateProviderEnZh,
+        _translateProviderEnZh.name,
+      );
+      await prefs.setString(
+        _prefKeyTranslateProviderOther,
+        _translateProviderOther.name,
+      );
       await prefs.setBool(
         _prefKeyManualPromptOrder,
         _manualPromptSubtitleFirst,
@@ -393,9 +700,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     try {
       final prefs = await SharedPreferences.getInstance();
 
-      final savedProvider = _providerFromName(
-        prefs.getString(_prefKeyTranslateProvider),
-      );
+      final savedEnZhStr = prefs.getString(_prefKeyTranslateProviderEnZh);
+      final savedOtherStr = prefs.getString(_prefKeyTranslateProviderOther);
+      final savedEnZh = _providerFromName(savedEnZhStr);
+      final savedOther = _providerFromName(savedOtherStr);
+      final hasSavedEnZh = savedEnZhStr != null;
+      final hasSavedOther = savedOtherStr != null;
       final savedManualMode =
           prefs.getBool(_prefKeyTranslateMode) ?? _manualTranslateMode;
       final savedPromptOrder =
@@ -407,7 +717,22 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
       if (!mounted) return;
       setState(() {
-        _translateProvider = savedProvider;
+        // 双方向服务默认均为 MyMemory；
+        // 仅当用户在 UI 中手动改过对应方向时才沿用其保存值。
+        _translateProviderEnZh = hasSavedEnZh
+            ? savedEnZh
+            : SubtitleTranslateProvider.mymemory;
+        _translateProviderOther = hasSavedOther
+            ? savedOther
+            : SubtitleTranslateProvider.mymemory;
+        // UI 当前显示的服务 = 根据当前语言方向自动选择
+        _translateProvider =
+            _subtitleTranslationService.isEnZhDirection(
+              _translateSourceLanguage,
+              _translateTargetLanguage,
+            )
+            ? _translateProviderEnZh
+            : _translateProviderOther;
         _manualTranslateMode = savedManualMode;
         _manualPromptSubtitleFirst = savedPromptOrder;
       });
@@ -446,8 +771,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     super.didUpdateWidget(oldWidget);
     if (widget.videoPath != oldWidget.videoPath) {
       setState(() {
-        _isLoading = true;
+        _isScanningFiles = true;
+        _isScanningEmbedded = widget.showEmbeddedSubtitles;
         _subtitleFiles = [];
+        _subtitleFileSizes.clear();
+        _sidecarSubtitlePaths.clear();
         _embeddedTracks = [];
         _extractingTrackIndex = null;
         _selectedPaths = _normalizeSelectedPaths(widget.initialSelectedPaths);
@@ -480,106 +808,86 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   }
 
   Future<void> _loadSubtitles() async {
-    setState(() => _isLoading = true);
+    final generation = ++_scanGeneration;
+    final settings = SettingsService();
+    final embeddedService = Provider.of<EmbeddedSubtitleService>(
+      context,
+      listen: false,
+    );
+    if (mounted) {
+      setState(() {
+        _isScanningFiles = true;
+        _isScanningEmbedded = widget.showEmbeddedSubtitles;
+      });
+    }
+    unawaited(_loadEmbeddedTracks(generation, embeddedService));
+
     try {
       _extractedTrackPaths.clear();
-      // 1. Load Local Files
-      final videoFile = File(widget.videoPath);
-      final dir = videoFile.parent;
+      _taskSubtitlePaths.clear();
       final videoName = p.basenameWithoutExtension(widget.videoPath);
-      final extractedPrefix = "$videoName.stream_";
       final extractedPrefixes = <String>{
         videoName,
         if (widget.videoId != null && widget.videoId!.trim().isNotEmpty)
           widget.videoId!.trim(),
       };
 
-      if (await dir.exists()) {
-        final files = dir.listSync();
-        _subtitleFiles = files.whereType<File>().where((file) {
-          final name = p.basename(file.path);
-          if (!name.startsWith(videoName)) return false;
-          if (name.startsWith(extractedPrefix)) return false;
-          final ext = p.extension(file.path).toLowerCase();
-          return [
-            '.srt',
-            '.vtt',
-            '.ass',
-            '.ssa',
-            '.sup',
-            '.lrc',
-            '.sub',
-            '.idx',
-            '.scc',
-          ].contains(ext);
-        }).toList();
+      final discovered = await const SubtitleDiscoveryService()
+          .scanVideoDirectory(
+            videoPath: widget.videoPath,
+            rules: SubtitleScanRules(
+              prefixMatchMode: settings.desktopSubtitlePrefixMatchMode,
+              caseSensitive: settings.desktopSubtitleScanCaseSensitive,
+            ),
+          );
+      if (!mounted || generation != _scanGeneration) return;
+
+      final filesByPath = <String, File>{};
+      final modifiedByPath = <String, DateTime>{};
+      for (final entry in discovered) {
+        final key = _normalizePath(entry.path);
+        filesByPath[key] = File(entry.path);
+        modifiedByPath[key] = entry.modifiedAt;
+        _subtitleFileSizes[key] = entry.length;
       }
+      setState(() {
+        _sidecarSubtitlePaths
+          ..clear()
+          ..addAll(
+            discovered
+                .where(
+                  (entry) => entry.sourceType == SubtitleSourceType.sidecar,
+                )
+                .map((entry) => _normalizePath(entry.path)),
+          );
+        _subtitleFiles = discovered.map((entry) => File(entry.path)).toList();
+      });
 
-      // 2. Load Extracted Subtitles and AI Subtitles from AppDocDir
-      final dataRoot = await SettingsService().resolveLargeDataRootDir();
-      final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-      if (await subDir.exists()) {
-        final docFiles = subDir.listSync().whereType<File>();
-
-        // Handle Extracted Streams
-        final extractedFiles = docFiles.where((file) {
-          final ext = p.extension(file.path).toLowerCase();
-          return _matchesCurrentVideoExtractedFile(
-                file.path,
-                extractedPrefixes,
-              ) &&
-              [
-                '.srt',
-                '.vtt',
-                '.ass',
-                '.ssa',
-                '.sup',
-                '.lrc',
-                '.sub',
-                '.idx',
-                '.scc',
-              ].contains(ext);
-        });
-
-        for (final file in extractedFiles) {
+      final videoId = widget.videoId?.trim() ?? '';
+      if (videoId.isNotEmpty) {
+        final taskFiles = await const TaskSubtitleStorageService()
+            .listTaskSubtitles(videoId);
+        if (!mounted || generation != _scanGeneration) return;
+        _taskSubtitlePaths.addAll(
+          taskFiles.map((file) => _normalizePath(file.path)),
+        );
+        await Provider.of<LibraryService>(
+          context,
+          listen: false,
+        ).reconcileManagedSubtitleAssets(
+          videoId,
+          taskFiles.map((file) => file.path),
+        );
+        if (!mounted || generation != _scanGeneration) return;
+        for (final file in taskFiles) {
           _registerExtractedTrackPath(
             file.path,
             extractedPrefixes: extractedPrefixes,
           );
-        }
-
-        // Handle AI Subtitles
-        final aiFileNames = <String>{
-          "$videoName.ai.srt",
-          if (widget.videoId != null && widget.videoId!.trim().isNotEmpty)
-            "${widget.videoId!.trim()}.ai.srt",
-        };
-        final aiFiles = docFiles.where((file) {
-          final name = p.basename(file.path);
-          return aiFileNames.contains(name);
-        });
-
-        for (final file in aiFiles) {
-          if (!_subtitleFiles.any((f) => f.path == file.path)) {
-            _subtitleFiles.add(file);
-          }
+          await _addFileWithMetadata(file, filesByPath, modifiedByPath);
         }
       }
 
-      final legacyDocDir = await getApplicationDocumentsDirectory();
-      final legacySubDir = Directory(p.join(legacyDocDir.path, 'subtitles'));
-      if (p.normalize(legacySubDir.path) != p.normalize(subDir.path) &&
-          await legacySubDir.exists()) {
-        final legacyFiles = legacySubDir.listSync().whereType<File>();
-        for (final file in legacyFiles) {
-          _registerExtractedTrackPath(
-            file.path,
-            extractedPrefixes: extractedPrefixes,
-          );
-        }
-      }
-
-      // 3. Ensure selected paths are in the list (if they exist)
       for (final path in _selectedPaths) {
         final file = File(path);
         if (await file.exists()) {
@@ -587,43 +895,203 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
             path,
             extractedPrefixes: extractedPrefixes,
           );
-          final name = p.basename(path);
-          if (name.contains(".stream_")) {
-            continue;
-          }
-          if (name.startsWith(extractedPrefix)) {
-            continue;
-          }
-          if (!_subtitleFiles.any((f) => f.path == path)) {
-            _subtitleFiles.add(file);
-          }
+          if (_streamIndexFromExtractedPath(path) != null) continue;
+          await _addFileWithMetadata(file, filesByPath, modifiedByPath);
         }
       }
 
-      // Sort by modification time (newest first)
-      _subtitleFiles.sort(
-        (a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()),
-      );
-
-      // 4. Load Embedded Tracks
-      if (mounted) {
-        if (widget.showEmbeddedSubtitles) {
-          final service = Provider.of<EmbeddedSubtitleService>(
-            context,
-            listen: false,
-          );
-          _embeddedTracks = await service.getEmbeddedSubtitles(
-            widget.videoPath,
-          );
-        } else {
-          _embeddedTracks = [];
-        }
+      // Locally created/managed groups are explicit local subtitles. They may
+      // live outside both the video folder and the standard subtitles folder.
+      for (final path in widget.localSubtitles?.values ?? const <String>[]) {
+        final file = File(path);
+        if (!await file.exists()) continue;
+        _registerExtractedTrackPath(path, extractedPrefixes: extractedPrefixes);
+        if (_streamIndexFromExtractedPath(path) != null) continue;
+        await _addFileWithMetadata(file, filesByPath, modifiedByPath);
       }
+
+      if (!mounted || generation != _scanGeneration) return;
+      final allFiles = filesByPath.values.toList()
+        ..sort((first, second) {
+          final firstTime = modifiedByPath[_normalizePath(first.path)];
+          final secondTime = modifiedByPath[_normalizePath(second.path)];
+          if (firstTime == null || secondTime == null) return 0;
+          return secondTime.compareTo(firstTime);
+        });
+      setState(() {
+        _subtitleFiles = allFiles;
+        _isScanningFiles = false;
+      });
     } catch (e) {
       debugPrint("Error listing subtitles: $e");
-    } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
+      if (mounted && generation == _scanGeneration) {
+        setState(() => _isScanningFiles = false);
+      }
+    }
+  }
+
+  bool get _isDesktop =>
+      Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+
+  Future<void> _showScanSettingsDialog() async {
+    final settings = SettingsService();
+    var matchMode = settings.desktopSubtitlePrefixMatchMode;
+    var caseSensitive = settings.desktopSubtitleScanCaseSensitive;
+
+    final shouldApply = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF252525),
+          title: const Row(
+            children: [
+              Icon(Icons.manage_search, color: Colors.lightBlueAccent),
+              SizedBox(width: 10),
+              Text('同文件夹字幕扫描设置'),
+            ],
+          ),
+          content: SizedBox(
+            width: 520,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '前缀匹配要求',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<SubtitlePrefixMatchMode>(
+                  initialValue: matchMode,
+                  dropdownColor: const Color(0xFF303030),
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: const [
+                    DropdownMenuItem(
+                      value: SubtitlePrefixMatchMode.exactOrDelimited,
+                      child: Text('同名或分隔后缀（推荐）'),
+                    ),
+                    DropdownMenuItem(
+                      value: SubtitlePrefixMatchMode.exactOnly,
+                      child: Text('仅完全同名（最严格）'),
+                    ),
+                    DropdownMenuItem(
+                      value: SubtitlePrefixMatchMode.startsWith,
+                      child: Text('任意相同前缀（兼容旧逻辑）'),
+                    ),
+                  ],
+                  onChanged: (value) {
+                    if (value == null) return;
+                    setDialogState(() => matchMode = value);
+                  },
+                ),
+                const SizedBox(height: 8),
+                Text(switch (matchMode) {
+                  SubtitlePrefixMatchMode.exactOrDelimited =>
+                    '匹配 Movie.srt、Movie.zh-CN.srt；排除 Movie2.srt。',
+                  SubtitlePrefixMatchMode.exactOnly =>
+                    '只匹配 Movie.srt，不匹配带语言或版本后缀的字幕。',
+                  SubtitlePrefixMatchMode.startsWith =>
+                    '匹配所有以 Movie 开头的字幕，也可能包含 Movie2.srt。',
+                }, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('区分文件名大小写'),
+                  subtitle: const Text(
+                    '默认关闭，更符合 Windows 和 macOS 的文件使用习惯。',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  value: caseSensitive,
+                  onChanged: (value) {
+                    setDialogState(() => caseSensitive = value);
+                  },
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '扫描只读取视频所在文件夹的第一层；所有符合规则的字幕都会显示在管理区。',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                setDialogState(() {
+                  matchMode = SubtitleScanRules.defaults.prefixMatchMode;
+                  caseSensitive = SubtitleScanRules.defaults.caseSensitive;
+                });
+              },
+              child: const Text('恢复默认'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('保存并重新扫描'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (shouldApply != true) return;
+    await settings.saveDesktopSubtitleScanSettings(
+      prefixMatchMode: matchMode,
+      caseSensitive: caseSensitive,
+    );
+    if (!mounted) return;
+    AppToast.show('扫描设置已保存', type: AppToastType.success);
+    await _loadSubtitles();
+  }
+
+  Future<void> _addFileWithMetadata(
+    File file,
+    Map<String, File> filesByPath,
+    Map<String, DateTime> modifiedByPath,
+  ) async {
+    final key = _normalizePath(file.path);
+    if (filesByPath.containsKey(key)) return;
+    try {
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file) return;
+      filesByPath[key] = file;
+      modifiedByPath[key] = stat.modified;
+      _subtitleFileSizes[key] = stat.size;
+    } on FileSystemException {
+      // A file can disappear while its directory is being scanned.
+    }
+  }
+
+  Future<void> _loadEmbeddedTracks(
+    int generation,
+    EmbeddedSubtitleService service,
+  ) async {
+    if (!widget.showEmbeddedSubtitles) {
+      if (mounted && generation == _scanGeneration) {
+        setState(() {
+          _embeddedTracks = [];
+          _isScanningEmbedded = false;
+        });
+      }
+      return;
+    }
+    try {
+      final tracks = await service.getEmbeddedSubtitles(widget.videoPath);
+      if (!mounted || generation != _scanGeneration) return;
+      setState(() {
+        _embeddedTracks = tracks;
+        _isScanningEmbedded = false;
+      });
+    } catch (e) {
+      debugPrint('Error probing embedded subtitles: $e');
+      if (mounted && generation == _scanGeneration) {
+        setState(() => _isScanningEmbedded = false);
       }
     }
   }
@@ -646,11 +1114,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     setState(() => _extractingTrackIndex = track.index);
 
     try {
-      final dataRoot = await SettingsService().resolveLargeDataRootDir();
-      final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-      if (!await subDir.exists()) {
-        await subDir.create(recursive: true);
-      }
+      final videoId = _requireVideoId();
+      final subDir = await const TaskSubtitleStorageService().taskDirectory(
+        videoId,
+        create: true,
+      );
 
       if (mounted) {
         final service = Provider.of<EmbeddedSubtitleService>(
@@ -667,6 +1135,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         );
 
         if (path != null) {
+          await _registerManagedSubtitle(
+            path,
+            ManagedSubtitleAssetKind.embedded,
+            _displayEmbeddedTitle(track),
+          );
           if (mounted) {
             // Store mapping
             _extractedTrackPaths[track.index] = path;
@@ -695,43 +1168,75 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   }
 
   Future<void> _deleteSubtitle(File file) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF2C2C2C),
-        title: const Text("删除字幕", style: TextStyle(color: Colors.white)),
-        content: Text(
-          "确定要删除 ${p.basename(file.path)} 吗？",
-          style: const TextStyle(color: Colors.white70),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text("取消"),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
-            child: const Text("删除"),
-          ),
-        ],
-      ),
+    LibraryService? library;
+    try {
+      library = Provider.of<LibraryService>(context, listen: false);
+    } catch (_) {}
+
+    final normalizedPath = _normalizePath(file.path);
+    final isSidecar = _sidecarSubtitlePaths.contains(normalizedPath);
+    final isTaskOwned = _taskSubtitlePaths.contains(normalizedPath);
+    final isExternal = !isTaskOwned;
+    final videoId = widget.videoId?.trim() ?? '';
+    final deletionPaths = isTaskOwned && library != null && videoId.isNotEmpty
+        ? library.managedSubtitleDeletionPaths(videoId, file.path)
+        : <String>[file.path];
+
+    final confirm = await showSubtitleDeletionConfirmationDialog(
+      context,
+      fileName: p.basename(file.path),
+      isSidecar: isSidecar,
+      isExternal: isExternal,
+      dependentAssetCount: deletionPaths.length - 1,
     );
 
-    if (confirm == true) {
+    if (confirm) {
       try {
-        await file.delete();
-        final selectedIndex = _selectedIndexOf(file.path);
-        if (selectedIndex != -1) {
+        final deletedPathKeys = <String>{};
+        final successfullyDeletedPaths = <String>[];
+        final failedPaths = <String>[];
+        final storage = const TaskSubtitleStorageService();
+        for (final path in deletionPaths) {
+          try {
+            if (isTaskOwned && !await storage.isTaskOwnedPath(path, videoId)) {
+              failedPaths.add(path);
+              continue;
+            }
+            final target = File(path);
+            if (await target.exists()) await target.delete();
+            deletedPathKeys.add(_normalizePath(path));
+            successfullyDeletedPaths.add(path);
+          } on FileSystemException {
+            failedPaths.add(path);
+          }
+        }
+        if (isTaskOwned && library != null && videoId.isNotEmpty) {
+          await library.removeManagedSubtitleAssetsByPaths(
+            videoId,
+            successfullyDeletedPaths,
+          );
+        }
+        final hadDeletedSelection = _selectedPaths.any(
+          (path) => deletedPathKeys.contains(_normalizePath(path)),
+        );
+        if (hadDeletedSelection) {
           setState(() {
-            _selectedPaths.removeAt(selectedIndex);
+            _selectedPaths.removeWhere(
+              (path) => deletedPathKeys.contains(_normalizePath(path)),
+            );
           });
           if (widget.onSubtitleSelected != null) {
             widget.onSubtitleSelected!(_selectedPaths);
           }
         }
         _loadSubtitles(); // Reload list
-        widget.onSubtitleChanged(); // Notify parent
+        _notifySubtitleFilesChanged();
+        if (failedPaths.isNotEmpty && mounted) {
+          AppToast.show(
+            '有 ${failedPaths.length} 个字幕文件删除失败，请稍后重试',
+            type: AppToastType.error,
+          );
+        }
       } catch (e) {
         if (mounted) {
           AppToast.show("删除失败", type: AppToastType.error);
@@ -827,11 +1332,59 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       }
 
       if (Platform.isWindows) {
-        await Process.run('explorer', ['/select,', targetPath]);
+        // 将 /select, 和路径合并为单个参数，避免路径含空格/特殊字符时出错
+        bool opened = false;
+        try {
+          await Process.run('explorer', ['/select,$targetPath']);
+          opened = true;
+        } catch (e) {
+          debugPrint('explorer 打开失败，尝试 OpenFilex: $e');
+        }
+        if (!opened) {
+          try {
+            await OpenFilex.open(
+              targetPath,
+              type: _resolveMimeType(targetPath),
+            );
+          } catch (e) {
+            debugPrint('OpenFilex 也失败: $e');
+          }
+        }
         if (mounted) {
           AppToast.show("字幕已保存", type: AppToastType.success);
         }
+      } else if (Platform.isLinux || Platform.isMacOS) {
+        // 桌面 Linux/macOS 优先用系统命令打开所在文件夹
+        bool opened = false;
+        try {
+          if (Platform.isLinux) {
+            await Process.run('xdg-open', [p.dirname(targetPath)]);
+          } else {
+            await Process.run('open', [p.dirname(targetPath)]);
+          }
+          opened = true;
+        } catch (e) {
+          debugPrint('系统命令打开失败，尝试 OpenFilex: $e');
+        }
+        if (!opened) {
+          final result = await OpenFilex.open(
+            targetPath,
+            type: _resolveMimeType(targetPath),
+          );
+          if (mounted) {
+            if (result.type == ResultType.done) {
+              AppToast.show("字幕已下载并打开", type: AppToastType.success);
+            } else {
+              AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
+            }
+          }
+        } else {
+          if (mounted) {
+            AppToast.show("字幕已保存", type: AppToastType.success);
+          }
+        }
       } else {
+        // Android/iOS 等移动平台
         final result = await OpenFilex.open(
           targetPath,
           type: _resolveMimeType(targetPath),
@@ -845,6 +1398,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         }
       }
     } catch (e) {
+      debugPrint("下载字幕失败: $e");
       if (mounted) {
         AppToast.show("下载字幕失败", type: AppToastType.error);
       }
@@ -861,11 +1415,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     setState(() => _extractingTrackIndex = track.index);
 
     try {
-      final dataRoot = await SettingsService().resolveLargeDataRootDir();
-      final subDir = Directory(p.join(dataRoot.path, 'subtitles'));
-      if (!await subDir.exists()) {
-        await subDir.create(recursive: true);
-      }
+      final videoId = _requireVideoId();
+      final subDir = await const TaskSubtitleStorageService().taskDirectory(
+        videoId,
+        create: true,
+      );
 
       if (!mounted) return;
       final service = Provider.of<EmbeddedSubtitleService>(
@@ -881,6 +1435,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       );
 
       if (path != null) {
+        await _registerManagedSubtitle(
+          path,
+          ManagedSubtitleAssetKind.embedded,
+          _displayEmbeddedTitle(track),
+        );
         _extractedTrackPaths[track.index] = path;
         await _downloadSubtitleFile(path);
       } else {
@@ -898,6 +1457,56 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   }
 
   Future<void> _importSubtitle() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF2C2C2C),
+        title: const Text(
+          '导入字幕',
+          style: TextStyle(color: Colors.white, fontSize: 16),
+        ),
+        content: const Text(
+          '请选择导入方式：',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消', style: TextStyle(color: Colors.white54)),
+          ),
+          TextButton.icon(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _importSubtitleFromFile();
+            },
+            icon: const Icon(
+              Icons.folder_open,
+              size: 18,
+              color: Colors.white70,
+            ),
+            label: const Text('从文件导入', style: TextStyle(color: Colors.white)),
+          ),
+          TextButton.icon(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _showManualSubtitleInputDialog();
+            },
+            icon: const Icon(
+              Icons.edit_note,
+              size: 18,
+              color: Colors.blueAccent,
+            ),
+            label: const Text(
+              '手动输入文本',
+              style: TextStyle(color: Colors.blueAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _importSubtitleFromFile() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
@@ -915,19 +1524,337 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
     if (result != null && result.files.single.path != null) {
       final srcFile = File(result.files.single.path!);
-      final videoFile = File(widget.videoPath);
-      final dir = videoFile.parent;
-      final videoName = p.basenameWithoutExtension(widget.videoPath);
+      final videoId = _requireVideoId();
       final ext = p.extension(srcFile.path).toLowerCase();
-
-      // Copy to video dir so it appears in list
-      final newName =
-          "$videoName.imported.${DateTime.now().millisecondsSinceEpoch}$ext";
-      final destPath = p.join(dir.path, newName);
-
-      await srcFile.copy(destPath);
+      final destPath = await const TaskSubtitleStorageService().copyIntoTask(
+        videoId,
+        srcFile.path,
+        preferredFileName:
+            'imported.${DateTime.now().millisecondsSinceEpoch}$ext',
+      );
+      await _registerManagedSubtitle(
+        destPath,
+        ManagedSubtitleAssetKind.imported,
+        p.basenameWithoutExtension(srcFile.path),
+      );
       _loadSubtitles();
-      widget.onSubtitleChanged();
+      _notifySubtitleFilesChanged();
+    }
+  }
+
+  /// 生成默认手动字幕名称 (S1, S2, S3...)
+  String _generateDefaultManualSubtitleName() {
+    final videoName = p.basenameWithoutExtension(widget.videoPath);
+    final videoId = (widget.videoId ?? '').trim();
+    final prefixes = <String>{
+      '$videoName.manual.',
+      if (videoId.isNotEmpty) '$videoId.manual.',
+    };
+    int maxNum = 0;
+    final reg = RegExp(r'\.manual\.S(\d+)\.');
+    for (final file in _subtitleFiles) {
+      final name = p.basename(file.path);
+      if (!prefixes.any(name.startsWith)) continue;
+      final match = reg.firstMatch(name);
+      if (match != null) {
+        final n = int.tryParse(match.group(1)!) ?? 0;
+        if (n > maxNum) maxNum = n;
+      }
+    }
+    return 'S${maxNum + 1}';
+  }
+
+  /// 手动输入字幕文本对话框
+  Future<void> _showManualSubtitleInputDialog() async {
+    final nameController = TextEditingController(
+      text: _generateDefaultManualSubtitleName(),
+    );
+    final textController = TextEditingController();
+    SubtitleFormat? detectedFormat;
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final screenWidth = MediaQuery.of(ctx).size.width;
+            final screenHeight = MediaQuery.of(ctx).size.height;
+            final dialogWidth = (screenWidth * 0.85).clamp(320.0, 600.0);
+            final dialogHeight = (screenHeight * 0.75).clamp(360.0, 640.0);
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF2C2C2C),
+              contentPadding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              content: SizedBox(
+                width: dialogWidth,
+                height: dialogHeight,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 标题
+                    const Text(
+                      '手动输入字幕',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 名称输入框
+                    Row(
+                      children: [
+                        const Text(
+                          '名称：',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: SizedBox(
+                            height: 36,
+                            child: TextField(
+                              controller: nameController,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                              decoration: InputDecoration(
+                                isDense: true,
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 8,
+                                ),
+                                filled: true,
+                                fillColor: Colors.white10,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(6),
+                                  borderSide: BorderSide.none,
+                                ),
+                                hintText: '输入字幕名称',
+                                hintStyle: const TextStyle(
+                                  color: Colors.white38,
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+
+                    // 格式检测提示行 + 粘贴/清除按钮
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.info_outline,
+                          size: 14,
+                          color: detectedFormat != null
+                              ? Colors.greenAccent
+                              : Colors.white38,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          textController.text.isEmpty
+                              ? '输入文本后自动识别格式'
+                              : '识别格式: ${detectedFormat?.displayName ?? 'SRT'}',
+                          style: TextStyle(
+                            color: textController.text.isEmpty
+                                ? Colors.white38
+                                : (detectedFormat != null
+                                      ? Colors.greenAccent
+                                      : Colors.orangeAccent),
+                            fontSize: 11,
+                          ),
+                        ),
+                        const Spacer(),
+                        InkWell(
+                          onTap: () async {
+                            await _pasteIntoController(
+                              textController,
+                              successMessage: '已粘贴',
+                            );
+                            final fmt = SubtitleParser.detectFormat(
+                              textController.text,
+                            );
+                            setDialogState(() {
+                              detectedFormat = fmt;
+                            });
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.content_paste,
+                                  size: 14,
+                                  color: Colors.blueAccent,
+                                ),
+                                SizedBox(width: 2),
+                                Text(
+                                  '粘贴',
+                                  style: TextStyle(
+                                    color: Colors.blueAccent,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        InkWell(
+                          onTap: () {
+                            textController.clear();
+                            setDialogState(() {
+                              detectedFormat = null;
+                            });
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.clear_all,
+                                  size: 14,
+                                  color: Colors.orangeAccent,
+                                ),
+                                SizedBox(width: 2),
+                                Text(
+                                  '清除',
+                                  style: TextStyle(
+                                    color: Colors.orangeAccent,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+
+                    // 文本输入区
+                    Expanded(
+                      child: TextField(
+                        controller: textController,
+                        maxLines: null,
+                        expands: true,
+                        textAlignVertical: TextAlignVertical.top,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontFamily: 'monospace',
+                        ),
+                        decoration: InputDecoration(
+                          filled: true,
+                          fillColor: Colors.black26,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.all(10),
+                          hintText:
+                              '在此粘贴或输入字幕文本...\n\n'
+                              '支持 SRT / VTT / ASS / LRC 格式，将自动识别',
+                          hintStyle: const TextStyle(
+                            color: Colors.white24,
+                            fontSize: 12,
+                          ),
+                        ),
+                        onChanged: (value) {
+                          final fmt = SubtitleParser.detectFormat(value);
+                          setDialogState(() {
+                            detectedFormat = fmt;
+                          });
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text(
+                    '取消',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ),
+                ElevatedButton(
+                  onPressed: textController.text.trim().isEmpty
+                      ? null
+                      : () async {
+                          final name = nameController.text.trim();
+                          final content = textController.text;
+                          Navigator.pop(ctx);
+                          await _importManualSubtitleText(
+                            name.isEmpty ? 'S1' : name,
+                            content,
+                          );
+                        },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                  ),
+                  child: const Text('导入', style: TextStyle(fontSize: 13)),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// 将手动输入的字幕文本保存为本地文件并刷新列表
+  Future<void> _importManualSubtitleText(String name, String content) async {
+    try {
+      final format = SubtitleParser.detectFormat(content);
+      final videoId = _requireVideoId();
+
+      // 文件名安全处理
+      final safeName = name.replaceAll(RegExp(r'[^\w\u4e00-\u9fff\-]'), '_');
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final fileName = 'manual.$safeName.$timestamp${format.extension}';
+      final outputPath = await const TaskSubtitleStorageService().allocatePath(
+        videoId,
+        fileName,
+      );
+
+      await File(outputPath).writeAsString(content, flush: true);
+      await _registerManagedSubtitle(
+        outputPath,
+        ManagedSubtitleAssetKind.manual,
+        name,
+      );
+      await _loadSubtitles();
+      _notifySubtitleFilesChanged();
+
+      if (mounted) {
+        AppToast.show(
+          '字幕已导入：$name（${format.displayName}）',
+          type: AppToastType.success,
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        AppToast.show('导入失败：$e', type: AppToastType.error);
+      }
     }
   }
 
@@ -1036,6 +1963,64 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       ),
       child: Text(
         badge,
+        style: const TextStyle(
+          color: Colors.lightBlueAccent,
+          fontSize: 9,
+          fontWeight: FontWeight.w700,
+          height: 1,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSubtitleSourceBadge(String path) {
+    if (!_sidecarSubtitlePaths.contains(_normalizePath(path))) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.greenAccent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.42)),
+      ),
+      child: Text(
+        SubtitleSourceType.sidecar.displayName,
+        style: const TextStyle(
+          color: Colors.greenAccent,
+          fontSize: 9,
+          fontWeight: FontWeight.w700,
+          height: 1,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOcrBadge(ManagedSubtitleAsset? asset) {
+    if (asset?.kind != ManagedSubtitleAssetKind.ocr) {
+      return const SizedBox.shrink();
+    }
+    final language = switch (asset?.language) {
+      'zh-Hans' => '中',
+      'en' => '英',
+      'ja' => '日',
+      'ko' => '韩',
+      'latin' => '拉丁',
+      _ => null,
+    };
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.lightBlueAccent.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: Colors.lightBlueAccent.withValues(alpha: 0.45),
+        ),
+      ),
+      child: Text(
+        language == null ? 'OCR' : 'OCR · $language',
         style: const TextStyle(
           color: Colors.lightBlueAccent,
           fontSize: 9,
@@ -1360,70 +2345,195 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     final controller = TextEditingController();
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF2C2C2C),
-        title: const Text('输入翻译结果', style: TextStyle(color: Colors.white)),
-        content: SizedBox(
-          width: 560,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Align(
-                alignment: Alignment.centerRight,
-                child: TextButton.icon(
-                  onPressed: () => _pasteIntoController(
-                    controller,
-                    successMessage: '已粘贴翻译结果',
-                  ),
-                  icon: const Icon(Icons.content_paste_rounded, size: 16),
-                  label: const Text('粘贴', style: TextStyle(fontSize: 12)),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final screenWidth = MediaQuery.of(ctx).size.width;
+            final screenHeight = MediaQuery.of(ctx).size.height;
+            final dialogWidth = (screenWidth * 0.85).clamp(320.0, 600.0);
+            final dialogHeight = (screenHeight * 0.75).clamp(360.0, 640.0);
+
+            return AlertDialog(
+              backgroundColor: const Color(0xFF2C2C2C),
+              contentPadding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              content: SizedBox(
+                width: dialogWidth,
+                height: dialogHeight,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 标题
+                    const Text(
+                      '输入翻译结果',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // 提示行 + 粘贴/清除按钮
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.info_outline,
+                          size: 14,
+                          color: controller.text.isEmpty
+                              ? Colors.white38
+                              : Colors.greenAccent,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          controller.text.isEmpty
+                              ? '在此粘贴 AI 返回的完整字幕文本'
+                              : '已输入 ${controller.text.length} 字符',
+                          style: TextStyle(
+                            color: controller.text.isEmpty
+                                ? Colors.white38
+                                : Colors.greenAccent,
+                            fontSize: 11,
+                          ),
+                        ),
+                        const Spacer(),
+                        InkWell(
+                          onTap: () async {
+                            await _pasteIntoController(
+                              controller,
+                              successMessage: '已粘贴翻译结果',
+                            );
+                            setDialogState(() {});
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.content_paste,
+                                  size: 14,
+                                  color: Colors.blueAccent,
+                                ),
+                                SizedBox(width: 2),
+                                Text(
+                                  '粘贴',
+                                  style: TextStyle(
+                                    color: Colors.blueAccent,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        InkWell(
+                          onTap: () {
+                            controller.clear();
+                            setDialogState(() {});
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.clear_all,
+                                  size: 14,
+                                  color: Colors.orangeAccent,
+                                ),
+                                SizedBox(width: 2),
+                                Text(
+                                  '清除',
+                                  style: TextStyle(
+                                    color: Colors.orangeAccent,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+
+                    // 文本输入区
+                    Expanded(
+                      child: GestureDetector(
+                        onSecondaryTapDown: _isDesktopPlatform
+                            ? (_) {
+                                _pasteIntoController(
+                                  controller,
+                                  showToast: false,
+                                );
+                                setDialogState(() {});
+                              }
+                            : null,
+                        child: TextField(
+                          controller: controller,
+                          maxLines: null,
+                          expands: true,
+                          textAlignVertical: TextAlignVertical.top,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                          ),
+                          decoration: InputDecoration(
+                            filled: true,
+                            fillColor: Colors.black26,
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              borderSide: BorderSide.none,
+                            ),
+                            contentPadding: const EdgeInsets.all(10),
+                            hintText: '在此粘贴 AI 返回的完整字幕文本...',
+                            hintStyle: const TextStyle(
+                              color: Colors.white24,
+                              fontSize: 12,
+                            ),
+                          ),
+                          onChanged: (_) => setDialogState(() {}),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              GestureDetector(
-                onSecondaryTapDown: _isDesktopPlatform
-                    ? (_) {
-                        _pasteIntoController(controller, showToast: false);
-                      }
-                    : null,
-                child: TextField(
-                  controller: controller,
-                  minLines: 8,
-                  maxLines: 16,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontFamily: 'monospace',
-                    fontSize: 12,
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text(
+                    '取消',
+                    style: TextStyle(color: Colors.white54),
                   ),
-                  decoration: InputDecoration(
-                    border: const OutlineInputBorder(),
-                    hintText: '在此粘贴 AI 返回的完整字幕文本',
-                    hintStyle: const TextStyle(color: Colors.white38),
-                    suffixIcon: IconButton(
-                      tooltip: '粘贴',
-                      onPressed: () => _pasteIntoController(
-                        controller,
-                        successMessage: '已粘贴翻译结果',
-                      ),
-                      icon: const Icon(Icons.paste_rounded),
+                ),
+                ElevatedButton(
+                  onPressed: controller.text.trim().isEmpty
+                      ? null
+                      : () => Navigator.pop(ctx, true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
                     ),
                   ),
+                  child: const Text('确认导入', style: TextStyle(fontSize: 13)),
                 ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('确认导入'),
-          ),
-        ],
-      ),
+              ],
+            );
+          },
+        );
+      },
     );
 
     final text = controller.text;
@@ -1445,9 +2555,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     String content,
   ) async {
     try {
-      final videoFile = File(widget.videoPath);
-      final outputDir = videoFile.parent.path;
-      final videoName = p.basenameWithoutExtension(widget.videoPath);
+      final videoId = _requireVideoId();
+      final sourceName = p.basenameWithoutExtension(sourcePath);
       final sourceExt = p.extension(sourcePath).toLowerCase();
       final ext = sourceExt.isEmpty ? '.srt' : sourceExt;
       final safeTarget = _translateTargetLanguage.replaceAll(
@@ -1455,12 +2564,22 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         '-',
       );
       final outputName =
-          '$videoName.manual.translated.$safeTarget.${DateTime.now().millisecondsSinceEpoch}$ext';
-      final outputPath = p.join(outputDir, outputName);
+          '$sourceName.manual.translated.$safeTarget.${DateTime.now().millisecondsSinceEpoch}$ext';
+      final outputPath = await const TaskSubtitleStorageService().allocatePath(
+        videoId,
+        outputName,
+      );
 
       await File(outputPath).writeAsString(content, flush: true);
+      await _registerManagedSubtitle(
+        outputPath,
+        ManagedSubtitleAssetKind.translated,
+        '$sourceName（手动翻译）',
+        sourcePath: sourcePath,
+        language: _translateTargetLanguage,
+      );
       await _loadSubtitles();
-      widget.onSubtitleChanged();
+      _notifySubtitleFilesChanged();
 
       if (mounted) {
         setState(() {
@@ -1548,8 +2667,10 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   }
 
   void _toggleTranslatePanel(String path) {
-    if (_isTranslating) return;
-    final nextPath = _expandedTranslatePath == path ? null : path;
+    if (_isActiveTranslationForCurrentVideo()) {
+      return;
+    }
+    final nextPath = _isTranslationPanelExpandedFor(path) ? null : path;
     setState(() {
       _expandedTranslatePath = nextPath;
     });
@@ -1560,61 +2681,55 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   }
 
   Future<void> _translateSubtitle(String path) async {
-    if (_isTranslating) return;
+    // 防止对同一视频重复发起翻译。
+    if (_isPathTranslating(path)) return;
 
-    setState(() {
-      _isTranslating = true;
-      _translatingPath = path;
-      _translateProgress = 0;
-    });
-
+    // 翻译状态由服务（单例）持有并在内部管理；
+    // 完成后的刷新/toast 由 _onTranslationComplete 回调统一处理，
+    // 因此即便本页面中途销毁，重开后仍能恢复进度并在完成时收到事件。
     try {
-      final videoFile = File(widget.videoPath);
-      final outputDir = videoFile.parent.path;
-      final outputPrefix = p.basenameWithoutExtension(widget.videoPath);
-
+      final videoId = _requireVideoId();
+      final library = Provider.of<LibraryService>(context, listen: false);
+      final sourceAssetId = library
+          .managedSubtitleAssetForPath(videoId, path)
+          ?.assetId;
+      final taskDirectory = await const TaskSubtitleStorageService()
+          .taskDirectory(videoId, create: true);
+      // 根据源/目标语言方向自动选择翻译服务：
+      // 中英方向用 _translateProviderEnZh，其他语言方向用 _translateProviderOther
+      final effectiveProvider =
+          _subtitleTranslationService.isEnZhDirection(
+            _translateSourceLanguage,
+            _translateTargetLanguage,
+          )
+          ? _translateProviderEnZh
+          : _translateProviderOther;
       final result = await _subtitleTranslationService.translateSubtitleFile(
         inputPath: path,
         sourceLanguage: _translateSourceLanguage,
         targetLanguage: _translateTargetLanguage,
-        provider: _translateProvider,
-        outputDirectory: outputDir,
-        outputFilePrefix: outputPrefix,
-        onProgress: (progress) {
-          if (!mounted) return;
-          setState(() {
-            _translateProgress = progress;
-          });
+        provider: effectiveProvider,
+        videoPath: widget.videoPath,
+        outputDirectory: taskDirectory.path,
+        outputFilePrefix: p.basenameWithoutExtension(path),
+        onProgress: (_) {
+          // 进度由服务统一通过 ChangeNotifier 通知，这里无需额外处理。
         },
       );
-
-      await _loadSubtitles();
-      widget.onSubtitleChanged();
-
-      if (!mounted) return;
-      setState(() {
-        _expandedTranslatePath = null;
-      });
-      if (Platform.isWindows) {
-        try {
-          await Process.run('explorer', ['/select,', result.outputPath]);
-        } catch (_) {}
-      }
-      AppToast.show(
-        "翻译完成：${p.basename(result.outputPath)}\n保存位置：${result.outputPath}",
-        type: AppToastType.success,
+      await library.registerManagedSubtitleAsset(
+        videoId,
+        path: result.outputPath,
+        kind: ManagedSubtitleAssetKind.translated,
+        displayName: '${p.basenameWithoutExtension(path)}（翻译）',
+        sourceAssetId: sourceAssetId,
+        language: _translateTargetLanguage,
       );
-    } catch (e) {
-      if (!mounted) return;
-      AppToast.show("翻译失败：$e", type: AppToastType.error);
-    } finally {
       if (mounted) {
-        setState(() {
-          _isTranslating = false;
-          _translatingPath = null;
-          _translateProgress = 0;
-        });
+        await _loadSubtitles();
       }
+      // 完成事件由 _onTranslationComplete 处理，无需在此重复。
+    } catch (_) {
+      // 失败事件由 _onTranslationComplete 处理。
     }
   }
 
@@ -1632,12 +2747,123 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     );
   }
 
+  // 构建内嵌字幕的翻译按钮
+  Widget _buildEmbeddedTranslateButton(EmbeddedSubtitleTrack track) {
+    final isExtracted = _extractedTrackPaths.containsKey(track.index);
+    final isExtracting = _extractingTrackIndex == track.index;
+
+    return IconButton(
+      icon: const Icon(
+        Icons.translate,
+        color: Colors.lightBlueAccent,
+        size: 18,
+      ),
+      tooltip: isExtracted ? "翻译字幕" : "提取并翻译字幕",
+      onPressed: isExtracting ? null : () => _handleEmbeddedTranslate(track),
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(),
+    );
+  }
+
+  // 处理内嵌字幕的翻译：已提取则直接翻译，未提取则先提取再翻译
+  Future<void> _handleEmbeddedTranslate(EmbeddedSubtitleTrack track) async {
+    // 如果已经提取过，直接打开翻译面板
+    if (_extractedTrackPaths.containsKey(track.index)) {
+      _toggleTranslatePanel(_extractedTrackPaths[track.index]!);
+      return;
+    }
+
+    // 否则先提取，再打开翻译面板
+    await _extractAndTranslate(track);
+  }
+
+  // 提取字幕并打开翻译面板
+  Future<void> _extractAndTranslate(EmbeddedSubtitleTrack track) async {
+    if (_extractingTrackIndex != null) return;
+
+    setState(() => _extractingTrackIndex = track.index);
+
+    try {
+      final videoId = _requireVideoId();
+      final subDir = await const TaskSubtitleStorageService().taskDirectory(
+        videoId,
+        create: true,
+      );
+
+      if (!mounted) return;
+      final service = Provider.of<EmbeddedSubtitleService>(
+        context,
+        listen: false,
+      );
+      final path = await service.extractSubtitle(
+        widget.videoPath,
+        track.index,
+        subDir.path,
+        codecName: track.codecName,
+        videoId: widget.videoId,
+      );
+
+      if (path != null && mounted) {
+        await _registerManagedSubtitle(
+          path,
+          ManagedSubtitleAssetKind.embedded,
+          _displayEmbeddedTitle(track),
+        );
+        // 保存提取路径
+        setState(() {
+          _extractedTrackPaths[track.index] = path;
+        });
+
+        AppToast.show("内嵌字幕提取成功，正在打开翻译面板...", type: AppToastType.success);
+
+        // 打开翻译面板
+        _toggleTranslatePanel(path);
+      } else {
+        if (mounted) {
+          AppToast.show("提取字幕失败，可能格式不支持", type: AppToastType.error);
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        AppToast.show("提取出错: $e", type: AppToastType.error);
+      }
+    } finally {
+      if (mounted) setState(() => _extractingTrackIndex = null);
+    }
+  }
+
   Widget _buildTranslationPanel({required String path, required bool enabled}) {
-    if (_expandedTranslatePath != path) {
+    // 即使面板未展开，若该字幕正在翻译（含重开页面后恢复的进度），也显示精简进度条。
+    if (!_isTranslationPanelExpandedFor(path)) {
+      if (_isPathTranslating(path)) {
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+          child: Row(
+            children: [
+              const SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: LinearProgressIndicator(
+                  value: _subtitleTranslationService.progress,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '${(100 * _subtitleTranslationService.progress).toStringAsFixed(0)}%',
+                style: const TextStyle(color: Colors.white60, fontSize: 11),
+              ),
+            ],
+          ),
+        );
+      }
       return const SizedBox.shrink();
     }
 
-    final busy = _isTranslating && _translatingPath == path;
+    final busy = _isPathTranslating(path);
 
     final sourcePreview = _isLoadingManualSource
         ? '正在读取字幕全文...'
@@ -1754,6 +2980,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                     if (value == null) return;
                     setState(() {
                       _translateSourceLanguage = value;
+                      _syncProviderWithDirection();
                     });
                   },
           ),
@@ -1784,10 +3011,50 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                     if (value == null) return;
                     setState(() {
                       _translateTargetLanguage = value;
+                      _syncProviderWithDirection();
                     });
                   },
           ),
           const SizedBox(height: 8),
+          if (!_manualTranslateMode &&
+              _translateProvider == SubtitleTranslateProvider.so360 &&
+              !_subtitleTranslationService.isSo360DirectionSupported(
+                _translateSourceLanguage,
+                _translateTargetLanguage,
+              )) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.orange.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.orange, width: 0.5),
+              ),
+              child: const Text(
+                '360 翻译仅支持中英互译（英语⇄简体/繁体中文），当前语言方向请改用 Reverso 或 MyMemory 翻译',
+                style: TextStyle(color: Colors.orange, fontSize: 11),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (!_manualTranslateMode &&
+              _translateProvider == SubtitleTranslateProvider.reverso &&
+              (Platform.isAndroid || Platform.isIOS)) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.orange.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.orange, width: 0.5),
+              ),
+              child: const Text(
+                'Reverso 翻译仅支持桌面端（依赖系统 curl），移动端请改用 MyMemory 翻译',
+                style: TextStyle(color: Colors.orange, fontSize: 11),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           if (!_manualTranslateMode) ...[
             DropdownButtonFormField<SubtitleTranslateProvider>(
               initialValue: _translateProvider,
@@ -1799,6 +3066,18 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
               dropdownColor: const Color(0xFF2A2A2A),
               style: const TextStyle(color: Colors.white, fontSize: 12),
               items: const [
+                DropdownMenuItem(
+                  value: SubtitleTranslateProvider.mymemory,
+                  child: Text('MyMemory 翻译', style: TextStyle(fontSize: 12)),
+                ),
+                DropdownMenuItem(
+                  value: SubtitleTranslateProvider.so360,
+                  child: Text('360 翻译（中英）', style: TextStyle(fontSize: 12)),
+                ),
+                DropdownMenuItem(
+                  value: SubtitleTranslateProvider.reverso,
+                  child: Text('Reverso 翻译', style: TextStyle(fontSize: 12)),
+                ),
                 DropdownMenuItem(
                   value: SubtitleTranslateProvider.google,
                   child: Text('Google 翻译', style: TextStyle(fontSize: 12)),
@@ -1814,15 +3093,27 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                       if (value == null) return;
                       setState(() {
                         _translateProvider = value;
+                        // 将修改保存到当前语言方向对应的服务键
+                        if (_subtitleTranslationService.isEnZhDirection(
+                          _translateSourceLanguage,
+                          _translateTargetLanguage,
+                        )) {
+                          _translateProviderEnZh = value;
+                        } else {
+                          _translateProviderOther = value;
+                        }
                       });
+                      _scheduleTranslatePrefsSave();
                     },
             ),
             const SizedBox(height: 10),
             if (busy) ...[
-              LinearProgressIndicator(value: _translateProgress),
+              LinearProgressIndicator(
+                value: _subtitleTranslationService.progress,
+              ),
               const SizedBox(height: 6),
               Text(
-                '翻译中 ${(100 * _translateProgress).toStringAsFixed(0)}%',
+                '翻译中 ${(100 * _subtitleTranslationService.progress).toStringAsFixed(0)}%',
                 style: const TextStyle(color: Colors.white60, fontSize: 11),
               ),
               const SizedBox(height: 8),
@@ -1935,10 +3226,21 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   @override
   Widget build(BuildContext context) {
     final shownPaths = <String>{};
-    final associatedSubtitles = <String, String>{};
-    if (widget.additionalSubtitles != null) {
-      associatedSubtitles.addAll(widget.additionalSubtitles!);
-    }
+    final associatedSubtitles = <String, String>{
+      ...?widget.associatedSubtitles,
+    };
+    final classification = SubtitleClassificationIndex(
+      downloadAssociatedPaths: associatedSubtitles.values,
+      extractedEmbeddedPaths: _extractedTrackPaths.values,
+    );
+    final localSubtitleFiles = _subtitleFiles.where((file) {
+      if (classification.categoryForPath(file.path) != SubtitleCategory.local) {
+        return false;
+      }
+      return !_extractedTrackPaths.values.any(
+        (path) => _normalizePath(path) == _normalizePath(file.path),
+      );
+    }).toList();
     final hasEmbeddedContent =
         widget.showEmbeddedSubtitles &&
         (_embeddedTracks.isNotEmpty || _extractedTrackPaths.isNotEmpty);
@@ -1964,6 +3266,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                 ),
               ),
               const Spacer(),
+              if (_isDesktop)
+                Tooltip(
+                  message: '扫描设置',
+                  child: IconButton(
+                    icon: const Icon(
+                      Icons.manage_search,
+                      color: Colors.white70,
+                    ),
+                    onPressed: _showScanSettingsDialog,
+                    constraints: const BoxConstraints(),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                  ),
+                ),
               IconButton(
                 icon: const Icon(Icons.close, color: Colors.white70),
                 onPressed: () {
@@ -2058,11 +3373,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           const SizedBox(height: 8),
 
           Expanded(
-            child: _isLoading
-                ? const Center(child: CircularProgressIndicator())
-                : (_subtitleFiles.isEmpty &&
-                      !hasEmbeddedContent &&
-                      associatedSubtitles.isEmpty)
+            child:
+                (_subtitleFiles.isEmpty &&
+                    !hasEmbeddedContent &&
+                    associatedSubtitles.isEmpty &&
+                    !_isScanningFiles &&
+                    !_isScanningEmbedded)
                 ? const Center(
                     child: Text(
                       "暂无关联字幕文件",
@@ -2072,7 +3388,34 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                   )
                 : ListView(
                     children: [
-                      // 1. Library/Associated Subtitles (Moved to front)
+                      if (_isScanningFiles || _isScanningEmbedded)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Row(
+                            children: [
+                              const SizedBox(
+                                width: 14,
+                                height: 14,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.8,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  _isScanningFiles
+                                      ? '正在后台扫描同文件夹字幕…'
+                                      : '正在后台检测内嵌字幕…',
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      // 1. Subtitles created and bound by a download task.
                       if (associatedSubtitles.isNotEmpty) ...[
                         const Padding(
                           padding: EdgeInsets.only(bottom: 4, top: 4),
@@ -2222,6 +3565,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                               .where(
                                 (e) => shownPaths.add(_normalizePath(e.value)),
                               )
+                              .where(
+                                (e) =>
+                                    classification.categoryForPath(e.value) ==
+                                    SubtitleCategory.embedded,
+                              )
                               .map((entry) {
                                 final trackIndex = entry.key;
                                 final path = entry.value;
@@ -2323,6 +3671,13 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                           final isImage = _isImageSubtitleCodec(
                             track.codecName,
                           );
+                          // 获取提取后的路径（如果已提取）
+                          final extractedPath =
+                              _extractedTrackPaths[track.index];
+                          final exists =
+                              extractedPath != null &&
+                              File(extractedPath).existsSync();
+
                           return Container(
                             margin: const EdgeInsets.only(bottom: 4),
                             decoration: BoxDecoration(
@@ -2332,66 +3687,78 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                 color: Colors.blueAccent.withValues(alpha: 0.2),
                               ),
                             ),
-                            child: ListTile(
-                              dense: true,
-                              visualDensity: VisualDensity.compact,
-                              contentPadding: const EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 0,
-                              ),
-                              leading: (_extractingTrackIndex == track.index)
-                                  ? const SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(
-                                      Icons.closed_caption,
-                                      color: Colors.blueAccent,
-                                      size: 20,
-                                    ),
-                              title: Text(
-                                _displayEmbeddedTitle(track),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 13,
-                                ),
-                              ),
-                              subtitle: Text(
-                                "${track.language} • ${track.codecName}${isImage ? " • 图像字幕" : ""}",
-                                style: const TextStyle(
-                                  color: Colors.white30,
-                                  fontSize: 11,
-                                ),
-                              ),
-                              trailing: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  IconButton(
-                                    icon: const Icon(
-                                      Icons.download_outlined,
-                                      color: Colors.white70,
-                                      size: 18,
-                                    ),
-                                    onPressed:
-                                        _extractingTrackIndex == track.index
-                                        ? null
-                                        : () => _downloadEmbeddedTrack(track),
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(),
+                            child: Column(
+                              children: [
+                                ListTile(
+                                  dense: true,
+                                  visualDensity: VisualDensity.compact,
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 0,
                                   ),
-                                  const SizedBox(width: 4),
-                                  if (_extractedTrackPaths.containsKey(
-                                    track.index,
-                                  ))
-                                    _buildSelectionBadge(
-                                      _extractedTrackPaths[track.index]!,
+                                  leading:
+                                      (_extractingTrackIndex == track.index)
+                                      ? const SizedBox(
+                                          width: 20,
+                                          height: 20,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                      : const Icon(
+                                          Icons.closed_caption,
+                                          color: Colors.blueAccent,
+                                          size: 20,
+                                        ),
+                                  title: Text(
+                                    _displayEmbeddedTitle(track),
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 13,
                                     ),
-                                ],
-                              ),
-                              onTap: () => _handleEmbeddedTrackSelection(track),
+                                  ),
+                                  subtitle: Text(
+                                    "${track.language} • ${track.codecName}${isImage ? " • 图像字幕" : ""}",
+                                    style: const TextStyle(
+                                      color: Colors.white30,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      IconButton(
+                                        icon: const Icon(
+                                          Icons.download_outlined,
+                                          color: Colors.white70,
+                                          size: 18,
+                                        ),
+                                        onPressed:
+                                            _extractingTrackIndex == track.index
+                                            ? null
+                                            : () =>
+                                                  _downloadEmbeddedTrack(track),
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(),
+                                      ),
+                                      const SizedBox(width: 4),
+                                      // 翻译按钮：已提取则直接翻译，未提取则先提取再翻译
+                                      _buildEmbeddedTranslateButton(track),
+                                      const SizedBox(width: 4),
+                                      if (extractedPath != null)
+                                        _buildSelectionBadge(extractedPath),
+                                    ],
+                                  ),
+                                  onTap: () =>
+                                      _handleEmbeddedTrackSelection(track),
+                                ),
+                                // 添加翻译面板（如果已展开）
+                                if (extractedPath != null)
+                                  _buildTranslationPanel(
+                                    path: extractedPath,
+                                    enabled: exists,
+                                  ),
+                              ],
                             ),
                           );
                         }),
@@ -2401,8 +3768,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                         ),
                       ],
 
-                      // 3. Local Files Section
-                      if (_subtitleFiles.isNotEmpty) ...[
+                      // 3. All non-download, non-embedded subtitle files.
+                      if (localSubtitleFiles.isNotEmpty) ...[
                         const Padding(
                           padding: EdgeInsets.only(bottom: 4, top: 4),
                           child: Text(
@@ -2414,19 +3781,64 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                             ),
                           ),
                         ),
-                        ..._subtitleFiles
+                        ...localSubtitleFiles
                             .where(
                               (file) =>
-                                  !_extractedTrackPaths.values.any(
-                                    (v) =>
-                                        _normalizePath(v) ==
-                                        _normalizePath(file.path),
-                                  ) &&
                                   shownPaths.add(_normalizePath(file.path)),
                             )
                             .map((file) {
                               final name = p.basename(file.path);
                               final isAi = name.contains(".ai.");
+                              final isManual = name.contains(".manual.");
+                              ManagedSubtitleAsset? managedAsset;
+                              final videoId = widget.videoId;
+                              if (videoId != null && videoId.isNotEmpty) {
+                                try {
+                                  managedAsset =
+                                      Provider.of<LibraryService>(
+                                        context,
+                                        listen: false,
+                                      ).managedSubtitleAssetForPath(
+                                        videoId,
+                                        file.path,
+                                      );
+                                } catch (_) {}
+                              }
+                              final isOcr =
+                                  managedAsset?.kind ==
+                                  ManagedSubtitleAssetKind.ocr;
+                              // 从手动字幕文件名中提取自定义名称
+                              // 格式: {prefix}.manual.{customName}.{timestamp}.{ext}
+                              String displayName = name;
+                              if (managedAsset != null &&
+                                  managedAsset.displayName.trim().isNotEmpty) {
+                                displayName = managedAsset.displayName.trim();
+                              }
+                              if (isManual) {
+                                final parts = name.split('.manual.');
+                                if (parts.length > 1) {
+                                  final afterManual = parts
+                                      .sublist(1)
+                                      .join('.manual.');
+                                  // 去掉末尾的 timestamp.ext 部分
+                                  final dotIdx = afterManual.lastIndexOf('.');
+                                  if (dotIdx > 0) {
+                                    final withoutExt = afterManual.substring(
+                                      0,
+                                      dotIdx,
+                                    );
+                                    final lastDot = withoutExt.lastIndexOf('.');
+                                    if (lastDot > 0) {
+                                      displayName = withoutExt.substring(
+                                        0,
+                                        lastDot,
+                                      );
+                                    } else {
+                                      displayName = withoutExt;
+                                    }
+                                  }
+                                }
+                              }
 
                               return Container(
                                 margin: const EdgeInsets.only(bottom: 4),
@@ -2445,19 +3857,27 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                             vertical: 0,
                                           ),
                                       leading: Icon(
-                                        isAi
+                                        isOcr
+                                            ? Icons.document_scanner_outlined
+                                            : isAi
                                             ? Icons.auto_awesome
-                                            : Icons.subtitles,
-                                        color: isAi
+                                            : (isManual
+                                                  ? Icons.edit_note
+                                                  : Icons.subtitles),
+                                        color: isOcr
+                                            ? Colors.lightBlueAccent
+                                            : isAi
                                             ? Colors.blueAccent
-                                            : Colors.white70,
+                                            : (isManual
+                                                  ? Colors.tealAccent
+                                                  : Colors.white70),
                                         size: 20,
                                       ),
                                       title: Row(
                                         children: [
                                           Expanded(
                                             child: Text(
-                                              name,
+                                              displayName,
                                               style: TextStyle(
                                                 color:
                                                     _selectedIndexOf(
@@ -2483,13 +3903,20 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                           ),
                                           const SizedBox(width: 8),
                                           _buildSelectionBadge(file.path),
+                                          _buildSubtitleSourceBadge(file.path),
+                                          _buildOcrBadge(managedAsset),
                                           _buildTranslatedLanguageBadge(
                                             file.path,
                                           ),
                                         ],
                                       ),
                                       subtitle: Text(
-                                        "${(file.lengthSync() / 1024).toStringAsFixed(1)} KB",
+                                        _subtitleFileSizes[_normalizePath(
+                                                  file.path,
+                                                )] !=
+                                                null
+                                            ? "${(_subtitleFileSizes[_normalizePath(file.path)]! / 1024).toStringAsFixed(1)} KB"
+                                            : '字幕文件',
                                         style: const TextStyle(
                                           color: Colors.white30,
                                           fontSize: 11,
@@ -2567,8 +3994,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
               Expanded(
                 child: ElevatedButton.icon(
                   onPressed: () {
-                    if (widget.onClose == null)
+                    if (widget.onClose == null) {
                       Navigator.pop(context); // Close sheet if dialog
+                    }
                     widget.onOpenAi(); // Open AI panel
                   },
                   icon: const Icon(Icons.auto_awesome, size: 18),

@@ -318,9 +318,9 @@ class DownloadSessionConfig {
     this.useProxy = false,
     this.proxy,
     this.socketTimeoutSeconds,
-    this.retries,
-    this.fragmentRetries,
-    this.concurrentFragments,
+    this.retries = 2,
+    this.fragmentRetries = 2,
+    this.concurrentFragments = 4,
     this.rateLimit,
     this.forceIpv4 = false,
     this.enabledPlayerClients = const [],
@@ -638,6 +638,7 @@ class NativeDownloadRequest {
 
 class DownloadTaskEvent {
   final String taskId;
+  final int? generation;
   final String type;
   final double? progress;
   final int? downloadedBytes;
@@ -651,6 +652,7 @@ class DownloadTaskEvent {
 
   const DownloadTaskEvent({
     required this.taskId,
+    this.generation,
     required this.type,
     this.progress,
     this.downloadedBytes,
@@ -665,6 +667,7 @@ class DownloadTaskEvent {
 
   Map<String, dynamic> toJson() => {
     'taskId': taskId,
+    'generation': generation,
     'type': type,
     'progress': progress,
     'downloadedBytes': downloadedBytes,
@@ -680,6 +683,7 @@ class DownloadTaskEvent {
   factory DownloadTaskEvent.fromJson(Map<String, dynamic> json) {
     return DownloadTaskEvent(
       taskId: (json['taskId'] ?? '').toString(),
+      generation: _toInt(json['generation']),
       type: (json['type'] ?? '').toString(),
       progress: _toDouble(json['progress']),
       downloadedBytes: _toInt(json['downloadedBytes']),
@@ -1243,7 +1247,9 @@ String _thumbnailExtensionFromPath(String path) {
   return '';
 }
 
-List<ThumbnailInfo> _thumbnailCandidatesFromRawInfo(Map<String, dynamic> rawInfo) {
+List<ThumbnailInfo> _thumbnailCandidatesFromRawInfo(
+  Map<String, dynamic> rawInfo,
+) {
   final candidates = <ThumbnailInfo>[];
   final thumbnail = rawInfo['thumbnail']?.toString().trim();
   if (thumbnail != null && thumbnail.isNotEmpty) {

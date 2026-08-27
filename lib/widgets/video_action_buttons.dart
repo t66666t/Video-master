@@ -19,13 +19,17 @@ import '../services/temporary_storage_cleanup_service.dart';
 import '../services/transcription_manager.dart';
 import '../screens/batch_import_screen.dart';
 import '../screens/bilibili_download_screen.dart';
+import '../screens/batch_subtitle_screen.dart';
 import '../utils/app_toast.dart';
 
 class VideoActionButtons extends StatefulWidget {
   final String? collectionId;
-  final bool isHorizontal; // For empty state usage if needed, though mostly for FAB
+  final bool
+  isHorizontal; // For empty state usage if needed, though mostly for FAB
 
-  static const MethodChannel _fileManagerChannel = MethodChannel('com.example.video_player_app/file_manager');
+  static const MethodChannel _fileManagerChannel = MethodChannel(
+    'com.example.video_player_app/file_manager',
+  );
 
   static String _cleanImportedTitle(String path) {
     final name = p.basename(path);
@@ -33,7 +37,9 @@ class VideoActionButtons extends StatefulWidget {
         .replaceFirst(RegExp(r'^incoming_media_\d+_'), '')
         .replaceFirst(RegExp(r'^shared_media_\d+_'), '')
         .replaceFirst(
-          RegExp(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}_'),
+          RegExp(
+            r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}_',
+          ),
           '',
         );
     return cleaned.isEmpty ? name : cleaned;
@@ -63,24 +69,25 @@ class VideoActionButtons extends StatefulWidget {
         message,
         type: type,
         duration: autoHideDuration,
-        action: AppToastAction(
-          label: actionText,
-          onPressed: onActionPressed,
-        ),
+        action: AppToastAction(label: actionText, onPressed: onActionPressed),
       );
     } else {
       AppToast.show(message, type: type, duration: autoHideDuration);
     }
   }
 
-  static Future<void> processImportedFiles(BuildContext context, List<String> paths, String? collectionId) async {
-    final validExtensions = {
-      '.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm', '.wmv', '.3gp', '.m4v', '.ts',
-      '.rmvb', '.mpg', '.mpeg', '.f4v', '.m2ts', '.mts', '.vob', '.ogv', '.divx',
-      '.mp3', '.m4a', '.wav', '.flac', '.ogg', '.aac', '.wma', '.opus', '.m4b', '.aiff'
-    };
-    
-    final validPaths = paths.where((path) => validExtensions.contains(p.extension(path).toLowerCase())).toList();
+  static Future<void> processImportedFiles(
+    BuildContext context,
+    List<String> paths,
+    String? collectionId,
+  ) async {
+    const validExtensions = LibraryService.supportedMediaExtensions;
+
+    final validPaths = paths
+        .where(
+          (path) => validExtensions.contains(p.extension(path).toLowerCase()),
+        )
+        .toList();
     if (validPaths.isEmpty) {
       if (context.mounted) {
         _showTopBanner(
@@ -92,23 +99,32 @@ class VideoActionButtons extends StatefulWidget {
       return;
     }
 
-    final originalTitles = validPaths.map((path) => _cleanImportedTitle(path)).toList();
-    if (context.mounted) {
-      if (!context.mounted) return;
-      final library = Provider.of<LibraryService>(context, listen: false);
+    final originalTitles = validPaths
+        .map((path) => _cleanImportedTitle(path))
+        .toList();
+    if (!context.mounted) return;
+    final library = Provider.of<LibraryService>(context, listen: false);
+    if (library.hasActiveImport) {
       _showTopBanner(
         context,
-        "已开始后台导入 ${validPaths.length} 个媒体文件",
+        '已有导入任务正在运行，请等待完成后再试',
+        backgroundColor: const Color(0xFFB00020),
       );
-      library.importVideosBackground(
-        validPaths,
-        collectionId,
-        shouldCopy: false,
-        originalTitles: originalTitles,
-        useOriginalPath: false,
-        allowCacheRescue: true,
-      );
+      return;
     }
+    _showTopBanner(
+      context,
+      "已开始后台导入 ${validPaths.length} 个媒体文件",
+      autoHideDuration: const Duration(seconds: 2),
+    );
+    library.importVideosBackground(
+      validPaths,
+      collectionId,
+      shouldCopy: false,
+      originalTitles: originalTitles,
+      useOriginalPath: false,
+      allowCacheRescue: true,
+    );
   }
 
   static const List<String> _structuredArchiveExtensions = [
@@ -173,6 +189,10 @@ class VideoActionButtons extends StatefulWidget {
       if (LibraryService.isSupportedArchivePath(path)) {
         archivePaths.add(path);
       }
+    }
+
+    if (!context.mounted) {
+      return;
     }
 
     final structuredItemCount = archivePaths.length + folderPaths.length;
@@ -286,11 +306,20 @@ class VideoActionButtons extends StatefulWidget {
       }
 
       final library = Provider.of<LibraryService>(context, listen: false);
-      final summary = await _prepareArchiveSelectionSummary(
-        selection,
-        library,
-      );
+      if (library.hasActiveImport) {
+        _showTopBanner(
+          context,
+          '已有导入任务正在运行，请等待完成后再试',
+          backgroundColor: const Color(0xFFB00020),
+        );
+        return;
+      }
+      final summary = await _prepareArchiveSelectionSummary(selection, library);
       await AppToast.dismiss();
+      if (!context.mounted || ModalRoute.of(context)?.isCurrent != true) {
+        await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
+        return;
+      }
 
       final action = await _showStructuredImportDialog(context, summary);
       if (!context.mounted ||
@@ -302,6 +331,9 @@ class VideoActionButtons extends StatefulWidget {
 
       if (action == _StructuredImportDialogAction.preview) {
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
+        if (!context.mounted || ModalRoute.of(context)?.isCurrent != true) {
+          return;
+        }
         _showTopBanner(context, "压缩包预览功能暂未开放");
         return;
       }
@@ -310,14 +342,14 @@ class VideoActionButtons extends StatefulWidget {
       final sortOptions = StructuredImportSortOptions.fromSettings(settings);
       final archivePath = await _ensureArchivePathForImport(selection);
       final toastBridge = _ArchiveImportToastBridge(library);
-      toastBridge.start(
-        initialMessage: '正在准备导入压缩包：${summary.sourceName}',
-      );
-      final resultSummary = await library.importArchiveSelection(
-        archivePath,
-        collectionId,
-        sortOptions: sortOptions,
-      ).whenComplete(toastBridge.dispose);
+      toastBridge.start(initialMessage: '正在准备导入压缩包：${summary.sourceName}');
+      final resultSummary = await library
+          .importArchiveSelection(
+            archivePath,
+            collectionId,
+            sortOptions: sortOptions,
+          )
+          .whenComplete(toastBridge.dispose);
       await AppToast.dismiss();
       if (!context.mounted) return;
       if (ModalRoute.of(context)?.isCurrent != true) return;
@@ -349,6 +381,14 @@ class VideoActionButtons extends StatefulWidget {
       if (!context.mounted) return;
       if (ModalRoute.of(context)?.isCurrent != true) return;
       final library = Provider.of<LibraryService>(context, listen: false);
+      if (library.hasActiveImport) {
+        _showTopBanner(
+          context,
+          '已有导入任务正在运行，请等待完成后再试',
+          backgroundColor: const Color(0xFFB00020),
+        );
+        return;
+      }
       final summary = await library.analyzeFolderSelection(folderPath);
       if (!context.mounted) return;
       if (ModalRoute.of(context)?.isCurrent != true) return;
@@ -396,9 +436,8 @@ class VideoActionButtons extends StatefulWidget {
     try {
       final normalizedPath = p.normalize(path);
       final tempDir = await getTemporaryDirectory();
-      final normalizedTemp = p.normalize(tempDir.path);
-      if (p.equals(normalizedTemp, normalizedPath) ||
-          p.isWithin(normalizedTemp, normalizedPath)) {
+      final archiveCache = p.normalize(p.join(tempDir.path, 'picked_archives'));
+      if (p.isWithin(archiveCache, normalizedPath)) {
         return true;
       }
 
@@ -406,9 +445,10 @@ class VideoActionButtons extends StatefulWidget {
         final extCacheDirs = await getExternalCacheDirectories();
         if (extCacheDirs != null) {
           for (final dir in extCacheDirs) {
-            final normalizedCache = p.normalize(dir.path);
-            if (p.equals(normalizedCache, normalizedPath) ||
-                p.isWithin(normalizedCache, normalizedPath)) {
+            final externalArchiveCache = p.normalize(
+              p.join(dir.path, 'picked_archives'),
+            );
+            if (p.isWithin(externalArchiveCache, normalizedPath)) {
               return true;
             }
           }
@@ -433,7 +473,8 @@ class VideoActionButtons extends StatefulWidget {
     } catch (_) {}
   }
 
-  static Future<StructuredImportSelectionSummary> _prepareArchiveSelectionSummary(
+  static Future<StructuredImportSelectionSummary>
+  _prepareArchiveSelectionSummary(
     _ArchiveSelection selection,
     LibraryService library,
   ) async {
@@ -457,10 +498,7 @@ class VideoActionButtons extends StatefulWidget {
     await Future<void>.delayed(const Duration(milliseconds: 60));
 
     final summary = selection.toSelectionSummary(library);
-    AppToast.updateProgress(
-      message: '压缩包信息已就绪，正在打开确认窗口...',
-      progress: 0.95,
-    );
+    AppToast.updateProgress(message: '压缩包信息已就绪，正在打开确认窗口...', progress: 0.95);
     await Future<void>.delayed(const Duration(milliseconds: 90));
     return summary;
   }
@@ -481,10 +519,7 @@ class VideoActionButtons extends StatefulWidget {
     );
     final result = await _fileManagerChannel.invokeMethod<Object?>(
       "materializeArchiveForImport",
-      {
-        "uri": selection.uri,
-        "displayName": selection.displayName,
-      },
+      {"uri": selection.uri, "displayName": selection.displayName},
     );
     if (result is! String || result.isEmpty) {
       throw StateError('无法准备压缩包文件');
@@ -557,7 +592,10 @@ class VideoActionButtons extends StatefulWidget {
                     else
                       Text(
                         '检测到 ${summary.folderCount} 个文件夹，${summary.mediaFileCount} 个可导入媒体文件。',
-                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white70,
+                        ),
                       ),
                     const SizedBox(height: 16),
                     const Text(
@@ -581,9 +619,7 @@ class VideoActionButtons extends StatefulWidget {
                         if (value == null) return;
                         updateSortSetting(field: value);
                       },
-                      decoration: const InputDecoration(
-                        labelText: '排序方式',
-                      ),
+                      decoration: const InputDecoration(labelText: '排序方式'),
                     ),
                     const SizedBox(height: 8),
                     DropdownButtonFormField<String>(
@@ -606,9 +642,7 @@ class VideoActionButtons extends StatefulWidget {
                         if (value == null) return;
                         updateSortSetting(direction: value);
                       },
-                      decoration: const InputDecoration(
-                        labelText: '顺序方向',
-                      ),
+                      decoration: const InputDecoration(labelText: '顺序方向'),
                     ),
                     const SizedBox(height: 10),
                     const Text(
@@ -719,10 +753,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         context,
         listen: false,
       ),
-      ytDlpDownloadService: Provider.of(
-        context,
-        listen: false,
-      ),
+      ytDlpDownloadService: Provider.of(context, listen: false),
     );
 
     _isHiddenCleanupDialogOpen = true;
@@ -782,53 +813,67 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                           child: Center(child: CircularProgressIndicator()),
                         )
                       : errorMessage != null
-                          ? Text(errorMessage!, style: const TextStyle(fontSize: 13))
-                          : Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  '可识别占用：${_formatBytes(totalBytes)}',
-                                  style: const TextStyle(fontSize: 13),
-                                ),
-                                const SizedBox(height: 6),
-                                const Text(
-                                  '仅统计应用明确管理的临时文件；正在运行或可继续的任务会自动跳过，不会误删。',
-                                  style: TextStyle(fontSize: 12, color: Colors.white70),
-                                ),
-                                const SizedBox(height: 12),
-                                if (categories.isEmpty)
-                                  const Text(
-                                    '未发现可统计的临时文件。',
-                                    style: TextStyle(fontSize: 13, color: Colors.white70),
-                                  )
-                                else
-                                  ConstrainedBox(
-                                    constraints: const BoxConstraints(maxHeight: 280),
-                                    child: ListView.separated(
-                                      shrinkWrap: true,
-                                      itemCount: categories.length,
-                                      separatorBuilder: (_, _) =>
-                                          const Divider(height: 12),
-                                      itemBuilder: (context, index) {
-                                        final item = categories[index];
-                                        return _TemporaryStorageCategoryTile(
-                                          report: item,
-                                          sizeText: _formatBytes(item.totalBytes),
-                                        );
-                                      },
-                                    ),
-                                  ),
-                              ],
+                      ? Text(
+                          errorMessage!,
+                          style: const TextStyle(fontSize: 13),
+                        )
+                      : Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '可识别占用：${_formatBytes(totalBytes)}',
+                              style: const TextStyle(fontSize: 13),
                             ),
+                            const SizedBox(height: 6),
+                            const Text(
+                              '仅统计应用明确管理的临时文件；正在运行或可继续的任务会自动跳过，不会误删。',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.white70,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            if (categories.isEmpty)
+                              const Text(
+                                '未发现可统计的临时文件。',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: Colors.white70,
+                                ),
+                              )
+                            else
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxHeight: 280,
+                                ),
+                                child: ListView.separated(
+                                  shrinkWrap: true,
+                                  itemCount: categories.length,
+                                  separatorBuilder: (_, _) =>
+                                      const Divider(height: 12),
+                                  itemBuilder: (context, index) {
+                                    final item = categories[index];
+                                    return _TemporaryStorageCategoryTile(
+                                      report: item,
+                                      sizeText: _formatBytes(item.totalBytes),
+                                    );
+                                  },
+                                ),
+                              ),
+                          ],
+                        ),
                 ),
                 actions: [
                   TextButton(
-                    onPressed: isCleaning ? null : () => Navigator.pop(dialogContext),
+                    onPressed: isCleaning
+                        ? null
+                        : () => Navigator.pop(dialogContext),
                     child: const Text('关闭'),
                   ),
                   TextButton(
-                    onPressed: isLoading ||
+                    onPressed:
+                        isLoading ||
                             isCleaning ||
                             errorMessage != null ||
                             !(currentReport?.hasClearableContent ?? false)
@@ -877,7 +922,26 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           ElevatedButton(
-            onPressed: () => showCreateCollectionDialog(context, widget.collectionId),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) =>
+                      BatchSubtitleScreen(collectionId: widget.collectionId),
+                  settings: const RouteSettings(name: '/batch_subtitle'),
+                ),
+              );
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.teal,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("批量字幕生成"),
+          ),
+          const SizedBox(width: 16),
+          ElevatedButton(
+            onPressed: () =>
+                showCreateCollectionDialog(context, widget.collectionId),
             child: const Text("新建合集"),
           ),
           const SizedBox(width: 16),
@@ -887,17 +951,24 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           ),
           const SizedBox(width: 16),
           ElevatedButton(
-            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BatchImportScreen(folderId: widget.collectionId))),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) =>
+                    BatchImportScreen(folderId: widget.collectionId),
+              ),
+            ),
             child: const Text("批量导入媒体"),
           ),
-           const SizedBox(width: 16),
+          const SizedBox(width: 16),
           ElevatedButton(
             onPressed: () {
               Navigator.push(
                 context,
                 MaterialPageRoute(
-                  builder: (_) =>
-                      BilibiliDownloadScreen(targetFolderId: widget.collectionId),
+                  builder: (_) => BilibiliDownloadScreen(
+                    targetFolderId: widget.collectionId,
+                  ),
                   settings: const RouteSettings(name: '/bilibili_download'),
                 ),
               );
@@ -946,7 +1017,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                 transitionBuilder: (Widget child, Animation<double> animation) {
                   return SizeTransition(
                     sizeFactor: animation,
-                    axisAlignment: 1.0, // Anchor at bottom
+                    alignment: AlignmentDirectional.bottomStart,
                     child: FadeTransition(opacity: animation, child: child),
                   );
                 },
@@ -959,15 +1030,42 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           FloatingActionButton(
+                            heroTag: "batch_subtitle_${widget.collectionId}",
+                            onPressed: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => BatchSubtitleScreen(
+                                    collectionId: widget.collectionId,
+                                  ),
+                                  settings: const RouteSettings(
+                                    name: '/batch_subtitle',
+                                  ),
+                                ),
+                              );
+                            },
+                            tooltip: "批量字幕生成",
+                            backgroundColor: Colors.teal,
+                            child: const Icon(
+                              Icons.closed_caption,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          FloatingActionButton(
                             heroTag: "add_folder_${widget.collectionId}",
-                            onPressed: () => showCreateCollectionDialog(context, widget.collectionId),
+                            onPressed: () => showCreateCollectionDialog(
+                              context,
+                              widget.collectionId,
+                            ),
                             tooltip: "新建合集",
                             child: const Icon(Icons.create_new_folder),
                           ),
                           const SizedBox(height: 16),
                           FloatingActionButton(
                             heroTag: "add_video_${widget.collectionId}",
-                            onPressed: () => importVideos(context, widget.collectionId),
+                            onPressed: () =>
+                                importVideos(context, widget.collectionId),
                             tooltip: "导入视频或音频",
                             child: const Icon(Icons.video_call),
                           ),
@@ -1007,22 +1105,38 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                             },
                             tooltip: "YT-DLP 视频下载",
                             backgroundColor: const Color(0xFFFF4040),
-                            child: const Icon(Icons.ondemand_video, color: Colors.white),
+                            child: const Icon(
+                              Icons.ondemand_video,
+                              color: Colors.white,
+                            ),
                           ),
                           const SizedBox(height: 16),
                           Consumer<BatchImportService>(
                             builder: (context, batch, _) {
-                              final count = batch.getPendingCount(widget.collectionId);
+                              final count = batch.getPendingCount(
+                                widget.collectionId,
+                              );
                               return Stack(
                                 clipBehavior: Clip.none,
                                 alignment: Alignment.topRight,
                                 children: [
                                   FloatingActionButton(
-                                    heroTag: "batch_import_${widget.collectionId}",
-                                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BatchImportScreen(folderId: widget.collectionId))),
+                                    heroTag:
+                                        "batch_import_${widget.collectionId}",
+                                    onPressed: () => Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) => BatchImportScreen(
+                                          folderId: widget.collectionId,
+                                        ),
+                                      ),
+                                    ),
                                     tooltip: "批量导入媒体及对应字幕",
                                     backgroundColor: Colors.deepPurpleAccent,
-                                    child: const Icon(Icons.playlist_add, color: Colors.white),
+                                    child: const Icon(
+                                      Icons.playlist_add,
+                                      color: Colors.white,
+                                    ),
                                   ),
                                   if (count > 0)
                                     Positioned(
@@ -1030,13 +1144,23 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                       top: -4,
                                       child: Container(
                                         padding: const EdgeInsets.all(6),
-                                        decoration: const BoxDecoration(color: Colors.redAccent, shape: BoxShape.circle),
-                                        child: Text("$count", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                                        decoration: const BoxDecoration(
+                                          color: Colors.redAccent,
+                                          shape: BoxShape.circle,
+                                        ),
+                                        child: Text(
+                                          "$count",
+                                          style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
                                       ),
                                     ),
                                 ],
                               );
-                            }
+                            },
                           ),
                           const SizedBox(height: 16),
                         ],
@@ -1051,18 +1175,25 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                   heroTag: "collapse_toggle_${widget.collectionId ?? 'root'}",
                   onPressed: () {
                     _registerHiddenCleanupTap(context);
-                    settings.updateSetting('isActionButtonsCollapsed', !isCollapsed);
+                    settings.updateSetting(
+                      'isActionButtonsCollapsed',
+                      !isCollapsed,
+                    );
                   },
                   tooltip: isCollapsed ? "展开" : "收起",
                   backgroundColor: const Color(0xFF333333),
                   foregroundColor: Colors.white,
-                  child: Icon(isCollapsed ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down),
+                  child: Icon(
+                    isCollapsed
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                  ),
                 ),
               ),
             ),
           ],
         );
-      }
+      },
     );
   }
 
@@ -1085,8 +1216,10 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           TextButton(
             onPressed: () {
               if (controller.text.isNotEmpty) {
-                Provider.of<LibraryService>(context, listen: false)
-                    .createCollection(controller.text, parentId);
+                Provider.of<LibraryService>(
+                  context,
+                  listen: false,
+                ).createCollection(controller.text, parentId);
                 Navigator.pop(context);
               }
             },
@@ -1101,7 +1234,8 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     if (!Platform.isAndroid) {
       return true;
     }
-    final hasPermission = await Permission.videos.request().isGranted ||
+    final hasPermission =
+        await Permission.videos.request().isGranted ||
         await Permission.storage.request().isGranted ||
         await Permission.manageExternalStorage.request().isGranted;
     if (!hasPermission && context.mounted) {
@@ -1166,7 +1300,10 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     );
   }
 
-  Future<void> _pickFromGallery(BuildContext context, String? collectionId) async {
+  Future<void> _pickFromGallery(
+    BuildContext context,
+    String? collectionId,
+  ) async {
     try {
       final permission = await PhotoManager.requestPermissionExtend();
       if (!permission.isAuth && !permission.isLimited) {
@@ -1200,26 +1337,30 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         return;
       }
 
-      AppToast.showLoading("正在处理媒体文件...");
-
       final List<String> paths = [];
       final List<String> originalTitles = [];
 
-      for (final asset in assets) {
-        final File? file = await asset.file;
-        if (file == null) continue;
-        paths.add(file.path);
-        
-        String title = asset.title ?? '';
-        if (title.isEmpty || title.trim().isEmpty) {
-          final date = asset.createDateTime;
-          final prefix = asset.type == AssetType.video ? "Video" : (asset.type == AssetType.audio ? "Audio" : "Media");
-          title = "${prefix}_${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}_${date.hour.toString().padLeft(2, '0')}${date.minute.toString().padLeft(2, '0')}${date.second.toString().padLeft(2, '0')}";
-        }
-        originalTitles.add(title);
-      }
+      final processingToast = AppToast.showLoading("正在处理媒体文件...");
+      try {
+        for (final asset in assets) {
+          final File? file = await asset.file;
+          if (file == null) continue;
+          paths.add(file.path);
 
-      AppToast.dismiss();
+          String title = asset.title ?? '';
+          if (title.isEmpty || title.trim().isEmpty) {
+            final date = asset.createDateTime;
+            final prefix = asset.type == AssetType.video
+                ? "Video"
+                : (asset.type == AssetType.audio ? "Audio" : "Media");
+            title =
+                "${prefix}_${date.year}${date.month.toString().padLeft(2, '0')}${date.day.toString().padLeft(2, '0')}_${date.hour.toString().padLeft(2, '0')}${date.minute.toString().padLeft(2, '0')}${date.second.toString().padLeft(2, '0')}";
+          }
+          originalTitles.add(title);
+        }
+      } finally {
+        await processingToast.dismiss(immediate: true);
+      }
 
       if (paths.isEmpty) {
         if (context.mounted) {
@@ -1237,6 +1378,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         VideoActionButtons._showTopBanner(
           context,
           "已开始后台导入 ${paths.length} 个媒体文件",
+          autoHideDuration: const Duration(seconds: 2),
         );
         library.importVideosBackground(
           paths,
@@ -1246,7 +1388,6 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         );
       }
     } catch (e) {
-      AppToast.dismiss();
       if (context.mounted) {
         VideoActionButtons._showTopBanner(
           context,
@@ -1258,20 +1399,21 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     }
   }
 
-  Future<void> _pickFromFileManager(BuildContext context, String? collectionId) async {
+  Future<void> _pickFromFileManager(
+    BuildContext context,
+    String? collectionId,
+  ) async {
     try {
       if (!await _requestStoragePermissionIfNeeded(context)) {
         return;
       }
 
       if (Platform.isAndroid) {
-        final result = await VideoActionButtons._fileManagerChannel.invokeMethod<List<dynamic>>(
-          "pickFiles",
-          {
-            "mimeTypes": ["video/*", "audio/*"],
-            "allowMultiple": true,
-          },
-        );
+        final result = await VideoActionButtons._fileManagerChannel
+            .invokeMethod<List<dynamic>>("pickFiles", {
+              "mimeTypes": ["video/*", "audio/*"],
+              "allowMultiple": true,
+            });
         final pickedPaths = result?.whereType<String>().toList() ?? [];
         if (pickedPaths.isEmpty) {
           if (context.mounted) {
@@ -1281,7 +1423,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         }
 
         if (context.mounted) {
-          await VideoActionButtons.processImportedFiles(context, pickedPaths, collectionId);
+          await VideoActionButtons.processImportedFiles(
+            context,
+            pickedPaths,
+            collectionId,
+          );
         }
         return;
       }
@@ -1312,7 +1458,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
       }
 
       if (context.mounted) {
-        await VideoActionButtons.processImportedFiles(context, paths, collectionId);
+        await VideoActionButtons.processImportedFiles(
+          context,
+          paths,
+          collectionId,
+        );
       }
     } catch (e) {
       if (context.mounted) {
@@ -1337,10 +1487,8 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
       }
 
       if (Platform.isAndroid) {
-        final result = await VideoActionButtons._fileManagerChannel.invokeMethod<
-            Map<dynamic, dynamic>?>(
-          "pickArchive",
-        );
+        final result = await VideoActionButtons._fileManagerChannel
+            .invokeMethod<Map<dynamic, dynamic>?>("pickArchive");
         if (result == null) {
           if (context.mounted) {
             VideoActionButtons._showTopBanner(context, "未选择压缩包");
@@ -1374,6 +1522,9 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         return;
       }
 
+      if (!context.mounted) {
+        return;
+      }
       await VideoActionButtons.processDroppedArchive(
         context,
         archivePath,
@@ -1429,7 +1580,6 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
       }
     }
   }
-
 }
 
 class _TemporaryStorageCategoryTile extends StatelessWidget {
@@ -1459,7 +1609,10 @@ class _TemporaryStorageCategoryTile extends StatelessWidget {
             Expanded(
               child: Text(
                 report.title,
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
             const SizedBox(width: 12),
@@ -1620,7 +1773,13 @@ class _ArchiveSelection {
   }
 
   StructuredImportSelectionSummary toSelectionSummary(LibraryService library) {
-    final archiveNameOrPath = hasResolvedPath ? resolvedPath! : displayName;
+    // App-owned temporary copies may have UUID/timestamp prefixes. The
+    // original display name is the stable source for validation and the root
+    // collection title.
+    final archiveNameOrPath = displayName;
+    if (!LibraryService.isSupportedArchivePath(archiveNameOrPath)) {
+      throw UnsupportedError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
+    }
     final sourcePath = hasResolvedPath
         ? resolvedPath!
         : 'Android 系统文件管理器已选中：$displayName';

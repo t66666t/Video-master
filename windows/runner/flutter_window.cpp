@@ -1,9 +1,6 @@
 ﻿#include "flutter_window.h"
 
 #include <Windows.h>
-#include <knownfolders.h>
-#include <shlobj.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -118,103 +115,50 @@ std::wstring QuoteArg(const std::wstring& arg) {
 }
 
 std::optional<std::filesystem::path> FindExecutable(
-    const std::vector<std::wstring>& candidates) {
-  // 优先搜索托管安装目录（Dart 安装器/更新器写入的位置），
-  // 确保在线更新后的二进制文件能被正确发现。
-  std::vector<std::filesystem::path> managed_roots;
-  auto append_known_folder = [](std::vector<std::filesystem::path>& roots,
-                                const KNOWNFOLDERID& folder_id) {
-    PWSTR folder_path = nullptr;
-    if (SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, nullptr, &folder_path) !=
-        S_OK) {
-      return;
-    }
-    const std::filesystem::path base_path{std::wstring(folder_path)};
-    CoTaskMemFree(folder_path);
-    roots.push_back(base_path / L"video_player_app" / L"yt_dlp");
-  };
-
-  append_known_folder(managed_roots, FOLDERID_RoamingAppData);
-  append_known_folder(managed_roots, FOLDERID_LocalAppData);
-
-  for (const auto& root : managed_roots) {
-    for (const auto& candidate : candidates) {
-      const auto local_path = root / candidate;
-      if (std::filesystem::exists(local_path)) {
-        return local_path;
-      }
-    }
+    const std::vector<std::wstring>& candidates,
+    const std::optional<std::filesystem::path>& configured_path = std::nullopt) {
+  if (configured_path) {
+    return std::filesystem::is_regular_file(*configured_path)
+               ? configured_path
+               : std::nullopt;
   }
 
-  // 回退到 exe 目录及其 resources 子目录
-  std::vector<std::filesystem::path> fallback_roots;
+  // Windows 桌面端的二进制文件只允许位于软件目录中。
   const auto exe_dir = GetExecutableDirectory();
-  fallback_roots.push_back(exe_dir);
-  fallback_roots.push_back(exe_dir / L"resources");
+  const std::vector<std::filesystem::path> software_roots = {
+      exe_dir / L"yt_dlp", exe_dir / L"resources" / L"yt_dlp", exe_dir,
+      exe_dir / L"resources"};
 
-  for (const auto& root : fallback_roots) {
+  for (const auto& root : software_roots) {
     for (const auto& candidate : candidates) {
       const auto local_path = root / candidate;
-      if (std::filesystem::exists(local_path)) {
+      if (std::filesystem::is_regular_file(local_path)) {
         return local_path;
       }
     }
-  }
-
-  wchar_t* env_path = nullptr;
-  size_t env_len = 0;
-  if (_wdupenv_s(&env_path, &env_len, L"PATH") != 0 || env_path == nullptr) {
-    return std::nullopt;
-  }
-  std::wstring path_value(env_path);
-  free(env_path);
-
-  size_t cursor = 0;
-  while (cursor <= path_value.size()) {
-    const size_t next = path_value.find(L';', cursor);
-    const std::wstring segment = path_value.substr(
-        cursor, next == std::wstring::npos ? std::wstring::npos : next - cursor);
-    if (!segment.empty()) {
-      for (const auto& candidate : candidates) {
-        const auto path = std::filesystem::path(segment) / candidate;
-        if (std::filesystem::exists(path)) {
-          return path;
-        }
-      }
-    }
-    if (next == std::wstring::npos) {
-      break;
-    }
-    cursor = next + 1;
   }
   return std::nullopt;
 }
 
 std::string BuildBinaryDiagnostic(
     const std::vector<std::wstring>& yt_dlp_candidates,
-    const std::vector<std::wstring>& ffmpeg_candidates) {
+    const std::vector<std::wstring>& ffmpeg_candidates,
+    const std::optional<std::filesystem::path>& configured_yt_dlp,
+    const std::optional<std::filesystem::path>& configured_ffmpeg) {
   std::ostringstream output;
-  output << "windows search roots:";
+  output << "windows software-managed binary paths:";
+  output << "\n- yt-dlp: "
+         << (configured_yt_dlp ? WideToUtf8(configured_yt_dlp->wstring())
+                               : "not configured");
+  output << "\n- ffmpeg: "
+         << (configured_ffmpeg ? WideToUtf8(configured_ffmpeg->wstring())
+                               : "not configured");
+  output << "\nsoftware directory search roots:";
 
   const auto exe_dir = GetExecutableDirectory();
+  output << "\n- " << WideToUtf8((exe_dir / L"yt_dlp").wstring());
   output << "\n- " << WideToUtf8(exe_dir.wstring());
   output << "\n- " << WideToUtf8((exe_dir / L"resources").wstring());
-
-  auto append_known_folder = [&output](const KNOWNFOLDERID& folder_id,
-                                       const char* label) {
-    PWSTR folder_path = nullptr;
-    if (SHGetKnownFolderPath(folder_id, KF_FLAG_DEFAULT, nullptr, &folder_path) !=
-        S_OK) {
-      return;
-    }
-    const std::filesystem::path base_path{std::wstring(folder_path)};
-    CoTaskMemFree(folder_path);
-    output << "\n- " << label << ": "
-           << WideToUtf8((base_path / L"video_player_app" / L"yt_dlp").wstring());
-  };
-
-  append_known_folder(FOLDERID_RoamingAppData, "RoamingAppData");
-  append_known_folder(FOLDERID_LocalAppData, "LocalAppData");
   output << "\nyt-dlp candidates:";
   for (const auto& candidate : yt_dlp_candidates) {
     output << "\n- " << WideToUtf8(candidate);
@@ -237,6 +181,7 @@ struct ProcessResult {
 struct StreamingProcess {
   PROCESS_INFORMATION process_info{};
   HANDLE output_read = nullptr;
+  HANDLE job_handle = nullptr;
 
   bool valid() const { return process_info.hProcess != nullptr; }
 };
@@ -350,6 +295,21 @@ StreamingProcess StartStreamingProcess(
   startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
   PROCESS_INFORMATION process_info{};
+  HANDLE job_handle = CreateJobObjectW(nullptr, nullptr);
+  if (job_handle == nullptr) {
+    CloseHandle(output_read);
+    CloseHandle(output_write);
+    return {};
+  }
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_info{};
+  job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!SetInformationJobObject(job_handle, JobObjectExtendedLimitInformation,
+                               &job_info, sizeof(job_info))) {
+    CloseHandle(job_handle);
+    CloseHandle(output_read);
+    CloseHandle(output_write);
+    return {};
+  }
   std::vector<wchar_t> command_buffer(command.begin(), command.end());
   command_buffer.push_back(L'\0');
 
@@ -358,16 +318,27 @@ StreamingProcess StartStreamingProcess(
                                : working_directory;
   const BOOL created = CreateProcessW(
       nullptr, command_buffer.data(), nullptr, nullptr, TRUE,
-      CREATE_NO_WINDOW, nullptr, working_dir.c_str(), &startup_info,
+      CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, working_dir.c_str(), &startup_info,
       &process_info);
 
   CloseHandle(output_write);
   if (!created) {
+    CloseHandle(job_handle);
     CloseHandle(output_read);
     return {};
   }
 
-  return {process_info, output_read};
+  if (!AssignProcessToJobObject(job_handle, process_info.hProcess)) {
+    TerminateProcess(process_info.hProcess, 1);
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+    CloseHandle(job_handle);
+    CloseHandle(output_read);
+    return {};
+  }
+  ResumeThread(process_info.hThread);
+
+  return {process_info, output_read, job_handle};
 }
 
 void CloseStreamingProcess(StreamingProcess* process) {
@@ -386,6 +357,24 @@ void CloseStreamingProcess(StreamingProcess* process) {
     CloseHandle(process->process_info.hProcess);
     process->process_info.hProcess = nullptr;
   }
+  if (process->job_handle != nullptr) {
+    CloseHandle(process->job_handle);
+    process->job_handle = nullptr;
+  }
+}
+
+bool TerminateStreamingProcessTree(StreamingProcess* process,
+                                   UINT exit_code) {
+  if (process == nullptr) {
+    return false;
+  }
+  if (process->job_handle != nullptr) {
+    return TerminateJobObject(process->job_handle, exit_code) == TRUE;
+  }
+  if (process->process_info.hProcess != nullptr) {
+    return TerminateProcess(process->process_info.hProcess, exit_code) == TRUE;
+  }
+  return false;
 }
 
 std::optional<std::string> ReadFileUtf8(const std::filesystem::path& path) {
@@ -724,55 +713,96 @@ void FlutterWindow::RegisterYtDlpChannel() {
       [this](const flutter::MethodCall<flutter::EncodableValue>& call,
              std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
                  result) {
+        if (call.method_name() == "configureYtDlpBinaryPaths") {
+          const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args == nullptr) {
+            result->Success(flutter::EncodableValue(false));
+            return;
+          }
+
+          const auto read_configured_path = [args](const char* key)
+              -> std::optional<std::filesystem::path> {
+            const auto it = args->find(flutter::EncodableValue(key));
+            if (it == args->end()) {
+              return std::nullopt;
+            }
+            const auto* value = std::get_if<std::string>(&it->second);
+            if (value == nullptr || value->empty()) {
+              return std::nullopt;
+            }
+            const auto candidate =
+                std::filesystem::path(Utf8ToWide(*value)).lexically_normal();
+            return candidate;
+          };
+
+          configured_yt_dlp_path_ = read_configured_path("ytDlpPath");
+          configured_ffmpeg_path_ = read_configured_path("ffmpegPath");
+          result->Success(flutter::EncodableValue(
+              configured_yt_dlp_path_.has_value() &&
+              std::filesystem::is_regular_file(*configured_yt_dlp_path_)));
+          return;
+        }
+
         if (call.method_name() == "getYtDlpBinaryStatus") {
-          flutter::EncodableMap payload;
           const std::vector<std::wstring> yt_dlp_candidates = {L"yt-dlp.exe"};
           const std::vector<std::wstring> ffmpeg_candidates = {L"ffmpeg.exe"};
+          const auto configured_yt_dlp = configured_yt_dlp_path_;
+          const auto configured_ffmpeg = configured_ffmpeg_path_;
+          auto async_result = std::shared_ptr<
+              flutter::MethodResult<flutter::EncodableValue>>(std::move(result));
+          std::thread([this, yt_dlp_candidates, ffmpeg_candidates,
+                       configured_yt_dlp, configured_ffmpeg,
+                       async_result]() {
+            flutter::EncodableMap payload;
+            const auto yt_dlp =
+                FindExecutable(yt_dlp_candidates, configured_yt_dlp);
+            const auto ffmpeg =
+                FindExecutable(ffmpeg_candidates, configured_ffmpeg);
+            payload[flutter::EncodableValue("ytDlpReady")] =
+                flutter::EncodableValue(yt_dlp.has_value());
+            payload[flutter::EncodableValue("ffmpegReady")] =
+                flutter::EncodableValue(ffmpeg.has_value());
+            payload[flutter::EncodableValue("ytDlpPath")] =
+                yt_dlp ? flutter::EncodableValue(WideToUtf8(yt_dlp->wstring()))
+                       : flutter::EncodableValue();
+            payload[flutter::EncodableValue("ffmpegPath")] =
+                ffmpeg ? flutter::EncodableValue(WideToUtf8(ffmpeg->wstring()))
+                       : flutter::EncodableValue();
+            payload[flutter::EncodableValue("diagnosticMessage")] =
+                flutter::EncodableValue(BuildBinaryDiagnostic(
+                    yt_dlp_candidates, ffmpeg_candidates, configured_yt_dlp,
+                    configured_ffmpeg));
 
-          const auto yt_dlp = FindExecutable(yt_dlp_candidates);
-          const auto ffmpeg = FindExecutable(ffmpeg_candidates);
-
-          payload[flutter::EncodableValue("ytDlpReady")] =
-              flutter::EncodableValue(yt_dlp.has_value());
-          payload[flutter::EncodableValue("ffmpegReady")] =
-              flutter::EncodableValue(ffmpeg.has_value());
-          payload[flutter::EncodableValue("ytDlpPath")] =
-              yt_dlp ? flutter::EncodableValue(WideToUtf8(yt_dlp->wstring()))
-                     : flutter::EncodableValue();
-          payload[flutter::EncodableValue("ffmpegPath")] =
-              ffmpeg ? flutter::EncodableValue(WideToUtf8(ffmpeg->wstring()))
-                     : flutter::EncodableValue();
-          payload[flutter::EncodableValue("diagnosticMessage")] =
-              flutter::EncodableValue(
-                  BuildBinaryDiagnostic(yt_dlp_candidates, ffmpeg_candidates));
-
-          if (yt_dlp) {
-            const auto version_result = RunProcess(*yt_dlp, {L"--version"});
-            payload[flutter::EncodableValue("ytDlpVersion")] =
-                version_result.success
-                    ? flutter::EncodableValue(Trim(version_result.stdout_text))
-                    : flutter::EncodableValue();
-          } else {
-            payload[flutter::EncodableValue("ytDlpVersion")] =
-                flutter::EncodableValue();
-          }
-
-          if (ffmpeg) {
-            const auto version_result = RunProcess(*ffmpeg, {L"-version"});
-            std::string first_line = Trim(version_result.stdout_text);
-            const auto newline_pos = first_line.find('\n');
-            if (newline_pos != std::string::npos) {
-              first_line = first_line.substr(0, newline_pos);
+            if (yt_dlp) {
+              const auto version_result =
+                  RunProcess(*yt_dlp, {L"--version"}, 15000);
+              payload[flutter::EncodableValue("ytDlpVersion")] =
+                  version_result.success
+                      ? flutter::EncodableValue(Trim(version_result.stdout_text))
+                      : flutter::EncodableValue();
+            } else {
+              payload[flutter::EncodableValue("ytDlpVersion")] =
+                  flutter::EncodableValue();
             }
-            payload[flutter::EncodableValue("ffmpegVersion")] =
-                version_result.success ? flutter::EncodableValue(first_line)
-                                       : flutter::EncodableValue();
-          } else {
-            payload[flutter::EncodableValue("ffmpegVersion")] =
-                flutter::EncodableValue();
-          }
-
-          result->Success(flutter::EncodableValue(payload));
+            if (ffmpeg) {
+              const auto version_result =
+                  RunProcess(*ffmpeg, {L"-version"}, 15000);
+              std::string first_line = Trim(version_result.stdout_text);
+              const auto newline_pos = first_line.find('\n');
+              if (newline_pos != std::string::npos) {
+                first_line = first_line.substr(0, newline_pos);
+              }
+              payload[flutter::EncodableValue("ffmpegVersion")] =
+                  version_result.success ? flutter::EncodableValue(first_line)
+                                         : flutter::EncodableValue();
+            } else {
+              payload[flutter::EncodableValue("ffmpegVersion")] =
+                  flutter::EncodableValue();
+            }
+            PostUiTask([async_result, payload]() {
+              async_result->Success(flutter::EncodableValue(payload));
+            });
+          }).detach();
           return;
         }
 
@@ -814,7 +844,8 @@ void FlutterWindow::RegisterYtDlpChannel() {
         }
 
         if (call.method_name() == "resolveYoutubeMeta") {
-          const auto yt_dlp = FindExecutable({L"yt-dlp.exe"});
+          const auto yt_dlp =
+              FindExecutable({L"yt-dlp.exe"}, configured_yt_dlp_path_);
           if (!yt_dlp) {
             result->Error("YT_DLP_NOT_FOUND", "yt-dlp executable not found");
             return;
@@ -962,8 +993,18 @@ void FlutterWindow::RegisterYtDlpChannel() {
               task_id_it == args->end()
                   ? nullptr
                   : std::get_if<std::string>(&task_id_it->second);
-          result->Success(flutter::EncodableValue(
-              task_id == nullptr ? false : PauseYtDlpDownload(*task_id)));
+          const bool stopped =
+              task_id == nullptr ? false : PauseYtDlpDownload(*task_id);
+          flutter::EncodableMap pause_result;
+          pause_result[flutter::EncodableValue("accepted")] =
+              flutter::EncodableValue(stopped);
+          pause_result[flutter::EncodableValue("stopped")] =
+              flutter::EncodableValue(stopped);
+          if (!stopped) {
+            pause_result[flutter::EncodableValue("reason")] =
+                flutter::EncodableValue("running task not found");
+          }
+          result->Success(flutter::EncodableValue(pause_result));
           return;
         }
 
@@ -1033,9 +1074,7 @@ void FlutterWindow::OnDestroy() {
     for (auto& entry : yt_dlp_tasks_) {
       auto& task = entry.second;
       task->termination_reason = "cancel";
-      if (task->process.process_info.hProcess != nullptr) {
-        TerminateProcess(task->process.process_info.hProcess, 1);
-      }
+      TerminateStreamingProcessTree(&task->process, 1);
     }
     yt_dlp_tasks_.clear();
     yt_dlp_event_sink_.reset();
@@ -1151,7 +1190,8 @@ bool FlutterWindow::StartYtDlpDownload(const flutter::EncodableMap& request,
     return false;
   }
 
-  const auto yt_dlp = FindExecutable({L"yt-dlp.exe"});
+  const auto yt_dlp =
+      FindExecutable({L"yt-dlp.exe"}, configured_yt_dlp_path_);
   if (!yt_dlp) {
     if (error_message) {
       *error_message = "yt-dlp executable not found";
@@ -1160,7 +1200,8 @@ bool FlutterWindow::StartYtDlpDownload(const flutter::EncodableMap& request,
   }
 
   std::vector<std::wstring> command_args;
-  const auto ffmpeg = FindExecutable({L"ffmpeg.exe"});
+  const auto ffmpeg =
+      FindExecutable({L"ffmpeg.exe"}, configured_ffmpeg_path_);
   if (ffmpeg) {
     command_args.push_back(L"--ffmpeg-location");
     command_args.push_back(ffmpeg->wstring());
@@ -1202,9 +1243,7 @@ bool FlutterWindow::StartYtDlpDownload(const flutter::EncodableMap& request,
     auto existing = yt_dlp_tasks_.find(*task_id);
     if (existing != yt_dlp_tasks_.end()) {
       existing->second->termination_reason = "cancel";
-      if (existing->second->process.process_info.hProcess != nullptr) {
-        TerminateProcess(existing->second->process.process_info.hProcess, 1);
-      }
+      TerminateStreamingProcessTree(&existing->second->process, 1);
       yt_dlp_tasks_.erase(existing);
     }
     yt_dlp_tasks_[*task_id] = task;
@@ -1222,35 +1261,29 @@ bool FlutterWindow::StartYtDlpDownload(const flutter::EncodableMap& request,
 }
 
 bool FlutterWindow::PauseYtDlpDownload(const std::string& task_id) {
-  std::shared_ptr<WindowsYtDlpTask> task;
-  {
-    std::lock_guard<std::mutex> lock(yt_dlp_mutex_);
-    const auto it = yt_dlp_tasks_.find(task_id);
-    if (it == yt_dlp_tasks_.end()) {
-      return false;
-    }
-    task = it->second;
-    task->termination_reason = "pause";
-    task->status = "paused";
-    task->message = "Paused";
+  std::lock_guard<std::mutex> lock(yt_dlp_mutex_);
+  const auto it = yt_dlp_tasks_.find(task_id);
+  if (it == yt_dlp_tasks_.end()) {
+    return false;
   }
-  return TerminateProcess(task->process.process_info.hProcess, 0) == TRUE;
+  auto& task = it->second;
+  task->termination_reason = "pause";
+  task->status = "paused";
+  task->message = "Paused";
+  return TerminateStreamingProcessTree(&task->process, 0);
 }
 
 bool FlutterWindow::CancelYtDlpDownload(const std::string& task_id) {
-  std::shared_ptr<WindowsYtDlpTask> task;
-  {
-    std::lock_guard<std::mutex> lock(yt_dlp_mutex_);
-    const auto it = yt_dlp_tasks_.find(task_id);
-    if (it == yt_dlp_tasks_.end()) {
-      return false;
-    }
-    task = it->second;
-    task->termination_reason = "cancel";
-    task->status = "cancelled";
-    task->message = "Cancelled";
+  std::lock_guard<std::mutex> lock(yt_dlp_mutex_);
+  const auto it = yt_dlp_tasks_.find(task_id);
+  if (it == yt_dlp_tasks_.end()) {
+    return false;
   }
-  return TerminateProcess(task->process.process_info.hProcess, 1) == TRUE;
+  auto& task = it->second;
+  task->termination_reason = "cancel";
+  task->status = "cancelled";
+  task->message = "Cancelled";
+  return TerminateStreamingProcessTree(&task->process, 1);
 }
 
 bool FlutterWindow::RemoveYtDlpTask(const std::string& task_id) {
@@ -1266,22 +1299,11 @@ bool FlutterWindow::RemoveYtDlpTask(const std::string& task_id) {
     }
   }
   if (task && task->process.process_info.hProcess != nullptr) {
-    TerminateProcess(task->process.process_info.hProcess, 1);
+    TerminateStreamingProcessTree(&task->process, 1);
   }
-  if (task) {
-    std::error_code ec;
-    if (!task->output_path.empty()) {
-      std::filesystem::remove(std::filesystem::path(Utf8ToWide(task->output_path)),
-                              ec);
-    }
-    for (const auto& produced_path : task->produced_paths) {
-      if (produced_path.empty()) {
-        continue;
-      }
-      std::filesystem::remove(std::filesystem::path(Utf8ToWide(produced_path)),
-                              ec);
-    }
-  }
+  // Removing a task is a metadata operation. Final output files may already be
+  // referenced by the media library, so native code must never delete them.
+  // Dart performs the narrowly-scoped cleanup of .part/.ytdl/temp artifacts.
   return true;
 }
 
@@ -1359,7 +1381,6 @@ void FlutterWindow::MonitorYtDlpTask(
   WaitForSingleObject(task->process.process_info.hProcess, INFINITE);
   DWORD exit_code = 0;
   GetExitCodeProcess(task->process.process_info.hProcess, &exit_code);
-  CloseStreamingProcess(&task->process);
 
   std::string event_type;
   std::string message;
@@ -1382,10 +1403,9 @@ void FlutterWindow::MonitorYtDlpTask(
     }
     if (task->termination_reason == "pause") {
       task->status = "paused";
-      yt_dlp_tasks_.erase(task->task_id);
-      return;
-    }
-    if (task->termination_reason == "cancel") {
+      event_type = "task_paused";
+      message = task->message.empty() ? "Paused" : task->message;
+    } else if (task->termination_reason == "cancel") {
       task->status = "cancelled";
       event_type = "task_cancelled";
       message = task->message.empty() ? "Cancelled" : task->message;
@@ -1446,7 +1466,11 @@ void FlutterWindow::MonitorYtDlpTask(
         message = "Download failed";
       }
     }
-    yt_dlp_tasks_.erase(task->task_id);
+    CloseStreamingProcess(&task->process);
+    const auto current = yt_dlp_tasks_.find(task->task_id);
+    if (current != yt_dlp_tasks_.end() && current->second == task) {
+      yt_dlp_tasks_.erase(current);
+    }
   }
 
   EmitYtDlpEvent({

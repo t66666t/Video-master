@@ -7,6 +7,7 @@ class FolderDropTarget extends StatefulWidget {
   final int index;
   final Function(int draggedIndex, String targetFolderId) onMoveToFolder;
   final Function(int draggedIndex, int newIndex) onReorder;
+  final bool allowReorder;
 
   const FolderDropTarget({
     super.key,
@@ -15,6 +16,7 @@ class FolderDropTarget extends StatefulWidget {
     required this.index,
     required this.onMoveToFolder,
     required this.onReorder,
+    this.allowReorder = true,
   });
 
   @override
@@ -35,8 +37,11 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
   void _handleDragEnter() {
     setState(() {
       _isHovering = true;
+      _isMoveMode = !widget.allowReorder;
     });
-    
+
+    if (!widget.allowReorder) return;
+
     _hoverTimer?.cancel();
     _hoverTimer = Timer(const Duration(milliseconds: 300), () {
       if (mounted && _isHovering) {
@@ -57,74 +62,90 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
 
   @override
   Widget build(BuildContext context) {
-    return DragTarget<int>(
-      onWillAcceptWithDetails: (details) {
-        final data = details.data;
-        if (data == widget.index) return false;
-        _handleDragEnter();
-        return true;
-      },
-      onLeave: (_) => _handleDragLeave(),
-      onAcceptWithDetails: (details) {
-        final draggedIndex = details.data;
-        _hoverTimer?.cancel();
-        
-        if (_isMoveMode) {
-          widget.onMoveToFolder(draggedIndex, widget.folderId);
-        } else {
-          widget.onReorder(draggedIndex, widget.index);
-        }
-        
-        setState(() {
-          _isHovering = false;
-          _isMoveMode = false;
-        });
-      },
-      builder: (context, candidateData, rejectedData) {
-        if (!_isHovering || candidateData.isEmpty) {
-          return widget.child;
-        }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final unit = constraints.biggest.shortestSide;
+        return DragTarget<int>(
+          onWillAcceptWithDetails: (details) {
+            final data = details.data;
+            if (data == widget.index) return false;
+            _handleDragEnter();
+            return true;
+          },
+          onLeave: (_) => _handleDragLeave(),
+          onAcceptWithDetails: (details) {
+            final draggedIndex = details.data;
+            _hoverTimer?.cancel();
 
-        // Visual Feedback
-        return Stack(
-          children: [
-            widget.child,
-            
-            // Overlay based on mode
-            Positioned.fill(
-              child: Container(
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  color: _isMoveMode 
-                      ? Colors.greenAccent.withValues(alpha: 0.3) 
-                      : Colors.transparent, // Reorder is handled by GridView usually, but here we show border
-                  border: Border.all(
-                    color: _isMoveMode ? Colors.greenAccent : Colors.blueAccent,
-                    width: 3,
+            if (_isMoveMode || !widget.allowReorder) {
+              widget.onMoveToFolder(draggedIndex, widget.folderId);
+            } else {
+              widget.onReorder(draggedIndex, widget.index);
+            }
+
+            setState(() {
+              _isHovering = false;
+              _isMoveMode = false;
+            });
+          },
+          builder: (context, candidateData, rejectedData) {
+            if (!_isHovering || candidateData.isEmpty) {
+              return widget.child;
+            }
+
+            return Stack(
+              children: [
+                widget.child,
+                Positioned.fill(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(unit * 0.16),
+                      color: _isMoveMode
+                          ? Colors.greenAccent.withValues(alpha: 0.3)
+                          : Colors.transparent,
+                      border: Border.all(
+                        color: _isMoveMode
+                            ? Colors.greenAccent
+                            : Colors.blueAccent,
+                        width: unit * 0.025,
+                      ),
+                    ),
+                    child: _isMoveMode
+                        ? Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.move_to_inbox,
+                                  color: Colors.white,
+                                  size: unit * 0.28,
+                                ),
+                                SizedBox(height: unit * 0.05),
+                                Text(
+                                  "移动到此处",
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: unit * 0.09,
+                                    height: 1,
+                                    fontWeight: FontWeight.bold,
+                                    shadows: const [
+                                      Shadow(
+                                        blurRadius: 4,
+                                        color: Colors.black,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          )
+                        : null,
                   ),
                 ),
-                child: _isMoveMode 
-                    ? const Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(Icons.move_to_inbox, color: Colors.white, size: 40),
-                            SizedBox(height: 8),
-                            Text(
-                              "移动到此处",
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                shadows: [Shadow(blurRadius: 4, color: Colors.black)],
-                              ),
-                            ),
-                          ],
-                        ),
-                      )
-                    : null,
-              ),
-            ),
-          ],
+              ],
+            );
+          },
         );
       },
     );

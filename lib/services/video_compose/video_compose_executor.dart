@@ -17,6 +17,7 @@ class VideoComposeExecutor {
   Future<void> execute({
     required VideoComposeRequest request,
     required String filter,
+    String? preciseSubtitleConcatPath,
     required List<ComposeSubtitleInput> softSubtitleInputs,
     required Duration duration,
     required bool transcodeVideo,
@@ -27,6 +28,7 @@ class VideoComposeExecutor {
         await _executeDesktopCompose(
           request: request,
           filter: currentFilter,
+          preciseSubtitleConcatPath: preciseSubtitleConcatPath,
           softSubtitleInputs: softSubtitleInputs,
           duration: duration,
           transcodeVideo: transcodeVideo,
@@ -37,6 +39,7 @@ class VideoComposeExecutor {
       await _executeMobileCompose(
         request: request,
         filter: currentFilter,
+        preciseSubtitleConcatPath: preciseSubtitleConcatPath,
         softSubtitleInputs: softSubtitleInputs,
         duration: duration,
         transcodeVideo: transcodeVideo,
@@ -141,6 +144,7 @@ class VideoComposeExecutor {
   Future<void> _executeDesktopCompose({
     required VideoComposeRequest request,
     required String filter,
+    String? preciseSubtitleConcatPath,
     required List<ComposeSubtitleInput> softSubtitleInputs,
     required Duration duration,
     required bool transcodeVideo,
@@ -149,13 +153,35 @@ class VideoComposeExecutor {
     final String ffmpegPath = await FFmpegUtils.ffmpegPath;
     final bool hasSoftSubtitles = softSubtitleInputs.isNotEmpty;
     final List<String> args = <String>['-y', '-i', request.videoPath];
+    final bool hasPreciseOverlay =
+        preciseSubtitleConcatPath != null &&
+        preciseSubtitleConcatPath.isNotEmpty;
+    if (hasPreciseOverlay) {
+      args.addAll(<String>[
+        '-f',
+        'concat',
+        '-safe',
+        '0',
+        '-i',
+        preciseSubtitleConcatPath,
+      ]);
+    }
     for (final ComposeSubtitleInput softInput in softSubtitleInputs) {
       args.addAll(<String>['-i', softInput.path]);
     }
     if (transcodeVideo) {
+      if (hasPreciseOverlay) {
+        args.addAll(<String>[
+          '-filter_complex',
+          '[0:v]$filter[base];[1:v]format=rgba,setpts=PTS-STARTPTS[sub];'
+              '[base][sub]overlay=0:0:eof_action=pass:repeatlast=1[outv]',
+          '-map',
+          '[outv]',
+        ]);
+      } else {
+        args.addAll(<String>['-vf', filter]);
+      }
       args.addAll(<String>[
-        '-vf',
-        filter,
         '-c:v',
         'libx264',
         '-preset',
@@ -171,18 +197,27 @@ class VideoComposeExecutor {
       args.addAll(<String>['-c:v', 'copy', '-c:a', 'copy']);
     }
     if (hasSoftSubtitles) {
-      args.addAll(<String>['-map', '0:v?']);
+      if (!hasPreciseOverlay) {
+        args.addAll(<String>['-map', '0:v?']);
+      }
       args.addAll(<String>['-map', '0:a?']);
+      final int softInputOffset = hasPreciseOverlay ? 2 : 1;
       for (int i = 0; i < softSubtitleInputs.length; i++) {
-        args.addAll(<String>['-map', '${i + 1}:0']);
+        args.addAll(<String>['-map', '${i + softInputOffset}:0']);
       }
       args.addAll(<String>['-c:s', 'mov_text']);
       _appendSoftSubtitleMetadataArgs(args, softSubtitleInputs);
     } else if (!transcodeVideo) {
       args.addAll(<String>['-map', '0']);
+    } else if (hasPreciseOverlay) {
+      args.addAll(<String>['-map', '0:a?']);
     }
     args.add(request.outputPath);
-    final Process process = await Process.start(ffmpegPath, args, runInShell: true);
+    final Process process = await Process.start(
+      ffmpegPath,
+      args,
+      runInShell: true,
+    );
     _activeDesktopComposeProcess = process;
     final Completer<void> completer = Completer<void>();
     final StringBuffer buffer = StringBuffer();
@@ -192,8 +227,9 @@ class VideoComposeExecutor {
 
     void onLine(String line) {
       buffer.writeln(line);
-      final Match? match =
-          RegExp(r'time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)').firstMatch(line);
+      final Match? match = RegExp(
+        r'time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)',
+      ).firstMatch(line);
       if (match != null) {
         final double h = double.tryParse(match.group(1) ?? '') ?? 0;
         final double m = double.tryParse(match.group(2) ?? '') ?? 0;
@@ -232,21 +268,46 @@ class VideoComposeExecutor {
   Future<void> _executeMobileCompose({
     required VideoComposeRequest request,
     required String filter,
+    String? preciseSubtitleConcatPath,
     required List<ComposeSubtitleInput> softSubtitleInputs,
     required Duration duration,
     required bool transcodeVideo,
     required VideoComposeProgressCallback onProgress,
   }) async {
-    final int totalMs = duration.inMilliseconds <= 0 ? 1 : duration.inMilliseconds;
+    final int totalMs = duration.inMilliseconds <= 0
+        ? 1
+        : duration.inMilliseconds;
     final bool hasSoftSubtitles = softSubtitleInputs.isNotEmpty;
     final List<String> args = <String>['-y', '-i', request.videoPath];
+    final bool hasPreciseOverlay =
+        preciseSubtitleConcatPath != null &&
+        preciseSubtitleConcatPath.isNotEmpty;
+    if (hasPreciseOverlay) {
+      args.addAll(<String>[
+        '-f',
+        'concat',
+        '-safe',
+        '0',
+        '-i',
+        preciseSubtitleConcatPath,
+      ]);
+    }
     for (final ComposeSubtitleInput softInput in softSubtitleInputs) {
       args.addAll(<String>['-i', softInput.path]);
     }
     if (transcodeVideo) {
+      if (hasPreciseOverlay) {
+        args.addAll(<String>[
+          '-filter_complex',
+          '[0:v]$filter[base];[1:v]format=rgba,setpts=PTS-STARTPTS[sub];'
+              '[base][sub]overlay=0:0:eof_action=pass:repeatlast=1[outv]',
+          '-map',
+          '[outv]',
+        ]);
+      } else {
+        args.addAll(<String>['-vf', filter]);
+      }
       args.addAll(<String>[
-        '-vf',
-        filter,
         '-c:v',
         'libx264',
         '-preset',
@@ -262,15 +323,20 @@ class VideoComposeExecutor {
       args.addAll(<String>['-c:v', 'copy', '-c:a', 'copy']);
     }
     if (hasSoftSubtitles) {
-      args.addAll(<String>['-map', '0:v?']);
+      if (!hasPreciseOverlay) {
+        args.addAll(<String>['-map', '0:v?']);
+      }
       args.addAll(<String>['-map', '0:a?']);
+      final int softInputOffset = hasPreciseOverlay ? 2 : 1;
       for (int i = 0; i < softSubtitleInputs.length; i++) {
-        args.addAll(<String>['-map', '${i + 1}:0']);
+        args.addAll(<String>['-map', '${i + softInputOffset}:0']);
       }
       args.addAll(<String>['-c:s', 'mov_text']);
       _appendSoftSubtitleMetadataArgs(args, softSubtitleInputs);
     } else if (!transcodeVideo) {
       args.addAll(<String>['-map', '0']);
+    } else if (hasPreciseOverlay) {
+      args.addAll(<String>['-map', '0:a?']);
     }
     args.add(request.outputPath);
     final String command = args.map(_quoteFFmpegArg).join(' ');
@@ -307,7 +373,10 @@ class VideoComposeExecutor {
           : softInput.title.trim();
       args.addAll(<String>['-metadata:s:s:$i', 'title=$title']);
       args.addAll(<String>['-metadata:s:s:$i', 'handler_name=$title']);
-      args.addAll(<String>['-metadata:s:s:$i', 'language=${softInput.language}']);
+      args.addAll(<String>[
+        '-metadata:s:s:$i',
+        'language=${softInput.language}',
+      ]);
     }
   }
 

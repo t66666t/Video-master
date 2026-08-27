@@ -43,6 +43,46 @@ void main() {
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.getDouble('playbackSpeed'), 1.25);
     expect(prefs.getBool('isPlaybackSpeedLocked'), isFalse);
+    expect(
+      prefs.getString('playbackSpeedLockStateV2'),
+      '{"speed":1.25,"locked":false}',
+    );
+  });
+
+  test('显式锁定操作不会因重复调用而反转状态', () async {
+    SharedPreferences.setMockInitialValues({});
+
+    final settings = SettingsService();
+    settings.resetForTest();
+    await settings.init();
+
+    await settings.setPlaybackSpeedLock(2.0, true);
+    await settings.setPlaybackSpeedLock(2.0, true);
+
+    expect(settings.playbackSpeed, 2.0);
+    expect(settings.isPlaybackSpeedLocked, isTrue);
+
+    await settings.setPlaybackSpeedLock(2.0, false);
+    await settings.setPlaybackSpeedLock(2.0, false);
+
+    expect(settings.playbackSpeed, 2.0);
+    expect(settings.isPlaybackSpeedLocked, isFalse);
+  });
+
+  test('单一快照优先于可能不一致的旧版字段', () async {
+    SharedPreferences.setMockInitialValues({
+      'playbackSpeed': 1.0,
+      'isPlaybackSpeedLocked': false,
+      'playbackSpeedLockStateV2': '{"speed":2.5,"locked":true}',
+    });
+
+    final settings = SettingsService();
+    settings.resetForTest();
+    await settings.init();
+
+    expect(settings.playbackSpeed, 2.5);
+    expect(settings.isPlaybackSpeedLocked, isTrue);
+    expect(settings.effectiveGlobalPlaybackSpeed, 2.5);
   });
 
   test('播放器专用设置接口保持与原持久化行为一致', () async {

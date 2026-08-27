@@ -69,6 +69,108 @@ void main() {
       expect(extractorArgs, contains('po_token=web.gvs+token-abc'));
     });
 
+    test('default request uses bounded retries and parallel fragments', () {
+      final request = builder.build(
+        taskId: 'task-speed-defaults',
+        url: meta.webpageUrl,
+        meta: meta,
+        selection: const DownloadSelection(),
+        sessionConfig: DownloadSessionConfig.defaults(),
+        outputDir: 'C:/downloads',
+      );
+
+      final retriesIndex = request.args.indexOf('--retries');
+      final fragmentRetriesIndex = request.args.indexOf('--fragment-retries');
+      final fragmentsIndex = request.args.indexOf('-N');
+      expect(request.args[retriesIndex + 1], '2');
+      expect(request.args[fragmentRetriesIndex + 1], '2');
+      expect(request.args[fragmentsIndex + 1], '4');
+      expect(request.debugContext['expectedDownloadTracks'], [
+        {'formatId': '137', 'mediaKind': 'video', 'weight': 0.9},
+        {'formatId': '140', 'mediaKind': 'audio', 'weight': 0.1},
+      ]);
+    });
+
+    test('request preserves partial files for pause and resume', () {
+      final request = builder.build(
+        taskId: 'task-resume',
+        url: meta.webpageUrl,
+        meta: meta,
+        selection: const DownloadSelection(),
+        sessionConfig: DownloadSessionConfig.defaults(),
+        outputDir: 'C:/downloads',
+      );
+
+      expect(request.args, contains('--continue'));
+      expect(request.args, contains('--part'));
+      expect(request.args, contains('--no-force-overwrites'));
+      expect(request.args, isNot(contains('--force-overwrites')));
+      expect(request.args, isNot(contains('--no-continue')));
+    });
+
+    test('progress weights use selected track file sizes when available', () {
+      const sizedMeta = VideoMeta(
+        id: 'sized',
+        source: 'youtube',
+        webpageUrl: 'https://www.youtube.com/watch?v=sized',
+        title: 'Sized video',
+        uploader: 'Uploader',
+        videoFormats: [
+          VideoFormat(
+            formatId: 'video',
+            ext: 'webm',
+            height: 2160,
+            fileSize: 90000000,
+          ),
+        ],
+        audioFormats: [
+          AudioFormat(formatId: 'audio', ext: 'm4a', fileSize: 10000000),
+        ],
+        recommendedVideoFormatId: 'video',
+        recommendedAudioFormatId: 'audio',
+      );
+      final request = builder.build(
+        taskId: 'task-sized-progress',
+        url: sizedMeta.webpageUrl,
+        meta: sizedMeta,
+        selection: const DownloadSelection(),
+        sessionConfig: DownloadSessionConfig.defaults(),
+        outputDir: 'C:/downloads',
+      );
+
+      expect(request.debugContext['expectedDownloadTracks'], [
+        {
+          'formatId': 'video',
+          'mediaKind': 'video',
+          'fileSize': 90000000,
+          'weight': 0.9,
+        },
+        {
+          'formatId': 'audio',
+          'mediaKind': 'audio',
+          'fileSize': 10000000,
+          'weight': 0.1,
+        },
+      ]);
+    });
+
+    test('request clamps excessive retry settings to two', () {
+      final request = builder.build(
+        taskId: 'task-bounded-retries',
+        url: meta.webpageUrl,
+        meta: meta,
+        selection: const DownloadSelection(),
+        sessionConfig: const DownloadSessionConfig(
+          retries: 8,
+          fragmentRetries: 9,
+        ),
+        outputDir: 'C:/downloads',
+      );
+
+      expect(request.args[request.args.indexOf('--retries') + 1], '2');
+      expect(request.args[request.args.indexOf('--fragment-retries') + 1], '2');
+    });
+
     test(
       'build request for video download contains common and format args',
       () {
@@ -103,6 +205,7 @@ void main() {
         );
 
         expect(request.args, contains('--no-warnings'));
+        expect(request.args, contains('--embed-chapters'));
         expect(request.args, contains('--cookies'));
         expect(request.args, contains('C:/cookies.txt'));
         expect(request.args, contains('--proxy'));
@@ -250,6 +353,45 @@ void main() {
         expect(request.args[formatIndex + 1], '22');
       },
     );
+
+    test('request fallback uses the shared compatible video selector', () {
+      const fallbackMeta = VideoMeta(
+        id: 'fallback-compatible',
+        source: 'youtube',
+        webpageUrl: 'https://www.youtube.com/shorts/fallback-compatible',
+        title: 'Fallback Compatible',
+        uploader: 'Uploader',
+        videoFormats: [
+          VideoFormat(
+            formatId: '401',
+            ext: 'mp4',
+            videoCodec: 'av01.0.08M.08',
+            height: 1080,
+          ),
+          VideoFormat(
+            formatId: '22',
+            ext: 'mp4',
+            videoCodec: 'avc1.64001F',
+            audioCodec: 'mp4a.40.2',
+            height: 720,
+            hasAudio: true,
+          ),
+        ],
+      );
+
+      final request = builder.build(
+        taskId: 'task-compatible-fallback',
+        url: fallbackMeta.webpageUrl,
+        meta: fallbackMeta,
+        selection: const DownloadSelection(outputContainer: 'mkv'),
+        sessionConfig: DownloadSessionConfig.defaults(),
+        outputDir: 'C:/downloads',
+      );
+
+      final formatIndex = request.args.indexOf('-f');
+      expect(formatIndex, greaterThanOrEqualTo(0));
+      expect(request.args[formatIndex + 1], '22');
+    });
 
     test('build request supports compatibility mode and remove audio', () {
       final request = builder.build(

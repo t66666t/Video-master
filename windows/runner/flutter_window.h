@@ -10,10 +10,12 @@
 #include <flutter/standard_message_codec.h>
 
 #include <atomic>
-#include <memory>
 #include <chrono>
+#include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -63,6 +65,8 @@ class FlutterWindow : public Win32Window {
       yt_dlp_channel_;
   std::unique_ptr<flutter::EventChannel<flutter::EncodableValue>>
       yt_dlp_event_channel_;
+  std::optional<std::filesystem::path> configured_yt_dlp_path_;
+  std::optional<std::filesystem::path> configured_ffmpeg_path_;
   std::shared_ptr<flutter::EventSink<flutter::EncodableValue>> yt_dlp_event_sink_;
   std::mutex yt_dlp_mutex_;
   std::unordered_map<std::string, std::shared_ptr<WindowsYtDlpTask>>

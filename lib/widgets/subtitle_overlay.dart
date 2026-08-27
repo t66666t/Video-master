@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../models/subtitle_style.dart';
 
@@ -23,6 +23,83 @@ class SubtitleOverlayEntry {
   }
 }
 
+/// Small visual gap between the subtitle background and playback controls.
+/// It scales with the current player viewport instead of using a device-
+/// independent fixed offset that can look excessive on short screens.
+double subtitlePlaybackControlsClearance(double viewportHeight) {
+  if (!viewportHeight.isFinite || viewportHeight <= 0) return 0;
+  return viewportHeight * 0.008;
+}
+
+/// Resolves the subtitle group's exact position inside its viewport.
+///
+/// When [playbackControlsTop] is supplied, the primary and secondary subtitle
+/// block is treated as one unit. It only moves when its rendered bottom edge
+/// would cross that boundary, and it moves by the minimum required distance.
+/// This pure geometry helper also keeps the behavior independently testable.
+Offset resolveSubtitleOverlayOffset({
+  required Size viewportSize,
+  required Size subtitleSize,
+  required Alignment alignment,
+  double? playbackControlsTop,
+  List<Rect> playbackControlRects = const <Rect>[],
+}) {
+  final double availableX = (viewportSize.width - subtitleSize.width)
+      .clamp(0.0, double.infinity)
+      .toDouble();
+  final double availableY = (viewportSize.height - subtitleSize.height)
+      .clamp(0.0, double.infinity)
+      .toDouble();
+  final double dx = availableX * (alignment.x + 1) / 2;
+  double dy = availableY * (alignment.y + 1) / 2;
+
+  final List<Rect> effectiveControlRects = <Rect>[
+    ...playbackControlRects.where(
+      (rect) =>
+          rect.left.isFinite &&
+          rect.top.isFinite &&
+          rect.right.isFinite &&
+          rect.bottom.isFinite &&
+          !rect.isEmpty,
+    ),
+  ];
+  if (playbackControlsTop != null && playbackControlsTop.isFinite) {
+    final double safeTop = playbackControlsTop
+        .clamp(0.0, viewportSize.height)
+        .toDouble();
+    effectiveControlRects.add(
+      Rect.fromLTRB(0, safeTop, viewportSize.width, viewportSize.height),
+    );
+  }
+
+  // Resolve each genuinely intersecting control region independently. A
+  // chapter pill therefore only affects subtitles whose horizontal bounds
+  // actually cross that pill, instead of reserving its complete row.
+  bool moved;
+  do {
+    moved = false;
+    final Rect subtitleRect = Rect.fromLTWH(
+      dx,
+      dy,
+      subtitleSize.width,
+      subtitleSize.height,
+    );
+    for (final Rect controlRect in effectiveControlRects) {
+      if (!subtitleRect.overlaps(controlRect)) continue;
+      final double resolvedY = (controlRect.top - subtitleSize.height)
+          .clamp(0.0, availableY)
+          .toDouble();
+      if (resolvedY < dy) {
+        dy = resolvedY;
+        moved = true;
+        break;
+      }
+    }
+  } while (moved);
+
+  return Offset(dx, dy);
+}
+
 class SubtitleOverlayGroup extends StatelessWidget {
   final List<SubtitleOverlayEntry> entries;
   final SubtitleStyle style;
@@ -36,6 +113,10 @@ class SubtitleOverlayGroup extends StatelessWidget {
   final bool animateAlignment;
   final Duration alignmentDuration;
   final Curve alignmentCurve;
+  final ValueListenable<bool>? playbackControlsVisibility;
+  final double? playbackControlsTop;
+  final List<Rect> Function()? playbackControlRects;
+  final bool avoidPlaybackControls;
 
   const SubtitleOverlayGroup({
     super.key,
@@ -51,6 +132,10 @@ class SubtitleOverlayGroup extends StatelessWidget {
     this.animateAlignment = false,
     this.alignmentDuration = const Duration(milliseconds: 300),
     this.alignmentCurve = Curves.easeOutCubic,
+    this.playbackControlsVisibility,
+    this.playbackControlsTop,
+    this.playbackControlRects,
+    this.avoidPlaybackControls = false,
   });
 
   @override
@@ -95,32 +180,141 @@ class SubtitleOverlayGroup extends StatelessWidget {
                     isVisualOnly: isVisualOnly,
                   ),
                 ),
-                if (i != visibleEntries.length - 1) SizedBox(height: itemGap * scale),
+                if (i != visibleEntries.length - 1)
+                  SizedBox(height: itemGap * scale),
               ],
             ],
           ),
         );
 
-        final Widget alignedChild = animateAlignment
-            ? AnimatedAlign(
-                alignment: alignment,
-                duration: alignmentDuration,
-                curve: alignmentCurve,
-                child: content,
-              )
-            : Align(
-                alignment: alignment,
-                child: content,
+        Widget buildPositionedContent(bool controlsVisible) {
+          final double? effectiveControlsTop =
+              avoidPlaybackControls && controlsVisible
+              ? playbackControlsTop
+              : null;
+          final List<Rect> effectiveControlRects =
+              avoidPlaybackControls && controlsVisible
+              ? playbackControlRects?.call() ?? const <Rect>[]
+              : const <Rect>[];
+          if (animateAlignment) {
+            return _AnimatedSubtitlePosition(
+              alignment: alignment,
+              duration: alignmentDuration,
+              curve: alignmentCurve,
+              playbackControlsTop: effectiveControlsTop,
+              playbackControlRects: effectiveControlRects,
+              child: content,
+            );
+          }
+          return CustomSingleChildLayout(
+            delegate: _SubtitlePositionDelegate(
+              alignment: alignment,
+              playbackControlsTop: effectiveControlsTop,
+              playbackControlRects: effectiveControlRects,
+            ),
+            child: content,
+          );
+        }
+
+        final Widget alignedChild = playbackControlsVisibility == null
+            ? buildPositionedContent(false)
+            : ValueListenableBuilder<bool>(
+                valueListenable: playbackControlsVisibility!,
+                builder: (context, controlsVisible, _) =>
+                    buildPositionedContent(controlsVisible),
               );
 
         return SizedBox(
           width: constraints.maxWidth,
           height: constraints.maxHeight,
-          child: ClipRect(
-            child: alignedChild,
-          ),
+          child: ClipRect(child: alignedChild),
         );
       },
+    );
+  }
+}
+
+class _SubtitlePositionDelegate extends SingleChildLayoutDelegate {
+  final Alignment alignment;
+  final double? playbackControlsTop;
+  final List<Rect> playbackControlRects;
+
+  const _SubtitlePositionDelegate({
+    required this.alignment,
+    required this.playbackControlsTop,
+    this.playbackControlRects = const <Rect>[],
+  });
+
+  @override
+  Size getSize(BoxConstraints constraints) => constraints.biggest;
+
+  @override
+  BoxConstraints getConstraintsForChild(BoxConstraints constraints) =>
+      constraints.loosen();
+
+  @override
+  Offset getPositionForChild(Size size, Size childSize) =>
+      resolveSubtitleOverlayOffset(
+        viewportSize: size,
+        subtitleSize: childSize,
+        alignment: alignment,
+        playbackControlsTop: playbackControlsTop,
+        playbackControlRects: playbackControlRects,
+      );
+
+  @override
+  bool shouldRelayout(_SubtitlePositionDelegate oldDelegate) =>
+      alignment != oldDelegate.alignment ||
+      playbackControlsTop != oldDelegate.playbackControlsTop ||
+      playbackControlRects != oldDelegate.playbackControlRects;
+}
+
+class _AnimatedSubtitlePosition extends ImplicitlyAnimatedWidget {
+  final Alignment alignment;
+  final double? playbackControlsTop;
+  final List<Rect> playbackControlRects;
+  final Widget child;
+
+  const _AnimatedSubtitlePosition({
+    required this.alignment,
+    required super.duration,
+    required super.curve,
+    required this.playbackControlsTop,
+    required this.playbackControlRects,
+    required this.child,
+  });
+
+  @override
+  AnimatedWidgetBaseState<_AnimatedSubtitlePosition> createState() =>
+      _AnimatedSubtitlePositionState();
+}
+
+class _AnimatedSubtitlePositionState
+    extends AnimatedWidgetBaseState<_AnimatedSubtitlePosition> {
+  AlignmentTween? _alignmentTween;
+
+  @override
+  void forEachTween(TweenVisitor<dynamic> visitor) {
+    _alignmentTween =
+        visitor(
+              _alignmentTween,
+              widget.alignment,
+              (dynamic value) => AlignmentTween(begin: value as Alignment),
+            )
+            as AlignmentTween?;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomSingleChildLayout(
+      delegate: _SubtitlePositionDelegate(
+        alignment: _alignmentTween?.evaluate(animation) ?? widget.alignment,
+        // This value is deliberately not tweened: controls visibility must
+        // move or restore subtitles in the same frame with no animation.
+        playbackControlsTop: widget.playbackControlsTop,
+        playbackControlRects: widget.playbackControlRects,
+      ),
+      child: widget.child,
     );
   }
 }
@@ -133,8 +327,9 @@ class SubtitleOverlay extends StatelessWidget {
   final double? referenceHeight;
   final VoidCallback? onLongPress;
   final bool isDragging;
-  final bool isGestureOnly; // If true, renders transparent text but captures gestures
-  final bool isVisualOnly;  // If true, renders visible text but ignores gestures
+  final bool
+  isGestureOnly; // If true, renders transparent text but captures gestures
+  final bool isVisualOnly; // If true, renders visible text but ignores gestures
 
   const SubtitleOverlay({
     super.key,
@@ -151,7 +346,12 @@ class SubtitleOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (text.isEmpty && (secondaryText == null || secondaryText!.isEmpty) && image == null && !isDragging) return const SizedBox.shrink();
+    if (text.isEmpty &&
+        (secondaryText == null || secondaryText!.isEmpty) &&
+        image == null &&
+        !isDragging) {
+      return const SizedBox.shrink();
+    }
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -168,12 +368,14 @@ class SubtitleOverlay extends StatelessWidget {
             );
         final double scale = resolvedMetrics.scale;
         final SubtitleStyle scaledStyle = resolvedMetrics.applyToStyle(style);
-        
+
         // In drag mode, show placeholder if text is empty and no image
-        final displayText = (text.isEmpty && image == null && isDragging) ? "字幕位置预览\nSubtitle Preview" : text;
-        
+        final displayText = (text.isEmpty && image == null && isDragging)
+            ? "字幕位置预览\nSubtitle Preview"
+            : text;
+
         // If Gesture Only, use transparent colors
-        final effectiveStyle = isGestureOnly 
+        final effectiveStyle = isGestureOnly
             ? scaledStyle.copyWith(
                 textColor: Colors.transparent,
                 backgroundColor: Colors.transparent,
@@ -195,23 +397,45 @@ class SubtitleOverlay extends StatelessWidget {
                   ),
                 )
               : Container(
-                  padding: EdgeInsets.symmetric(horizontal: 12 * scale, vertical: 6 * scale),
+                  padding: EdgeInsets.symmetric(
+                    horizontal: 12 * scale,
+                    vertical: 6 * scale,
+                  ),
                   decoration: BoxDecoration(
-                    color: effectiveStyle.backgroundColor.withValues(alpha: effectiveStyle.backgroundOpacity),
+                    color: effectiveStyle.backgroundColor.withValues(
+                      alpha: effectiveStyle.backgroundOpacity,
+                    ),
                     borderRadius: BorderRadius.circular(8 * scale),
-                    border: isDragging ? Border.all(color: Colors.greenAccent, width: 2 * scale) : null,
+                    border: isDragging
+                        ? Border.all(
+                            color: Colors.greenAccent,
+                            width: 2 * scale,
+                          )
+                        : null,
                   ),
                   child: effectiveStyle.hasBorder
                       ? Stack(
                           children: [
-                            _buildContent(displayText, effectiveStyle, isStroke: true),
-                            _buildContent(displayText, effectiveStyle, isStroke: false),
+                            _buildContent(
+                              displayText,
+                              effectiveStyle,
+                              isStroke: true,
+                            ),
+                            _buildContent(
+                              displayText,
+                              effectiveStyle,
+                              isStroke: false,
+                            ),
                           ],
                         )
-                      : _buildContent(displayText, effectiveStyle, isStroke: false),
+                      : _buildContent(
+                          displayText,
+                          effectiveStyle,
+                          isStroke: false,
+                        ),
                 ),
         );
-        
+
         if (isVisualOnly) {
           return IgnorePointer(child: content);
         }
@@ -221,49 +445,57 @@ class SubtitleOverlay extends StatelessWidget {
           behavior: HitTestBehavior.translucent,
           child: content,
         );
-      }
+      },
     );
   }
 
-  Widget _buildContent(String text, SubtitleStyle style, {required bool isStroke}) {
+  Widget _buildContent(
+    String text,
+    SubtitleStyle style, {
+    required bool isStroke,
+  }) {
     // If we have explicit secondary text, we ignore the newline splitting logic for styling
     // and render primary and secondary blocks distinctly.
     if (secondaryText != null && secondaryText!.isNotEmpty) {
       List<InlineSpan> spans = [];
-      
+
       // 1. Primary Block
       if (text.isNotEmpty) {
         // Render all lines of primary text with primary style
         final lines = text.split('\n');
         for (int i = 0; i < lines.length; i++) {
           if (i > 0) spans.add(const TextSpan(text: "\n"));
-          spans.add(TextSpan(
-             // Use default line height for primary
-             children: _buildSpans(lines[i], style, isStroke: isStroke)
-          ));
+          spans.add(
+            TextSpan(
+              // Use default line height for primary
+              children: _buildSpans(lines[i], style, isStroke: isStroke),
+            ),
+          );
         }
       }
 
       // 2. Secondary Block
       if (text.isNotEmpty) spans.add(const TextSpan(text: "\n"));
-      
+
       final secLines = secondaryText!.split('\n');
-        final secFontSize = style.secondaryFontSize ?? style.fontSize;
+      final secFontSize = style.secondaryFontSize ?? style.fontSize;
       final secStyle = style.copyWith(fontSize: secFontSize);
-      
+
       for (int i = 0; i < secLines.length; i++) {
         if (i > 0) spans.add(const TextSpan(text: "\n"));
-        
+
         // Calculate height for secondary lines (same logic as before)
         final double height = SubtitleResolvedStyleMetrics.resolveLineHeight(
           lineSpacing: style.lineSpacing,
           fontSize: secFontSize,
         );
 
-        spans.add(TextSpan(
-          style: TextStyle(height: height),
-          children: _buildSpans(secLines[i], secStyle, isStroke: isStroke),
-        ));
+        spans.add(
+          TextSpan(
+            style: TextStyle(height: height),
+            children: _buildSpans(secLines[i], secStyle, isStroke: isStroke),
+          ),
+        );
       }
 
       return RichText(
@@ -283,13 +515,13 @@ class SubtitleOverlay extends StatelessWidget {
     // 1. Split is OFF -> All text is primary.
     // 2. Split is ON but there was only one line -> Primary.
     // So we just render everything with Primary Style.
-    
+
     // Wait, the existing logic (pre-refactor) enforced splitting by newline here.
     // If I change this, I might break behavior if VideoPlayerScreen doesn't do the splitting.
     // The plan is: VideoPlayerScreen will handle the splitting logic.
     // So `SubtitleOverlay` becomes "dumb" regarding logic, just renders what it gets.
     // If `secondaryText` is null, everything is Primary.
-    
+
     final lines = text.split('\n');
     if (lines.isEmpty) return const SizedBox.shrink();
 
@@ -298,9 +530,9 @@ class SubtitleOverlay extends StatelessWidget {
     for (int i = 0; i < lines.length; i++) {
       if (i > 0) spans.add(const TextSpan(text: "\n"));
       // All lines use primary style (null height override)
-      spans.add(TextSpan(
-        children: _buildSpans(lines[i], style, isStroke: isStroke),
-      ));
+      spans.add(
+        TextSpan(children: _buildSpans(lines[i], style, isStroke: isStroke)),
+      );
     }
 
     return RichText(
@@ -314,7 +546,11 @@ class SubtitleOverlay extends StatelessWidget {
       (codeUnit >= 0x3000 && codeUnit <= 0x303f) ||
       (codeUnit >= 0xff00 && codeUnit <= 0xffef);
 
-  List<TextSpan> _buildSpans(String text, SubtitleStyle style, {required bool isStroke}) {
+  List<TextSpan> _buildSpans(
+    String text,
+    SubtitleStyle style, {
+    required bool isStroke,
+  }) {
     List<TextSpan> spans = [];
     StringBuffer currentBuffer = StringBuffer();
     bool? isCurrentChinese;
@@ -330,23 +566,44 @@ class SubtitleOverlay extends StatelessWidget {
         currentBuffer.write(char);
       } else {
         // Flush previous
-        spans.add(_createSpan(currentBuffer.toString(), isCurrentChinese, style, isStroke));
+        spans.add(
+          _createSpan(
+            currentBuffer.toString(),
+            isCurrentChinese,
+            style,
+            isStroke,
+          ),
+        );
         currentBuffer.clear();
         currentBuffer.write(char);
         isCurrentChinese = isCharChinese;
       }
     }
     if (currentBuffer.isNotEmpty) {
-      spans.add(_createSpan(currentBuffer.toString(), isCurrentChinese ?? false, style, isStroke));
+      spans.add(
+        _createSpan(
+          currentBuffer.toString(),
+          isCurrentChinese ?? false,
+          style,
+          isStroke,
+        ),
+      );
     }
     return spans;
   }
 
-  TextSpan _createSpan(String text, bool isChinese, SubtitleStyle style, bool isStroke) {
+  TextSpan _createSpan(
+    String text,
+    bool isChinese,
+    SubtitleStyle style,
+    bool isStroke,
+  ) {
     TextStyle ts = style.getTextStyle(
-      overrideFontFamily: isChinese ? style.fontFamilyChinese : style.fontFamilyEnglish
+      overrideFontFamily: isChinese
+          ? style.fontFamilyChinese
+          : style.fontFamilyEnglish,
     );
-    
+
     if (isStroke) {
       final double effectiveBorderWidth = style.effectiveBorderWidth;
       ts = ts.copyWith(
@@ -358,17 +615,19 @@ class SubtitleOverlay extends StatelessWidget {
           ..color = style.borderColor,
       );
     } else {
-       final Offset effectiveShadowOffset = style.effectiveShadowOffset;
-       final double effectiveShadowBlur = style.effectiveShadowBlur;
-       if (style.hasShadow) {
-         ts = ts.copyWith(
-           shadows: [Shadow(
+      final Offset effectiveShadowOffset = style.effectiveShadowOffset;
+      final double effectiveShadowBlur = style.effectiveShadowBlur;
+      if (style.hasShadow) {
+        ts = ts.copyWith(
+          shadows: [
+            Shadow(
               offset: effectiveShadowOffset,
               blurRadius: effectiveShadowBlur,
-              color: style.shadowColor
-           )]
-         );
-       }
+              color: style.shadowColor,
+            ),
+          ],
+        );
+      }
     }
     return TextSpan(text: text, style: ts);
   }

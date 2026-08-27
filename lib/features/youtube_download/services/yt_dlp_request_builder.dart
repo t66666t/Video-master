@@ -1,5 +1,6 @@
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
 
 class YtDlpRequestBuilder {
   const YtDlpRequestBuilder();
@@ -20,13 +21,16 @@ class YtDlpRequestBuilder {
       '--no-warnings',
       '--newline',
       '--progress',
-      '--force-overwrites',
+      '--continue',
+      '--part',
+      '--no-force-overwrites',
       '--restrict-filenames',
       '--no-mtime',
       '--write-thumbnail',
       '--convert-thumbnails',
       'png',
       '--embed-metadata',
+      '--embed-chapters',
       '--print',
       'before_dl:__YTDLP_BEFORE_DL__:%(filepath,_filename|)s',
       '--print',
@@ -40,6 +44,12 @@ class YtDlpRequestBuilder {
       meta,
       selection,
       resolvedSubtitleTracks,
+    );
+    final expectedDownloadTracks = _buildExpectedDownloadTracks(
+      meta: meta,
+      selection: selection,
+      resolvedVideoId: resolvedVideoId,
+      resolvedAudioIds: resolvedAudioIds,
     );
 
     args.addAll(_buildSessionArgs(sessionConfig));
@@ -83,6 +93,7 @@ class YtDlpRequestBuilder {
         'webpageUrl': meta.webpageUrl,
         'resolvedVideoFormatId': resolvedVideoId,
         'resolvedAudioFormatIds': resolvedAudioIds,
+        'expectedDownloadTracks': expectedDownloadTracks,
         'resolvedSubtitleLanguages': resolvedSubtitleLanguages,
         'resolvedSubtitleTrackKeys': resolvedSubtitleTracks
             .map((item) => item.selectionKey)
@@ -93,6 +104,7 @@ class YtDlpRequestBuilder {
         'extractorArgs': extractorArgs,
         'outputContainer': effectiveOutputContainer,
         'audioOnly': selection.audioOnly,
+        'removeAudio': selection.removeAudio,
         'compatibilityMode': selection.enableCompatibilityMode,
         'sessionConfigSummary': {
           'useCookies': sessionConfig.useCookies,
@@ -129,17 +141,17 @@ class YtDlpRequestBuilder {
         sessionConfig.socketTimeoutSeconds!.toString(),
       ]);
     }
-    if ((sessionConfig.retries ?? 0) > 0) {
-      args.addAll(['--retries', sessionConfig.retries!.toString()]);
+    final retries = (sessionConfig.retries ?? 2).clamp(0, 2);
+    if (retries >= 0) {
+      args.addAll(['--retries', retries.toString()]);
     }
-    if ((sessionConfig.fragmentRetries ?? 0) > 0) {
-      args.addAll([
-        '--fragment-retries',
-        sessionConfig.fragmentRetries!.toString(),
-      ]);
+    final fragmentRetries = (sessionConfig.fragmentRetries ?? 2).clamp(0, 2);
+    if (fragmentRetries >= 0) {
+      args.addAll(['--fragment-retries', fragmentRetries.toString()]);
     }
-    if ((sessionConfig.concurrentFragments ?? 0) > 0) {
-      args.addAll(['-N', sessionConfig.concurrentFragments!.toString()]);
+    final concurrentFragments = sessionConfig.concurrentFragments ?? 4;
+    if (concurrentFragments > 0) {
+      args.addAll(['-N', concurrentFragments.toString()]);
     }
     if ((sessionConfig.rateLimit?.isNotEmpty ?? false)) {
       args.addAll(['-r', sessionConfig.rateLimit!]);
@@ -214,6 +226,117 @@ class YtDlpRequestBuilder {
       return ['-f', videoId];
     }
     return ['-f', 'bestvideo+bestaudio/best'];
+  }
+
+  List<Map<String, dynamic>> _buildExpectedDownloadTracks({
+    required VideoMeta meta,
+    required DownloadSelection selection,
+    required String? resolvedVideoId,
+    required List<String> resolvedAudioIds,
+  }) {
+    VideoFormat? selectedVideo;
+    for (final format in meta.videoFormats) {
+      if (format.formatId == resolvedVideoId) {
+        selectedVideo = format;
+        break;
+      }
+    }
+    AudioFormat? selectedAudio;
+    final resolvedAudioId = resolvedAudioIds.firstOrNull;
+    for (final format in meta.audioFormats) {
+      if (format.formatId == resolvedAudioId) {
+        selectedAudio = format;
+        break;
+      }
+    }
+
+    final tracks = <Map<String, dynamic>>[];
+    if (selection.audioOnly) {
+      _appendExpectedTrack(
+        tracks,
+        formatId: resolvedAudioId,
+        mediaKind: 'audio',
+        fileSize: selectedAudio?.fileSize,
+      );
+    } else {
+      final shouldMergeAudio =
+          resolvedAudioId != null &&
+          (!(selectedVideo?.hasAudio ?? false) ||
+              selection.selectedAudioFormatIds.isNotEmpty);
+      _appendExpectedTrack(
+        tracks,
+        formatId: resolvedVideoId,
+        mediaKind: shouldMergeAudio || selection.removeAudio
+            ? 'video'
+            : 'media',
+        fileSize: selectedVideo?.fileSize,
+      );
+      if (shouldMergeAudio && !selection.removeAudio) {
+        _appendExpectedTrack(
+          tracks,
+          formatId: resolvedAudioId,
+          mediaKind: 'audio',
+          fileSize: selectedAudio?.fileSize,
+        );
+      }
+    }
+    _assignExpectedTrackWeights(tracks);
+    return tracks;
+  }
+
+  void _appendExpectedTrack(
+    List<Map<String, dynamic>> tracks, {
+    required String? formatId,
+    required String mediaKind,
+    required int? fileSize,
+  }) {
+    final normalizedId = formatId?.trim();
+    if (normalizedId == null || normalizedId.isEmpty) return;
+    tracks.add({
+      'formatId': normalizedId,
+      'mediaKind': mediaKind,
+      if ((fileSize ?? 0) > 0) 'fileSize': fileSize,
+    });
+  }
+
+  void _assignExpectedTrackWeights(List<Map<String, dynamic>> tracks) {
+    if (tracks.isEmpty) return;
+    if (tracks.length == 1) {
+      tracks.first['weight'] = 1.0;
+      return;
+    }
+    final sizes = tracks
+        .map((track) => track['fileSize'] as int?)
+        .whereType<int>()
+        .toList();
+    if (sizes.length == tracks.length) {
+      final totalSize = sizes.fold<int>(0, (sum, size) => sum + size);
+      if (totalSize > 0) {
+        for (final track in tracks) {
+          track['weight'] = (track['fileSize'] as int) / totalSize;
+        }
+        return;
+      }
+    }
+    final videoTracks = tracks
+        .where((track) => track['mediaKind'] == 'video')
+        .toList();
+    final audioTracks = tracks
+        .where((track) => track['mediaKind'] == 'audio')
+        .toList();
+    if (videoTracks.isNotEmpty && audioTracks.isNotEmpty) {
+      for (final track in videoTracks) {
+        track['weight'] = 0.9 / videoTracks.length;
+      }
+      for (final track in audioTracks) {
+        track['weight'] = 0.1 / audioTracks.length;
+      }
+      return;
+    }
+    final equalWeight = 1.0 / tracks.length;
+    for (final track in tracks) {
+      track['weight'] = equalWeight;
+    }
   }
 
   List<String> _buildSubtitleArgs({
@@ -409,14 +532,7 @@ class YtDlpRequestBuilder {
   }
 
   String? _pickDefaultVideoId(VideoMeta meta) {
-    if (meta.videoFormats.isEmpty) return null;
-    final sorted = [...meta.videoFormats]
-      ..sort((a, b) {
-        final aScore = _videoPriorityScore(a);
-        final bScore = _videoPriorityScore(b);
-        return bScore.compareTo(aScore);
-      });
-    return sorted.first.formatId;
+    return YtDlpVideoFormatSelector.pickFormatId(meta.videoFormats);
   }
 
   String? _pickDefaultAudioId(VideoMeta meta) {
@@ -428,16 +544,6 @@ class YtDlpRequestBuilder {
         return bScore.compareTo(aScore);
       });
     return sorted.first.formatId;
-  }
-
-  int _videoPriorityScore(VideoFormat format) {
-    int score = 0;
-    if (format.ext == 'mp4') score += 40;
-    final codec = (format.videoCodec ?? '').toLowerCase();
-    if (codec.contains('avc') || codec.contains('h264')) score += 30;
-    if (format.hasAudio) score += 20;
-    score += (format.height ?? 0);
-    return score;
   }
 
   int _audioPriorityScore(AudioFormat format) {

@@ -333,11 +333,7 @@ class BatchImportService extends ChangeNotifier {
   Future<void> moveVideo(String? folderId, int oldIndex, int newIndex) async {
     final state = _getState(folderId);
     if (oldIndex < 0 || oldIndex >= state.videoItems.length) return;
-    if (newIndex < 0 || newIndex > state.videoItems.length) return;
-
-    if (oldIndex < newIndex) {
-      newIndex -= 1;
-    }
+    if (newIndex < 0 || newIndex >= state.videoItems.length) return;
 
     final item = state.videoItems.removeAt(oldIndex);
     state.videoItems.insert(newIndex, item);
@@ -354,11 +350,7 @@ class BatchImportService extends ChangeNotifier {
   ) async {
     final state = _getState(folderId);
     if (oldIndex < 0 || oldIndex >= state.subtitleItems.length) return;
-    if (newIndex < 0 || newIndex > state.subtitleItems.length) return;
-
-    if (oldIndex < newIndex) {
-      newIndex -= 1;
-    }
+    if (newIndex < 0 || newIndex >= state.subtitleItems.length) return;
 
     final item = state.subtitleItems.removeAt(oldIndex);
     state.subtitleItems.insert(newIndex, item);

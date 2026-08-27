@@ -3,15 +3,18 @@ import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
+import 'package:video_player_app/features/youtube_download/presentation/widgets/yt_dlp_binary_manager_dialog.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_updater.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_download_service.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_input_url_extractor.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_version.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 
 class YtDlpDownloadScreen extends StatefulWidget {
@@ -41,7 +44,6 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
   void initState() {
     super.initState();
     _service = context.read<YtDlpDownloadService>();
-    unawaited(_service.ensureReady(activatePage: true));
     if (widget.initialInput != null) {
       _inputController.text = widget.initialInput!;
     }
@@ -156,12 +158,40 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     }
   }
 
-  Future<void> _showBinaryStatusDialog(YtDlpDownloadService service) async {
+  Future<void> _showBinaryManager(YtDlpDownloadService service) async {
     if (_isCheckingBinaryStatus) return;
     _isCheckingBinaryStatus = true;
     try {
       await service.refreshBinaryStatus();
-      if (service.supportsOnlineYtDlpUpdate) {
+      if (service.supportsDesktopYtDlpPaths) {
+        await service.refreshDesktopYtDlpPaths();
+      }
+      if (service.supportsLatestYtDlpReleaseCheck) {
+        try {
+          await service.refreshLatestYtDlpRelease();
+        } catch (_) {}
+      }
+    } catch (_) {
+      // The manager renders runtime and network errors inline.
+    } finally {
+      _isCheckingBinaryStatus = false;
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => YtDlpBinaryManagerDialog(service: service),
+    );
+  }
+
+  // ignore: unused_element
+  Future<void> _showBinaryStatusDialogLegacy(
+    YtDlpDownloadService service,
+  ) async {
+    if (_isCheckingBinaryStatus) return;
+    _isCheckingBinaryStatus = true;
+    try {
+      await service.refreshBinaryStatus();
+      if (service.supportsLatestYtDlpReleaseCheck) {
         try {
           await service.refreshLatestYtDlpRelease();
         } catch (_) {
@@ -200,16 +230,17 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
             final progressLabel = updateProgress == null
                 ? null
                 : '${(updateProgress * 100).clamp(0, 100).toStringAsFixed(updateProgress >= 0.995 ? 0 : 1)}%';
-            final latestVersionLabel =
-                latestVersion ??
-                (service.supportsOnlineYtDlpUpdate ? '检查失败' : '当前平台不支持在线更新');
+            final latestVersionLabel = YtDlpVersions.latestStableLabel(
+              latestVersion ?? service.bundledYtDlpVersion,
+              supportsOnlineUpdate: service.supportsOnlineYtDlpUpdate,
+            );
             final updateHint = service.supportsOnlineYtDlpUpdate
                 ? service.hasProcessingTasks || service.isResolving
                       ? '请先等待当前解析或下载任务结束'
                       : service.hasNewerYtDlpRelease
-                      ? '发现新版本，可直接更新'
-                      : '当前已是最新版本，仍可手动重装最新版本'
-                : '当前平台暂不支持在线更新';
+                      ? '发现新的稳定版，可直接更新'
+                      : '当前已是最新稳定版，仍可手动重装'
+                : 'Android 内嵌 yt-dlp 将随应用升级一并更新';
             final diagnostic = status.diagnosticMessage?.trim();
             final updateError = service.ytDlpUpdateError?.trim();
 
@@ -233,7 +264,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                     SelectableText(
                       '当前版本: $currentVersion\n'
                       '内置版本: ${service.bundledYtDlpVersion}\n'
-                      '最新版本: $latestVersionLabel\n'
+                      '最新稳定版: $latestVersionLabel\n'
+                      '安装位置: ${status.ytDlpPath ?? '未找到'}\n'
                       'ffmpeg: ${status.ffmpegVersion ?? 'unknown'}',
                       style: const TextStyle(fontSize: 13, height: 1.45),
                     ),
@@ -286,7 +318,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                     onPressed: canUpdate
                         ? () async {
                             Navigator.of(dialogContext).pop();
-                            AppToast.showProgress('正在检查最新版本...', progress: 0);
+                            AppToast.showProgress('正在检查最新稳定版...', progress: 0);
                             void syncUpdateToast() {
                               final progress = service.ytDlpUpdateProgress;
                               final stage = service.ytDlpUpdateStage;
@@ -381,13 +413,13 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       text: temp.socketTimeoutSeconds?.toString() ?? '30',
     );
     final retriesController = TextEditingController(
-      text: temp.retries?.toString() ?? '3',
+      text: temp.retries?.toString() ?? '2',
     );
     final fragmentRetriesController = TextEditingController(
-      text: temp.fragmentRetries?.toString() ?? '3',
+      text: temp.fragmentRetries?.toString() ?? '2',
     );
     final fragmentsController = TextEditingController(
-      text: temp.concurrentFragments?.toString() ?? '1',
+      text: temp.concurrentFragments?.toString() ?? '4',
     );
     final rateLimitController = TextEditingController(
       text: temp.rateLimit ?? '',
@@ -501,7 +533,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                         leftLabel: '首选清晰度',
                         leftValue: tempPreferences.preferredQuality,
                         leftItems: const [
-                          DropdownMenuItem(value: 'best', child: Text('最佳')),
+                          DropdownMenuItem(
+                            value: 'best',
+                            child: Text('推荐（兼容优先）'),
+                          ),
                           DropdownMenuItem(
                             value: '2160p',
                             child: Text('2160p'),
@@ -545,6 +580,12 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                             );
                           });
                         },
+                      ),
+                      _buildLabeledField(
+                        label: '分片并发数',
+                        controller: fragmentsController,
+                        hintText: '1–16，建议 4',
+                        keyboardType: TextInputType.number,
                       ),
                       SwitchListTile(
                         title: const Text('下载完成自动导入媒体库'),
@@ -710,11 +751,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                           rightLabel: '重试次数',
                           rightController: retriesController,
                         ),
-                        _buildNumericRow(
-                          leftLabel: '分片重试',
-                          leftController: fragmentRetriesController,
-                          rightLabel: '并发分片',
-                          rightController: fragmentsController,
+                        _buildLabeledField(
+                          label: '分片重试',
+                          controller: fragmentRetriesController,
+                          keyboardType: TextInputType.number,
                         ),
                         _buildLabeledField(
                           label: '限速',
@@ -724,7 +764,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                         _buildLabeledField(
                           label: 'Player Clients',
                           controller: clientsController,
-                          hintText: '例如 tv_embedded,mweb,web_creator',
+                          hintText: '例如 android,visionos',
                         ),
                         _buildLabeledField(
                           label: 'Visitor Data',
@@ -855,7 +895,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                       ),
                       concurrentFragments: int.tryParse(
                         fragmentsController.text.trim(),
-                      ),
+                      )?.clamp(1, 16),
                       rateLimit: rateLimitController.text.trim().isEmpty
                           ? null
                           : rateLimitController.text.trim(),
@@ -1013,12 +1053,14 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     );
   }
 
-  Widget _buildKeepAwakeBanner(YtDlpDownloadService service) {
-    if (!service.supportsProcessingKeepAwakeToggle ||
-        !service.keepScreenAwakeDuringProcessing) {
+  Widget _buildKeepAwakeBanner({
+    required bool supported,
+    required bool enabled,
+    required bool active,
+  }) {
+    if (!supported || !enabled) {
       return const SizedBox.shrink();
     }
-    final active = service.isProcessingKeepAwakeActive;
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(12, 10, 12, 4),
@@ -1153,33 +1195,42 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                   ),
                   backgroundColor: const Color(0xFF1E1E1E),
                   actions: [
-                    Consumer<YtDlpDownloadService>(
-                      builder: (context, currentService, _) {
-                        final status = currentService.binaryStatus;
-                        final canResolve = status.ytDlpReady;
-                        final hasFullPostProcessing = Platform.isAndroid
-                            ? status.ytDlpReady
-                            : status.ytDlpReady && status.ffmpegReady;
+                    Selector<
+                      YtDlpDownloadService,
+                      ({bool canResolve, bool full, bool newer})
+                    >(
+                      selector: (_, currentService) => (
+                        canResolve: currentService.binaryStatus.ytDlpReady,
+                        full: Platform.isAndroid
+                            ? currentService.binaryStatus.ytDlpReady
+                            : currentService.binaryStatus.ytDlpReady &&
+                                  currentService.binaryStatus.ffmpegReady,
+                        newer: currentService.hasNewerYtDlpRelease,
+                      ),
+                      builder: (context, runtime, _) {
+                        final currentService = context
+                            .read<YtDlpDownloadService>();
+                        final canResolve = runtime.canResolve;
+                        final hasFullPostProcessing = runtime.full;
                         final tooltip = canResolve
                             ? hasFullPostProcessing
-                                  ? currentService.hasNewerYtDlpRelease
+                                  ? runtime.newer
                                         ? 'yt-dlp 与 ffmpeg 已就绪，发现新版本'
                                         : 'yt-dlp 与 ffmpeg 已就绪'
                                   : 'yt-dlp 已就绪，后处理能力受限'
                             : '检查执行环境与更新';
                         return IconButton(
                           tooltip: tooltip,
-                          onPressed: () =>
-                              _showBinaryStatusDialog(currentService),
+                          onPressed: () => _showBinaryManager(currentService),
                           icon: Icon(
-                            currentService.hasNewerYtDlpRelease
+                            runtime.newer
                                 ? Icons.system_update_alt_rounded
                                 : hasFullPostProcessing
                                 ? Icons.verified
                                 : canResolve
                                 ? Icons.info_outline
                                 : Icons.warning_amber_rounded,
-                            color: currentService.hasNewerYtDlpRelease
+                            color: runtime.newer
                                 ? Colors.amberAccent
                                 : hasFullPostProcessing
                                 ? Colors.greenAccent
@@ -1193,23 +1244,31 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                         );
                       },
                     ),
-                    Consumer<YtDlpDownloadService>(
-                      builder: (context, currentService, _) {
-                        if (!currentService.supportsProcessingKeepAwakeToggle) {
+                    Selector<
+                      YtDlpDownloadService,
+                      ({bool supported, bool enabled, bool active})
+                    >(
+                      selector: (_, currentService) => (
+                        supported:
+                            currentService.supportsProcessingKeepAwakeToggle,
+                        enabled: currentService.keepScreenAwakeDuringProcessing,
+                        active: currentService.isProcessingKeepAwakeActive,
+                      ),
+                      builder: (context, keepAwake, _) {
+                        if (!keepAwake.supported) {
                           return const SizedBox.shrink();
                         }
+                        final currentService = context
+                            .read<YtDlpDownloadService>();
                         return IconButton(
-                          tooltip: currentService.isProcessingKeepAwakeActive
-                              ? '下载时保持亮屏已开启'
-                              : '下载时保持亮屏',
+                          tooltip: keepAwake.active ? '下载时保持亮屏已开启' : '下载时保持亮屏',
                           onPressed: currentService
                               .toggleKeepScreenAwakeDuringProcessing,
                           icon: Icon(
-                            currentService.keepScreenAwakeDuringProcessing
+                            keepAwake.enabled
                                 ? Icons.wb_sunny_rounded
                                 : Icons.light_mode_outlined,
-                            color:
-                                currentService.keepScreenAwakeDuringProcessing
+                            color: keepAwake.enabled
                                 ? const Color(0xFFFF5A5F)
                                 : Colors.white70,
                           ),
@@ -1292,8 +1351,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                     Selector<YtDlpDownloadService, bool>(
                                       selector: (_, s) => s.isResolving,
                                       builder: (context, isResolving, _) {
-                                        final svc =
-                                            context.read<YtDlpDownloadService>();
+                                        final svc = context
+                                            .read<YtDlpDownloadService>();
                                         return ElevatedButton(
                                           style: ElevatedButton.styleFrom(
                                             backgroundColor: const Color(
@@ -1377,8 +1436,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 Selector<YtDlpDownloadService, bool>(
                                   selector: (_, s) => s.isResolving,
                                   builder: (context, isResolving, _) {
-                                    final svc =
-                                        context.read<YtDlpDownloadService>();
+                                    final svc = context
+                                        .read<YtDlpDownloadService>();
                                     return ElevatedButton(
                                       style: ElevatedButton.styleFrom(
                                         backgroundColor: const Color(
@@ -1437,10 +1496,21 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                         );
                       },
                     ),
-                    Consumer<YtDlpDownloadService>(
-                      builder: (context, currentService, _) {
-                        return _buildKeepAwakeBanner(currentService);
-                      },
+                    Selector<
+                      YtDlpDownloadService,
+                      ({bool supported, bool enabled, bool active})
+                    >(
+                      selector: (_, currentService) => (
+                        supported:
+                            currentService.supportsProcessingKeepAwakeToggle,
+                        enabled: currentService.keepScreenAwakeDuringProcessing,
+                        active: currentService.isProcessingKeepAwakeActive,
+                      ),
+                      builder: (context, keepAwake, _) => _buildKeepAwakeBanner(
+                        supported: keepAwake.supported,
+                        enabled: keepAwake.enabled,
+                        active: keepAwake.active,
+                      ),
                     ),
                     Selector<
                       YtDlpDownloadService,
@@ -1493,19 +1563,21 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                           return ListView.builder(
                             padding: const EdgeInsets.all(16),
                             itemCount: taskIds.length,
-                            cacheExtent: 800,
+                            scrollCacheExtent: const ScrollCacheExtent.pixels(
+                              800,
+                            ),
                             addAutomaticKeepAlives: false,
                             addRepaintBoundaries: true,
                             addSemanticIndexes: false,
                             itemBuilder: (context, index) {
                               final taskId = taskIds[index];
-                              return Selector<YtDlpDownloadService, int>(
+                              return Selector<
+                                YtDlpDownloadService,
+                                YtDlpTaskRecord?
+                              >(
                                 selector: (_, service) =>
-                                    service.taskRenderSignature(taskId),
-                                builder: (context, _, _) {
-                                  final task = context
-                                      .read<YtDlpDownloadService>()
-                                      .getTaskById(taskId);
+                                    service.getTaskById(taskId),
+                                builder: (context, task, _) {
                                   if (task == null) {
                                     return const SizedBox.shrink();
                                   }
@@ -2117,28 +2189,35 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
         task.status == YtDlpTaskStatus.pausing && task.progress <= 0;
     final effectiveProgress =
         task.status == YtDlpTaskStatus.queued && progress <= 0 ? 0.0 : progress;
-    final shouldShowStepMessages =
-        task.stepMessages.isNotEmpty &&
+    final stageText = task.statusMessage?.trim();
+    final shouldShowStage =
+        stageText != null &&
+        stageText.isNotEmpty &&
         task.status != YtDlpTaskStatus.completed &&
         task.status != YtDlpTaskStatus.exported;
     final sizeText = _taskSizeText(task);
     final speedText = _displayTaskSpeedText(task.speedText);
     return Column(
       children: [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(999),
-          child: LinearProgressIndicator(
-            value: showIndeterminate ? null : effectiveProgress,
-            minHeight: 3,
-            backgroundColor: Colors.grey[800],
-            color: const Color(0xFFFF5A5F),
+        TweenAnimationBuilder<double>(
+          tween: Tween<double>(begin: 0, end: effectiveProgress),
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.linear,
+          builder: (context, animatedProgress, _) => ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: showIndeterminate ? null : animatedProgress,
+              minHeight: 3,
+              backgroundColor: Colors.grey[800],
+              color: const Color(0xFFFF5A5F),
+            ),
           ),
         ),
         const SizedBox(height: 4),
         Row(
           children: [
             Text(
-              '${(progress * 100).toStringAsFixed(1)}%',
+              '${(progress * 100).toStringAsFixed(2)}%',
               style: const TextStyle(color: Colors.white38, fontSize: 10),
             ),
             const Spacer(),
@@ -2164,18 +2243,18 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
             ),
           ],
         ),
-        if (shouldShowStepMessages) ...[
+        if (shouldShowStage) ...[
           const SizedBox(height: 5),
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              task.stepMessages.reversed.take(3).toList().reversed.join('\n'),
+              stageText,
               style: const TextStyle(
                 color: Colors.white54,
                 fontSize: 10,
                 height: 1.35,
               ),
-              maxLines: 3,
+              maxLines: 2,
               overflow: TextOverflow.ellipsis,
             ),
           ),
@@ -2700,9 +2779,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
         .map((item) => item.trim())
         .where((item) => item.isNotEmpty)
         .toList();
-    if (localPath != null &&
-        localPath.isNotEmpty &&
-        File(localPath).existsSync()) {
+    if (localPath != null && localPath.isNotEmpty) {
       return Image(
         key: imageKey,
         image: ResizeImage(
@@ -3002,12 +3079,22 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
           );
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
-        children: [
-          Expanded(child: left),
-          const SizedBox(width: 10),
-          Expanded(child: right),
-        ],
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth < 520) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [left, const SizedBox(height: 10), right],
+            );
+          }
+          return Row(
+            children: [
+              Expanded(child: left),
+              const SizedBox(width: 10),
+              Expanded(child: right),
+            ],
+          );
+        },
       ),
     );
   }
@@ -3514,24 +3601,49 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     required TextEditingController controller,
     Widget? trailing,
     String? hintText,
+    TextInputType? keyboardType,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
-        children: [
-          SizedBox(width: 110, child: Text(label)),
-          Expanded(
-            child: TextField(
-              controller: controller,
-              decoration: InputDecoration(
-                hintText: hintText,
-                isDense: true,
-                border: const OutlineInputBorder(),
-              ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final field = TextField(
+            controller: controller,
+            keyboardType: keyboardType,
+            decoration: InputDecoration(
+              hintText: hintText,
+              isDense: true,
+              border: const OutlineInputBorder(),
             ),
-          ),
-          if (trailing != null) ...[trailing],
-        ],
+          );
+          if (constraints.maxWidth < 460) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(
+                    label,
+                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ),
+                Row(
+                  children: [
+                    Expanded(child: field),
+                    ?trailing,
+                  ],
+                ),
+              ],
+            );
+          }
+          return Row(
+            children: [
+              SizedBox(width: 110, child: Text(label)),
+              Expanded(child: field),
+              ?trailing,
+            ],
+          );
+        },
       ),
     );
   }
@@ -3544,22 +3656,32 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
-        children: [
-          Expanded(
-            child: _buildLabeledField(
-              label: leftLabel,
-              controller: leftController,
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: _buildLabeledField(
-              label: rightLabel,
-              controller: rightController,
-            ),
-          ),
-        ],
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final left = _buildLabeledField(
+            label: leftLabel,
+            controller: leftController,
+            keyboardType: TextInputType.number,
+          );
+          final right = _buildLabeledField(
+            label: rightLabel,
+            controller: rightController,
+            keyboardType: TextInputType.number,
+          );
+          if (constraints.maxWidth < 560) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [left, right],
+            );
+          }
+          return Row(
+            children: [
+              Expanded(child: left),
+              const SizedBox(width: 8),
+              Expanded(child: right),
+            ],
+          );
+        },
       ),
     );
   }

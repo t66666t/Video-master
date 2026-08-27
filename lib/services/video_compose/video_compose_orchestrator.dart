@@ -10,15 +10,17 @@ import 'video_compose_executor.dart';
 import 'video_compose_font_service.dart';
 import 'video_compose_output_path_service.dart';
 import 'video_compose_probe_service.dart';
+import 'video_compose_precise_renderer.dart';
 import 'video_compose_subtitle_service.dart';
 import 'video_compose_types.dart';
 
-typedef VideoComposeStatusCallback = void Function({
-  VideoComposeStage? stage,
-  double? progress,
-  String? message,
-  String? error,
-});
+typedef VideoComposeStatusCallback =
+    void Function({
+      VideoComposeStage? stage,
+      double? progress,
+      String? message,
+      String? error,
+    });
 
 typedef VideoComposeArtifactCallback = void Function(String filePath);
 
@@ -27,6 +29,7 @@ class VideoComposeOrchestrator {
   final VideoComposeSubtitleService _subtitleService;
   final VideoComposeAssRenderer _assRenderer;
   final VideoComposeFontService _fontService;
+  final VideoComposePreciseRenderer _preciseRenderer;
   final VideoComposeExecutor _executor;
   final VideoComposeOutputPathService _outputPathService;
 
@@ -35,18 +38,22 @@ class VideoComposeOrchestrator {
     required VideoComposeSubtitleService subtitleService,
     required VideoComposeAssRenderer assRenderer,
     required VideoComposeFontService fontService,
+    required VideoComposePreciseRenderer preciseRenderer,
     required VideoComposeExecutor executor,
     required VideoComposeOutputPathService outputPathService,
   }) : _probeService = probeService,
        _subtitleService = subtitleService,
        _assRenderer = assRenderer,
        _fontService = fontService,
+       _preciseRenderer = preciseRenderer,
        _executor = executor,
        _outputPathService = outputPathService;
 
   Future<String?> getSourceResolutionLabel(String videoPath) async {
     try {
-      final VideoProbeInfo probe = await _probeService.probeVideoInfo(videoPath);
+      final VideoProbeInfo probe = await _probeService.probeVideoInfo(
+        videoPath,
+      );
       if (probe.displayWidth <= 0 || probe.displayHeight <= 0) {
         return null;
       }
@@ -57,6 +64,7 @@ class VideoComposeOrchestrator {
   }
 
   Future<void> cancelRunningCompose() {
+    _preciseRenderer.cancel();
     return _executor.cancel();
   }
 
@@ -71,7 +79,8 @@ class VideoComposeOrchestrator {
       throw StateError('视频文件不存在');
     }
     final bool softOnly = request.softSubtitleOnly;
-    final bool shouldEmbedSoftSubtitles = request.embedSoftSubtitles || softOnly;
+    final bool shouldEmbedSoftSubtitles =
+        request.embedSoftSubtitles || softOnly;
     final bool shouldRenderVideoSubtitles = !softOnly;
     final bool softOnlyUseSourceQuality =
         softOnly && request.softSubtitleUseSourceQuality;
@@ -129,8 +138,9 @@ class VideoComposeOrchestrator {
     if (shouldEmbedSoftSubtitles) {
       for (final VideoComposeSoftSubtitleTrack track in softTracks) {
         if (track.path.trim().isEmpty) continue;
-        final List<SubtitleItem> items =
-            await _subtitleService.loadSubtitle(track.path);
+        final List<SubtitleItem> items = await _subtitleService.loadSubtitle(
+          track.path,
+        );
         if (items.isEmpty) continue;
         softSubtitles.add(
           ComposeSubtitleSource(
@@ -151,10 +161,10 @@ class VideoComposeOrchestrator {
           (secondaryPath == null || secondaryPath.isEmpty)) {
         throw StateError('未选择可渲染字幕');
       }
-      final List<SubtitleItem> primarySubtitles =
-          await _subtitleService.loadSubtitle(primaryPath);
-      final List<SubtitleItem> secondarySubtitles =
-          await _subtitleService.loadSubtitle(secondaryPath);
+      final List<SubtitleItem> primarySubtitles = await _subtitleService
+          .loadSubtitle(primaryPath);
+      final List<SubtitleItem> secondarySubtitles = await _subtitleService
+          .loadSubtitle(secondaryPath);
       effectivePrimary = primarySubtitles;
       effectiveSecondary = secondarySubtitles;
       if (effectivePrimary.isEmpty && effectiveSecondary.isNotEmpty) {
@@ -188,7 +198,9 @@ class VideoComposeOrchestrator {
 
     final Directory tempDir = await getTemporaryDirectory();
     String? assPath;
-    if (shouldRenderVideoSubtitles) {
+    String? preciseSubtitleConcatPath;
+    if (shouldRenderVideoSubtitles &&
+        request.renderMode == VideoComposeRenderMode.approximate) {
       assPath = p.join(
         tempDir.path,
         'compose_${DateTime.now().millisecondsSinceEpoch}.ass',
@@ -205,6 +217,37 @@ class VideoComposeOrchestrator {
         ),
         flush: true,
       );
+    }
+    if (shouldRenderVideoSubtitles &&
+        request.renderMode == VideoComposeRenderMode.precise) {
+      final Directory preciseDir = Directory(
+        p.join(
+          tempDir.path,
+          'compose_precise_${DateTime.now().millisecondsSinceEpoch}',
+        ),
+      );
+      final PreciseSubtitleAssets assets = await _preciseRenderer.render(
+        outputDirectory: preciseDir,
+        width: target!.width,
+        height: target.height,
+        duration: probe?.duration ?? Duration.zero,
+        primary: effectivePrimary,
+        secondary: effectiveSecondary,
+        style: request.styleForCanvas(
+          width: target.width,
+          height: target.height,
+        ),
+        alignment: request.subtitleAlignment,
+        splitSubtitleByLine: request.splitSubtitleByLine,
+        itemGap: request.subtitleItemGap,
+        onProgress: (progress) => onStatus(
+          stage: VideoComposeStage.preparing,
+          progress: 0.15 + progress * 0.12,
+          message: '生成精确字幕 ${(progress * 100).toStringAsFixed(0)}%',
+        ),
+        onArtifact: onArtifact,
+      );
+      preciseSubtitleConcatPath = assets.concatPath;
     }
 
     final List<ComposeSubtitleInput> softSubtitleInputs =
@@ -232,16 +275,20 @@ class VideoComposeOrchestrator {
     await _outputPathService.ensureParentDirectory(request.outputPath);
 
     String? fontsDir;
-    if (shouldRenderVideoSubtitles) {
+    if (shouldRenderVideoSubtitles &&
+        request.renderMode == VideoComposeRenderMode.approximate) {
       fontsDir = await _fontService.resolveAssFontsDir();
     }
     if ((Platform.isAndroid || Platform.isIOS) &&
         shouldRenderVideoSubtitles &&
+        request.renderMode == VideoComposeRenderMode.approximate &&
         _fontService.requiresBundledFonts(request.subtitleStyle) &&
         (fontsDir == null || fontsDir.isEmpty)) {
       throw StateError('移动端内置字体资源加载失败');
     }
-    if ((Platform.isAndroid || Platform.isIOS) && shouldRenderVideoSubtitles) {
+    if ((Platform.isAndroid || Platform.isIOS) &&
+        shouldRenderVideoSubtitles &&
+        request.renderMode == VideoComposeRenderMode.approximate) {
       await _fontService.configureForRender(fontsDir: fontsDir);
     }
 
@@ -265,6 +312,7 @@ class VideoComposeOrchestrator {
     await _executor.execute(
       request: request,
       filter: filter,
+      preciseSubtitleConcatPath: preciseSubtitleConcatPath,
       softSubtitleInputs: softSubtitleInputs,
       duration: probe?.duration ?? Duration.zero,
       transcodeVideo: shouldTranscodeVideo,

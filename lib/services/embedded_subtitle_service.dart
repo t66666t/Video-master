@@ -23,18 +23,44 @@ class EmbeddedSubtitleTrack {
   });
 }
 
+class _EmbeddedSubtitleCacheEntry {
+  final int size;
+  final DateTime modifiedAt;
+  final List<EmbeddedSubtitleTrack> tracks;
+
+  const _EmbeddedSubtitleCacheEntry({
+    required this.size,
+    required this.modifiedAt,
+    required this.tracks,
+  });
+}
+
 class EmbeddedSubtitleService extends ChangeNotifier {
+  final Map<String, _EmbeddedSubtitleCacheEntry> _trackCache =
+      <String, _EmbeddedSubtitleCacheEntry>{};
+  final Map<String, Future<List<EmbeddedSubtitleTrack>>> _inFlightProbes =
+      <String, Future<List<EmbeddedSubtitleTrack>>>{};
 
   String _languageLabel(String? language) {
     if (language == null) return "未知语言";
     final normalized = language.toLowerCase().replaceAll('_', '-').trim();
-    if (normalized.isEmpty || normalized == 'und' || normalized == 'unknown') return "未知语言";
-    if (normalized == 'chi' || normalized == 'zho' || normalized.startsWith('zh')) return "中文";
+    if (normalized.isEmpty || normalized == 'und' || normalized == 'unknown') {
+      return "未知语言";
+    }
+    if (normalized == 'chi' ||
+        normalized == 'zho' ||
+        normalized.startsWith('zh')) {
+      return "中文";
+    }
     if (normalized == 'en' || normalized == 'eng') return "English";
     if (normalized == 'ja' || normalized == 'jpn') return "日本語";
     if (normalized == 'ko' || normalized == 'kor') return "한국어";
-    if (normalized == 'fr' || normalized == 'fra' || normalized == 'fre') return "Français";
-    if (normalized == 'de' || normalized == 'deu' || normalized == 'ger') return "Deutsch";
+    if (normalized == 'fr' || normalized == 'fra' || normalized == 'fre') {
+      return "Français";
+    }
+    if (normalized == 'de' || normalized == 'deu' || normalized == 'ger') {
+      return "Deutsch";
+    }
     if (normalized == 'es' || normalized == 'spa') return "Español";
     if (normalized == 'ru' || normalized == 'rus') return "Русский";
     if (normalized == 'it' || normalized == 'ita') return "Italiano";
@@ -42,23 +68,68 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     if (normalized == 'ar' || normalized == 'ara') return "العربية";
     return normalized.toUpperCase();
   }
-  
+
   /// 获取视频文件中的内嵌字幕流信息
-  Future<List<EmbeddedSubtitleTrack>> getEmbeddedSubtitles(String videoPath) async {
+  Future<List<EmbeddedSubtitleTrack>> getEmbeddedSubtitles(
+    String videoPath,
+  ) async {
+    final normalizedPath = p.normalize(videoPath);
+    final cacheKey = Platform.isWindows
+        ? normalizedPath.toLowerCase()
+        : normalizedPath;
+    late final FileStat stat;
+    try {
+      stat = await File(normalizedPath).stat();
+      if (stat.type != FileSystemEntityType.file) {
+        return const <EmbeddedSubtitleTrack>[];
+      }
+      final cached = _trackCache[cacheKey];
+      if (cached != null &&
+          cached.size == stat.size &&
+          cached.modifiedAt == stat.modified) {
+        return List<EmbeddedSubtitleTrack>.from(cached.tracks);
+      }
+    } on FileSystemException {
+      return const <EmbeddedSubtitleTrack>[];
+    }
+
+    final existingProbe = _inFlightProbes[cacheKey];
+    if (existingProbe != null) {
+      return List<EmbeddedSubtitleTrack>.from(await existingProbe);
+    }
+
+    final probe = _probeEmbeddedSubtitles(normalizedPath);
+    _inFlightProbes[cacheKey] = probe;
+    try {
+      final tracks = await probe;
+      _trackCache[cacheKey] = _EmbeddedSubtitleCacheEntry(
+        size: stat.size,
+        modifiedAt: stat.modified,
+        tracks: List<EmbeddedSubtitleTrack>.from(tracks),
+      );
+      return List<EmbeddedSubtitleTrack>.from(tracks);
+    } finally {
+      _inFlightProbes.remove(cacheKey);
+    }
+  }
+
+  Future<List<EmbeddedSubtitleTrack>> _probeEmbeddedSubtitles(
+    String videoPath,
+  ) async {
     if (Platform.isWindows) {
       return _getEmbeddedSubtitlesWindows(videoPath);
     }
 
     List<EmbeddedSubtitleTrack> tracks = [];
-    
+
     try {
       // 优化：使用 executeAsync 配合 Completer，或者直接使用 Future.wait 来避免主线程阻塞
       // FFprobeKit.getMediaInformation 本身是异步的，应该不会阻塞 UI。
       // 但解析大文件元数据可能耗时。
-      
+
       final session = await FFprobeKit.getMediaInformation(videoPath);
       final info = session.getMediaInformation();
-      
+
       if (info == null) {
         debugPrint("FFprobe failed to get media info for $videoPath");
         return [];
@@ -69,7 +140,7 @@ class EmbeddedSubtitleService extends ChangeNotifier {
         if (stream.getType() == "subtitle") {
           final props = stream.getAllProperties();
           final index = stream.getIndex();
-          
+
           if (index == null) continue; // Skip if index is missing
 
           // 尝试获取元数据
@@ -78,41 +149,50 @@ class EmbeddedSubtitleService extends ChangeNotifier {
           String codec = stream.getCodec() ?? "unknown";
 
           if (props != null) {
-             if (props['tags'] != null) {
-               final tags = props['tags'];
-               if (tags is Map) {
-                 final titleValue = tags['title'] ?? tags['handler_name'] ?? tags['name'];
-                 if (titleValue != null && titleValue.toString().trim().isNotEmpty) {
-                   title = titleValue.toString();
-                 }
-                 final languageValue = tags['language'];
-                 if (languageValue != null && languageValue.toString().trim().isNotEmpty) {
-                   language = languageValue.toString();
-                 }
-               }
-             }
+            if (props['tags'] != null) {
+              final tags = props['tags'];
+              if (tags is Map) {
+                final titleValue =
+                    tags['title'] ?? tags['handler_name'] ?? tags['name'];
+                if (titleValue != null &&
+                    titleValue.toString().trim().isNotEmpty) {
+                  title = titleValue.toString();
+                }
+                final languageValue = tags['language'];
+                if (languageValue != null &&
+                    languageValue.toString().trim().isNotEmpty) {
+                  language = languageValue.toString();
+                }
+              }
+            }
           }
-          
+
           final displayLanguage = _languageLabel(language);
-          final displayTitle = (title.trim().isEmpty || title == "未知标题") && displayLanguage != "未知语言"
+          final displayTitle =
+              (title.trim().isEmpty || title == "未知标题") &&
+                  displayLanguage != "未知语言"
               ? displayLanguage
               : title;
-          tracks.add(EmbeddedSubtitleTrack(
-            index: index,
-            title: displayTitle,
-            language: displayLanguage,
-            codecName: codec,
-          ));
+          tracks.add(
+            EmbeddedSubtitleTrack(
+              index: index,
+              title: displayTitle,
+              language: displayLanguage,
+              codecName: codec,
+            ),
+          );
         }
       }
     } catch (e) {
       debugPrint("Error probing subtitles: $e");
     }
-    
+
     return tracks;
   }
 
-  Future<List<EmbeddedSubtitleTrack>> _getEmbeddedSubtitlesWindows(String videoPath) async {
+  Future<List<EmbeddedSubtitleTrack>> _getEmbeddedSubtitlesWindows(
+    String videoPath,
+  ) async {
     try {
       final mediaKitTracks = await _getEmbeddedSubtitlesWindowsViaMediaKit(
         videoPath,
@@ -124,12 +204,7 @@ class EmbeddedSubtitleService extends ChangeNotifier {
       final ffmpegPath = await FFmpegUtils.ffmpegPath;
       final result = await Process.run(
         ffmpegPath,
-        [
-          '-hide_banner',
-          '-nostdin',
-          '-i',
-          videoPath,
-        ],
+        ['-hide_banner', '-nostdin', '-i', videoPath],
         stdoutEncoding: null,
         stderrEncoding: null,
       ).timeout(const Duration(seconds: 15));
@@ -147,21 +222,18 @@ class EmbeddedSubtitleService extends ChangeNotifier {
   ) async {
     MediaKit.ensureInitialized();
     final player = Player(
-      configuration: const PlayerConfiguration(
-        osc: false,
-        libass: false,
-      ),
+      configuration: const PlayerConfiguration(osc: false, libass: false),
     );
 
     try {
-      await player.open(
-        Media(videoPath),
-        play: false,
-      );
+      await player.open(Media(videoPath), play: false);
 
       final tracks = await _waitForWindowsSubtitleTracks(player);
       final subtitleTracks = tracks.subtitle.where((track) {
-        return track.id != 'auto' && track.id != 'no' && !track.uri && !track.data;
+        return track.id != 'auto' &&
+            track.id != 'no' &&
+            !track.uri &&
+            !track.data;
       }).toList();
 
       if (subtitleTracks.isEmpty) {
@@ -173,8 +245,9 @@ class EmbeddedSubtitleService extends ChangeNotifier {
         final track = subtitleTracks[i];
         final language = _languageLabel(track.language);
         final rawTitle = (track.title ?? '').trim();
-        final displayTitle =
-            rawTitle.isEmpty && language != '未知语言' ? language : (rawTitle.isEmpty ? '未知标题' : rawTitle);
+        final displayTitle = rawTitle.isEmpty && language != '未知语言'
+            ? language
+            : (rawTitle.isEmpty ? '未知标题' : rawTitle);
         result.add(
           EmbeddedSubtitleTrack(
             index: i,
@@ -200,12 +273,12 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     }
 
     try {
-      return await player.stream.tracks.firstWhere(
-        (tracks) => tracks.subtitle.length > 2,
-      ).timeout(
-        const Duration(seconds: 2),
-        onTimeout: () => player.state.tracks,
-      );
+      return await player.stream.tracks
+          .firstWhere((tracks) => tracks.subtitle.length > 2)
+          .timeout(
+            const Duration(seconds: 2),
+            onTimeout: () => player.state.tracks,
+          );
     } catch (_) {
       return player.state.tracks;
     }
@@ -223,14 +296,16 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     try {
       // 构造输出文件名
       final videoName = p.basenameWithoutExtension(videoPath);
-      
+
       String extension = ".srt";
       String codec = codecName ?? "unknown";
 
       // 如果未提供 codec，则尝试探测
       if (codec == "unknown") {
         if (Platform.isWindows) {
-          codec = await _probeSubtitleCodecWindows(videoPath, streamIndex) ?? "unknown";
+          codec =
+              await _probeSubtitleCodecWindows(videoPath, streamIndex) ??
+              "unknown";
         } else {
           final probeSession = await FFprobeKit.getMediaInformation(videoPath);
           final info = probeSession.getMediaInformation();
@@ -245,18 +320,19 @@ class EmbeddedSubtitleService extends ChangeNotifier {
           }
         }
       }
-      
+
       if (codec == "hdmv_pgs_subtitle") {
         extension = ".sup";
       } else if (codec == "dvd_subtitle") {
         // 将 DVD Subtitle 转码为 PGS (.sup) 以便统一解析
-        extension = ".sup"; 
+        extension = ".sup";
       } else if (codec == "ass" || codec == "ssa") {
         extension = ".ass";
       }
-      
-      final filePrefix =
-          videoId != null && videoId.isNotEmpty ? videoId : videoName;
+
+      final filePrefix = videoId != null && videoId.isNotEmpty
+          ? videoId
+          : videoName;
       final fileName = "$filePrefix.stream_$streamIndex$extension";
       final outputPath = p.join(outputDir, fileName);
       final outputFile = File(outputPath);
@@ -271,19 +347,21 @@ class EmbeddedSubtitleService extends ChangeNotifier {
       String command;
       if (extension == ".sup") {
         if (codec == "dvd_subtitle") {
-           // VobSub -> PGS 转码
-           command = "-i \"$videoPath\" -map 0:$streamIndex -c:s hdmv_pgs_subtitle \"$outputPath\"";
+          // VobSub -> PGS 转码
+          command =
+              "-i \"$videoPath\" -map 0:$streamIndex -c:s hdmv_pgs_subtitle \"$outputPath\"";
         } else {
-           // PGS: 直接拷贝流
-           command = "-i \"$videoPath\" -map 0:$streamIndex -c:s copy \"$outputPath\"";
+          // PGS: 直接拷贝流
+          command =
+              "-i \"$videoPath\" -map 0:$streamIndex -c:s copy \"$outputPath\"";
         }
       } else if (extension == ".ass") {
-         command = "-i \"$videoPath\" -map 0:$streamIndex \"$outputPath\"";
+        command = "-i \"$videoPath\" -map 0:$streamIndex \"$outputPath\"";
       } else {
-         // 默认尝试转 SRT (text)
-         command = "-i \"$videoPath\" -map 0:$streamIndex \"$outputPath\"";
+        // 默认尝试转 SRT (text)
+        command = "-i \"$videoPath\" -map 0:$streamIndex \"$outputPath\"";
       }
-      
+
       debugPrint("Executing FFmpeg: $command");
 
       // Use execute() synchronously to ensure completion before returning.
@@ -300,7 +378,12 @@ class EmbeddedSubtitleService extends ChangeNotifier {
           }
         }
         args.add(outputPath);
-        final result = await Process.run(ffmpegPath, args, stdoutEncoding: null, stderrEncoding: null).timeout(const Duration(seconds: 60));
+        final result = await Process.run(
+          ffmpegPath,
+          args,
+          stdoutEncoding: null,
+          stderrEncoding: null,
+        ).timeout(const Duration(seconds: 60));
         if (result.exitCode == 0) {
           return outputPath;
         }
@@ -325,7 +408,10 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     }
   }
 
-  Future<String?> _probeSubtitleCodecWindows(String videoPath, int streamIndex) async {
+  Future<String?> _probeSubtitleCodecWindows(
+    String videoPath,
+    int streamIndex,
+  ) async {
     try {
       final tracks = await _getEmbeddedSubtitlesWindows(videoPath);
       for (final track in tracks) {
@@ -406,8 +492,7 @@ class EmbeddedSubtitleService extends ChangeNotifier {
     }
 
     return buffers.map((buffer) {
-      final rawLanguage =
-          buffer.language.isEmpty ? '未知语言' : buffer.language;
+      final rawLanguage = buffer.language.isEmpty ? '未知语言' : buffer.language;
       final displayLanguage = _languageLabel(rawLanguage);
       final rawTitle = buffer.title.isEmpty ? '未知标题' : buffer.title;
       final displayTitle =

@@ -56,7 +56,9 @@ class VideoComposeArtifactCleaner {
     final RegExp? pattern = buildComposeOutputPattern(normalizedOutputPath);
     final Directory parent = Directory(p.dirname(normalizedOutputPath));
     if (pattern != null && await parent.exists()) {
-      await for (final FileSystemEntity entity in parent.list(followLinks: false)) {
+      await for (final FileSystemEntity entity in parent.list(
+        followLinks: false,
+      )) {
         if (entity is! File) continue;
         final String name = p.basename(entity.path);
         if (!pattern.hasMatch(name)) continue;
@@ -82,8 +84,9 @@ class VideoComposeArtifactCleaner {
 
   RegExp? buildComposeOutputPattern(String outputPath) {
     final String fileName = p.basename(outputPath);
-    final Match? match =
-        RegExp(r'^(.*)_compose_(\d+)(\.[^.]*)?$').firstMatch(fileName);
+    final Match? match = RegExp(
+      r'^(.*)_compose_(\d+)(\.[^.]*)?$',
+    ).firstMatch(fileName);
     if (match == null) return null;
     final String titlePart = RegExp.escape(match.group(1) ?? '');
     final String composeId = RegExp.escape(match.group(2) ?? '');
@@ -110,6 +113,15 @@ class VideoComposeArtifactCleaner {
   Future<bool> deleteFileWithRetry(String filePath) async {
     final String normalizedPath = await normalizeDeletePath(filePath);
     if (normalizedPath.isEmpty) return true;
+    final Directory directory = Directory(normalizedPath);
+    if (await directory.exists()) {
+      try {
+        await directory.delete(recursive: true);
+        return !await directory.exists();
+      } catch (_) {
+        return false;
+      }
+    }
     String currentPath = normalizedPath;
     for (int i = 0; i < 5; i++) {
       final File file = File(currentPath);

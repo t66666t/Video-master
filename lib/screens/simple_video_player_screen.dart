@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +7,7 @@ import 'package:video_player/video_player.dart';
 
 import '../services/media_playback_service.dart';
 import '../services/settings_service.dart';
+import '../platform/windows_video_player_media_kit.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../models/subtitle_style.dart';
 
@@ -20,7 +22,8 @@ class SimpleVideoPlayerScreen extends StatefulWidget {
   });
 
   @override
-  State<SimpleVideoPlayerScreen> createState() => _SimpleVideoPlayerScreenState();
+  State<SimpleVideoPlayerScreen> createState() =>
+      _SimpleVideoPlayerScreenState();
 }
 
 class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
@@ -32,7 +35,16 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
   bool _isLongPressing = false;
   String _longPressFeedbackText = '';
   double _preLongPressSpeed = 1.0;
+  double _confirmedPlaybackSpeed = 1.0;
+  double _lastDispatchedPlaybackSpeed = 1.0;
+  int _playbackSpeedRequestId = 0;
+  Future<void> _playbackSpeedCommandTail = Future<void>.value();
   final FocusNode _videoFocusNode = FocusNode();
+  MediaPlaybackService? _suspendedPlaybackService;
+  VideoPlayerController? _suspendedController;
+  String? _suspendedItemId;
+  bool _resumeOriginalPlayback = false;
+  Future<void>? _cleanupFuture;
 
   @override
   void initState() {
@@ -49,8 +61,9 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
 
   @override
   void dispose() {
+    _playbackSpeedRequestId++;
     _restoreSystemUiImmediately();
-    _controller?.dispose();
+    unawaited(_cleanupPreviewAndRestorePlayback());
     _videoFocusNode.dispose();
     super.dispose();
   }
@@ -63,16 +76,19 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
       DeviceOrientation.landscapeRight,
     ]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
-      systemNavigationBarColor: Colors.transparent,
-      systemNavigationBarDividerColor: Colors.transparent,
-    ));
+    SystemChrome.setSystemUIOverlayStyle(
+      const SystemUiOverlayStyle(
+        systemNavigationBarColor: Colors.transparent,
+        systemNavigationBarDividerColor: Colors.transparent,
+      ),
+    );
   }
 
   Future<void> _exitPreview() async {
     if (_isExiting) return;
     _isExiting = true;
     _restoreSystemUiImmediately();
+    await _cleanupPreviewAndRestorePlayback();
     if (!mounted) return;
     final navigator = Navigator.of(context);
     if (navigator.canPop()) {
@@ -80,6 +96,37 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
       return;
     }
     _isExiting = false;
+  }
+
+  Future<void> _cleanupPreviewAndRestorePlayback() {
+    return _cleanupFuture ??= _performPreviewCleanup();
+  }
+
+  Future<void> _performPreviewCleanup() async {
+    final previewController = _controller;
+    _controller = null;
+    _playbackSpeedRequestId++;
+    if (previewController != null) {
+      try {
+        previewController.removeListener(_onPlayerStateChanged);
+      } catch (_) {}
+      try {
+        await previewController.pause();
+      } catch (_) {}
+      try {
+        await previewController.dispose();
+      } catch (_) {}
+    }
+
+    final playbackService = _suspendedPlaybackService;
+    final originalController = _suspendedController;
+    if (_resumeOriginalPlayback &&
+        playbackService != null &&
+        playbackService.controller == originalController &&
+        playbackService.currentItem?.id == _suspendedItemId &&
+        originalController?.value.isInitialized == true) {
+      await playbackService.resume();
+    }
   }
 
   Future<void> _initPlayer() async {
@@ -98,33 +145,46 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
         context,
         listen: false,
       );
-      if (playbackService.currentItem != null &&
-          playbackService.state != PlaybackState.idle) {
-        await playbackService.stop();
+      _suspendedPlaybackService = playbackService;
+      _suspendedController = playbackService.controller;
+      _suspendedItemId = playbackService.currentItem?.id;
+      _resumeOriginalPlayback = playbackService.isPlaying;
+      if (_resumeOriginalPlayback) {
+        await playbackService.pause();
       }
-      if (!mounted) return;
+      if (!mounted || _isExiting) {
+        await _cleanupPreviewAndRestorePlayback();
+        return;
+      }
       final settings = Provider.of<SettingsService>(context, listen: false);
-      _controller = VideoPlayerController.file(
+      final previewController = VideoPlayerController.file(
         file,
         videoPlayerOptions: MediaPlaybackService.buildVideoPlayerOptions(
           settings: settings,
         ),
       );
-      await _controller!.initialize();
+      _controller = previewController;
+      await previewController.initialize();
+      if (!mounted || _isExiting) {
+        await _cleanupPreviewAndRestorePlayback();
+        return;
+      }
       final targetSpeed = settings.effectiveGlobalPlaybackSpeed;
       if (!settings.isSamePlaybackSpeed(
-        _controller!.value.playbackSpeed,
+        previewController.value.playbackSpeed,
         targetSpeed,
       )) {
-        await _controller!.setPlaybackSpeed(targetSpeed);
+        await previewController.setPlaybackSpeed(targetSpeed);
       }
-      _controller!.addListener(_onPlayerStateChanged);
-      
+      _confirmedPlaybackSpeed = targetSpeed;
+      _lastDispatchedPlaybackSpeed = targetSpeed;
+      previewController.addListener(_onPlayerStateChanged);
+
       if (!mounted) return;
       setState(() {
         _isReady = true;
       });
-      _controller!.play();
+      previewController.play();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -147,26 +207,57 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
     }
   }
 
-  void _startLongPressSpeed() {
+  bool _startLongPressSpeed() {
     final controller = _controller;
-    if (controller == null) return;
+    if (controller == null) return false;
     final settings = Provider.of<SettingsService>(context, listen: false);
-    _preLongPressSpeed = controller.value.playbackSpeed;
-    setState(() {
-      _isLongPressing = true;
-      _longPressFeedbackText = "${settings.longPressSpeed}x";
-    });
-    controller.setPlaybackSpeed(settings.longPressSpeed);
+    _preLongPressSpeed = _confirmedPlaybackSpeed;
+    _isLongPressing = true;
+    _longPressFeedbackText = "${settings.longPressSpeed}x";
+    unawaited(_requestPlaybackSpeed(controller, settings.longPressSpeed));
+    return true;
   }
 
   void _endLongPressSpeed() {
     if (!_isLongPressing) return;
     final controller = _controller;
-    setState(() {
-      _isLongPressing = false;
-    });
+    _isLongPressing = false;
     if (controller == null) return;
-    controller.setPlaybackSpeed(_preLongPressSpeed);
+    unawaited(_requestPlaybackSpeed(controller, _preLongPressSpeed));
+  }
+
+  Future<void> _requestPlaybackSpeed(
+    VideoPlayerController controller,
+    double speed,
+  ) async {
+    if (!speed.isFinite || speed <= 0) return;
+    final requestId = ++_playbackSpeedRequestId;
+    // ignore: invalid_use_of_visible_for_testing_member
+    NativeVideoPlayerMediaKit.cancelPendingRateChange(controller.playerId);
+    final previousCommand = _playbackSpeedCommandTail;
+    final command = () async {
+      try {
+        await previousCommand;
+      } catch (_) {}
+      if (requestId != _playbackSpeedRequestId || controller != _controller) {
+        return;
+      }
+      try {
+        if ((_lastDispatchedPlaybackSpeed - speed).abs() >= 0.001) {
+          _lastDispatchedPlaybackSpeed = speed;
+          await controller.setPlaybackSpeed(speed);
+        }
+        if (requestId != _playbackSpeedRequestId || controller != _controller) {
+          return;
+        }
+        _confirmedPlaybackSpeed = speed;
+      } catch (_) {
+        _lastDispatchedPlaybackSpeed = _confirmedPlaybackSpeed;
+        rethrow;
+      }
+    }();
+    _playbackSpeedCommandTail = command.catchError((Object _) {});
+    await command;
   }
 
   @override
@@ -178,7 +269,11 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, color: Colors.redAccent, size: 64),
+              const Icon(
+                Icons.error_outline,
+                color: Colors.redAccent,
+                size: 64,
+              ),
               const SizedBox(height: 12),
               Text(
                 _errorMessage!,
@@ -186,10 +281,7 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _exitPreview,
-                child: const Text("返回"),
-              ),
+              ElevatedButton(onPressed: _exitPreview, child: const Text("返回")),
             ],
           ),
         ),
@@ -206,11 +298,9 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
     final settings = Provider.of<SettingsService>(context);
 
     return PopScope(
-      canPop: true,
+      canPop: false,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) return;
-        _isExiting = false;
-        _restoreSystemUiImmediately();
+        if (!didPop) unawaited(_exitPreview());
       },
       child: Scaffold(
         backgroundColor: Colors.black,
@@ -245,9 +335,8 @@ class _SimpleVideoPlayerScreenState extends State<SimpleVideoPlayerScreen> {
               onOpenVideoCompose: null,
               onToggleEpisodePicker: null,
               onToggleFullScreen: null,
-              onSpeedUpdate: (speed) {
-                _controller!.setPlaybackSpeed(speed);
-              },
+              onSpeedUpdate: (speed) =>
+                  _requestPlaybackSpeed(_controller!, speed),
               doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
               enableDoubleTapSubtitleSeek: false,
               showSubtitles: false,

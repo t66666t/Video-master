@@ -1,13 +1,119 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
+import 'package:video_player_app/features/youtube_download/platform/yt_dlp_native_bridge.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_download_service.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 
 void main() {
   group('youtube download models', () {
+    test(
+      'task removal policy never classifies final outputs as disposable',
+      () {
+        const taskId = 'task-safe-delete';
+
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.mp4',
+            taskId,
+          ),
+          isFalse,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.mkv',
+            taskId,
+          ),
+          isFalse,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.zh-CN.srt',
+            taskId,
+          ),
+          isFalse,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.mp4.part',
+            taskId,
+          ),
+          isTrue,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.f137.webm',
+            taskId,
+          ),
+          isTrue,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__another-task.mp4.part',
+            taskId,
+          ),
+          isFalse,
+        );
+      },
+    );
+
+    test('embedded FFmpeg backend is available without a standalone CLI', () {
+      final status = YtDlpBinaryStatus.fromJson({
+        'ytDlpReady': true,
+        'ffmpegReady': true,
+        'ffmpegCliReady': false,
+        'ffmpegBackend': 'FFmpegKit 内置插件',
+      });
+
+      expect(status.ffmpegReady, isTrue);
+      expect(status.ffmpegCliReady, isFalse);
+      expect(status.ffmpegAvailabilityLabel, '可用（FFmpegKit 内置插件）');
+    });
+
+    test('task state codec migrates v1 lists and writes one v2 snapshot', () {
+      const task = YtDlpTaskRecord(
+        taskId: 'migration-task',
+        sourceUrl: 'https://example.com/video',
+        selection: DownloadSelection(),
+        createdAtIso: '2026-08-26T00:00:00.000Z',
+      );
+
+      final fromV1 = decodeYtDlpTaskState(encodeTaskList([task]));
+      final v2Raw = encodeYtDlpTaskStateV2(fromV1);
+      final decodedV2 = decodeYtDlpTaskState(v2Raw);
+
+      expect(fromV1.single.taskId, 'migration-task');
+      expect(v2Raw, contains('"version":2'));
+      expect(decodedV2.single.taskId, 'migration-task');
+    });
+
+    test('pause result supports structured and legacy platform replies', () {
+      final structured = YtDlpPauseResult.fromPlatform({
+        'accepted': true,
+        'stopped': true,
+        'reason': null,
+      });
+      final legacy = YtDlpPauseResult.fromPlatform(true);
+      final rejected = YtDlpPauseResult.fromPlatform({
+        'accepted': false,
+        'stopped': false,
+        'reason': 'not running',
+      });
+
+      expect(structured.accepted, isTrue);
+      expect(structured.stopped, isTrue);
+      expect(legacy.accepted, isTrue);
+      expect(legacy.stopped, isTrue);
+      expect(rejected.accepted, isFalse);
+      expect(rejected.reason, 'not running');
+    });
+
     test('DownloadSessionConfig defaults do not force player clients', () {
       final config = DownloadSessionConfig.defaults();
 
       expect(config.enabledPlayerClients, isEmpty);
+      expect(config.retries, 2);
+      expect(config.fragmentRetries, 2);
+      expect(config.concurrentFragments, 4);
     });
 
     test('DownloadSessionConfig serializes and deserializes', () {
@@ -151,7 +257,10 @@ void main() {
       expect(decoded.single.selection.selectedVideoFormatId, '137');
       expect(decoded.single.progress, 0.5);
       expect(decoded.single.speedText, '1.2 MB/s');
-      expect(decoded.single.sourceRef?.value, 'https://youtube.com/watch?v=video-1');
+      expect(
+        decoded.single.sourceRef?.value,
+        'https://youtube.com/watch?v=video-1',
+      );
       expect(decoded.single.sourceRef?.kind, MediaSourceKind.url);
       expect(
         decoded.single.statusMessage,
@@ -222,6 +331,7 @@ void main() {
     test('DownloadTaskEvent parses producedPaths payload', () {
       final event = DownloadTaskEvent.fromJson({
         'taskId': 'task-1',
+        'generation': 3,
         'type': 'task_step',
         'outputPath': '/tmp/output.mkv',
         'producedPaths': ['/tmp/output.mkv', '', '   ', '/tmp/subtitles.srt'],
@@ -229,6 +339,7 @@ void main() {
       });
 
       expect(event.taskId, 'task-1');
+      expect(event.generation, 3);
       expect(event.type, 'task_step');
       expect(event.outputPath, '/tmp/output.mkv');
       expect(event.producedPaths, ['/tmp/output.mkv', '/tmp/subtitles.srt']);

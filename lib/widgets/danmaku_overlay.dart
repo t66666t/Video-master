@@ -1,0 +1,1410 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+
+import '../models/danmaku_model.dart';
+import '../models/danmaku_style.dart';
+import '../utils/danmaku_ass_parser.dart';
+import '../utils/subtitle_parser.dart';
+
+DanmakuDocument _parseDanmakuBytes(Uint8List bytes) {
+  return DanmakuAssParser.parse(SubtitleParser.decodeBytes(bytes));
+}
+
+class DanmakuOverlay extends StatefulWidget {
+  final String path;
+  final ValueListenable<Duration> position;
+  final double displayArea;
+  final double opacity;
+  final double fontScale;
+
+  /// User-selected motion multiplier in media time. Playback speed must not
+  /// be multiplied here: [position] is the shared presentation clock and
+  /// already advances at the rate accepted by the native player.
+  final double speed;
+  final String? fontFamily;
+  final int fontWeight;
+  final DanmakuOutlineType outlineType;
+  final double playerHeight;
+
+  const DanmakuOverlay({
+    super.key,
+    required this.path,
+    required this.position,
+    required this.displayArea,
+    required this.opacity,
+    required this.fontScale,
+    required this.speed,
+    required this.fontFamily,
+    required this.fontWeight,
+    required this.outlineType,
+    required this.playerHeight,
+  });
+
+  @override
+  State<DanmakuOverlay> createState() => _DanmakuOverlayState();
+}
+
+class _DanmakuOverlayState extends State<DanmakuOverlay> {
+  DanmakuDocument? _document;
+  _DanmakuActiveSet? _activeSet;
+  int _loadToken = 0;
+  late final _DanmakuAtlasManager _atlasManager;
+  late final _DanmakuPerformanceGovernor _performanceGovernor;
+  _DanmakuAtlasStyle? _preparedStyle;
+  int? _requestedPrefetchBucket;
+  int? _completedPrefetchBucket;
+  int? _completedPrefetchGeneration;
+  bool _prefetchScheduled = false;
+  bool _prefetchRunning = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _atlasManager = _DanmakuAtlasManager(maximumBytes: _atlasMemoryBudget());
+    _performanceGovernor = _DanmakuPerformanceGovernor()..start();
+    _performanceGovernor.addListener(_onPerformancePolicyChanged);
+    widget.position.addListener(_onPositionChanged);
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant DanmakuOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.path != widget.path) _load();
+    if (oldWidget.position != widget.position) {
+      oldWidget.position.removeListener(_onPositionChanged);
+      widget.position.addListener(_onPositionChanged);
+    }
+    if (oldWidget.fontScale != widget.fontScale ||
+        oldWidget.fontFamily != widget.fontFamily ||
+        oldWidget.fontWeight != widget.fontWeight ||
+        oldWidget.outlineType != widget.outlineType ||
+        oldWidget.playerHeight != widget.playerHeight ||
+        oldWidget.speed != widget.speed) {
+      _invalidatePrefetchProgress();
+      _schedulePrefetch();
+    }
+  }
+
+  Future<void> _load() async {
+    final token = ++_loadToken;
+    try {
+      final bytes = await File(widget.path).readAsBytes();
+      final document = await compute(
+        _parseDanmakuBytes,
+        bytes,
+        debugLabel: 'parse-bilibili-danmaku',
+      );
+      if (!mounted || token != _loadToken) return;
+      _atlasManager.clear();
+      _invalidatePrefetchProgress();
+      setState(() {
+        _document = document;
+        _activeSet = _DanmakuActiveSet(document.items);
+      });
+      _schedulePrefetch();
+    } catch (_) {
+      if (!mounted || token != _loadToken) return;
+      _atlasManager.clear();
+      setState(() {
+        _document = null;
+        _activeSet = null;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.position.removeListener(_onPositionChanged);
+    _performanceGovernor.removeListener(_onPerformancePolicyChanged);
+    _performanceGovernor.dispose();
+    _atlasManager.dispose();
+    super.dispose();
+  }
+
+  void _onPositionChanged() => _schedulePrefetch();
+
+  void _onPerformancePolicyChanged() {
+    _invalidatePrefetchProgress();
+    _schedulePrefetch();
+  }
+
+  void _invalidatePrefetchProgress() {
+    _requestedPrefetchBucket = null;
+    _completedPrefetchBucket = null;
+  }
+
+  void _schedulePrefetch() {
+    // One maintenance pass per second is enough because upcoming atlas work is
+    // grouped into stable five-second media-time segments below. Running this
+    // four times per second caused small but measurable periodic UI work.
+    final positionBucket = widget.position.value.inMilliseconds ~/ 1000;
+    if (_completedPrefetchBucket == positionBucket &&
+        _completedPrefetchGeneration == _atlasManager.generation) {
+      return;
+    }
+    if (_requestedPrefetchBucket == positionBucket &&
+        (_prefetchScheduled || _prefetchRunning)) {
+      return;
+    }
+    _requestedPrefetchBucket = positionBucket;
+    if (_prefetchScheduled || _prefetchRunning) return;
+    _prefetchScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _prefetchScheduled = false;
+      if (!mounted || _prefetchRunning) return;
+      unawaited(_runPrefetchLoop());
+    });
+  }
+
+  Future<void> _runPrefetchLoop() async {
+    _prefetchRunning = true;
+    try {
+      while (mounted) {
+        final document = _document;
+        final style = _preparedStyle;
+        final requestedBucket = _requestedPrefetchBucket;
+        if (document == null || style == null || requestedBucket == null) {
+          return;
+        }
+
+        final generation = _atlasManager.generation;
+        final positionUs = widget.position.value.inMicroseconds;
+        final allIndices = resolveDanmakuPrefetchIndices(
+          document.items,
+          positionUs: positionUs,
+          speed: widget.speed,
+        );
+        final indices = _performanceGovernor.pauseLookAhead
+            ? <int>[
+                for (final index in allIndices)
+                  if (document.items[index].startTime.inMicroseconds <=
+                      positionUs)
+                    index,
+              ]
+            : allIndices;
+
+        _atlasManager.beginPrefetchCycle();
+        const batchSize = 64;
+        for (var offset = 0; offset < indices.length; offset += batchSize) {
+          if (!mounted || generation != _atlasManager.generation) break;
+          final end = math.min(offset + batchSize, indices.length);
+          final items = <DanmakuItem>[
+            for (var i = offset; i < end; i++) document.items[indices[i]],
+          ];
+          final pinsCurrentFrame = items.any((item) {
+            final elapsedUs = positionUs - item.startTime.inMicroseconds;
+            final durationUs = math.max(
+              1,
+              (item.duration.inMicroseconds /
+                      widget.speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax))
+                  .round(),
+            );
+            return elapsedUs >= 0 && elapsedUs < durationUs;
+          });
+          await _atlasManager.prepare(
+            items,
+            generation: generation,
+            pinPages: pinsCurrentFrame,
+          );
+          // Atlas construction is kept outside paint() and yields after every
+          // batch, so a dense burst cannot monopolize the UI isolate.
+          if (end < indices.length && mounted) {
+            await WidgetsBinding.instance.endOfFrame;
+          }
+        }
+
+        if (requestedBucket == _requestedPrefetchBucket &&
+            generation == _atlasManager.generation) {
+          _completedPrefetchBucket = requestedBucket;
+          _completedPrefetchGeneration = generation;
+          return;
+        }
+      }
+    } finally {
+      _prefetchRunning = false;
+      if (mounted &&
+          (_requestedPrefetchBucket != _completedPrefetchBucket ||
+              _completedPrefetchGeneration != _atlasManager.generation) &&
+          !_prefetchScheduled) {
+        _schedulePrefetch();
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final document = _document;
+    final activeSet = _activeSet;
+    if (document == null || document.items.isEmpty || activeSet == null) {
+      return const SizedBox.shrink();
+    }
+    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
+    final style = _DanmakuAtlasStyle(
+      fontSize: resolveDanmakuFontSize(
+        playerHeight: widget.playerHeight,
+        fontScale: widget.fontScale,
+      ),
+      devicePixelRatio: devicePixelRatio,
+      fontFamily: widget.fontFamily,
+      fontWeight: widget.fontWeight,
+      outlineType: widget.outlineType,
+    );
+    _atlasManager.ensureStyle(style);
+    _preparedStyle = style;
+    _schedulePrefetch();
+
+    return IgnorePointer(
+      child: RepaintBoundary(
+        child: CustomPaint(
+          painter: _DanmakuPainter(
+            document: document,
+            position: widget.position,
+            displayArea: widget.displayArea,
+            opacity: widget.opacity,
+            speed: widget.speed,
+            requestedFontSize: style.fontSize,
+            activeSet: activeSet,
+            atlasManager: _atlasManager,
+            performanceGovernor: _performanceGovernor,
+          ),
+          // The overlay changes on every VSync. Marking it as complex invites
+          // a raster-cache attempt which can never be reused as a static layer.
+          isComplex: false,
+          willChange: true,
+          size: Size.infinite,
+        ),
+      ),
+    );
+  }
+}
+
+class _DanmakuPainter extends CustomPainter {
+  final DanmakuDocument document;
+  final ValueListenable<Duration> position;
+  final double displayArea;
+  final double opacity;
+  final double speed;
+  final double requestedFontSize;
+  final _DanmakuActiveSet activeSet;
+  final _DanmakuAtlasManager atlasManager;
+  final _DanmakuPerformanceGovernor performanceGovernor;
+  late final Paint _atlasPaint = Paint()
+    ..isAntiAlias = true
+    ..filterQuality = FilterQuality.low;
+
+  _DanmakuPainter({
+    required this.document,
+    required this.position,
+    required this.displayArea,
+    required this.opacity,
+    required this.speed,
+    required this.requestedFontSize,
+    required this.activeSet,
+    required this.atlasManager,
+    required this.performanceGovernor,
+  }) : super(
+         repaint: Listenable.merge(<Listenable>[
+           position,
+           atlasManager,
+           performanceGovernor,
+         ]),
+       );
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) return;
+    final positionUs = position.value.inMicroseconds;
+    // All movement is derived from shared media time. At 2x, position itself
+    // advances twice as fast in wall time, so danmaku accelerates with the
+    // video without maintaining a second, drift-prone animation clock.
+    final visibleHeight =
+        size.height *
+        displayArea.clamp(kDanmakuDisplayAreaMin, kDanmakuDisplayAreaMax);
+    final fontSize = atlasManager.activeStyle?.fontSize ?? requestedFontSize;
+    final edgePadding = math.max(2.0, fontSize * 0.1);
+    final laneExtent = fontSize + edgePadding;
+    final renderRect = Rect.fromLTWH(0, 0, size.width, visibleHeight);
+    final contentRect = Rect.fromLTRB(
+      renderRect.left + edgePadding,
+      renderRect.top + edgePadding,
+      math.max(renderRect.left + edgePadding, renderRect.right - edgePadding),
+      math.max(renderRect.top + edgePadding, renderRect.bottom - edgePadding),
+    );
+    final activeIndices = activeSet.update(
+      positionUs: positionUs,
+      speed: speed,
+      admissionCap: performanceGovernor.admissionCap,
+    );
+    if (activeIndices.isEmpty) return;
+
+    atlasManager.beginFrame();
+    canvas.save();
+    canvas.clipRect(renderRect);
+    final usesFallback = atlasManager.usesFallback;
+    if (usesFallback && opacity < 0.999) {
+      canvas.saveLayer(
+        renderRect,
+        Paint()..color = Color.fromRGBO(255, 255, 255, opacity.clamp(0.1, 1.0)),
+      );
+    }
+    for (var active = activeIndices.length - 1; active >= 0; active--) {
+      final item = document.items[activeIndices[active]];
+      final elapsedUs = positionUs - item.startTime.inMicroseconds;
+      final durationUs = math.max(
+        1,
+        (item.duration.inMicroseconds /
+                speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax))
+            .round(),
+      );
+      if (elapsedUs < 0 || elapsedUs >= durationUs) continue;
+
+      final y = _resolveY(
+        item,
+        contentRect: contentRect,
+        laneExtent: laneExtent,
+      );
+      final sprite = atlasManager.lookup(item.index);
+      final fallback = atlasManager.lookupFallback(item.index);
+      final layoutWidth = sprite?.width ?? fallback?.width;
+      final layoutHeight = sprite?.height ?? fallback?.height;
+      if (layoutWidth == null ||
+          layoutHeight == null ||
+          y < contentRect.top ||
+          y + layoutHeight > contentRect.bottom) {
+        continue;
+      }
+      final progress = elapsedUs / durationUs;
+      final x = switch (item.type) {
+        DanmakuType.scroll =>
+          contentRect.right - progress * (contentRect.width + layoutWidth),
+        DanmakuType.top ||
+        DanmakuType.bottom => contentRect.center.dx - layoutWidth / 2,
+      };
+      if (sprite != null) {
+        sprite.page.addSprite(sprite, x, y);
+      } else {
+        fallback!.paintTextAt(canvas, x, y);
+      }
+    }
+
+    atlasManager.paintFrame(canvas, _atlasPaint, opacity.clamp(0.1, 1.0));
+    if (usesFallback && opacity < 0.999) canvas.restore();
+    canvas.restore();
+  }
+
+  double _resolveY(
+    DanmakuItem item, {
+    required Rect contentRect,
+    required double laneExtent,
+  }) {
+    if (item.type == DanmakuType.bottom) {
+      final sourceDistanceFromBottom = (document.referenceHeight - item.sourceY)
+          .clamp(0, document.referenceHeight);
+      final lane = (sourceDistanceFromBottom / 40).floor();
+      return contentRect.bottom - (lane + 1) * laneExtent;
+    }
+    final lane = (item.sourceY / 40).floor();
+    return contentRect.top + lane * laneExtent;
+  }
+
+  @override
+  bool shouldRepaint(covariant _DanmakuPainter oldDelegate) {
+    return oldDelegate.document != document ||
+        oldDelegate.displayArea != displayArea ||
+        oldDelegate.opacity != opacity ||
+        oldDelegate.speed != speed ||
+        oldDelegate.requestedFontSize != requestedFontSize;
+  }
+}
+
+@visibleForTesting
+double resolveDanmakuFontSize({
+  required double playerHeight,
+  required double fontScale,
+}) {
+  const referencePlayerHeight = 1080.0;
+  const referenceFontSize = 40.0;
+  final safePlayerHeight = playerHeight.isFinite && playerHeight > 0
+      ? playerHeight
+      : referencePlayerHeight;
+  return (referenceFontSize *
+          safePlayerHeight /
+          referencePlayerHeight *
+          fontScale.clamp(kDanmakuFontScaleMin, kDanmakuFontScaleMax))
+      .clamp(2.0, 160.0);
+}
+
+@visibleForTesting
+class DanmakuIndexRange {
+  final int start;
+  final int endExclusive;
+
+  const DanmakuIndexRange(this.start, this.endExclusive);
+
+  bool get isEmpty => start >= endExclusive;
+  int get length => math.max(0, endExclusive - start);
+}
+
+@visibleForTesting
+DanmakuIndexRange resolveDanmakuActiveRange(
+  List<DanmakuItem> items, {
+  required int positionUs,
+  required double speed,
+}) {
+  if (items.isEmpty) return const DanmakuIndexRange(0, 0);
+  final safeSpeed = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax);
+  final earliestStartUs = positionUs - (16000000 / safeSpeed).round();
+  return DanmakuIndexRange(
+    _firstStartAtOrAfter(items, earliestStartUs),
+    _firstStartAfter(items, positionUs),
+  );
+}
+
+@visibleForTesting
+List<int> resolveDanmakuPrefetchIndices(
+  List<DanmakuItem> items, {
+  required int positionUs,
+  required double speed,
+}) {
+  const maximumActiveItems = 640;
+  const maximumUpcomingItems = 800;
+  const lookAheadUs = 10000000;
+  const atlasSegmentUs = 5000000;
+  final result = <int>[];
+  final active = resolveDanmakuActiveRange(
+    items,
+    positionUs: positionUs,
+    speed: speed,
+  );
+  for (
+    var i = active.endExclusive - 1;
+    i >= active.start && result.length < maximumActiveItems;
+    i--
+  ) {
+    result.add(i);
+  }
+
+  final requestedFutureUs = positionUs + lookAheadUs;
+  final alignedFutureUs =
+      ((requestedFutureUs + atlasSegmentUs - 1) ~/ atlasSegmentUs) *
+      atlasSegmentUs;
+  final upcomingEnd = _firstStartAfter(items, alignedFutureUs);
+  var upcomingCount = 0;
+  for (
+    var i = active.endExclusive;
+    i < upcomingEnd && upcomingCount < maximumUpcomingItems;
+    i++
+  ) {
+    result.add(i);
+    upcomingCount++;
+  }
+  return result;
+}
+
+int _firstStartAtOrAfter(List<DanmakuItem> items, int positionUs) {
+  var low = 0;
+  var high = items.length;
+  while (low < high) {
+    final mid = (low + high) >> 1;
+    if (items[mid].startTime.inMicroseconds < positionUs) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+int _firstStartAfter(List<DanmakuItem> items, int positionUs) {
+  var low = 0;
+  var high = items.length;
+  while (low < high) {
+    final mid = (low + high) >> 1;
+    if (items[mid].startTime.inMicroseconds <= positionUs) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+class _DanmakuActiveSet {
+  _DanmakuActiveSet(this.items)
+    : _maximumDurationUs = items.fold<int>(
+        0,
+        (maximum, item) => math.max(maximum, item.duration.inMicroseconds),
+      );
+
+  final List<DanmakuItem> items;
+  final int _maximumDurationUs;
+  final List<int> _active = <int>[];
+  final Map<String, int> _activeTextCounts = <String, int>{};
+  int _nextStartIndex = 0;
+  int? _lastPositionUs;
+  double? _lastSpeed;
+
+  List<int> update({
+    required int positionUs,
+    required double speed,
+    required int admissionCap,
+  }) {
+    final safeSpeed = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax);
+    final mustReset =
+        _lastPositionUs == null ||
+        positionUs < _lastPositionUs! ||
+        positionUs - _lastPositionUs! > 2000000 ||
+        _lastSpeed != safeSpeed;
+    if (mustReset) {
+      _reset(positionUs, safeSpeed, admissionCap);
+    } else {
+      _removeExpired(positionUs, safeSpeed);
+      _addNew(positionUs, safeSpeed, admissionCap);
+    }
+    _lastPositionUs = positionUs;
+    _lastSpeed = safeSpeed;
+    return _active;
+  }
+
+  void _reset(int positionUs, double speed, int admissionCap) {
+    _active.clear();
+    _activeTextCounts.clear();
+    final earliest = positionUs - (_maximumDurationUs / speed).ceil();
+    final first = _firstStartAtOrAfter(items, earliest);
+    _nextStartIndex = _firstStartAfter(items, positionUs);
+    final candidates = <int>[];
+    for (var index = first; index < _nextStartIndex; index++) {
+      if (_isActive(items[index], positionUs, speed)) candidates.add(index);
+    }
+    _admit(candidates, admissionCap);
+  }
+
+  void _removeExpired(int positionUs, double speed) {
+    var write = 0;
+    for (final index in _active) {
+      final item = items[index];
+      if (_isActive(item, positionUs, speed)) {
+        _active[write++] = index;
+      } else {
+        final count = _activeTextCounts[item.text] ?? 0;
+        if (count <= 1) {
+          _activeTextCounts.remove(item.text);
+        } else {
+          _activeTextCounts[item.text] = count - 1;
+        }
+      }
+    }
+    _active.length = write;
+  }
+
+  void _addNew(int positionUs, double speed, int admissionCap) {
+    final candidates = <int>[];
+    while (_nextStartIndex < items.length &&
+        items[_nextStartIndex].startTime.inMicroseconds <= positionUs) {
+      final index = _nextStartIndex++;
+      if (_isActive(items[index], positionUs, speed)) candidates.add(index);
+    }
+    _admit(candidates, admissionCap);
+  }
+
+  void _admit(List<int> candidates, int admissionCap) {
+    if (candidates.isEmpty) return;
+    if (admissionCap < 0x3fffffff) {
+      candidates.sort((left, right) {
+        final leftDuplicate = _activeTextCounts.containsKey(items[left].text);
+        final rightDuplicate = _activeTextCounts.containsKey(items[right].text);
+        if (leftDuplicate != rightDuplicate) return leftDuplicate ? 1 : -1;
+        return _stablePriority(
+          items[right],
+        ).compareTo(_stablePriority(items[left]));
+      });
+    }
+    for (final index in candidates) {
+      if (_active.length >= admissionCap) break;
+      final item = items[index];
+      if (admissionCap < 0x3fffffff &&
+          _active.length >= admissionCap * 3 ~/ 4 &&
+          _activeTextCounts.containsKey(item.text)) {
+        continue;
+      }
+      _active.add(index);
+      _activeTextCounts.update(
+        item.text,
+        (count) => count + 1,
+        ifAbsent: () => 1,
+      );
+    }
+  }
+
+  bool _isActive(DanmakuItem item, int positionUs, double speed) {
+    final elapsedUs = positionUs - item.startTime.inMicroseconds;
+    final durationUs = math.max(
+      1,
+      (item.duration.inMicroseconds / speed).round(),
+    );
+    return elapsedUs >= 0 && elapsedUs < durationUs;
+  }
+
+  int _stablePriority(DanmakuItem item) {
+    var hash = item.index * 0x1f1f1f1f;
+    for (final codeUnit in item.text.codeUnits) {
+      hash = 0x1fffffff & (hash * 31 + codeUnit);
+    }
+    return hash;
+  }
+}
+
+class _DanmakuAtlasStyle {
+  const _DanmakuAtlasStyle({
+    required this.fontSize,
+    required this.devicePixelRatio,
+    required this.fontFamily,
+    required this.fontWeight,
+    required this.outlineType,
+  });
+
+  final double fontSize;
+  final double devicePixelRatio;
+  final String? fontFamily;
+  final int fontWeight;
+  final DanmakuOutlineType outlineType;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _DanmakuAtlasStyle &&
+        other.fontSize == fontSize &&
+        other.devicePixelRatio == devicePixelRatio &&
+        other.fontFamily == fontFamily &&
+        other.fontWeight == fontWeight &&
+        other.outlineType == outlineType;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+    fontSize,
+    devicePixelRatio,
+    fontFamily,
+    fontWeight,
+    outlineType,
+  );
+}
+
+class _DanmakuSpriteKey {
+  const _DanmakuSpriteKey(this.text, this.colorValue);
+
+  final String text;
+  final int colorValue;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _DanmakuSpriteKey &&
+        other.text == text &&
+        other.colorValue == colorValue;
+  }
+
+  @override
+  int get hashCode => Object.hash(text, colorValue);
+}
+
+class _DanmakuAtlasManager extends ChangeNotifier {
+  _DanmakuAtlasManager({required this.maximumBytes});
+
+  final int maximumBytes;
+  _DanmakuAtlasStyle? _requestedStyle;
+  _DanmakuAtlasCache? _active;
+  _DanmakuAtlasCache? _building;
+  _DanmakuAtlasStyle? _fallbackStyle;
+  final Map<_DanmakuSpriteKey, _PreparedDanmakuText> _fallbackSprites =
+      <_DanmakuSpriteKey, _PreparedDanmakuText>{};
+  final Map<int, _PreparedDanmakuText> _fallbackItems =
+      <int, _PreparedDanmakuText>{};
+  int _generation = 0;
+  bool _disposed = false;
+  bool _fallbackEnabled = false;
+  bool _fallbackNotificationScheduled = false;
+
+  int get generation => _generation;
+  _DanmakuAtlasStyle? get activeStyle => _fallbackStyle ?? _active?.style;
+  bool get usesFallback => _fallbackEnabled;
+
+  void ensureStyle(_DanmakuAtlasStyle style) {
+    if (_requestedStyle == style) return;
+    _requestedStyle = style;
+    _generation++;
+    if (_fallbackEnabled) {
+      _disposeFallbackLayouts();
+      _fallbackStyle = style;
+      return;
+    }
+    if (_active == null) {
+      _active = _DanmakuAtlasCache(style, maximumBytes);
+    } else {
+      _building?.dispose();
+      _building = _DanmakuAtlasCache(style, maximumBytes);
+    }
+  }
+
+  void beginPrefetchCycle() {
+    _active?.unpinAll();
+    _building?.unpinAll();
+  }
+
+  Future<void> prepare(
+    List<DanmakuItem> items, {
+    required int generation,
+    required bool pinPages,
+  }) async {
+    if (_disposed || generation != _generation || items.isEmpty) return;
+    if (_fallbackEnabled) {
+      if (_prepareFallback(items)) notifyListeners();
+      return;
+    }
+    final target = _building ?? _active;
+    if (target == null) return;
+    bool changed;
+    try {
+      changed = await target.prepareBatch(items, pinPages: pinPages);
+    } catch (_) {
+      if (!_disposed && generation == _generation) {
+        _activateFallback(target.style, items);
+        notifyListeners();
+      }
+      return;
+    }
+    if (_disposed || generation != _generation) return;
+    if (identical(_building, target) && target.hasSprites) {
+      final previous = _active;
+      _active = target;
+      _building = null;
+      previous?.dispose();
+      notifyListeners();
+    } else if (identical(_active, target) && changed) {
+      notifyListeners();
+    }
+  }
+
+  _DanmakuSprite? lookup(int itemIndex) => _active?.lookup(itemIndex);
+
+  _PreparedDanmakuText? lookupFallback(int itemIndex) {
+    return _fallbackItems[itemIndex];
+  }
+
+  void beginFrame() => _active?.beginFrame();
+
+  void paintFrame(Canvas canvas, Paint paint, double opacity) {
+    if (_fallbackEnabled) return;
+    try {
+      _active?.paintFrame(canvas, paint, opacity);
+    } catch (_) {
+      final style = _active?.style ?? _requestedStyle;
+      if (style == null) return;
+      _activateFallback(style, const <DanmakuItem>[]);
+      if (_fallbackNotificationScheduled) return;
+      _fallbackNotificationScheduled = true;
+      scheduleMicrotask(() {
+        _fallbackNotificationScheduled = false;
+        if (!_disposed) notifyListeners();
+      });
+    }
+  }
+
+  void _activateFallback(
+    _DanmakuAtlasStyle style,
+    List<DanmakuItem> initialItems,
+  ) {
+    _active?.dispose();
+    _building?.dispose();
+    _active = null;
+    _building = null;
+    _fallbackEnabled = true;
+    _fallbackStyle = style;
+    _disposeFallbackLayouts();
+    _prepareFallback(initialItems);
+  }
+
+  bool _prepareFallback(List<DanmakuItem> items) {
+    final style = _fallbackStyle;
+    if (style == null) return false;
+    var changed = false;
+    for (final item in items) {
+      final text = item.text.replaceAll(RegExp(r'[\r\n]+'), ' ');
+      final key = _DanmakuSpriteKey(text, item.colorValue);
+      final layout = _fallbackSprites.putIfAbsent(
+        key,
+        () => _PreparedDanmakuText(item, style),
+      );
+      if (!_fallbackItems.containsKey(item.index)) changed = true;
+      _fallbackItems[item.index] = layout;
+    }
+    return changed;
+  }
+
+  void _disposeFallbackLayouts() {
+    for (final layout in _fallbackSprites.values) {
+      layout.dispose();
+    }
+    _fallbackSprites.clear();
+    _fallbackItems.clear();
+  }
+
+  void clear() {
+    _generation++;
+    _active?.dispose();
+    _building?.dispose();
+    _disposeFallbackLayouts();
+    _active = null;
+    _building = null;
+    _fallbackStyle = null;
+    _fallbackEnabled = false;
+    _requestedStyle = null;
+  }
+
+  @override
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    clear();
+    super.dispose();
+  }
+}
+
+class _DanmakuAtlasCache {
+  _DanmakuAtlasCache(this.style, this.maximumBytes);
+
+  static const int _pageWidth = 2048;
+  static const int _pageHeight = 1024;
+  static const int _gutter = 2;
+
+  final _DanmakuAtlasStyle style;
+  final int maximumBytes;
+  final Map<_DanmakuSpriteKey, _DanmakuSprite> _sprites =
+      <_DanmakuSpriteKey, _DanmakuSprite>{};
+  final Map<int, _DanmakuSprite> _itemSprites = <int, _DanmakuSprite>{};
+  final List<_DanmakuAtlasPage> _pages = <_DanmakuAtlasPage>[];
+  int _byteSize = 0;
+  int _touchSequence = 0;
+  bool _disposed = false;
+
+  bool get hasSprites => _sprites.isNotEmpty;
+
+  _DanmakuSprite? lookup(int itemIndex) => _itemSprites[itemIndex];
+
+  void unpinAll() {
+    for (final page in _pages) {
+      page.pinned = false;
+    }
+  }
+
+  Future<bool> prepareBatch(
+    List<DanmakuItem> items, {
+    required bool pinPages,
+  }) async {
+    if (_disposed) return false;
+    final pending = <_DanmakuSpriteKey, _PendingDanmakuSprite>{};
+    var changed = false;
+    for (final item in items) {
+      final normalizedText = item.text.replaceAll(RegExp(r'[\r\n]+'), ' ');
+      final key = _DanmakuSpriteKey(normalizedText, item.colorValue);
+      final cached = _sprites[key];
+      if (cached != null) {
+        _itemSprites[item.index] = cached;
+        cached.page.pinned = cached.page.pinned || pinPages;
+        cached.page.lastTouch = ++_touchSequence;
+        continue;
+      }
+      final entry = pending.putIfAbsent(
+        key,
+        () => _PendingDanmakuSprite(
+          key: key,
+          prepared: _PreparedDanmakuText(item, style),
+        ),
+      );
+      entry.itemIndices.add(item.index);
+    }
+    if (pending.isEmpty) return changed;
+
+    final plans = <_DanmakuAtlasPagePlan>[];
+    _DanmakuAtlasPagePlan? current;
+    for (final entry in pending.values) {
+      final prepared = entry.prepared;
+      if (prepared.pixelWidth + _gutter * 2 > _pageWidth ||
+          prepared.pixelHeight + _gutter * 2 > _pageHeight) {
+        final dedicated = _DanmakuAtlasPagePlan(
+          math.max(1, prepared.pixelWidth + _gutter * 2),
+          math.max(1, prepared.pixelHeight + _gutter * 2),
+          _gutter,
+        );
+        dedicated.tryPlace(entry);
+        plans.add(dedicated);
+        continue;
+      }
+      current ??= _DanmakuAtlasPagePlan(_pageWidth, _pageHeight, _gutter);
+      if (!current.tryPlace(entry)) {
+        plans.add(current);
+        current = _DanmakuAtlasPagePlan(_pageWidth, _pageHeight, _gutter)
+          ..tryPlace(entry);
+      }
+    }
+    if (current != null && current.placements.isNotEmpty) plans.add(current);
+
+    try {
+      for (final plan in plans) {
+        final recorder = ui.PictureRecorder();
+        final pictureCanvas = Canvas(recorder)..scale(style.devicePixelRatio);
+        for (final placement in plan.placements) {
+          placement.pending.prepared.paint(
+            pictureCanvas,
+            placement.left / style.devicePixelRatio,
+            placement.top / style.devicePixelRatio,
+          );
+        }
+        final picture = recorder.endRecording();
+        ui.Image image;
+        try {
+          image = await picture.toImage(plan.usedWidth, plan.usedHeight);
+        } finally {
+          picture.dispose();
+        }
+        if (_disposed) {
+          image.dispose();
+          return false;
+        }
+        final page = _DanmakuAtlasPage(
+          image: image,
+          devicePixelRatio: style.devicePixelRatio,
+          byteSize: plan.usedWidth * plan.usedHeight * 4,
+          pinned: pinPages,
+          lastTouch: ++_touchSequence,
+        );
+        _pages.add(page);
+        _byteSize += page.byteSize;
+        for (final placement in plan.placements) {
+          final pendingSprite = placement.pending;
+          final prepared = pendingSprite.prepared;
+          final sprite = _DanmakuSprite(
+            page: page,
+            sourceLeft: placement.left.toDouble(),
+            sourceTop: placement.top.toDouble(),
+            sourceWidth: prepared.pixelWidth.toDouble(),
+            sourceHeight: prepared.pixelHeight.toDouble(),
+            width: prepared.width,
+            height: prepared.height,
+            imagePadding: prepared.imagePadding,
+          );
+          _sprites[pendingSprite.key] = sprite;
+          for (final itemIndex in pendingSprite.itemIndices) {
+            _itemSprites[itemIndex] = sprite;
+          }
+        }
+        changed = true;
+        _evictIfNeeded();
+      }
+      return changed;
+    } finally {
+      for (final entry in pending.values) {
+        entry.prepared.dispose();
+      }
+    }
+  }
+
+  void _evictIfNeeded() {
+    while (_byteSize > maximumBytes && _pages.length > 1) {
+      _DanmakuAtlasPage? oldest;
+      for (final page in _pages) {
+        if (page.pinned) continue;
+        if (oldest == null || page.lastTouch < oldest.lastTouch) oldest = page;
+      }
+      if (oldest == null) return;
+      _pages.remove(oldest);
+      _byteSize -= oldest.byteSize;
+      _sprites.removeWhere((_, sprite) => identical(sprite.page, oldest));
+      _itemSprites.removeWhere((_, sprite) => identical(sprite.page, oldest));
+      oldest.dispose();
+    }
+  }
+
+  void beginFrame() {
+    for (final page in _pages) {
+      page.beginFrame();
+    }
+  }
+
+  void paintFrame(Canvas canvas, Paint paint, double opacity) {
+    for (final page in _pages) {
+      page.paint(canvas, paint, opacity);
+    }
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    for (final page in _pages) {
+      page.dispose();
+    }
+    _pages.clear();
+    _sprites.clear();
+    _itemSprites.clear();
+    _byteSize = 0;
+  }
+}
+
+class _PendingDanmakuSprite {
+  _PendingDanmakuSprite({required this.key, required this.prepared});
+
+  final _DanmakuSpriteKey key;
+  final _PreparedDanmakuText prepared;
+  final List<int> itemIndices = <int>[];
+}
+
+class _PreparedDanmakuText {
+  _PreparedDanmakuText(DanmakuItem item, _DanmakuAtlasStyle style)
+    : _devicePixelRatio = style.devicePixelRatio {
+    final text = item.text.replaceAll(RegExp(r'[\r\n]+'), ' ');
+    _fill = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: Color(item.colorValue),
+          fontSize: style.fontSize,
+          fontFamily: style.fontFamily,
+          fontWeight: danmakuFontWeight(style.fontWeight),
+          height: 1,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+    final strokeWidth = switch (style.outlineType) {
+      DanmakuOutlineType.standard => math.max(1.2, style.fontSize * 0.075),
+      DanmakuOutlineType.thin => math.max(0.8, style.fontSize * 0.042),
+      DanmakuOutlineType.heavy => math.max(1.8, style.fontSize * 0.12),
+      DanmakuOutlineType.projection => math.max(0.6, style.fontSize * 0.025),
+    };
+    _stroke = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          fontSize: style.fontSize,
+          fontFamily: style.fontFamily,
+          fontWeight: danmakuFontWeight(style.fontWeight),
+          height: 1,
+          foreground: Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeJoin = StrokeJoin.round
+            ..strokeWidth = strokeWidth
+            ..color = Colors.black.withValues(alpha: 0.9),
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: 1,
+    )..layout();
+    _projectionDistance = style.outlineType == DanmakuOutlineType.projection
+        ? math.max(1.5, style.fontSize * 0.1)
+        : 0.0;
+    _projection = style.outlineType == DanmakuOutlineType.projection
+        ? (TextPainter(
+            text: TextSpan(
+              text: text,
+              style: TextStyle(
+                color: Colors.black.withValues(alpha: 0.9),
+                fontSize: style.fontSize,
+                fontFamily: style.fontFamily,
+                fontWeight: danmakuFontWeight(style.fontWeight),
+                height: 1,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+            maxLines: 1,
+          )..layout())
+        : null;
+    width = _fill.width;
+    height = _fill.height;
+    imagePadding = strokeWidth / 2 + _projectionDistance + 1;
+    pixelWidth = math.max(
+      1,
+      ((width + imagePadding * 2) * _devicePixelRatio).ceil(),
+    );
+    pixelHeight = math.max(
+      1,
+      ((height + imagePadding * 2) * _devicePixelRatio).ceil(),
+    );
+  }
+
+  late final TextPainter _fill;
+  late final TextPainter _stroke;
+  late final TextPainter? _projection;
+  late final double _projectionDistance;
+  final double _devicePixelRatio;
+  late final double width;
+  late final double height;
+  late final double imagePadding;
+  late final int pixelWidth;
+  late final int pixelHeight;
+
+  void paint(Canvas canvas, double left, double top) {
+    final textOffset = Offset(left + imagePadding, top + imagePadding);
+    final projection = _projection;
+    if (projection != null) {
+      projection.paint(
+        canvas,
+        textOffset + Offset(_projectionDistance, _projectionDistance),
+      );
+    }
+    _stroke.paint(canvas, textOffset);
+    _fill.paint(canvas, textOffset);
+  }
+
+  void paintTextAt(Canvas canvas, double x, double y) {
+    paint(canvas, x - imagePadding, y - imagePadding);
+  }
+
+  void dispose() {
+    _fill.dispose();
+    _stroke.dispose();
+    _projection?.dispose();
+  }
+}
+
+class _DanmakuAtlasPlacement {
+  const _DanmakuAtlasPlacement(this.pending, this.left, this.top);
+
+  final _PendingDanmakuSprite pending;
+  final int left;
+  final int top;
+}
+
+class _DanmakuAtlasPagePlan {
+  _DanmakuAtlasPagePlan(this.maximumWidth, this.maximumHeight, this.gutter)
+    : _cursorX = gutter,
+      _cursorY = gutter;
+
+  final int maximumWidth;
+  final int maximumHeight;
+  final int gutter;
+  final List<_DanmakuAtlasPlacement> placements = <_DanmakuAtlasPlacement>[];
+  int _cursorX;
+  int _cursorY;
+  int _rowHeight = 0;
+  int usedWidth = 1;
+  int usedHeight = 1;
+
+  bool tryPlace(_PendingDanmakuSprite pending) {
+    final width = pending.prepared.pixelWidth;
+    final height = pending.prepared.pixelHeight;
+    if (width + gutter * 2 > maximumWidth ||
+        height + gutter * 2 > maximumHeight) {
+      return false;
+    }
+    if (_cursorX + width + gutter > maximumWidth) {
+      _cursorX = gutter;
+      _cursorY += _rowHeight + gutter;
+      _rowHeight = 0;
+    }
+    if (_cursorY + height + gutter > maximumHeight) return false;
+    placements.add(_DanmakuAtlasPlacement(pending, _cursorX, _cursorY));
+    usedWidth = math.max(usedWidth, _cursorX + width + gutter);
+    usedHeight = math.max(usedHeight, _cursorY + height + gutter);
+    _cursorX += width + gutter;
+    _rowHeight = math.max(_rowHeight, height);
+    return true;
+  }
+}
+
+class _DanmakuSprite {
+  const _DanmakuSprite({
+    required this.page,
+    required this.sourceLeft,
+    required this.sourceTop,
+    required this.sourceWidth,
+    required this.sourceHeight,
+    required this.width,
+    required this.height,
+    required this.imagePadding,
+  });
+
+  final _DanmakuAtlasPage page;
+  final double sourceLeft;
+  final double sourceTop;
+  final double sourceWidth;
+  final double sourceHeight;
+  final double width;
+  final double height;
+  final double imagePadding;
+}
+
+class _DanmakuAtlasPage {
+  _DanmakuAtlasPage({
+    required this.image,
+    required this.devicePixelRatio,
+    required this.byteSize,
+    required this.pinned,
+    required this.lastTouch,
+  });
+
+  final ui.Image image;
+  final double devicePixelRatio;
+  final int byteSize;
+  bool pinned;
+  int lastTouch;
+  Float32List _transforms = Float32List(64 * 4);
+  Float32List _rects = Float32List(64 * 4);
+  Int32List _colors = Int32List(64);
+  int _spriteCount = 0;
+
+  void beginFrame() => _spriteCount = 0;
+
+  void addSprite(_DanmakuSprite sprite, double x, double y) {
+    _ensureCapacity(_spriteCount + 1);
+    final offset = _spriteCount * 4;
+    final scale = 1 / devicePixelRatio;
+    _transforms[offset] = scale;
+    _transforms[offset + 1] = 0;
+    _transforms[offset + 2] = x - sprite.imagePadding;
+    _transforms[offset + 3] = y - sprite.imagePadding;
+    _rects[offset] = sprite.sourceLeft;
+    _rects[offset + 1] = sprite.sourceTop;
+    _rects[offset + 2] = sprite.sourceLeft + sprite.sourceWidth;
+    _rects[offset + 3] = sprite.sourceTop + sprite.sourceHeight;
+    _spriteCount++;
+  }
+
+  void _ensureCapacity(int required) {
+    final currentCapacity = _transforms.length ~/ 4;
+    if (required <= currentCapacity) return;
+    var nextCapacity = currentCapacity;
+    while (nextCapacity < required) {
+      nextCapacity *= 2;
+    }
+    final nextTransforms = Float32List(nextCapacity * 4)
+      ..setRange(0, _transforms.length, _transforms);
+    final nextRects = Float32List(nextCapacity * 4)
+      ..setRange(0, _rects.length, _rects);
+    final nextColors = Int32List(nextCapacity)
+      ..setRange(0, _colors.length, _colors);
+    _transforms = nextTransforms;
+    _rects = nextRects;
+    _colors = nextColors;
+  }
+
+  void paint(Canvas canvas, Paint paint, double opacity) {
+    if (_spriteCount == 0) return;
+    final valueCount = _spriteCount * 4;
+    final alpha = (opacity * 255).round().clamp(0, 255);
+    final useColors = alpha < 255;
+    if (useColors) {
+      _colors.fillRange(0, _spriteCount, alpha << 24);
+    }
+    canvas.drawRawAtlas(
+      image,
+      Float32List.sublistView(_transforms, 0, valueCount),
+      Float32List.sublistView(_rects, 0, valueCount),
+      useColors ? Int32List.sublistView(_colors, 0, _spriteCount) : null,
+      useColors ? BlendMode.srcIn : null,
+      null,
+      paint,
+    );
+  }
+
+  void dispose() => image.dispose();
+}
+
+class _DanmakuPerformanceGovernor extends ChangeNotifier {
+  static const int _unlimitedAdmissions = 0x3fffffff;
+  final Queue<bool> _overBudgetWindow = Queue<bool>();
+  TimingsCallback? _callback;
+  int? _lastVsyncUs;
+  int _level = 0;
+  int _admissionCap = _unlimitedAdmissions;
+  int _recoveryFrames = 0;
+
+  bool get pauseLookAhead => _level >= 1;
+  int get admissionCap => _admissionCap;
+
+  void start() {
+    if (_callback != null) return;
+    _callback = _handleTimings;
+    SchedulerBinding.instance.addTimingsCallback(_callback!);
+  }
+
+  void _handleTimings(List<FrameTiming> timings) {
+    var changed = false;
+    for (final timing in timings) {
+      final vsyncUs = timing.timestampInMicroseconds(ui.FramePhase.vsyncStart);
+      final intervalUs = _lastVsyncUs == null ? 16667 : vsyncUs - _lastVsyncUs!;
+      _lastVsyncUs = vsyncUs;
+      final budgetUs = intervalUs >= 5000 && intervalUs <= 34000
+          ? intervalUs
+          : 16667;
+      final workUs = math.max(
+        timing.buildDuration.inMicroseconds,
+        timing.rasterDuration.inMicroseconds,
+      );
+      final overBudget = workUs > budgetUs * 0.8;
+      _overBudgetWindow.addLast(overBudget);
+      if (_overBudgetWindow.length > 12) _overBudgetWindow.removeFirst();
+
+      if (workUs < budgetUs * 0.6) {
+        _recoveryFrames++;
+      } else {
+        _recoveryFrames = 0;
+      }
+
+      if (_overBudgetWindow.length == 12 &&
+          _overBudgetWindow.where((value) => value).length >= 8) {
+        _recoveryFrames = 0;
+        _overBudgetWindow.clear();
+        if (_level == 0) {
+          _level = 1;
+          changed = true;
+        } else if (_level == 1) {
+          _level = 2;
+          _admissionCap = 200;
+          changed = true;
+        } else {
+          final reduced = math.max(32, (_admissionCap * 0.8).floor());
+          if (reduced != _admissionCap) {
+            _admissionCap = reduced;
+            changed = true;
+          }
+        }
+      } else if (_recoveryFrames >= 120 && _level > 0) {
+        _recoveryFrames = 0;
+        _overBudgetWindow.clear();
+        if (_level == 2) {
+          _level = 1;
+          _admissionCap = _unlimitedAdmissions;
+        } else {
+          _level = 0;
+        }
+        changed = true;
+      }
+    }
+    if (changed) notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    final callback = _callback;
+    if (callback != null) {
+      SchedulerBinding.instance.removeTimingsCallback(callback);
+      _callback = null;
+    }
+    super.dispose();
+  }
+}
+
+int _atlasMemoryBudget() {
+  if (kIsWeb) return 64 * 1024 * 1024;
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.android || TargetPlatform.iOS => 64 * 1024 * 1024,
+    _ => 128 * 1024 * 1024,
+  };
+}

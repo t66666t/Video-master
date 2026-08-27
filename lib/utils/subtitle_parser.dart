@@ -2,6 +2,18 @@ import 'dart:convert';
 import 'package:fast_gbk/fast_gbk.dart';
 import '../models/subtitle_model.dart';
 
+/// 字幕格式枚举，包含文件扩展名和显示名称
+enum SubtitleFormat {
+  srt('.srt', 'SRT'),
+  vtt('.vtt', 'WebVTT'),
+  ass('.ass', 'ASS/SSA'),
+  lrc('.lrc', 'LRC');
+
+  final String extension;
+  final String displayName;
+  const SubtitleFormat(this.extension, this.displayName);
+}
+
 class SubtitleParser {
   static String decodeBytes(List<int> bytes) {
     if (bytes.isEmpty) return '';
@@ -146,6 +158,34 @@ class SubtitleParser {
       return parseLrc(normalized);
     }
     return []; // 未知格式
+  }
+
+  /// 根据纯文本内容特征推断字幕格式（不依赖文件扩展名）
+  /// 检测优先级: WEBVTT > [Script Info]/[Events]/Dialogue: > --> > [mm:ss > 默认SRT
+  static SubtitleFormat detectFormat(String content) {
+    final normalized = _normalizeContent(content).trim();
+    if (normalized.isEmpty) return SubtitleFormat.srt;
+
+    // ① WEBVTT 头标识 → VTT
+    if (normalized.contains('WEBVTT')) {
+      return SubtitleFormat.vtt;
+    }
+    // ② ASS/SSA 段落头或对话行标记 → ASS
+    if (normalized.contains('[Script Info]') ||
+        normalized.contains('[Events]') ||
+        normalized.contains('Dialogue:')) {
+      return SubtitleFormat.ass;
+    }
+    // ③ 时间箭头 → SRT (VTT 已在 ① 排除)
+    if (normalized.contains('-->')) {
+      return SubtitleFormat.srt;
+    }
+    // ④ [mm:ss 时间标签 → LRC
+    if (RegExp(r'\[\d{2}:\d{2}').hasMatch(normalized)) {
+      return SubtitleFormat.lrc;
+    }
+    // ⑤ 无法识别，默认 SRT
+    return SubtitleFormat.srt;
   }
 
   /// 解析 WebVTT 格式

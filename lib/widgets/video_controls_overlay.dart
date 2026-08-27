@@ -8,14 +8,23 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart'; // Added for LogicalKeyboardKey
 import 'package:provider/provider.dart';
 import 'package:screen_brightness/screen_brightness.dart';
+import 'experimental_tap_gateway.dart';
 import 'package:volume_controller/volume_controller.dart';
 import '../models/subtitle_style.dart';
 import '../models/subtitle_model.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../services/media_playback_service.dart';
 import '../services/settings_service.dart';
+import '../services/app_haptics.dart';
 import '../services/video_preview_service.dart';
 import '../utils/desktop_player_shortcuts.dart';
+import '../models/media_chapter.dart';
+import 'chapter_slider_track_shape.dart';
+import 'player_control_metrics.dart';
+import 'progress_interaction_geometry.dart';
+import 'playback_speed_dialog.dart';
+
+const Color _danmakuControlAccent = Color(0xFFFF6699);
 
 class VideoControlsOverlay extends StatefulWidget {
   final VideoPlayerController controller;
@@ -30,21 +39,26 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onOpenSubtitleEditor;
   final VoidCallback? onToggleFloatingSubtitleSettings;
   final VoidCallback? onOpenVideoCompose; // New parameter
+  final VoidCallback? onOpenOcrSubtitle;
   final VoidCallback onToggleLock;
+  final bool showDanmakuControls;
+  final bool danmakuEnabled;
+  final VoidCallback? onToggleDanmaku;
+  final VoidCallback? onOpenDanmakuSettings;
   final VoidCallback? onToggleFullScreen; // New: For desktop full screen toggle
   final ValueChanged<Duration>? onSeekTo;
-  final ValueChanged<double> onSpeedUpdate;
-  final ValueChanged<double>? onSpeedLockToggle;
+  final Future<void> Function(double speed) onSpeedUpdate;
   final int doubleTapSeekSeconds;
   final bool enableDoubleTapSubtitleSeek;
   final List<SubtitleItem> subtitles;
   final double longPressSpeed;
   final bool showSubtitles;
+  final bool suppressSubtitleOverlay;
   final VoidCallback onToggleSubtitles;
   final VoidCallback onMoveSubtitles; // New callback for move subtitles
   final bool isLongPressing;
   final String longPressFeedbackText;
-  final VoidCallback onLongPressStart;
+  final ValueGetter<bool> onLongPressStart;
   final VoidCallback onLongPressEnd;
 
   // Subtitle Dragging Passthrough
@@ -73,6 +87,12 @@ class VideoControlsOverlay extends StatefulWidget {
   final bool showResetScreenButton;
   final VoidCallback? onResetScreenTransform;
   final bool suppressPrimaryGestures;
+  final bool allowPlayWhenUninitialized;
+  final VoidCallback? onExperimentalTrigger;
+  final List<MediaChapter> chapters;
+  final VoidCallback? onOpenChapters;
+  final bool isChapterSidebarVisible;
+  final ValueNotifier<bool>? playbackControlsVisibility;
 
   const VideoControlsOverlay({
     super.key,
@@ -88,16 +108,21 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onOpenSubtitleEditor,
     this.onToggleFloatingSubtitleSettings,
     this.onOpenVideoCompose,
+    this.onOpenOcrSubtitle,
     required this.onToggleLock,
+    this.showDanmakuControls = false,
+    this.danmakuEnabled = true,
+    this.onToggleDanmaku,
+    this.onOpenDanmakuSettings,
     this.onToggleFullScreen,
     this.onSeekTo,
     required this.onSpeedUpdate,
-    this.onSpeedLockToggle,
     this.doubleTapSeekSeconds = 5,
     this.enableDoubleTapSubtitleSeek = true,
     this.subtitles = const [],
     this.longPressSpeed = 2.0,
     required this.showSubtitles,
+    this.suppressSubtitleOverlay = false,
     required this.onToggleSubtitles,
     required this.onMoveSubtitles,
     required this.isLongPressing,
@@ -126,16 +151,40 @@ class VideoControlsOverlay extends StatefulWidget {
     this.showResetScreenButton = false,
     this.onResetScreenTransform,
     this.suppressPrimaryGestures = false,
+    this.allowPlayWhenUninitialized = false,
+    this.onExperimentalTrigger,
+    this.chapters = const <MediaChapter>[],
+    this.onOpenChapters,
+    this.isChapterSidebarVisible = false,
+    this.playbackControlsVisibility,
   });
 
   @override
-  State<VideoControlsOverlay> createState() => _VideoControlsOverlayState();
+  State<VideoControlsOverlay> createState() => VideoControlsOverlayState();
 }
 
-class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
+class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isDraggingProgress = false;
   double _dragProgressValue = 0.0;
+  int? _desktopProgressPointer;
+  bool _isProgressHovered = false;
+  double? _hoverProgressValue;
+  int? _dragChapterIndex;
   bool _showControls = true;
+
+  void _setShowControls(bool value) {
+    _showControls = value;
+    _publishPlaybackControlsVisibility();
+  }
+
+  void _publishPlaybackControlsVisibility() {
+    final notifier = widget.playbackControlsVisibility;
+    if (notifier == null) return;
+    final visible = widget.showBottomBar && _showControls;
+    if (notifier.value != visible) {
+      notifier.value = visible;
+    }
+  }
 
   // Gesture Seek
   bool _isGestureSeeking = false;
@@ -144,10 +193,27 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isGestureCanceling = false;
   bool _showControlsBeforeGestureSeek = false;
   bool _isProgressDragCanceling = false; // New: For slider drag cancellation
+  bool _progressDragWasCancelled = false;
 
-  // Long Press Speed
-  // bool _isLongPressingZone = false; // Moved to parent
-  // String _zoneFeedbackText = ""; // Moved to parent
+  // Keep transient feedback local so a rate change does not rebuild the
+  // entire player page in the same frame as the native player update.
+  bool _longPressActive = false;
+  String _localLongPressFeedbackText = "";
+
+  // The parent keeps playback-speed state, but this overlay exclusively owns
+  // the transient visual. A parent rebuild during a press can otherwise leave
+  // widget.isLongPressing stuck at its previous value until another rebuild.
+  bool get _isLongPressActive => _longPressActive;
+
+  String get _effectiveLongPressFeedbackText =>
+      _localLongPressFeedbackText.isNotEmpty
+      ? _localLongPressFeedbackText
+      : widget.longPressFeedbackText;
+
+  void cancelLongPressFeedback() {
+    if (!_longPressActive || !mounted) return;
+    setState(() => _longPressActive = false);
+  }
 
   // Double Tap Feedback (Local)
   bool _showDoubleTapFeedback = false;
@@ -187,14 +253,10 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   final FocusNode _focusNode = FocusNode(
     debugLabel: 'VideoControlsOverlayFocus',
   );
-  Timer? _keyboardLongPressTimer;
+  final Map<LogicalKeyboardKey, _KeyboardPressState> _keyboardPressStates =
+      <LogicalKeyboardKey, _KeyboardPressState>{};
+  LogicalKeyboardKey? _activeSpeedBoostKey;
   bool _isKeyboardLongPressing = false;
-  bool _wasPlayingBeforeLongPress = false; // 新增：记录长按前的播放状态
-  // Key press tracking
-  bool _isSpacePressed = false;
-  bool _isRightArrowPressed = false;
-  bool _isLeftArrowPressed = false;
-  bool _isEscPressed = false;
 
   Uint8List? _previewImage;
   int _previewRequestSerial = 0;
@@ -207,9 +269,23 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   static const Duration _seekPreviewMinInterval = Duration(milliseconds: 65);
   static const int _seekPreviewMinStepMs = 24;
 
+  bool get _isSeekPreviewInteractionActive =>
+      _isDraggingProgress ||
+      (_isProgressHovered && _hoverProgressValue != null);
+
+  double? get _activeSeekPreviewValue => _isDraggingProgress
+      ? _dragProgressValue
+      : (_isProgressHovered ? _hoverProgressValue : null);
+
+  bool _isCurrentSeekPreviewTarget(double value, {double tolerance = 1.0}) {
+    final activeValue = _activeSeekPreviewValue;
+    return activeValue != null && (activeValue - value).abs() <= tolerance;
+  }
+
   // Auto-hide controls timer
   Timer? _autoHideTimer;
   static const Duration _autoHideDelay = Duration(seconds: 3);
+  bool _isPlaybackSpeedDialogOpen = false;
 
   String? _resolvePreviewFilePath() {
     final path = widget.controller.dataSource;
@@ -227,40 +303,25 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     return filePath;
   }
 
-  bool _isLockedSpeed(SettingsService settings, double speed) {
-    return settings.isLockedPlaybackSpeed(speed);
-  }
-
-  PopupMenuEntry<double> _buildPlaybackSpeedMenuItem(
-    BuildContext context,
+  Future<void> _showPlaybackSpeedPicker(
     SettingsService settings,
-    double speed,
-  ) {
-    final bool isLockedSpeed = _isLockedSpeed(settings, speed);
-
-    return PopupMenuItem<double>(
-      value: speed,
-      padding: EdgeInsets.zero,
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onLongPress: widget.onSpeedLockToggle == null
-            ? null
-            : () {
-                Navigator.of(context).pop();
-                widget.onSpeedLockToggle!(speed);
-              },
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-          child: Row(
-            children: [
-              Expanded(child: Text("${speed}x")),
-              if (isLockedSpeed)
-                const Icon(Icons.lock, size: 16, color: Colors.blueAccent),
-            ],
-          ),
-        ),
-      ),
-    );
+    BuildContext anchorContext,
+  ) async {
+    if (_isPlaybackSpeedDialogOpen) return;
+    _isPlaybackSpeedDialogOpen = true;
+    _autoHideTimer?.cancel();
+    try {
+      await showPlaybackSpeedDialog(
+        context: context,
+        anchorContext: anchorContext,
+        initialSpeed: widget.controller.value.playbackSpeed,
+        settings: settings,
+        onSpeedSelected: widget.onSpeedUpdate,
+      );
+    } finally {
+      _isPlaybackSpeedDialogOpen = false;
+      if (mounted) _startAutoHideTimer();
+    }
   }
 
   void _warmSeekPreviewMetadata() {
@@ -279,10 +340,10 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _seekPreviewRefineTimer?.cancel();
     final int targetTimeMs = value.toInt();
     _seekPreviewRefineTimer = Timer(_seekPreviewRefineDelay, () {
-      if (!mounted || !_isDraggingProgress) {
+      if (!mounted || !_isSeekPreviewInteractionActive) {
         return;
       }
-      if ((_dragProgressValue - value).abs() > 1.0) {
+      if (!_isCurrentSeekPreviewTarget(value)) {
         return;
       }
       _updateSeekPreview(value, precise: true, expectedTimeMs: targetTimeMs);
@@ -307,7 +368,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _scheduleLiveSeekPreview(double value, {bool immediate = false}) {
-    if (!_isDraggingProgress) {
+    if (!_isSeekPreviewInteractionActive) {
       return;
     }
     final now = DateTime.now();
@@ -341,7 +402,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       () {
         _seekPreviewThrottleTimer = null;
         final pendingValue = _pendingSeekPreviewValue;
-        if (!mounted || !_isDraggingProgress || pendingValue == null) {
+        if (!mounted ||
+            !_isSeekPreviewInteractionActive ||
+            pendingValue == null) {
           return;
         }
         final pendingTimeMs = pendingValue.toInt();
@@ -385,9 +448,12 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         : VideoPreviewService().requestPreview(filePath, requestTimeMs);
     future.then((data) {
       if (mounted &&
-          _isDraggingProgress &&
+          _isSeekPreviewInteractionActive &&
           (expectedTimeMs == null ||
-              (_dragProgressValue.toInt() - expectedTimeMs).abs() <= 1) &&
+              _isCurrentSeekPreviewTarget(
+                expectedTimeMs.toDouble(),
+                tolerance: 1.0,
+              )) &&
           requestSerial == _previewRequestSerial &&
           (data != null)) {
         setState(() {
@@ -397,9 +463,293 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     });
   }
 
+  void _updateProgressHover({
+    required double localDx,
+    required double width,
+    required double sliderMax,
+    required double trackInset,
+    required TextDirection textDirection,
+  }) {
+    // A pressed mouse sends move events through the slider, not through the
+    // hover-preview state. Keeping the two paths separate prevents a hover
+    // rebuild from replacing the slider while it owns the drag gesture.
+    if (_isDraggingProgress || widget.isLocked || sliderMax <= 0) return;
+    final value = progressValueFromLocalDx(
+      localDx: localDx,
+      width: width,
+      maxValue: sliderMax,
+      trackInset: trackInset,
+      textDirection: textDirection,
+    );
+    final previous = _hoverProgressValue;
+    if (!_isProgressHovered ||
+        previous == null ||
+        (previous - value).abs() > 1) {
+      setState(() {
+        _isProgressHovered = true;
+        _hoverProgressValue = value;
+      });
+    }
+    _cancelAutoHideTimer();
+    _scheduleLiveSeekPreview(value, immediate: previous == null);
+    _schedulePreciseSeekPreview(value);
+  }
+
+  void _endProgressHover() {
+    if (!_isProgressHovered && _hoverProgressValue == null) return;
+    if (_isDraggingProgress) {
+      setState(() {
+        _isProgressHovered = false;
+        _hoverProgressValue = null;
+      });
+      return;
+    }
+    _cancelSeekPreviewRefine();
+    _resetSeekPreviewRequestState();
+    setState(() {
+      _isProgressHovered = false;
+      _hoverProgressValue = null;
+      if (!_isDraggingProgress) {
+        _previewRequestSerial++;
+        _previewImage = null;
+      }
+    });
+    if (!_isDraggingProgress) {
+      VideoPreviewService().markInteractionEnded();
+      _startAutoHideTimer();
+    }
+  }
+
+  int _chapterIndexAt(double value) {
+    if (widget.chapters.isEmpty) return -1;
+    final chapter = MediaChapter.atPosition(
+      widget.chapters,
+      Duration(milliseconds: value.toInt()),
+    );
+    return chapter == null ? -1 : widget.chapters.indexOf(chapter);
+  }
+
+  void _beginProgressDrag(double value) {
+    final chapterIndex = _chapterIndexAt(value);
+    setState(() {
+      _isDraggingProgress = true;
+      _progressDragWasCancelled = false;
+      _dragProgressValue = value;
+      _dragChapterIndex = chapterIndex;
+      if (_isProgressHovered) {
+        _hoverProgressValue = value;
+      }
+    });
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    unawaited(AppHaptics.selectionClick(settings));
+    _scheduleLiveSeekPreview(value, immediate: true);
+    _schedulePreciseSeekPreview(value);
+    _cancelAutoHideTimer();
+  }
+
+  void _updateProgressDrag(double value) {
+    final chapterIndex = _chapterIndexAt(value);
+    final crossedChapter =
+        _dragChapterIndex != null &&
+        chapterIndex >= 0 &&
+        chapterIndex != _dragChapterIndex;
+    setState(() {
+      _isDraggingProgress = true;
+      _dragProgressValue = value;
+      _dragChapterIndex = chapterIndex;
+      if (_isProgressHovered) {
+        _hoverProgressValue = value;
+      }
+    });
+    if (crossedChapter) {
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      unawaited(AppHaptics.selectionClick(settings));
+    }
+    _scheduleLiveSeekPreview(value);
+    _schedulePreciseSeekPreview(value);
+    _cancelAutoHideTimer();
+  }
+
+  void _finishProgressDrag(double value) {
+    _cancelSeekPreviewRefine();
+    _resetSeekPreviewRequestState();
+    final cancelSeek = _isProgressDragCanceling || _progressDragWasCancelled;
+    if (!cancelSeek) {
+      _seekTo(Duration(milliseconds: value.toInt()));
+    }
+    setState(() {
+      _previewRequestSerial++;
+      _isDraggingProgress = false;
+      _dragChapterIndex = null;
+      if (_isProgressHovered) {
+        _hoverProgressValue = value;
+      } else {
+        _previewImage = null;
+      }
+      _isProgressDragCanceling = false;
+      _progressDragWasCancelled = false;
+    });
+    if (_isProgressHovered) {
+      _scheduleLiveSeekPreview(value, immediate: true);
+      _schedulePreciseSeekPreview(value);
+    } else {
+      VideoPreviewService().markInteractionEnded();
+      _startAutoHideTimer();
+    }
+  }
+
+  void _cancelProgressDrag() {
+    if (!_isDraggingProgress) return;
+    _cancelSeekPreviewRefine();
+    _resetSeekPreviewRequestState();
+    setState(() {
+      _isDraggingProgress = false;
+      _progressDragWasCancelled = true;
+      _dragChapterIndex = null;
+      if (!_isProgressHovered) {
+        _previewRequestSerial++;
+        _previewImage = null;
+      }
+      _isProgressDragCanceling = false;
+    });
+    if (_isProgressHovered && _hoverProgressValue != null) {
+      _scheduleLiveSeekPreview(_hoverProgressValue!, immediate: true);
+      _schedulePreciseSeekPreview(_hoverProgressValue!);
+    } else {
+      VideoPreviewService().markInteractionEnded();
+      _startAutoHideTimer();
+    }
+  }
+
+  Widget _buildSeekPreviewOverlay({
+    required double progressWidth,
+    required double sliderMax,
+    required double previewValue,
+    required double trackInset,
+    required TextDirection textDirection,
+    required double bottom,
+    required bool showThumbnail,
+  }) {
+    final preferredWidth = (progressWidth * 0.2).clamp(132.0, 180.0);
+    final previewWidth = math.min(progressWidth, preferredWidth).toDouble();
+    final previewHeight = previewWidth * 9 / 16;
+    final anchorX = progressLocalDxFromValue(
+      value: previewValue,
+      width: progressWidth,
+      maxValue: sliderMax,
+      trackInset: trackInset,
+      textDirection: textDirection,
+    );
+    final maxLeft = math.max(0.0, progressWidth - previewWidth);
+    final left = (anchorX - (previewWidth / 2)).clamp(0.0, maxLeft);
+
+    return Positioned(
+      key: const ValueKey('video-controls-seek-preview'),
+      left: left,
+      bottom: bottom,
+      child: IgnorePointer(
+        child: TweenAnimationBuilder<double>(
+          key: ValueKey<String>(
+            _isDraggingProgress ? 'seek-preview-drag' : 'seek-preview-hover',
+          ),
+          tween: Tween<double>(begin: 0.94, end: 1),
+          duration: const Duration(milliseconds: 130),
+          curve: Curves.easeOutCubic,
+          builder: (context, animation, child) => Opacity(
+            opacity: animation,
+            child: Transform.scale(
+              scale: animation,
+              alignment: Alignment.bottomCenter,
+              child: child,
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              if (showThumbnail) ...<Widget>[
+                Container(
+                  width: previewWidth,
+                  height: previewHeight,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF151515),
+                    border: Border.all(color: Colors.white70, width: 1.2),
+                    borderRadius: BorderRadius.circular(8),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Colors.black54,
+                        blurRadius: 8,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(6.5),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 110),
+                      switchInCurve: Curves.easeOut,
+                      child: _previewImage == null
+                          ? const ColoredBox(
+                              key: ValueKey('seek-preview-loading'),
+                              color: Color(0xFF202020),
+                              child: Center(
+                                child: Icon(
+                                  Icons.image_search_rounded,
+                                  color: Colors.white38,
+                                  size: 24,
+                                ),
+                              ),
+                            )
+                          : Image.memory(
+                              _previewImage!,
+                              key: ValueKey<int>(
+                                Object.hash(
+                                  _previewImage!.length,
+                                  _lastSeekPreviewRequestTimeMs,
+                                ),
+                              ),
+                              fit: BoxFit.cover,
+                              gaplessPlayback: true,
+                            ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 5),
+              ],
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.78),
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 7,
+                    vertical: 3,
+                  ),
+                  child: Text(
+                    _formatDuration(
+                      Duration(milliseconds: previewValue.toInt()),
+                    ),
+                    key: const ValueKey('video-controls-seek-preview-time'),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontFeatures: <FontFeature>[FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
+    _publishPlaybackControlsVisibility();
+    _effectiveFocusNode.addListener(_handleKeyboardFocusChange);
     if (Platform.isAndroid) {
       VolumeController.instance.showSystemUI = false;
     }
@@ -409,7 +759,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     // Auto request focus to enable keyboard listening
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        (widget.focusNode ?? _focusNode).requestFocus();
+        _requestKeyboardFocus();
       }
     });
     // Start auto-hide timer since controls are initially visible
@@ -419,6 +769,31 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   @override
   void didUpdateWidget(VideoControlsOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.focusNode != widget.focusNode) {
+      (oldWidget.focusNode ?? _focusNode).removeListener(
+        _handleKeyboardFocusChange,
+      );
+      _resetKeyboardPressStateAfterBuild();
+      _effectiveFocusNode.addListener(_handleKeyboardFocusChange);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _requestKeyboardFocus();
+      });
+    }
+    if (!oldWidget.isLocked && widget.isLocked) {
+      _resetKeyboardPressStateAfterBuild();
+      VideoPreviewService().markInteractionEnded();
+      _cancelSeekPreviewRefine();
+      _resetSeekPreviewRequestState();
+      _previewRequestSerial++;
+      _isDraggingProgress = false;
+      _desktopProgressPointer = null;
+      _isProgressHovered = false;
+      _hoverProgressValue = null;
+      _dragChapterIndex = null;
+      _previewImage = null;
+      _isProgressDragCanceling = false;
+      _progressDragWasCancelled = false;
+    }
     if (oldWidget.subtitles != widget.subtitles) {
       _rebuildSubtitleIndex();
     }
@@ -428,6 +803,13 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _resetSeekPreviewRequestState();
       _previewRequestSerial++;
       _previewImage = null;
+      _isDraggingProgress = false;
+      _desktopProgressPointer = null;
+      _isProgressHovered = false;
+      _hoverProgressValue = null;
+      _dragChapterIndex = null;
+      _isProgressDragCanceling = false;
+      _progressDragWasCancelled = false;
       _warmSeekPreviewMetadata();
     }
   }
@@ -435,8 +817,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   @override
   void dispose() {
     VideoPreviewService().markInteractionEnded();
+    _effectiveFocusNode.removeListener(_handleKeyboardFocusChange);
+    _resetKeyboardPressState(notify: false, endSpeedBoost: false);
     _focusNode.dispose();
-    _keyboardLongPressTimer?.cancel();
     _singleTapTimer?.cancel();
     _seekResetTimer?.cancel();
     _seekDebounceTimer?.cancel();
@@ -452,9 +835,13 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   void _startAutoHideTimer() {
     _autoHideTimer?.cancel();
     _autoHideTimer = Timer(_autoHideDelay, () {
-      if (mounted && _showControls && !widget.isLocked) {
+      if (mounted &&
+          _showControls &&
+          !widget.isLocked &&
+          !_isDraggingProgress &&
+          !_isProgressHovered) {
         setState(() {
-          _showControls = false;
+          _setShowControls(false);
         });
       }
     });
@@ -466,16 +853,83 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _autoHideTimer = null;
   }
 
-  // Desktop: Show controls when mouse moves over the player area
-  void _onMouseHover(PointerHoverEvent event) {
-    if (!_showControls && !widget.isLocked) {
+  // Desktop: The MouseRegion covers the complete player surface, including
+  // any black letterbox/pillarbox space around the video.
+  void _showControlsForMouseActivity() {
+    if (widget.isLocked) return;
+
+    if (!_showControls) {
       setState(() {
-        _showControls = true;
+        _setShowControls(true);
       });
-      _startAutoHideTimer();
-    } else if (_showControls) {
-      // Reset the auto-hide timer on continued mouse movement
-      _startAutoHideTimer();
+    }
+
+    // Entering or moving inside the player both count as fresh activity.
+    _startAutoHideTimer();
+  }
+
+  void _onMouseEnter(PointerEnterEvent event) {
+    _showControlsForMouseActivity();
+  }
+
+  void _onMouseHover(PointerHoverEvent event) {
+    _showControlsForMouseActivity();
+  }
+
+  void _onMouseExit(PointerExitEvent event) {
+    if (widget.isLocked) return;
+
+    // Do not leave a stale timer running after the pointer has entered a
+    // sidebar (or any other non-player area).
+    _cancelAutoHideTimer();
+    if (_showControls) {
+      setState(() {
+        _setShowControls(false);
+      });
+    }
+  }
+
+  FocusNode get _effectiveFocusNode => widget.focusNode ?? _focusNode;
+
+  void _requestKeyboardFocus() {
+    final FocusNode focusNode = _effectiveFocusNode;
+    if (mounted && focusNode.canRequestFocus && !focusNode.hasFocus) {
+      focusNode.requestFocus();
+    }
+  }
+
+  void _handleKeyboardFocusChange() {
+    if (!_effectiveFocusNode.hasFocus) {
+      _resetKeyboardPressState();
+    }
+  }
+
+  void _resetKeyboardPressState({
+    bool notify = true,
+    bool endSpeedBoost = true,
+  }) {
+    final bool shouldEndSpeedBoost = _activeSpeedBoostKey != null;
+    for (final _KeyboardPressState state in _keyboardPressStates.values) {
+      state.timer?.cancel();
+    }
+    _keyboardPressStates.clear();
+    _activeSpeedBoostKey = null;
+    if (shouldEndSpeedBoost && endSpeedBoost) {
+      _endZoneLongPress();
+    }
+    if (_isKeyboardLongPressing) {
+      _isKeyboardLongPressing = false;
+      if (notify && mounted) setState(() {});
+    }
+  }
+
+  void _resetKeyboardPressStateAfterBuild() {
+    final bool shouldEndSpeedBoost = _activeSpeedBoostKey != null;
+    _resetKeyboardPressState(endSpeedBoost: false);
+    if (shouldEndSpeedBoost) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _endZoneLongPress();
+      });
     }
   }
 
@@ -508,7 +962,10 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         widget.onBackPressed();
         return;
       case DesktopPlayerShortcutAction.playPause:
-        if (!widget.controller.value.isInitialized) return;
+        if (!widget.controller.value.isInitialized &&
+            !widget.allowPlayWhenUninitialized) {
+          return;
+        }
         _startAutoHideTimer();
         widget.onTogglePlay();
         return;
@@ -611,24 +1068,20 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   // Handle Key Events
   KeyEventResult handleKeyEvent(FocusNode node, KeyEvent event) {
-    // If we don't have focus, we shouldn't handle keys here (let them bubble)
-    // BUT for video player, we want to capture keys even if sidebar is clicked.
-    // The issue is that clicking the sidebar moves focus to the sidebar or its items.
-
-    if (widget.isLocked) return KeyEventResult.ignored;
-
+    if (!_supportsDesktopPlayerShortcuts) return KeyEventResult.ignored;
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route != null && !route.isCurrent) return KeyEventResult.ignored;
     final key = event.logicalKey;
+    final bool hasBlockingModifier =
+        HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isAltPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
     final bool isLongPressKey =
         key == LogicalKeyboardKey.space ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.escape;
-    final bool hasBlockingModifier =
-        HardwareKeyboard.instance.isControlPressed ||
-        HardwareKeyboard.instance.isAltPressed ||
-        HardwareKeyboard.instance.isMetaPressed;
-    final DesktopPlayerShortcutAction? shortcutAction =
-        hasBlockingModifier || !_supportsDesktopPlayerShortcuts
+    final DesktopPlayerShortcutAction? shortcutAction = hasBlockingModifier
         ? null
         : DesktopPlayerShortcuts.matchAction(key);
 
@@ -641,6 +1094,15 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       return KeyEventResult.ignored;
     }
 
+    // In locked mode, consume only player-owned keys. System/application
+    // shortcuts with modifiers were returned above and remain available.
+    if (widget.isLocked) return KeyEventResult.handled;
+
+    // Windows emits repeated key events while a key is held.  A right/left
+    // arrow hold has already been converted to the long-press speed action by
+    // its timer, so treating those repeats as seek requests makes one hold
+    // look like several taps.  Swallow every repeat and wait for the matching
+    // key-up event to end the speed boost.
     if (event is KeyRepeatEvent) {
       return KeyEventResult.handled;
     }
@@ -648,141 +1110,93 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (event is KeyDownEvent) {
       if (!isLongPressKey && shortcutAction != null) {
         _dispatchDesktopShortcut(shortcutAction);
-      } else if (key == LogicalKeyboardKey.space && !_isSpacePressed) {
-        _isSpacePressed = true;
-        _wasPlayingBeforeLongPress = widget.controller.value.isPlaying;
-        _startKeyboardLongPressTimer(() {
-          _startZoneLongPress(2.0);
-        });
-      } else if (key == LogicalKeyboardKey.arrowRight &&
-          !_isRightArrowPressed) {
-        _isRightArrowPressed = true;
-        _startKeyboardLongPressTimer(() {
-          // Right Arrow Long Press -> Speed Up
-          _startZoneLongPress(2.0);
-        });
-      } else if (key == LogicalKeyboardKey.arrowLeft && !_isLeftArrowPressed) {
-        _isLeftArrowPressed = true;
-        // Left Arrow Long Press -> Continuous Seek Back?
-        // User didn't specify special action for Left Long Press, assuming standard or ignore.
-        // For now, we only handle Tap for seek.
-      } else if (key == LogicalKeyboardKey.escape && !_isEscPressed) {
-        _isEscPressed = true;
-        _startKeyboardLongPressTimer(() {
-          // ESC Long Press -> Exit Fullscreen if in fullscreen
-          final settings = Provider.of<SettingsService>(context, listen: false);
-          if (settings.isFullScreen) {
-            widget.onToggleFullScreen?.call();
-          }
-        });
+      } else if (isLongPressKey) {
+        _handleLongPressKeyDown(key);
       }
       return KeyEventResult.handled;
     } else if (event is KeyUpEvent) {
-      if (key == LogicalKeyboardKey.space) {
-        _isSpacePressed = false;
-        _handleKeyRelease(() {
-          // Space Tap -> Toggle Play
-          widget.onTogglePlay();
-        });
-      } else if (key == LogicalKeyboardKey.escape) {
-        _isEscPressed = false;
-        _handleKeyRelease(() {
-          // ESC Tap -> Back
-          widget.onBackPressed();
-        });
-      } else if (key == LogicalKeyboardKey.arrowRight) {
-        _isRightArrowPressed = false;
-        _handleKeyRelease(() {
-          if (Platform.isWindows && !widget.isPreviewMode) {
-            final playbackService = Provider.of<MediaPlaybackService>(
-              context,
-              listen: false,
-            );
-            final settings = Provider.of<SettingsService>(
-              context,
-              listen: false,
-            );
-            playbackService.handleExternalDoubleTapSeek(
-              isLeft: false,
-              doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
-              enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
-              subtitleOffset: settings.subtitleOffset,
-            );
-          } else {
-            _seekRelative(widget.doubleTapSeekSeconds);
-          }
-        });
-      } else if (key == LogicalKeyboardKey.arrowLeft) {
-        _isLeftArrowPressed = false;
-        // Left Arrow Tap -> Rewind
-        // Left Long press doesn't have a timer start, so it will always be treated as tap here
-        _handleKeyRelease(() {
-          if (Platform.isWindows && !widget.isPreviewMode) {
-            final playbackService = Provider.of<MediaPlaybackService>(
-              context,
-              listen: false,
-            );
-            final settings = Provider.of<SettingsService>(
-              context,
-              listen: false,
-            );
-            playbackService.handleExternalDoubleTapSeek(
-              isLeft: true,
-              doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
-              enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
-              subtitleOffset: settings.subtitleOffset,
-            );
-          } else {
-            _seekRelative(-widget.doubleTapSeekSeconds);
-          }
-        });
-      }
+      if (isLongPressKey) _handleLongPressKeyUp(key);
       return KeyEventResult.handled;
     }
 
-    // Handle repeat events for target keys to prevent bubbling
     return KeyEventResult.handled;
   }
 
-  void _startKeyboardLongPressTimer(VoidCallback onLongPress) {
-    _keyboardLongPressTimer?.cancel();
-    _isKeyboardLongPressing = false;
-    // 200ms threshold for long press
-    _keyboardLongPressTimer = Timer(const Duration(milliseconds: 200), () {
-      if (mounted) {
-        setState(() {
-          _isKeyboardLongPressing = true;
-        });
-        onLongPress();
+  void _handleLongPressKeyDown(LogicalKeyboardKey key) {
+    if (_keyboardPressStates.containsKey(key)) return;
+    final _KeyboardPressState state = _KeyboardPressState();
+    _keyboardPressStates[key] = state;
+    state.timer = Timer(const Duration(milliseconds: 200), () {
+      if (!mounted || _keyboardPressStates[key] != state) return;
+      state.longPressTriggered = true;
+      if (key == LogicalKeyboardKey.escape) {
+        final settings = Provider.of<SettingsService>(context, listen: false);
+        if (settings.isFullScreen) widget.onToggleFullScreen?.call();
+        return;
       }
+      if (_activeSpeedBoostKey != null || !_startZoneLongPress()) return;
+      _activeSpeedBoostKey = key;
+      state.speedBoostStarted = true;
+      setState(() => _isKeyboardLongPressing = true);
     });
   }
 
-  void _handleKeyRelease(VoidCallback onTap) {
-    _keyboardLongPressTimer?.cancel();
-
-    if (_isKeyboardLongPressing) {
-      // Was long pressing, now stop
-      _endZoneLongPress();
-      // 如果长按前是播放状态，确保长按结束后继续播放，不触发 tap 的切换逻辑
-      if (_wasPlayingBeforeLongPress && !widget.controller.value.isPlaying) {
-        widget.onTogglePlay();
+  void _handleLongPressKeyUp(LogicalKeyboardKey key) {
+    final _KeyboardPressState? state = _keyboardPressStates.remove(key);
+    if (state == null) return;
+    state.timer?.cancel();
+    if (state.longPressTriggered) {
+      if (state.speedBoostStarted && _activeSpeedBoostKey == key) {
+        _activeSpeedBoostKey = null;
+        _endZoneLongPress();
+        if (mounted) setState(() => _isKeyboardLongPressing = false);
       }
-      setState(() {
-        _isKeyboardLongPressing = false;
-      });
+      return;
+    }
+    if (key == LogicalKeyboardKey.space) {
+      widget.onTogglePlay();
+    } else if (key == LogicalKeyboardKey.escape) {
+      widget.onBackPressed();
+    } else if (key == LogicalKeyboardKey.arrowRight) {
+      _handleArrowTap(isLeft: false);
+    } else if (key == LogicalKeyboardKey.arrowLeft) {
+      _handleArrowTap(isLeft: true);
+    }
+  }
+
+  void _handleArrowTap({required bool isLeft}) {
+    if (Platform.isWindows && !widget.isPreviewMode) {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      playbackService.handleExternalDoubleTapSeek(
+        isLeft: isLeft,
+        doubleTapSeekSeconds: settings.doubleTapSeekSeconds,
+        enableDoubleTapSubtitleSeek: settings.enableDoubleTapSubtitleSeek,
+        subtitleOffset: settings.subtitleOffset,
+      );
     } else {
-      // Was a tap
-      onTap();
+      _seekRelative(
+        isLeft ? -widget.doubleTapSeekSeconds : widget.doubleTapSeekSeconds,
+      );
     }
   }
 
   // Helper to reuse Zone Long Press Logic
-  void _startZoneLongPress(double speedMultiplier) {
-    widget.onLongPressStart();
+  bool _startZoneLongPress() {
+    if (!widget.onLongPressStart()) return false;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    unawaited(AppHaptics.longPressStarted(settings));
+    final renderObject = context.findRenderObject();
+    final size = renderObject is RenderBox ? renderObject.size : Size.zero;
+    _showLongPressFeedback(Offset(size.width * 0.75, size.height * 0.5));
+    return true;
   }
 
   void _endZoneLongPress() {
+    cancelLongPressFeedback();
     widget.onLongPressEnd();
   }
 
@@ -895,7 +1309,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     });
 
     _doubleTapFeedbackHideTimer = Timer(_doubleTapFeedbackVisibleDuration, () {
-      if (!mounted || _isGestureSeeking || widget.isLongPressing) return;
+      if (!mounted || _isGestureSeeking || _isLongPressActive) return;
       setState(() {
         _isDoubleTapFeedbackFadingOut = true;
       });
@@ -973,7 +1387,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (_shouldBlockPrimaryGestures) return;
     if (!widget.controller.value.isInitialized || widget.isLocked) return;
     // 互斥：如果正在长按加速（或显示双击反馈），则不响应滑动
-    if (widget.isLongPressing) return;
+    if (_isLongPressActive) return;
+    // 恢复键盘焦点，确保手势操作后快捷键仍然可用
+    _requestKeyboardFocus();
 
     // Ignore if starting from edges (to avoid conflict with system gestures or volume/brightness)
     // But Volume/Brightness is VerticalDrag, so they shouldn't conflict if direction is clear.
@@ -1006,7 +1422,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (!_isGestureSeeking || widget.isLocked || _dragStartPosition == null) {
       return;
     }
-    if (widget.isLongPressing) return; // Double check
+    if (_isLongPressActive) return; // Double check
 
     final double offsetX = details.globalPosition.dx - _dragStartPosition!.dx;
     final int secondsToAdd = (offsetX / 10).round();
@@ -1046,7 +1462,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     setState(() {
       _isGestureSeeking = false;
       _isGestureCanceling = false;
-      _showControls = _showControlsBeforeGestureSeek;
+      _setShowControls(_showControlsBeforeGestureSeek);
       _showControlsBeforeGestureSeek = false;
       _dragStartPosition = null;
     });
@@ -1074,7 +1490,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       widget.onTogglePlay();
       // Hide controls immediately after double-tap play/pause
       setState(() {
-        _showControls = false;
+        _setShowControls(false);
         _showDoubleTapFeedback = false;
         _isDoubleTapFeedbackFadingOut = false;
       });
@@ -1224,12 +1640,18 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _seekTo(target);
     });
 
+    unawaited(AppHaptics.doubleTapSeek(settings));
     _triggerDoubleTapFeedback(localPosition);
   }
 
   void _handleZoneLongPressStart(Offset localPosition, double width) {
     if (_shouldBlockPrimaryGestures) return;
     if (widget.isLocked) return;
+    if (!widget.onLongPressStart()) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    unawaited(AppHaptics.longPressStarted(settings));
+    // 恢复键盘焦点，确保手势操作后快捷键仍然可用
+    _requestKeyboardFocus();
 
     // Allow long press anywhere on the screen
     // final dx = localPosition.dx;
@@ -1238,8 +1660,15 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
     // if (!isLeft && !isRight) return;
 
+    _showLongPressFeedback(localPosition);
+  }
+
+  void _showLongPressFeedback(Offset localPosition) {
+    if (!mounted) return;
     setState(() {
       _tapPosition = localPosition;
+      _longPressActive = true;
+      _localLongPressFeedbackText = "${widget.longPressSpeed}x";
       _showDoubleTapFeedback = false;
       _isDoubleTapFeedbackFadingOut = false;
       _cancelDoubleTapFeedbackTimers();
@@ -1254,12 +1683,89 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _isAdjustingBrightness = false;
       _isAdjustingVolume = false;
     });
-
-    widget.onLongPressStart();
   }
 
   void _handleZoneLongPressEnd(LongPressEndDetails details) {
-    widget.onLongPressEnd();
+    _endZoneLongPress();
+  }
+
+  Widget _buildLongPressFeedbackOverlay(double width, double height) {
+    final bool isLeftSide = (_tapPosition?.dx ?? width) <= width / 2;
+    final double textSize = _relativePlayerUnit(
+      width,
+      height,
+      fraction: 0.035,
+      min: 9,
+      max: 18,
+    );
+    final double iconSize = textSize * 1.35;
+    final double edgeInset = (width * 0.035).clamp(8.0, 40.0).toDouble();
+
+    final feedback = _isLongPressActive
+        ? Align(
+            key: ValueKey(isLeftSide ? 'long-press-left' : 'long-press-right'),
+            alignment: isLeftSide
+                ? Alignment.centerLeft
+                : Alignment.centerRight,
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: edgeInset),
+              child: Container(
+                key: const ValueKey('long-press-speed-feedback'),
+                padding: EdgeInsets.symmetric(
+                  horizontal: textSize * 0.9,
+                  vertical: textSize * 0.45,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.62),
+                  borderRadius: BorderRadius.circular(textSize * 0.5),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.fast_forward,
+                      color: Colors.white,
+                      size: iconSize,
+                    ),
+                    SizedBox(width: textSize * 0.45),
+                    Text(
+                      _effectiveLongPressFeedbackText,
+                      key: const ValueKey('long-press-speed-feedback-text'),
+                      textScaler: TextScaler.noScaling,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: textSize,
+                        fontWeight: FontWeight.bold,
+                        height: 1.1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        : const SizedBox.shrink(key: ValueKey('long-press-feedback-idle'));
+
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 150),
+          reverseDuration: const Duration(milliseconds: 110),
+          switchInCurve: Curves.easeOutCubic,
+          switchOutCurve: Curves.easeInCubic,
+          transitionBuilder: (child, animation) {
+            final scale = Tween<double>(begin: 0.94, end: 1).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+            );
+            return FadeTransition(
+              opacity: animation,
+              child: ScaleTransition(scale: scale, child: child),
+            );
+          },
+          child: feedback,
+        ),
+      ),
+    );
   }
 
   Widget _buildDoubleTapFeedbackOverlay(double width, double height) {
@@ -1358,7 +1864,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   void _onVerticalDragStart(DragStartDetails details, double width) async {
     if (_shouldBlockPrimaryGestures) return;
     if (widget.isLocked) return; // Prevent global drag if locked
-    if (widget.isLongPressing) return; // 互斥
+    if (_isLongPressActive) return; // 互斥
+    // 恢复键盘焦点，确保手势操作后快捷键仍然可用
+    _requestKeyboardFocus();
 
     final dx = details.localPosition.dx;
     final bool isWindows = !kIsWeb && Platform.isWindows;
@@ -1410,7 +1918,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
   void _onVerticalDragUpdate(DragUpdateDetails details, double height) {
     if (_shouldBlockPrimaryGestures) return;
     if (widget.isLocked) return;
-    if (widget.isLongPressing) return; // 互斥
+    if (_isLongPressActive) return; // 互斥
     if (!_isAdjustingBrightness && !_isAdjustingVolume) return;
 
     // Delta Y is positive when dragging down, negative when dragging up.
@@ -1449,11 +1957,65 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     setState(() {
       _isAdjustingBrightness = false;
       _isAdjustingVolume = false;
-      _showControls = false; // Auto hide controls after adjustment
+      _setShowControls(false); // Auto hide controls after adjustment
     });
 
     // Cancel auto-hide timer since controls are hidden
     _cancelAutoHideTimer();
+  }
+
+  // 鼠标滚轮调节音量（桌面端）
+  Timer? _wheelVolumeHideTimer;
+  void _onPointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (_shouldBlockPrimaryGestures) return;
+    if (widget.isLocked) return;
+    // 恢复键盘焦点，确保滚轮操作后快捷键仍然可用
+    _requestKeyboardFocus();
+
+    final double scrollDelta = event.scrollDelta.dy;
+    debugPrint('[_onPointerSignal] 滚动增量: $scrollDelta');
+    if (scrollDelta == 0) return;
+
+    // 获取播放服务
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+
+    // 从播放服务获取当前音量，确保音量调整的准确性
+    final double currentVolume = playbackService.volume;
+    debugPrint('[_onPointerSignal] 当前音量: $currentVolume');
+
+    // 计算音量变化：向上滚动(scrollDelta < 0)增加音量，向下滚动(scrollDelta > 0)减小音量
+    // 步长设为 0.03 (3%) 使调节平滑
+    final double step = 0.03;
+    final double delta = scrollDelta > 0 ? -step : step;
+
+    final double newVolume = (currentVolume + delta).clamp(0.0, 1.0);
+    debugPrint('[_onPointerSignal] 新音量: $newVolume');
+
+    setState(() {
+      _isAdjustingVolume = true;
+      _currentVolume = newVolume;
+    });
+
+    // 调整播放器音量
+    debugPrint('[_onPointerSignal] 正在设置音量: $_currentVolume');
+    unawaited(playbackService.setVolume(_currentVolume));
+
+    // 启动自动隐藏定时器
+    _startAutoHideTimer();
+
+    // 音量调节视觉反馈延时隐藏
+    _wheelVolumeHideTimer?.cancel();
+    _wheelVolumeHideTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) {
+        setState(() {
+          _isAdjustingVolume = false;
+        });
+      }
+    });
   }
 
   void _handleSmartTap(double width) {
@@ -1462,7 +2024,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     bool isDoubleTap = false;
 
     // Re-request focus on any tap within the player area to restore keyboard shortcuts
-    if (mounted) (widget.focusNode ?? _focusNode).requestFocus();
+    _requestKeyboardFocus();
 
     if (_lastTapTime != null &&
         now.difference(_lastTapTime!) < const Duration(milliseconds: 300)) {
@@ -1484,7 +2046,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     } else {
       // Single Tap Candidate
       // Re-request focus on tap to ensure keyboard shortcuts work
-      if (mounted) _focusNode.requestFocus();
+      _requestKeyboardFocus();
 
       _lastTapTime = now;
       _lastTapDownPosition = _tapPosition;
@@ -1497,7 +2059,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           widget.onClearSelection?.call();
 
           setState(() {
-            _showControls = !_showControls;
+            _setShowControls(!_showControls);
             // _showVolumeSlider = false; // Removed
           });
 
@@ -1517,49 +2079,90 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
     // Use listen: false to avoid rebuilding the entire overlay on every
     // position update (every 300ms during playback). Only the mute icon
     // needs reactive updates, handled by Selector below.
-    final playbackService = Provider.of<MediaPlaybackService>(context, listen: false);
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
     return LayoutBuilder(
       builder: (context, constraints) {
         final width = constraints.maxWidth;
         final height = constraints.maxHeight;
-        final isSmallScreen = width < 600;
+        final safeBottom = MediaQuery.maybeOf(context)?.padding.bottom ?? 0;
+        final controlMetrics = PlayerControlMetrics.fromSize(
+          Size(width, height),
+          safeBottom: safeBottom,
+        );
+        final isSmallScreen = controlMetrics.isCompact;
 
-        // Define sizes based on screen size
-        final double iconSize = isSmallScreen ? 18 : 24;
-        final double bigIconSize = isSmallScreen ? 28 : 32;
-        final double lockIconSize = isSmallScreen ? 20 : 32;
+        // Scale from the player's actual shortest side and available width.
+        final double iconSize = controlMetrics.iconSize;
+        final double bigIconSize = controlMetrics.primaryIconSize;
+        final double sideControlButtonExtent =
+            controlMetrics.sideControlButtonExtent;
+        final double sideControlIconSize = controlMetrics.sideControlIconSize;
         final double topActionIconSize = widget.compactTopRightButtons
-            ? (isSmallScreen ? 14 : 16)
-            : iconSize;
+            ? (20 * controlMetrics.scale).clamp(18.0, 20.0).toDouble()
+            : (24 * controlMetrics.scale).clamp(21.0, 24.0).toDouble();
         final EdgeInsets topActionPadding = widget.compactTopRightButtons
             ? EdgeInsets.zero
-            : const EdgeInsets.all(8);
-        final BoxConstraints topActionConstraints =
-            widget.compactTopRightButtons
-            ? const BoxConstraints(minWidth: 24, minHeight: 24)
-            : const BoxConstraints(minWidth: 40, minHeight: 40);
-        final EdgeInsets aspectChipPadding = widget.compactTopRightButtons
-            ? const EdgeInsets.symmetric(horizontal: 7, vertical: 4)
-            : const EdgeInsets.symmetric(horizontal: 10, vertical: 6);
-        final double aspectChipIconSize = widget.compactTopRightButtons
-            ? 14
-            : 16;
-        final double aspectChipTextSize = widget.compactTopRightButtons
-            ? 11
-            : 12;
-        final double aspectChipSpacing = widget.compactTopRightButtons ? 4 : 6;
-        final double aspectChipRadius = widget.compactTopRightButtons ? 16 : 20;
-        final double resetButtonIconSize = isSmallScreen ? 14 : 16;
-        final double resetButtonFontSize = isSmallScreen ? 11 : 12;
-        final EdgeInsets resetButtonPadding = EdgeInsets.symmetric(
-          horizontal: isSmallScreen ? 10 : 12,
-          vertical: isSmallScreen ? 4 : 6,
+            : EdgeInsets.all(
+                (3 * controlMetrics.scale).clamp(2.0, 3.0).toDouble(),
+              );
+        final double topActionExtent = widget.compactTopRightButtons
+            ? (32 * controlMetrics.scale).clamp(30.0, 32.0).toDouble()
+            : (36 * controlMetrics.scale).clamp(32.0, 36.0).toDouble();
+        final BoxConstraints topActionConstraints = BoxConstraints.tightFor(
+          width: topActionExtent,
+          height: topActionExtent,
         );
-        final double resetButtonRowHeight = isSmallScreen ? 36 : 40;
-
-        final double topBarPadding = isSmallScreen ? 4 : 8;
-        final double bottomBarPadding = isSmallScreen ? 8 : 16;
-        final double bottomBarVerticalPadding = isSmallScreen ? 8 : 24;
+        final ButtonStyle topIconButtonStyle = IconButton.styleFrom(
+          padding: topActionPadding,
+          fixedSize: Size.square(topActionExtent),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        );
+        final EdgeInsets aspectChipPadding = widget.compactTopRightButtons
+            ? EdgeInsets.symmetric(
+                horizontal: (7 * controlMetrics.scale)
+                    .clamp(5.0, 7.0)
+                    .toDouble(),
+                vertical: (4 * controlMetrics.scale).clamp(3.0, 4.0).toDouble(),
+              )
+            : EdgeInsets.symmetric(
+                horizontal: (8 * controlMetrics.scale)
+                    .clamp(6.0, 8.0)
+                    .toDouble(),
+                vertical: (5 * controlMetrics.scale).clamp(3.0, 5.0).toDouble(),
+              );
+        final double aspectChipIconSize = widget.compactTopRightButtons
+            ? (14 * controlMetrics.scale).clamp(12.0, 14.0).toDouble()
+            : (16 * controlMetrics.scale).clamp(13.0, 16.0).toDouble();
+        final double aspectChipTextSize = widget.compactTopRightButtons
+            ? (11 * controlMetrics.scale).clamp(9.5, 11.0).toDouble()
+            : (12 * controlMetrics.scale).clamp(10.0, 12.0).toDouble();
+        final double aspectChipSpacing =
+            ((widget.compactTopRightButtons ? 3 : 4) * controlMetrics.scale)
+                .clamp(2.0, 4.0)
+                .toDouble();
+        final double aspectChipRadius =
+            ((widget.compactTopRightButtons ? 16 : 20) * controlMetrics.scale)
+                .clamp(13.0, 20.0)
+                .toDouble();
+        final double topBarPadding = (8 * controlMetrics.scale)
+            .clamp(4.0, 8.0)
+            .toDouble();
+        final double bottomBarPadding = controlMetrics.bottomHorizontalPadding;
+        final bool hasChapterButton =
+            widget.chapters.isNotEmpty && widget.onOpenChapters != null;
+        final double progressTrackInset = math.max(
+          controlMetrics.overlayRadius,
+          controlMetrics.thumbRadius,
+        );
+        final ButtonStyle bottomIconButtonStyle = IconButton.styleFrom(
+          padding: EdgeInsets.zero,
+          fixedSize: Size.square(controlMetrics.bottomButtonExtent),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          visualDensity: VisualDensity.compact,
+        );
         final settings = Provider.of<SettingsService>(context);
         final bool isLeftHandedMode = settings.isLeftHandedMode;
         final Alignment timeAlignment = isLeftHandedMode
@@ -1572,13 +2175,38 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final bool showLockButton =
             !widget.isPreviewMode &&
             (kIsWeb || !(Platform.isWindows || Platform.isMacOS));
+        final bool showInteractiveDanmakuControls =
+            widget.showDanmakuControls && !widget.isLocked;
+        final bool reserveResetScreenControl =
+            widget.showResetScreenButton &&
+            widget.onResetScreenTransform != null;
+        final bool showResetScreenControl =
+            reserveResetScreenControl && !widget.isLocked;
+        final int visibleSideControlCount =
+            (showResetScreenControl ? 1 : 0) +
+            (showLockButton ? 1 : 0) +
+            (showInteractiveDanmakuControls ? 2 : 0);
+        // Keep the unlocked group's footprint while locked. Centering only the
+        // remaining lock button would otherwise make it jump vertically.
+        final int reservedSideControlCount =
+            (reserveResetScreenControl ? 1 : 0) +
+            (showLockButton ? 1 : 0) +
+            (widget.showDanmakuControls ? 2 : 0);
+        final double reservedSideControlGroupHeight =
+            reservedSideControlCount == 0
+            ? 0
+            : sideControlButtonExtent * reservedSideControlCount +
+                  controlMetrics.sideControlGap *
+                      (reservedSideControlCount - 1);
         final bool hideControlsForGestureSeek =
             _isGestureSeeking && !_showControlsBeforeGestureSeek;
         final double brightnessOverlayAlpha = (1.0 - _currentBrightness)
             .clamp(0.0, 1.0)
             .toDouble();
         final String mediaTitle = widget.mediaTitle.trim();
-        final bool isDesktop = !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+        final bool isDesktop =
+            !kIsWeb &&
+            (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
         final List<Widget> topLeading = [
           if (isDesktop)
             IconButton(
@@ -1592,6 +2220,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                 (widget.onExitPressed ?? widget.onBackPressed)();
               },
               iconSize: iconSize,
+              padding: topActionPadding,
+              constraints: topActionConstraints,
             )
           else
             IconButton(
@@ -1605,12 +2235,15 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                 widget.onBackPressed();
               },
               iconSize: iconSize,
+              padding: topActionPadding,
+              constraints: topActionConstraints,
             ),
         ];
         final List<Widget> topTrailing = [
           if (!widget.isPreviewMode) ...[
             if (widget.onOpenSettings != null)
               IconButton(
+                key: const ValueKey('video-controls-top-settings'),
                 icon: const Icon(Icons.settings, color: Colors.white),
                 tooltip: _tooltipWithShortcut(
                   "设置",
@@ -1626,6 +2259,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
               ),
             if (widget.onOpenSubtitleManager != null)
               IconButton(
+                key: const ValueKey('video-controls-top-subtitle-library'),
                 icon: const Icon(Icons.subtitles, color: Colors.white),
                 tooltip: _tooltipWithShortcut(
                   "字幕库",
@@ -1668,6 +2302,21 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                 onPressed: () {
                   _startAutoHideTimer();
                   widget.onOpenVideoCompose!();
+                },
+                iconSize: topActionIconSize,
+                padding: topActionPadding,
+                constraints: topActionConstraints,
+              ),
+            if (widget.onOpenOcrSubtitle != null)
+              IconButton(
+                icon: const Icon(
+                  Icons.document_scanner_outlined,
+                  color: Colors.white,
+                ),
+                tooltip: 'OCR 字幕',
+                onPressed: () {
+                  _startAutoHideTimer();
+                  widget.onOpenOcrSubtitle!();
                 },
                 iconSize: topActionIconSize,
                 padding: topActionPadding,
@@ -1788,13 +2437,13 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
         ];
 
         Widget focusChild = Focus(
-          focusNode: widget.focusNode ?? _focusNode,
+          focusNode: _effectiveFocusNode,
           autofocus: true,
           descendantsAreFocusable: false, // 禁用子控件焦点，确保键盘事件由 Focus 统一处理
           onKeyEvent: handleKeyEvent,
           child: Stack(
             children: [
-              // 1. Background Gesture Layer (Lowest Z-Order)
+              // 0. Background Gesture Layer (Lowest Z-Order)
               // This layer handles Double Tap (Seek), Single Tap (Toggle Controls), Long Press (Speed), Vertical Drag (Volume/Brightness).
               // It is BEHIND the control buttons, so buttons will intercept touches first.
               Positioned.fill(
@@ -1840,22 +2489,22 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                               _handleZoneLongPressStart(localOffset, width);
                             };
                             instance.onLongPressMoveUpdate = (details) {
-                              if (widget.isLongPressing) return;
+                              if (_isLongPressActive) return;
                               // Center long press seek removed in favor of Horizontal Drag
                             };
                             instance.onLongPressEnd = (details) {
-                              if (widget.isLongPressing) {
+                              if (_isLongPressActive) {
                                 _handleZoneLongPressEnd(details);
                               }
                             };
                             instance.onLongPressCancel = () {
-                              if (widget.isLongPressing) {
+                              if (_isLongPressActive) {
                                 // If gesture is canceled (e.g. system interruption), we must clean up
                                 // But if we use GlobalKey, we hope it persists.
                                 // If it still cancels, we reset. Better safe than stuck.
                                 // Note: LongPressEndDetails is required by _handleZoneLongPressEnd but it only uses it for nothing important (just triggers callback).
                                 // So we can pass a dummy or change the signature.
-                                widget.onLongPressEnd();
+                                _endZoneLongPress();
                               }
                             };
                           },
@@ -1907,7 +2556,8 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                       // Kept here so it participates in the background gesture arena.
                       // Tapping subtitle -> Hits here -> Parent RawGestureDetector handles Tap -> Toggles controls.
                       // Long Press subtitle -> Child SubtitleOverlay handles Long Press -> Drag mode.
-                      if (widget.showSubtitles)
+                      if (widget.showSubtitles &&
+                          !widget.suppressSubtitleOverlay)
                         Positioned.fill(
                           child: SubtitleOverlayGroup(
                             entries: widget.subtitleEntries,
@@ -1924,44 +2574,9 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                       // These are non-interactive visuals driven by state
 
                       // Zone Feedback (Long Press)
-                      if (widget.isLongPressing && _tapPosition != null)
-                        Positioned(
-                          left: _tapPosition!.dx <= width / 2 ? 40 : null,
-                          right: _tapPosition!.dx > width / 2 ? 40 : null,
-                          top: height / 2 - 30,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 8,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.black54,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  widget.isLongPressing
-                                      ? Icons.fast_forward
-                                      : (_tapPosition!.dx < width / 2
-                                            ? Icons.fast_rewind
-                                            : Icons.fast_forward),
-                                  color: Colors.white,
-                                ),
-                                const SizedBox(width: 8),
-                                Text(
-                                  widget.isLongPressing
-                                      ? widget.longPressFeedbackText
-                                      : _doubleTapFeedbackText,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
+                      if (settings.showLongPressSpeedIndicator &&
+                          _tapPosition != null)
+                        _buildLongPressFeedbackOverlay(width, height),
 
                       if (_showDoubleTapFeedback && _tapPosition != null)
                         _buildDoubleTapFeedbackOverlay(width, height),
@@ -1969,7 +2584,7 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                       // Gesture Seek Feedback (Center)
                       if (_isGestureSeeking &&
                           !widget.isLocked &&
-                          !widget.isLongPressing)
+                          !_isLongPressActive)
                         Center(
                           child: Container(
                             padding: const EdgeInsets.symmetric(
@@ -2120,688 +2735,1188 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
               // Volume Slider Overlay (Removed)
               // if (_showVolumeSlider && !widget.isLocked) ...
-
-              // Lock Button
-              if (showLockButton &&
+              if (visibleSideControlCount > 0 &&
                   (widget.isLocked ||
                       (_showControls && !hideControlsForGestureSeek)))
                 Positioned(
-                  left: isLeftHandedMode ? null : (isSmallScreen ? 12 : 20),
-                  right: isLeftHandedMode ? (isSmallScreen ? 12 : 20) : null,
-                  top:
-                      height / 2 -
-                      (lockIconSize / 2 + (isSmallScreen ? 8 : 12)),
-                  child: IconButton(
-                    onPressed: () {
-                      _startAutoHideTimer();
-                      widget.onToggleLock();
-                    },
-                    icon: Icon(
-                      widget.isLocked ? Icons.lock : Icons.lock_open,
-                      color: widget.isLocked
-                          ? Colors.blueAccent
-                          : Colors.white54,
-                      size: lockIconSize,
-                    ),
-                    style: IconButton.styleFrom(
-                      backgroundColor: Colors.black45,
-                      padding: EdgeInsets.all(isSmallScreen ? 8 : 12),
-                    ),
+                  left: isLeftHandedMode
+                      ? null
+                      : controlMetrics.sideControlHorizontalInset,
+                  right: isLeftHandedMode
+                      ? controlMetrics.sideControlHorizontalInset
+                      : null,
+                  top: math
+                      .max(
+                        controlMetrics.sideControlHorizontalInset,
+                        (height - reservedSideControlGroupHeight) / 2,
+                      )
+                      .toDouble(),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (reserveResetScreenControl)
+                        showResetScreenControl
+                            ? _PlayerSideControlButton(
+                                key: const ValueKey('player-side-reset-screen'),
+                                extent: sideControlButtonExtent,
+                                tooltip: '还原屏幕',
+                                onPressed: () {
+                                  widget.onResetScreenTransform?.call();
+                                  _startAutoHideTimer();
+                                },
+                                child: Icon(
+                                  Icons.center_focus_strong,
+                                  color: Colors.white70,
+                                  size: sideControlIconSize,
+                                ),
+                              )
+                            : SizedBox(height: sideControlButtonExtent),
+                      if (reserveResetScreenControl &&
+                          (showLockButton || showInteractiveDanmakuControls))
+                        SizedBox(height: controlMetrics.sideControlGap),
+                      if (showLockButton)
+                        _PlayerSideControlButton(
+                          key: const ValueKey('player-side-lock'),
+                          extent: sideControlButtonExtent,
+                          tooltip: widget.isLocked ? '解锁播放器' : '锁定播放器',
+                          highlighted: widget.isLocked,
+                          onPressed: () {
+                            _startAutoHideTimer();
+                            widget.onToggleLock();
+                          },
+                          child: Icon(
+                            widget.isLocked
+                                ? Icons.lock_rounded
+                                : Icons.lock_open_rounded,
+                            color: widget.isLocked
+                                ? _danmakuControlAccent
+                                : Colors.white70,
+                            size: sideControlIconSize,
+                          ),
+                        ),
+                      if (showLockButton && showInteractiveDanmakuControls)
+                        SizedBox(height: controlMetrics.sideControlGap),
+                      if (showInteractiveDanmakuControls)
+                        _PlayerSideControlButton(
+                          key: const ValueKey('player-side-danmaku-toggle'),
+                          extent: sideControlButtonExtent,
+                          tooltip: widget.danmakuEnabled ? '关闭弹幕' : '打开弹幕',
+                          highlighted: widget.danmakuEnabled,
+                          onPressed: () {
+                            _startAutoHideTimer();
+                            widget.onToggleDanmaku?.call();
+                          },
+                          child: _DanmakuToggleGlyph(
+                            enabled: widget.danmakuEnabled,
+                            size: sideControlIconSize,
+                          ),
+                        ),
+                      if (showInteractiveDanmakuControls)
+                        SizedBox(height: controlMetrics.sideControlGap),
+                      if (showInteractiveDanmakuControls)
+                        _PlayerSideControlButton(
+                          key: const ValueKey('player-side-danmaku-settings'),
+                          extent: sideControlButtonExtent,
+                          tooltip: '弹幕设置',
+                          onPressed: () {
+                            _startAutoHideTimer();
+                            widget.onOpenDanmakuSettings?.call();
+                          },
+                          child: Icon(
+                            Icons.tune_rounded,
+                            color: Colors.white70,
+                            size: sideControlIconSize,
+                          ),
+                        ),
+                    ],
                   ),
                 ),
 
               // 顶部及底部控制区（淡入淡出动画）
               Positioned.fill(
                 child: AnimatedOpacity(
-                  opacity: (_showControls && !widget.isLocked && !hideControlsForGestureSeek) ? 1.0 : 0.0,
+                  opacity:
+                      (_showControls &&
+                          !widget.isLocked &&
+                          !hideControlsForGestureSeek)
+                      ? 1.0
+                      : 0.0,
                   duration: const Duration(milliseconds: 250),
                   curve: Curves.easeInOut,
                   child: IgnorePointer(
-                    ignoring: !(_showControls && !widget.isLocked && !hideControlsForGestureSeek),
+                    ignoring:
+                        !(_showControls &&
+                            !widget.isLocked &&
+                            !hideControlsForGestureSeek),
                     child: Stack(
                       children: [
-                // Top Controls
-                  Positioned(
-                    top: 0,
-                    left: 0,
-                    right: 0,
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.translucent,
-                    onTap: () {
-                      // Reset auto-hide timer when any control is tapped
-                      _startAutoHideTimer();
-                    },
-                    child: Container(
-                      padding: EdgeInsets.symmetric(
-                        horizontal: isSmallScreen ? 8 : 16,
-                        vertical: topBarPadding,
-                      ),
-                      decoration: const BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [Colors.black54, Colors.transparent],
-                        ),
-                      ),
-                      child: Row(
-                        children: [
-                          if (isLeftHandedMode)
-                            ...topTrailing
-                          else
-                            ...topLeading,
-                          if (mediaTitle.isNotEmpty) ...[
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: _buildTopBarTitle(
-                                mediaTitle: mediaTitle,
-                                fontSize: isSmallScreen ? 14 : 16,
-                                alignRight: isLeftHandedMode,
+                        // Top Controls
+                        Positioned(
+                          top: 0,
+                          left: 0,
+                          right: 0,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.translucent,
+                            onTap: () {
+                              // Reset auto-hide timer when any control is tapped
+                              _startAutoHideTimer();
+                            },
+                            child: Container(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: isSmallScreen ? 8 : 16,
+                                vertical: topBarPadding,
+                              ),
+                              decoration: const BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [Colors.black54, Colors.transparent],
+                                ),
+                              ),
+                              child: IconButtonTheme(
+                                data: IconButtonThemeData(
+                                  style: topIconButtonStyle,
+                                ),
+                                child: Row(
+                                  children: [
+                                    if (isLeftHandedMode)
+                                      ...topTrailing
+                                    else
+                                      ...topLeading,
+                                    if (mediaTitle.isNotEmpty) ...[
+                                      SizedBox(
+                                        width: controlMetrics.controlGap,
+                                      ),
+                                      Expanded(
+                                        child: _buildTopBarTitle(
+                                          mediaTitle: mediaTitle,
+                                          fontSize: isSmallScreen ? 14 : 16,
+                                          alignRight: isLeftHandedMode,
+                                        ),
+                                      ),
+                                      SizedBox(
+                                        width: controlMetrics.controlGap,
+                                      ),
+                                    ] else
+                                      const Spacer(),
+                                    if (isLeftHandedMode)
+                                      ...topLeading
+                                    else
+                                      ...topTrailing,
+                                  ],
+                                ),
                               ),
                             ),
-                            const SizedBox(width: 8),
-                          ] else
-                            const Spacer(),
-                          if (isLeftHandedMode)
-                            ...topLeading
-                          else
-                            ...topTrailing,
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-
-                // Bottom Controls (Progress & Time)
-                if (widget.showBottomBar)
-                  Positioned(
-                    bottom: 0,
-                    left: 0,
-                    right: 0,
-                    child: GestureDetector(
-                      onHorizontalDragStart:
-                          (_) {}, // Consume horizontal drag to prevent conflict
-                      onTap: () {
-                        // Reset auto-hide timer when bottom controls are tapped
-                        _startAutoHideTimer();
-                      },
-                      child: Container(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: bottomBarPadding,
-                          vertical: bottomBarVerticalPadding,
-                        ),
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.bottomCenter,
-                            end: Alignment.topCenter,
-                            colors: [Colors.black87, Colors.transparent],
                           ),
                         ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            AnimatedBuilder(
-                              animation: widget.controller,
-                              builder: (context, child) {
-                                final position =
-                                    widget.controller.value.position;
-                                final duration =
-                                    widget.controller.value.duration;
-                                final isInitialized =
-                                    widget.controller.value.isInitialized &&
-                                    duration.inMilliseconds > 0;
 
-                                final currentPosition = _isDraggingProgress
-                                    ? Duration(
-                                        milliseconds: _dragProgressValue
-                                            .toInt(),
-                                      )
-                                    : position;
-
-                                final sliderMax = isInitialized
-                                    ? duration.inMilliseconds.toDouble()
-                                    : 1.0;
-                                final sliderValue = isInitialized
-                                    ? currentPosition.inMilliseconds
-                                          .toDouble()
-                                          .clamp(0.0, sliderMax)
-                                    : 0.0;
-
-                                return Column(
+                        // Bottom Controls (Progress & Time)
+                        if (widget.showBottomBar)
+                          Positioned(
+                            bottom: 0,
+                            left: 0,
+                            right: 0,
+                            child: GestureDetector(
+                              onHorizontalDragStart:
+                                  (
+                                    _,
+                                  ) {}, // Consume horizontal drag to prevent conflict
+                              onTap: () {
+                                // Reset auto-hide timer when bottom controls are tapped
+                                _startAutoHideTimer();
+                              },
+                              child: Container(
+                                key: const ValueKey(
+                                  'video-controls-bottom-panel',
+                                ),
+                                padding: EdgeInsets.fromLTRB(
+                                  bottomBarPadding,
+                                  0,
+                                  bottomBarPadding,
+                                  controlMetrics.bottomPadding,
+                                ),
+                                decoration: const BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.bottomCenter,
+                                    end: Alignment.topCenter,
+                                    colors: [
+                                      Colors.black87,
+                                      Colors.transparent,
+                                    ],
+                                  ),
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    // 进度条区域（RepaintBoundary 隔离重绘，避免每帧重绘底部控制栏）
-                                    RepaintBoundary(
-                                    child: LayoutBuilder(
-                                      builder: (context, sliderConstraints) {
-                                        return Stack(
-                                          clipBehavior: Clip.none,
-                                          alignment: Alignment.bottomLeft,
-                                          children: [
-                                            // Seek Preview Overlay
-                                            if (_isDraggingProgress &&
-                                                _previewImage != null)
-                                              Positioned(
-                                                left: () {
-                                                  final double width =
-                                                      sliderConstraints
-                                                          .maxWidth;
-                                                  final double pct =
-                                                      sliderMax > 0
-                                                      ? sliderValue / sliderMax
-                                                      : 0;
-                                                  // Center the 160px preview on the thumb
-                                                  double left =
-                                                      (width * pct) - 80;
-                                                  // Clamp to edges
-                                                  if (left < 0) left = 0;
-                                                  if (left + 160 > width) {
-                                                    left = width - 160;
-                                                  }
-                                                  return left;
-                                                }(),
-                                                bottom: 40,
-                                                child: Column(
-                                                  mainAxisSize:
-                                                      MainAxisSize.min,
-                                                  children: [
-                                                    Container(
-                                                      width: 160,
-                                                      height: 90,
-                                                      decoration: BoxDecoration(
-                                                        color: Colors.black,
-                                                        border: Border.all(
-                                                          color: Colors.white70,
-                                                          width: 1.5,
-                                                        ),
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                              8,
-                                                            ),
-                                                        boxShadow: const [
-                                                          BoxShadow(
-                                                            color:
-                                                                Colors.black45,
-                                                            blurRadius: 4,
-                                                          ),
-                                                        ],
-                                                      ),
-                                                      child: ClipRRect(
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                              6,
-                                                            ),
-                                                        child: Image.memory(
-                                                          _previewImage!,
-                                                          fit: BoxFit.cover,
-                                                          gaplessPlayback: true,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    const SizedBox(height: 4),
-                                                    Container(
-                                                      padding:
-                                                          const EdgeInsets.symmetric(
-                                                            horizontal: 6,
-                                                            vertical: 2,
-                                                          ),
-                                                      decoration: BoxDecoration(
-                                                        color: Colors.black54,
-                                                        borderRadius:
-                                                            BorderRadius.circular(
-                                                              4,
-                                                            ),
-                                                      ),
-                                                      child: Text(
-                                                        _formatDuration(
-                                                          Duration(
-                                                            milliseconds:
-                                                                sliderValue
-                                                                    .toInt(),
-                                                          ),
-                                                        ),
-                                                        style: const TextStyle(
-                                                          color: Colors.white,
-                                                          fontSize: 12,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-                                              ),
+                                    AnimatedBuilder(
+                                      animation: widget.controller,
+                                      builder: (context, child) {
+                                        final position =
+                                            widget.controller.value.position;
+                                        final duration =
+                                            widget.controller.value.duration;
+                                        final isInitialized =
+                                            widget
+                                                .controller
+                                                .value
+                                                .isInitialized &&
+                                            duration.inMilliseconds > 0;
 
-                                            Listener(
-                                              behavior:
-                                                  HitTestBehavior.translucent,
-                                              onPointerMove: (event) {
-                                                if (!_isDraggingProgress ||
-                                                    widget.isLocked) {
-                                                  return;
-                                                }
-                                                final isInCancelArea =
-                                                    _isInCancelArea(
-                                                      event.position,
-                                                    );
-                                                if (isInCancelArea !=
-                                                    _isProgressDragCanceling) {
-                                                  setState(() {
-                                                    _isProgressDragCanceling =
-                                                        isInCancelArea;
-                                                  });
-                                                }
-                                              },
-                                              onPointerCancel: (event) {
-                                                if (!_isDraggingProgress) {
-                                                  return;
-                                                }
-                                                VideoPreviewService()
-                                                    .markInteractionEnded();
-                                                _cancelSeekPreviewRefine();
-                                                _resetSeekPreviewRequestState();
-                                                setState(() {
-                                                  _isDraggingProgress = false;
-                                                  _previewImage = null;
-                                                  _isProgressDragCanceling =
-                                                      false;
-                                                });
-                                              },
-                                              child: SizedBox(
-                                                height:
-                                                    40, // Ensure enough height for hit testing
-                                                child: SliderTheme(
-                                                  data: SliderTheme.of(context).copyWith(
-                                                    activeTrackColor:
-                                                        _isProgressDragCanceling
-                                                        ? Colors.grey
-                                                        : const Color(
-                                                            0xFF0D47A1,
-                                                          ),
-                                                    inactiveTrackColor:
-                                                        Colors.white24,
-                                                    thumbColor: isInitialized
-                                                        ? (_isProgressDragCanceling
-                                                              ? Colors.grey
-                                                              : const Color(
-                                                                  0xFF1565C0,
-                                                                ))
-                                                        : Colors.grey,
-                                                    overlayColor: const Color(
-                                                      0x291565C0,
+                                        final currentPosition =
+                                            _isDraggingProgress
+                                            ? Duration(
+                                                milliseconds: _dragProgressValue
+                                                    .toInt(),
+                                              )
+                                            : position;
+
+                                        final sliderMax = isInitialized
+                                            ? duration.inMilliseconds.toDouble()
+                                            : 1.0;
+                                        final sliderValue = isInitialized
+                                            ? currentPosition.inMilliseconds
+                                                  .toDouble()
+                                                  .clamp(0.0, sliderMax)
+                                            : 0.0;
+
+                                        return RepaintBoundary(
+                                          // 进度条区域（RepaintBoundary 隔离重绘，避免每帧重绘底部控制栏）
+                                          child: LayoutBuilder(
+                                            builder: (context, sliderConstraints) {
+                                              final progressTextDirection =
+                                                  Directionality.of(context);
+                                              final trackInset =
+                                                  progressTrackInset;
+                                              final interactionPreviewValue =
+                                                  _activeSeekPreviewValue
+                                                      ?.clamp(0.0, sliderMax);
+                                              return Stack(
+                                                clipBehavior: Clip.none,
+                                                alignment: Alignment.bottomLeft,
+                                                children: [
+                                                  if (interactionPreviewValue !=
+                                                      null)
+                                                    _buildSeekPreviewOverlay(
+                                                      progressWidth:
+                                                          sliderConstraints
+                                                              .maxWidth,
+                                                      sliderMax: sliderMax,
+                                                      previewValue:
+                                                          interactionPreviewValue,
+                                                      trackInset: trackInset,
+                                                      textDirection:
+                                                          progressTextDirection,
+                                                      bottom:
+                                                          controlMetrics
+                                                              .progressAreaHeight(
+                                                                hasChapterButton:
+                                                                    hasChapterButton,
+                                                              ) +
+                                                          6,
+                                                      showThumbnail: settings
+                                                          .enableSeekPreview,
                                                     ),
-                                                    thumbShape:
-                                                        RoundSliderThumbShape(
-                                                          enabledThumbRadius:
-                                                              isSmallScreen
-                                                              ? 4.0
-                                                              : 6.0,
-                                                        ),
-                                                    trackHeight: isSmallScreen
-                                                        ? 2.0
-                                                        : 4.0,
-                                                    overlayShape:
-                                                        const RoundSliderOverlayShape(
-                                                          overlayRadius: 10,
-                                                        ), // Reduced overlay to fit
-                                                  ),
-                                                  child: Slider(
-                                                    min: 0.0,
-                                                    max: sliderMax,
-                                                    value: sliderValue,
-                                                    onChangeStart: isInitialized
-                                                        ? (newValue) {
-                                                            setState(() {
-                                                              _isDraggingProgress =
-                                                                  true;
-                                                              _dragProgressValue =
-                                                                  newValue;
-                                                            });
-                                                            _scheduleLiveSeekPreview(
-                                                              newValue,
-                                                              immediate: true,
+
+                                                  if (hasChapterButton)
+                                                    Positioned(
+                                                      left: trackInset,
+                                                      bottom: controlMetrics
+                                                          .chapterButtonBottom,
+                                                      child: AnimatedBuilder(
+                                                        animation:
+                                                            widget.controller,
+                                                        builder: (context, _) {
+                                                          final chapter =
+                                                              MediaChapter.atPosition(
+                                                                widget.chapters,
+                                                                currentPosition,
+                                                              ) ??
+                                                              widget
+                                                                  .chapters
+                                                                  .first;
+                                                          final chapterTextStyle =
+                                                              DefaultTextStyle.of(
+                                                                context,
+                                                              ).style.merge(
+                                                                TextStyle(
+                                                                  color: Colors
+                                                                      .white,
+                                                                  fontSize:
+                                                                      (13 *
+                                                                              controlMetrics.scale)
+                                                                          .clamp(
+                                                                            10.0,
+                                                                            13.0,
+                                                                          ),
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w600,
+                                                                ),
+                                                              );
+                                                          final chapterIconSize =
+                                                              (18 *
+                                                                      controlMetrics
+                                                                          .scale)
+                                                                  .clamp(
+                                                                    16.0,
+                                                                    18.0,
+                                                                  )
+                                                                  .toDouble();
+                                                          final chapterContentGap =
+                                                              (5 *
+                                                                      controlMetrics
+                                                                          .scale)
+                                                                  .clamp(
+                                                                    3.0,
+                                                                    5.0,
+                                                                  )
+                                                                  .toDouble();
+                                                          final chapterHorizontalPadding =
+                                                              (12 *
+                                                                      controlMetrics
+                                                                          .scale)
+                                                                  .clamp(
+                                                                    9.0,
+                                                                    12.0,
+                                                                  )
+                                                                  .toDouble();
+                                                          final chapterButtonMaxWidth =
+                                                              (sliderConstraints
+                                                                      .maxWidth -
+                                                                  (trackInset *
+                                                                      2)) *
+                                                              controlMetrics
+                                                                  .chapterButtonWidthFactor;
+                                                          final chapterFixedWidth =
+                                                              (chapterHorizontalPadding *
+                                                                  2) +
+                                                              chapterContentGap +
+                                                              chapterIconSize;
+                                                          final chapterTextMeasurementSlack =
+                                                              (4 *
+                                                                      controlMetrics
+                                                                          .scale)
+                                                                  .clamp(
+                                                                    3.0,
+                                                                    4.0,
+                                                                  )
+                                                                  .toDouble();
+                                                          final chapterTextPainter = TextPainter(
+                                                            text: TextSpan(
+                                                              text:
+                                                                  chapter.title,
+                                                              style:
+                                                                  chapterTextStyle,
+                                                            ),
+                                                            maxLines: 1,
+                                                            textDirection:
+                                                                progressTextDirection,
+                                                            textScaler:
+                                                                MediaQuery.textScalerOf(
+                                                                  context,
+                                                                ),
+                                                            locale:
+                                                                Localizations.maybeLocaleOf(
+                                                                  context,
+                                                                ),
+                                                            textWidthBasis:
+                                                                TextWidthBasis
+                                                                    .longestLine,
+                                                          )..layout();
+                                                          final chapterButtonWidth = math.min(
+                                                            chapterButtonMaxWidth,
+                                                            chapterFixedWidth +
+                                                                chapterTextPainter
+                                                                    .width +
+                                                                chapterTextMeasurementSlack,
+                                                          );
+                                                          return Tooltip(
+                                                            message:
+                                                                chapter.title,
+                                                            child: Material(
+                                                              key: const ValueKey(
+                                                                'video-controls-chapter-button',
+                                                              ),
+                                                              color:
+                                                                  const Color(
+                                                                    0xD9222222,
+                                                                  ),
+                                                              elevation: 2,
+                                                              shadowColor: Colors
+                                                                  .black
+                                                                  .withValues(
+                                                                    alpha: 0.5,
+                                                                  ),
+                                                              shape: RoundedRectangleBorder(
+                                                                borderRadius:
+                                                                    BorderRadius.circular(
+                                                                      controlMetrics
+                                                                              .chapterButtonHeight /
+                                                                          2,
+                                                                    ),
+                                                                side: BorderSide(
+                                                                  color: Colors
+                                                                      .white
+                                                                      .withValues(
+                                                                        alpha:
+                                                                            0.16,
+                                                                      ),
+                                                                  width: 0.75,
+                                                                ),
+                                                              ),
+                                                              clipBehavior: Clip
+                                                                  .antiAlias,
+                                                              child: InkWell(
+                                                                onTap: () {
+                                                                  _startAutoHideTimer();
+                                                                  widget
+                                                                      .onOpenChapters!();
+                                                                },
+                                                                child: SizedBox(
+                                                                  width:
+                                                                      chapterButtonWidth,
+                                                                  height: controlMetrics
+                                                                      .chapterButtonHeight,
+                                                                  child: Padding(
+                                                                    padding: EdgeInsets.symmetric(
+                                                                      horizontal:
+                                                                          chapterHorizontalPadding,
+                                                                    ),
+                                                                    child: Row(
+                                                                      mainAxisSize:
+                                                                          MainAxisSize
+                                                                              .min,
+                                                                      children: [
+                                                                        Expanded(
+                                                                          child: AnimatedSwitcher(
+                                                                            key: const ValueKey(
+                                                                              'video-controls-chapter-title',
+                                                                            ),
+                                                                            duration: const Duration(
+                                                                              milliseconds: 140,
+                                                                            ),
+                                                                            switchInCurve:
+                                                                                Curves.easeOutCubic,
+                                                                            switchOutCurve:
+                                                                                Curves.easeInCubic,
+                                                                            layoutBuilder:
+                                                                                (
+                                                                                  currentChild,
+                                                                                  previousChildren,
+                                                                                ) => Stack(
+                                                                                  alignment: AlignmentDirectional.centerStart,
+                                                                                  children: [
+                                                                                    ...previousChildren,
+                                                                                    ?currentChild,
+                                                                                  ],
+                                                                                ),
+                                                                            transitionBuilder:
+                                                                                (
+                                                                                  child,
+                                                                                  animation,
+                                                                                ) => FadeTransition(
+                                                                                  opacity: animation,
+                                                                                  child: SlideTransition(
+                                                                                    position:
+                                                                                        Tween<
+                                                                                              Offset
+                                                                                            >(
+                                                                                              begin: const Offset(
+                                                                                                0.035,
+                                                                                                0,
+                                                                                              ),
+                                                                                              end: Offset.zero,
+                                                                                            )
+                                                                                            .animate(
+                                                                                              animation,
+                                                                                            ),
+                                                                                    child: child,
+                                                                                  ),
+                                                                                ),
+                                                                            child: Text(
+                                                                              chapter.title,
+                                                                              key:
+                                                                                  ValueKey<
+                                                                                    int
+                                                                                  >(
+                                                                                    chapter.startMs,
+                                                                                  ),
+                                                                              maxLines: 1,
+                                                                              overflow: TextOverflow.ellipsis,
+                                                                              textAlign: TextAlign.start,
+                                                                              style: chapterTextStyle,
+                                                                            ),
+                                                                          ),
+                                                                        ),
+                                                                        SizedBox(
+                                                                          width:
+                                                                              chapterContentGap,
+                                                                        ),
+                                                                        Icon(
+                                                                          widget.isChapterSidebarVisible
+                                                                              ? Icons.keyboard_arrow_down
+                                                                              : Icons.chevron_right,
+                                                                          color:
+                                                                              Colors.white,
+                                                                          size:
+                                                                              chapterIconSize,
+                                                                        ),
+                                                                      ],
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          );
+                                                        },
+                                                      ),
+                                                    ),
+
+                                                  Listener(
+                                                    key: const ValueKey(
+                                                      'video-controls-progress-interaction',
+                                                    ),
+                                                    behavior: HitTestBehavior
+                                                        .translucent,
+                                                    onPointerDown:
+                                                        isDesktop &&
+                                                            isInitialized
+                                                        ? (event) {
+                                                            final progressAreaHeight =
+                                                                controlMetrics
+                                                                    .progressAreaHeight(
+                                                                      hasChapterButton:
+                                                                          hasChapterButton,
+                                                                    );
+                                                            final progressBandTop =
+                                                                progressAreaHeight -
+                                                                controlMetrics
+                                                                    .progressHitHeight;
+                                                            final isPrimaryMouse =
+                                                                event.kind ==
+                                                                    PointerDeviceKind
+                                                                        .mouse &&
+                                                                (event.buttons &
+                                                                        kPrimaryMouseButton) !=
+                                                                    0;
+                                                            if (!isPrimaryMouse ||
+                                                                event
+                                                                        .localPosition
+                                                                        .dy <
+                                                                    progressBandTop) {
+                                                              return;
+                                                            }
+                                                            _desktopProgressPointer =
+                                                                event.pointer;
+                                                            _beginProgressDrag(
+                                                              progressValueFromLocalDx(
+                                                                localDx: event
+                                                                    .localPosition
+                                                                    .dx,
+                                                                width:
+                                                                    sliderConstraints
+                                                                        .maxWidth,
+                                                                maxValue:
+                                                                    sliderMax,
+                                                                trackInset:
+                                                                    trackInset,
+                                                                textDirection:
+                                                                    progressTextDirection,
+                                                              ),
                                                             );
-                                                            _schedulePreciseSeekPreview(
-                                                              newValue,
-                                                            );
-                                                            _startAutoHideTimer();
                                                           }
                                                         : null,
-                                                    onChanged: isInitialized
-                                                        ? (newValue) {
-                                                            setState(() {
-                                                              _isDraggingProgress =
-                                                                  true;
-                                                              _dragProgressValue =
-                                                                  newValue;
-                                                            });
-                                                            _scheduleLiveSeekPreview(
-                                                              newValue,
-                                                            );
-                                                            _schedulePreciseSeekPreview(
-                                                              newValue,
-                                                            );
-                                                            // Reset auto-hide timer while dragging
-                                                            _startAutoHideTimer();
-                                                          }
-                                                        : null,
-                                                    onChangeEnd: (newValue) {
-                                                      VideoPreviewService()
-                                                          .markInteractionEnded();
-                                                      _cancelSeekPreviewRefine();
-                                                      _resetSeekPreviewRequestState();
-                                                      if (!_isProgressDragCanceling) {
-                                                        _seekTo(
-                                                          Duration(
-                                                            milliseconds:
-                                                                newValue
-                                                                    .toInt(),
+                                                    onPointerMove: (event) {
+                                                      if (_desktopProgressPointer ==
+                                                          event.pointer) {
+                                                        _updateProgressDrag(
+                                                          progressValueFromLocalDx(
+                                                            localDx: event
+                                                                .localPosition
+                                                                .dx,
+                                                            width:
+                                                                sliderConstraints
+                                                                    .maxWidth,
+                                                            maxValue: sliderMax,
+                                                            trackInset:
+                                                                trackInset,
+                                                            textDirection:
+                                                                progressTextDirection,
                                                           ),
                                                         );
                                                       }
-                                                      setState(() {
-                                                        _previewRequestSerial++;
-                                                        _isDraggingProgress =
-                                                            false;
-                                                        _previewImage = null;
-                                                        _isProgressDragCanceling =
-                                                            false;
-                                                      });
-                                                      // Reset auto-hide timer after seeking
-                                                      _startAutoHideTimer();
+                                                      if (!_isDraggingProgress ||
+                                                          widget.isLocked) {
+                                                        return;
+                                                      }
+                                                      final isInCancelArea =
+                                                          _isInCancelArea(
+                                                            event.position,
+                                                          );
+                                                      if (isInCancelArea !=
+                                                          _isProgressDragCanceling) {
+                                                        setState(() {
+                                                          _isProgressDragCanceling =
+                                                              isInCancelArea;
+                                                        });
+                                                      }
                                                     },
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                          ],
-                                        );
-                                      },
-                                    ),
-                                    ), // 进度条 RepaintBoundary 结束
-                                    // 底部控制栏（RepaintBoundary 隔离重绘）
-                                    RepaintBoundary(
-                                      child: SizedBox(
-                                      height:
-                                          bigIconSize * 1.5, // Adaptive height
-                                      child: Stack(
-                                        children: [
-                                          // Left: Time and Episode Picker
-                                          Align(
-                                            alignment: timeAlignment,
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                Text(
-                                                  "${_formatDuration(currentPosition)} / ${_formatDuration(duration)}",
-                                                  style: TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: isSmallScreen
-                                                        ? 10
-                                                        : 12,
-                                                  ),
-                                                ),
-                                                if (widget
-                                                        .onToggleEpisodePicker !=
-                                                    null) ...[
-                                                  const SizedBox(width: 8),
-                                                  Tooltip(
-                                                    message: _tooltipWithShortcut(
-                                                      "选集",
-                                                      DesktopPlayerShortcutAction
-                                                          .toggleEpisodePicker,
-                                                    ),
-                                                    child: TextButton.icon(
-                                                      onPressed: () {
-                                                        _startAutoHideTimer();
-                                                        widget
-                                                            .onToggleEpisodePicker
-                                                            ?.call();
-                                                      },
-                                                      style: TextButton.styleFrom(
-                                                        foregroundColor:
-                                                            Colors.white,
-                                                        padding:
-                                                            const EdgeInsets.symmetric(
-                                                              horizontal: 8,
-                                                              vertical: 2,
-                                                            ),
-                                                        minimumSize: const Size(
-                                                          0,
-                                                          32,
-                                                        ),
-                                                        tapTargetSize:
-                                                            MaterialTapTargetSize
-                                                                .shrinkWrap,
-                                                      ),
-                                                      icon: const Icon(
-                                                        Icons.playlist_play,
-                                                        size: 18,
-                                                      ),
-                                                      label: const Text(
-                                                        "选集",
-                                                        style: TextStyle(
-                                                          fontWeight:
-                                                              FontWeight.bold,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ],
-                                            ),
-                                          ),
-
-                                          // Center: Play Controls (Play/Pause, Seek)
-                                          if (widget.showPlayControls)
-                                            Align(
-                                              alignment: Alignment.center,
-                                              child: Row(
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  // Previous Episode
-                                                  if (widget.onPlayPrevious !=
-                                                      null) ...[
-                                                    IconButton(
-                                                      iconSize: bigIconSize,
-                                                      icon: Icon(
-                                                        Icons.skip_previous,
-                                                        color:
-                                                            widget.hasPrevious
-                                                            ? Colors.white
-                                                            : Colors.white38,
-                                                      ),
-                                                      onPressed:
-                                                          widget.hasPrevious
-                                                          ? () {
-                                                              _startAutoHideTimer();
-                                                              widget
-                                                                  .onPlayPrevious!();
-                                                            }
-                                                          : null,
-                                                      tooltip: _tooltipWithShortcut(
-                                                        "上一集",
-                                                        DesktopPlayerShortcutAction
-                                                            .previousEpisode,
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 8),
-                                                  ],
-
-                                                  // Seek Backward Button with Dynamic Number
-                                                  Tooltip(
-                                                    message: _tooltipWithShortcut(
-                                                      "快退 ${widget.doubleTapSeekSeconds} 秒",
-                                                      DesktopPlayerShortcutAction
-                                                          .seekBackward,
-                                                    ),
-                                                    child: InkWell(
-                                                      onTap: () {
-                                                        if (!widget
-                                                            .controller
-                                                            .value
-                                                            .isInitialized) {
-                                                          return;
+                                                    onPointerUp: (event) {
+                                                      if (_desktopProgressPointer !=
+                                                          event.pointer) {
+                                                        return;
+                                                      }
+                                                      final value =
+                                                          progressValueFromLocalDx(
+                                                            localDx: event
+                                                                .localPosition
+                                                                .dx,
+                                                            width:
+                                                                sliderConstraints
+                                                                    .maxWidth,
+                                                            maxValue: sliderMax,
+                                                            trackInset:
+                                                                trackInset,
+                                                            textDirection:
+                                                                progressTextDirection,
+                                                          );
+                                                      _updateProgressDrag(
+                                                        value,
+                                                      );
+                                                      _finishProgressDrag(
+                                                        value,
+                                                      );
+                                                      final pointer =
+                                                          event.pointer;
+                                                      scheduleMicrotask(() {
+                                                        if (_desktopProgressPointer ==
+                                                            pointer) {
+                                                          _desktopProgressPointer =
+                                                              null;
                                                         }
-                                                        _startAutoHideTimer();
-                                                        final newPos =
-                                                            widget
-                                                                .controller
-                                                                .value
-                                                                .position -
-                                                            Duration(
-                                                              seconds: widget
-                                                                  .doubleTapSeekSeconds,
-                                                            );
-                                                        _seekTo(
-                                                          newPos < Duration.zero
-                                                              ? Duration.zero
-                                                              : newPos,
-                                                        );
-                                                      },
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            20,
+                                                      });
+                                                    },
+                                                    onPointerCancel: (event) {
+                                                      if (_desktopProgressPointer !=
+                                                              null &&
+                                                          _desktopProgressPointer !=
+                                                              event.pointer) {
+                                                        return;
+                                                      }
+                                                      _cancelProgressDrag();
+                                                      final pointer =
+                                                          event.pointer;
+                                                      scheduleMicrotask(() {
+                                                        if (_desktopProgressPointer ==
+                                                            pointer) {
+                                                          _desktopProgressPointer =
+                                                              null;
+                                                        }
+                                                      });
+                                                    },
+                                                    child: SizedBox(
+                                                      key: const ValueKey(
+                                                        'video-controls-progress-area',
+                                                      ),
+                                                      height: controlMetrics
+                                                          .progressAreaHeight(
+                                                            hasChapterButton:
+                                                                hasChapterButton,
                                                           ),
-                                                      child: SizedBox(
-                                                        width: bigIconSize + 8,
-                                                        height: bigIconSize + 8,
-                                                        child: Stack(
-                                                          alignment:
-                                                              Alignment.center,
-                                                          children: [
-                                                            Icon(
-                                                              Icons.replay,
-                                                              color:
-                                                                  widget
-                                                                      .controller
-                                                                      .value
-                                                                      .isInitialized
-                                                                  ? Colors.white
-                                                                  : Colors
-                                                                        .white38,
-                                                              size:
-                                                                  bigIconSize *
-                                                                  0.75,
+                                                      child: Align(
+                                                        alignment: Alignment
+                                                            .bottomCenter,
+                                                        child: SizedBox(
+                                                          height: controlMetrics
+                                                              .progressHitHeight,
+                                                          child: MouseRegion(
+                                                            key: const ValueKey(
+                                                              'video-controls-progress-hover-region',
                                                             ),
-                                                            Text(
-                                                              "${widget.doubleTapSeekSeconds}",
-                                                              style: TextStyle(
-                                                                color:
-                                                                    widget
-                                                                        .controller
-                                                                        .value
-                                                                        .isInitialized
-                                                                    ? Colors
-                                                                          .white
-                                                                    : Colors
-                                                                          .white38,
-                                                                fontSize: 8,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .bold,
+                                                            cursor:
+                                                                isInitialized
+                                                                ? SystemMouseCursors
+                                                                      .precise
+                                                                : MouseCursor
+                                                                      .defer,
+                                                            onEnter:
+                                                                isDesktop &&
+                                                                    isInitialized
+                                                                ? (
+                                                                    event,
+                                                                  ) => _updateProgressHover(
+                                                                    localDx: event
+                                                                        .localPosition
+                                                                        .dx,
+                                                                    width: sliderConstraints
+                                                                        .maxWidth,
+                                                                    sliderMax:
+                                                                        sliderMax,
+                                                                    trackInset:
+                                                                        trackInset,
+                                                                    textDirection:
+                                                                        progressTextDirection,
+                                                                  )
+                                                                : null,
+                                                            onHover:
+                                                                isDesktop &&
+                                                                    isInitialized
+                                                                ? (
+                                                                    event,
+                                                                  ) => _updateProgressHover(
+                                                                    localDx: event
+                                                                        .localPosition
+                                                                        .dx,
+                                                                    width: sliderConstraints
+                                                                        .maxWidth,
+                                                                    sliderMax:
+                                                                        sliderMax,
+                                                                    trackInset:
+                                                                        trackInset,
+                                                                    textDirection:
+                                                                        progressTextDirection,
+                                                                  )
+                                                                : null,
+                                                            onExit: isDesktop
+                                                                ? (_) =>
+                                                                      _endProgressHover()
+                                                                : null,
+                                                            child: TweenAnimationBuilder<double>(
+                                                              tween: Tween<double>(
+                                                                end:
+                                                                    _isDraggingProgress
+                                                                    ? 1
+                                                                    : (_isProgressHovered
+                                                                          ? 0.62
+                                                                          : 0),
+                                                              ),
+                                                              duration:
+                                                                  const Duration(
+                                                                    milliseconds:
+                                                                        135,
+                                                                  ),
+                                                              curve: Curves
+                                                                  .easeOutCubic,
+                                                              builder:
+                                                                  (
+                                                                    context,
+                                                                    interaction,
+                                                                    child,
+                                                                  ) => SliderTheme(
+                                                                    data: SliderTheme.of(context).copyWith(
+                                                                      activeTrackColor:
+                                                                          _isProgressDragCanceling
+                                                                          ? Colors.grey
+                                                                          : Color.lerp(
+                                                                              const Color(
+                                                                                0xFF0D47A1,
+                                                                              ),
+                                                                              const Color(
+                                                                                0xFF2196F3,
+                                                                              ),
+                                                                              interaction,
+                                                                            ),
+                                                                      inactiveTrackColor: Colors.white.withValues(
+                                                                        alpha:
+                                                                            0.24 +
+                                                                            (interaction *
+                                                                                0.12),
+                                                                      ),
+                                                                      thumbColor:
+                                                                          isInitialized
+                                                                          ? (_isProgressDragCanceling
+                                                                                ? Colors.grey
+                                                                                : Color.lerp(
+                                                                                    const Color(
+                                                                                      0xFF1565C0,
+                                                                                    ),
+                                                                                    const Color(
+                                                                                      0xFF42A5F5,
+                                                                                    ),
+                                                                                    interaction,
+                                                                                  ))
+                                                                          : Colors.grey,
+                                                                      overlayColor:
+                                                                          const Color(
+                                                                            0xFF2196F3,
+                                                                          ).withValues(
+                                                                            alpha:
+                                                                                0.10 +
+                                                                                (interaction *
+                                                                                    0.08),
+                                                                          ),
+                                                                      thumbShape: RoundSliderThumbShape(
+                                                                        enabledThumbRadius:
+                                                                            controlMetrics.thumbRadius *
+                                                                            (1 +
+                                                                                (interaction *
+                                                                                    0.38)),
+                                                                      ),
+                                                                      trackHeight:
+                                                                          controlMetrics
+                                                                              .trackHeight *
+                                                                          (1 +
+                                                                              (interaction *
+                                                                                  0.65)),
+                                                                      trackShape:
+                                                                          widget.chapters.length >
+                                                                              1
+                                                                          ? ChapterSliderTrackShape(
+                                                                              chapters: widget.chapters,
+                                                                              durationMs: duration.inMilliseconds,
+                                                                            )
+                                                                          : const RoundedRectSliderTrackShape(),
+                                                                      overlayShape: RoundSliderOverlayShape(
+                                                                        overlayRadius:
+                                                                            controlMetrics.overlayRadius *
+                                                                            (1 +
+                                                                                (interaction *
+                                                                                    0.18)),
+                                                                      ),
+                                                                    ),
+                                                                    child:
+                                                                        child!,
+                                                                  ),
+                                                              child: Slider(
+                                                                min: 0.0,
+                                                                max: sliderMax,
+                                                                value:
+                                                                    sliderValue,
+                                                                onChangeStart:
+                                                                    isInitialized
+                                                                    ? (value) {
+                                                                        if (_desktopProgressPointer !=
+                                                                            null) {
+                                                                          return;
+                                                                        }
+                                                                        _beginProgressDrag(
+                                                                          value,
+                                                                        );
+                                                                      }
+                                                                    : null,
+                                                                onChanged:
+                                                                    isInitialized
+                                                                    ? (value) {
+                                                                        if (_desktopProgressPointer !=
+                                                                            null) {
+                                                                          return;
+                                                                        }
+                                                                        _updateProgressDrag(
+                                                                          value,
+                                                                        );
+                                                                      }
+                                                                    : null,
+                                                                onChangeEnd: (value) {
+                                                                  if (_desktopProgressPointer !=
+                                                                      null) {
+                                                                    return;
+                                                                  }
+                                                                  _finishProgressDrag(
+                                                                    value,
+                                                                  );
+                                                                },
                                                               ),
                                                             ),
-                                                          ],
+                                                          ),
                                                         ),
                                                       ),
                                                     ),
                                                   ),
-                                                  const SizedBox(width: 8),
-                                                  IconButton(
-                                                    iconSize: bigIconSize,
-                                                    icon: Icon(
-                                                      widget
-                                                              .controller
-                                                              .value
-                                                              .isPlaying
-                                                          ? Icons
-                                                                .pause_circle_filled
-                                                          : Icons
-                                                                .play_circle_fill,
-                                                      color:
-                                                          widget
-                                                              .controller
-                                                              .value
-                                                              .isInitialized
-                                                          ? Colors.white
-                                                          : Colors.white38,
+                                                  if (!_isDraggingProgress &&
+                                                      interactionPreviewValue !=
+                                                          null)
+                                                    Positioned(
+                                                      left:
+                                                          progressLocalDxFromValue(
+                                                            value:
+                                                                interactionPreviewValue,
+                                                            width:
+                                                                sliderConstraints
+                                                                    .maxWidth,
+                                                            maxValue: sliderMax,
+                                                            trackInset:
+                                                                trackInset,
+                                                            textDirection:
+                                                                progressTextDirection,
+                                                          ) -
+                                                          ((controlMetrics
+                                                                      .thumbRadius *
+                                                                  1.45) /
+                                                              2),
+                                                      bottom:
+                                                          (controlMetrics
+                                                                  .progressHitHeight -
+                                                              (controlMetrics
+                                                                      .thumbRadius *
+                                                                  1.45)) /
+                                                          2,
+                                                      child: IgnorePointer(
+                                                        child: TweenAnimationBuilder<double>(
+                                                          tween: Tween<double>(
+                                                            begin: 0,
+                                                            end: 1,
+                                                          ),
+                                                          duration:
+                                                              const Duration(
+                                                                milliseconds:
+                                                                    110,
+                                                              ),
+                                                          curve: Curves
+                                                              .easeOutBack,
+                                                          builder:
+                                                              (
+                                                                context,
+                                                                animation,
+                                                                child,
+                                                              ) => Transform.scale(
+                                                                scale:
+                                                                    animation,
+                                                                child: child,
+                                                              ),
+                                                          child: DecoratedBox(
+                                                            key: const ValueKey(
+                                                              'video-controls-progress-hover-marker',
+                                                            ),
+                                                            decoration: const BoxDecoration(
+                                                              color: Color(
+                                                                0xFF42A5F5,
+                                                              ),
+                                                              shape: BoxShape
+                                                                  .circle,
+                                                              boxShadow: <BoxShadow>[
+                                                                BoxShadow(
+                                                                  color: Colors
+                                                                      .black45,
+                                                                  blurRadius: 3,
+                                                                ),
+                                                              ],
+                                                            ),
+                                                            child: SizedBox.square(
+                                                              dimension:
+                                                                  controlMetrics
+                                                                      .thumbRadius *
+                                                                  1.45,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
                                                     ),
-                                                    onPressed:
-                                                        widget
-                                                            .controller
-                                                            .value
-                                                            .isInitialized
-                                                        ? () {
-                                                            _startAutoHideTimer();
-                                                            widget
-                                                                .onTogglePlay();
-                                                          }
-                                                        : null,
-                                                    tooltip: _tooltipWithShortcut(
-                                                      widget
-                                                              .controller
-                                                              .value
-                                                              .isPlaying
-                                                          ? "暂停"
-                                                          : "播放",
-                                                      DesktopPlayerShortcutAction
-                                                          .playPause,
-                                                    ),
-                                                  ),
-                                                  const SizedBox(width: 8),
-                                                  // Seek Forward Button with Dynamic Number
-                                                  Tooltip(
-                                                    message: _tooltipWithShortcut(
-                                                      "快进 ${widget.doubleTapSeekSeconds} 秒",
-                                                      DesktopPlayerShortcutAction
-                                                          .seekForward,
-                                                    ),
-                                                    child: InkWell(
-                                                      onTap: () {
-                                                        if (!widget
-                                                            .controller
-                                                            .value
-                                                            .isInitialized) {
-                                                          return;
-                                                        }
-                                                        _startAutoHideTimer();
-                                                        final newPos =
-                                                            widget
-                                                                .controller
-                                                                .value
-                                                                .position +
-                                                            Duration(
-                                                              seconds: widget
-                                                                  .doubleTapSeekSeconds,
-                                                            );
-                                                        final duration = widget
+                                                ],
+                                              );
+                                            },
+                                          ),
+                                        ); // 进度条 RepaintBoundary 结束
+                                      },
+                                    ), // AnimatedBuilder 结束 — 仅包裹进度条，避免每帧重建按钮区域
+                                    // 底部控制栏（移出 AnimatedBuilder，仅在控制层显示/隐藏时重建）
+                                    RepaintBoundary(
+                                      child: SizedBox(
+                                        key: const ValueKey(
+                                          'video-controls-bottom-row',
+                                        ),
+                                        height: controlMetrics.bottomRowHeight,
+                                        child: Stack(
+                                          children: [
+                                            // Left: Time and Episode Picker
+                                            Align(
+                                              alignment: timeAlignment,
+                                              child: Padding(
+                                                padding: EdgeInsets.only(
+                                                  left: isLeftHandedMode
+                                                      ? 0
+                                                      : progressTrackInset,
+                                                  right: isLeftHandedMode
+                                                      ? progressTrackInset
+                                                      : 0,
+                                                ),
+                                                child: Row(
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: [
+                                                    // 时间文本 — 小范围 AnimatedBuilder，仅重建 Text
+                                                    AnimatedBuilder(
+                                                      animation:
+                                                          widget.controller,
+                                                      builder: (context, _) {
+                                                        final pos =
+                                                            _isDraggingProgress
+                                                            ? Duration(
+                                                                milliseconds:
+                                                                    _dragProgressValue
+                                                                        .toInt(),
+                                                              )
+                                                            : widget
+                                                                  .controller
+                                                                  .value
+                                                                  .position;
+                                                        final dur = widget
                                                             .controller
                                                             .value
                                                             .duration;
-                                                        _seekTo(
-                                                          newPos > duration
-                                                              ? duration
-                                                              : newPos,
+                                                        return Text(
+                                                          key: const ValueKey(
+                                                            'video-controls-time-display',
+                                                          ),
+                                                          "${_formatDuration(pos)} / ${_formatDuration(dur)}",
+                                                          style: TextStyle(
+                                                            color: Colors.white,
+                                                            fontSize:
+                                                                controlMetrics
+                                                                    .timeFontSize,
+                                                          ),
                                                         );
                                                       },
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            20,
+                                                    ),
+                                                    if (widget
+                                                            .onToggleEpisodePicker !=
+                                                        null) ...[
+                                                      SizedBox(
+                                                        width: controlMetrics
+                                                            .controlGap,
+                                                      ),
+                                                      Tooltip(
+                                                        message: _tooltipWithShortcut(
+                                                          "选集",
+                                                          DesktopPlayerShortcutAction
+                                                              .toggleEpisodePicker,
+                                                        ),
+                                                        child: TextButton.icon(
+                                                          onPressed: () {
+                                                            _startAutoHideTimer();
+                                                            widget
+                                                                .onToggleEpisodePicker
+                                                                ?.call();
+                                                          },
+                                                          style: TextButton.styleFrom(
+                                                            foregroundColor:
+                                                                Colors.white,
+                                                            padding: EdgeInsets.symmetric(
+                                                              horizontal:
+                                                                  controlMetrics
+                                                                      .controlGap,
+                                                            ),
+                                                            minimumSize: Size(
+                                                              0,
+                                                              controlMetrics
+                                                                  .episodeButtonHeight,
+                                                            ),
+                                                            tapTargetSize:
+                                                                MaterialTapTargetSize
+                                                                    .shrinkWrap,
                                                           ),
-                                                      child: SizedBox(
-                                                        width: bigIconSize + 8,
-                                                        height: bigIconSize + 8,
-                                                        child: Stack(
-                                                          alignment:
-                                                              Alignment.center,
-                                                          children: [
-                                                            // Transform to flip the replay icon horizontally to make it look like forward
-                                                            Transform(
-                                                              alignment:
-                                                                  Alignment
-                                                                      .center,
-                                                              transform:
-                                                                  Matrix4.rotationY(
-                                                                    3.14159,
-                                                                  ),
-                                                              child: Icon(
+                                                          icon: Icon(
+                                                            Icons.playlist_play,
+                                                            size: controlMetrics
+                                                                .episodeIconSize,
+                                                          ),
+                                                          label: Text(
+                                                            "选集",
+                                                            style: TextStyle(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .bold,
+                                                              fontSize:
+                                                                  controlMetrics
+                                                                      .toolFontSize,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ],
+                                                  ],
+                                                ),
+                                              ),
+                                            ),
+
+                                            // Center: Play Controls (Play/Pause, Seek)
+                                            if (widget.showPlayControls)
+                                              Align(
+                                                alignment: Alignment.center,
+                                                child: Row(
+                                                  mainAxisSize:
+                                                      MainAxisSize.min,
+                                                  children: [
+                                                    // Previous Episode
+                                                    if (widget.onPlayPrevious !=
+                                                        null) ...[
+                                                      IconButton(
+                                                        iconSize: bigIconSize,
+                                                        style:
+                                                            bottomIconButtonStyle,
+                                                        icon: Icon(
+                                                          Icons.skip_previous,
+                                                          color:
+                                                              widget.hasPrevious
+                                                              ? Colors.white
+                                                              : Colors.white38,
+                                                        ),
+                                                        onPressed:
+                                                            widget.hasPrevious
+                                                            ? () {
+                                                                _startAutoHideTimer();
+                                                                widget
+                                                                    .onPlayPrevious!();
+                                                              }
+                                                            : null,
+                                                        tooltip: _tooltipWithShortcut(
+                                                          "上一集",
+                                                          DesktopPlayerShortcutAction
+                                                              .previousEpisode,
+                                                        ),
+                                                      ),
+                                                      SizedBox(
+                                                        width: controlMetrics
+                                                            .controlGap,
+                                                      ),
+                                                    ],
+
+                                                    // Seek Backward Button with Dynamic Number
+                                                    Tooltip(
+                                                      message: _tooltipWithShortcut(
+                                                        "快退 ${widget.doubleTapSeekSeconds} 秒",
+                                                        DesktopPlayerShortcutAction
+                                                            .seekBackward,
+                                                      ),
+                                                      child: InkWell(
+                                                        onTap: () {
+                                                          if (!widget
+                                                              .controller
+                                                              .value
+                                                              .isInitialized) {
+                                                            return;
+                                                          }
+                                                          _startAutoHideTimer();
+                                                          final newPos =
+                                                              widget
+                                                                  .controller
+                                                                  .value
+                                                                  .position -
+                                                              Duration(
+                                                                seconds: widget
+                                                                    .doubleTapSeekSeconds,
+                                                              );
+                                                          _seekTo(
+                                                            newPos <
+                                                                    Duration
+                                                                        .zero
+                                                                ? Duration.zero
+                                                                : newPos,
+                                                          );
+                                                        },
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              20,
+                                                            ),
+                                                        child: SizedBox(
+                                                          width: controlMetrics
+                                                              .bottomButtonExtent,
+                                                          height: controlMetrics
+                                                              .bottomButtonExtent,
+                                                          child: Stack(
+                                                            alignment: Alignment
+                                                                .center,
+                                                            children: [
+                                                              Icon(
                                                                 Icons.replay,
                                                                 color:
                                                                     widget
@@ -2814,277 +3929,415 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                           .white38,
                                                                 size:
                                                                     bigIconSize *
-                                                                    .75,
+                                                                    0.75,
                                                               ),
-                                                            ),
-                                                            Text(
-                                                              "${widget.doubleTapSeekSeconds}",
-                                                              style: TextStyle(
-                                                                color:
-                                                                    widget
-                                                                        .controller
-                                                                        .value
-                                                                        .isInitialized
-                                                                    ? Colors
-                                                                          .white
-                                                                    : Colors
-                                                                          .white38,
-                                                                fontSize: 8,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .bold,
+                                                              Text(
+                                                                "${widget.doubleTapSeekSeconds}",
+                                                                style: TextStyle(
+                                                                  color:
+                                                                      widget
+                                                                          .controller
+                                                                          .value
+                                                                          .isInitialized
+                                                                      ? Colors
+                                                                            .white
+                                                                      : Colors
+                                                                            .white38,
+                                                                  fontSize:
+                                                                      (8 *
+                                                                              controlMetrics.scale)
+                                                                          .clamp(
+                                                                            7.0,
+                                                                            8.0,
+                                                                          ),
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                ),
                                                               ),
-                                                            ),
-                                                          ],
+                                                            ],
+                                                          ),
                                                         ),
                                                       ),
                                                     ),
-                                                  ),
-
-                                                  // Next Episode
-                                                  if (widget.onPlayNext !=
-                                                      null) ...[
-                                                    const SizedBox(width: 8),
-                                                    IconButton(
-                                                      iconSize: bigIconSize,
-                                                      icon: Icon(
-                                                        Icons.skip_next,
-                                                        color: widget.hasNext
-                                                            ? Colors.white
-                                                            : Colors.white38,
-                                                      ),
-                                                      onPressed: widget.hasNext
-                                                          ? () {
-                                                              _startAutoHideTimer();
-                                                              widget
-                                                                  .onPlayNext!();
-                                                            }
-                                                          : null,
-                                                      tooltip: _tooltipWithShortcut(
-                                                        "下一集",
+                                                    SizedBox(
+                                                      width: controlMetrics
+                                                          .controlGap,
+                                                    ),
+                                                    // 播放/暂停按钮 — 小范围 AnimatedBuilder，仅重建 IconButton
+                                                    AnimatedBuilder(
+                                                      animation:
+                                                          widget.controller,
+                                                      builder: (context, _) {
+                                                        final isPlaying = widget
+                                                            .controller
+                                                            .value
+                                                            .isPlaying;
+                                                        final isInitialized =
+                                                            widget
+                                                                .controller
+                                                                .value
+                                                                .isInitialized;
+                                                        final canTogglePlay =
+                                                            isInitialized ||
+                                                            widget
+                                                                .allowPlayWhenUninitialized;
+                                                        return IconButton(
+                                                          key: const ValueKey(
+                                                            'video-controls-play-pause',
+                                                          ),
+                                                          iconSize: bigIconSize,
+                                                          style:
+                                                              bottomIconButtonStyle,
+                                                          icon: Icon(
+                                                            isPlaying
+                                                                ? Icons
+                                                                      .pause_circle_filled
+                                                                : Icons
+                                                                      .play_circle_fill,
+                                                            color: canTogglePlay
+                                                                ? Colors.white
+                                                                : Colors
+                                                                      .white38,
+                                                          ),
+                                                          onPressed:
+                                                              canTogglePlay
+                                                              ? () {
+                                                                  _startAutoHideTimer();
+                                                                  widget
+                                                                      .onTogglePlay();
+                                                                }
+                                                              : null,
+                                                          tooltip:
+                                                              _tooltipWithShortcut(
+                                                                isPlaying
+                                                                    ? "暂停"
+                                                                    : "播放",
+                                                                DesktopPlayerShortcutAction
+                                                                    .playPause,
+                                                              ),
+                                                        );
+                                                      },
+                                                    ),
+                                                    SizedBox(
+                                                      width: controlMetrics
+                                                          .controlGap,
+                                                    ),
+                                                    // Seek Forward Button with Dynamic Number
+                                                    Tooltip(
+                                                      message: _tooltipWithShortcut(
+                                                        "快进 ${widget.doubleTapSeekSeconds} 秒",
                                                         DesktopPlayerShortcutAction
-                                                            .nextEpisode,
+                                                            .seekForward,
                                                       ),
+                                                      child: InkWell(
+                                                        onTap: () {
+                                                          if (!widget
+                                                              .controller
+                                                              .value
+                                                              .isInitialized) {
+                                                            return;
+                                                          }
+                                                          _startAutoHideTimer();
+                                                          final newPos =
+                                                              widget
+                                                                  .controller
+                                                                  .value
+                                                                  .position +
+                                                              Duration(
+                                                                seconds: widget
+                                                                    .doubleTapSeekSeconds,
+                                                              );
+                                                          final duration =
+                                                              widget
+                                                                  .controller
+                                                                  .value
+                                                                  .duration;
+                                                          _seekTo(
+                                                            newPos > duration
+                                                                ? duration
+                                                                : newPos,
+                                                          );
+                                                        },
+                                                        borderRadius:
+                                                            BorderRadius.circular(
+                                                              20,
+                                                            ),
+                                                        child: SizedBox(
+                                                          width: controlMetrics
+                                                              .bottomButtonExtent,
+                                                          height: controlMetrics
+                                                              .bottomButtonExtent,
+                                                          child: Stack(
+                                                            alignment: Alignment
+                                                                .center,
+                                                            children: [
+                                                              // Transform to flip the replay icon horizontally to make it look like forward
+                                                              Transform(
+                                                                alignment:
+                                                                    Alignment
+                                                                        .center,
+                                                                transform:
+                                                                    Matrix4.rotationY(
+                                                                      3.14159,
+                                                                    ),
+                                                                child: Icon(
+                                                                  Icons.replay,
+                                                                  color:
+                                                                      widget
+                                                                          .controller
+                                                                          .value
+                                                                          .isInitialized
+                                                                      ? Colors
+                                                                            .white
+                                                                      : Colors
+                                                                            .white38,
+                                                                  size:
+                                                                      bigIconSize *
+                                                                      .75,
+                                                                ),
+                                                              ),
+                                                              Text(
+                                                                "${widget.doubleTapSeekSeconds}",
+                                                                style: TextStyle(
+                                                                  color:
+                                                                      widget
+                                                                          .controller
+                                                                          .value
+                                                                          .isInitialized
+                                                                      ? Colors
+                                                                            .white
+                                                                      : Colors
+                                                                            .white38,
+                                                                  fontSize:
+                                                                      (8 *
+                                                                              controlMetrics.scale)
+                                                                          .clamp(
+                                                                            7.0,
+                                                                            8.0,
+                                                                          ),
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+
+                                                    // Next Episode
+                                                    if (widget.onPlayNext !=
+                                                        null) ...[
+                                                      SizedBox(
+                                                        width: controlMetrics
+                                                            .controlGap,
+                                                      ),
+                                                      IconButton(
+                                                        iconSize: bigIconSize,
+                                                        style:
+                                                            bottomIconButtonStyle,
+                                                        icon: Icon(
+                                                          Icons.skip_next,
+                                                          color: widget.hasNext
+                                                              ? Colors.white
+                                                              : Colors.white38,
+                                                        ),
+                                                        onPressed:
+                                                            widget.hasNext
+                                                            ? () {
+                                                                _startAutoHideTimer();
+                                                                widget
+                                                                    .onPlayNext!();
+                                                              }
+                                                            : null,
+                                                        tooltip:
+                                                            _tooltipWithShortcut(
+                                                              "下一集",
+                                                              DesktopPlayerShortcutAction
+                                                                  .nextEpisode,
+                                                            ),
+                                                      ),
+                                                    ],
+                                                  ],
+                                                ),
+                                              ),
+
+                                            // Right: Tools (Speed, Subtitles, Volume)
+                                            Align(
+                                              alignment: toolsAlignment,
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  if (!widget
+                                                      .isPreviewMode) ...[
+                                                    Builder(
+                                                      builder: (speedButtonContext) => Tooltip(
+                                                        message: '倍速',
+                                                        child: Material(
+                                                          color: Colors
+                                                              .transparent,
+                                                          child: InkWell(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  8,
+                                                                ),
+                                                            onTap: () => unawaited(
+                                                              _showPlaybackSpeedPicker(
+                                                                settings,
+                                                                speedButtonContext,
+                                                              ),
+                                                            ),
+                                                            child: AnimatedBuilder(
+                                                              animation: widget
+                                                                  .controller,
+                                                              builder: (context, _) {
+                                                                final speed = widget
+                                                                    .controller
+                                                                    .value
+                                                                    .playbackSpeed;
+                                                                return SizedBox(
+                                                                  height: controlMetrics
+                                                                      .bottomButtonExtent,
+                                                                  child: Padding(
+                                                                    padding: EdgeInsets.symmetric(
+                                                                      horizontal:
+                                                                          controlMetrics
+                                                                              .controlGap,
+                                                                    ),
+                                                                    child: Row(
+                                                                      mainAxisSize:
+                                                                          MainAxisSize
+                                                                              .min,
+                                                                      children: [
+                                                                        ConstrainedBox(
+                                                                          constraints: const BoxConstraints(
+                                                                            maxWidth:
+                                                                                52,
+                                                                          ),
+                                                                          child: FittedBox(
+                                                                            fit:
+                                                                                BoxFit.scaleDown,
+                                                                            child: Text(
+                                                                              "${speed}x",
+                                                                              maxLines: 1,
+                                                                              style: TextStyle(
+                                                                                color: Colors.white,
+                                                                                fontWeight: FontWeight.bold,
+                                                                                fontSize: controlMetrics.toolFontSize,
+                                                                              ),
+                                                                            ),
+                                                                          ),
+                                                                        ),
+                                                                        if (settings.isLockedPlaybackSpeed(
+                                                                          speed,
+                                                                        )) ...[
+                                                                          SizedBox(
+                                                                            width:
+                                                                                controlMetrics.controlGap /
+                                                                                2,
+                                                                          ),
+                                                                          Icon(
+                                                                            Icons.lock,
+                                                                            size:
+                                                                                controlMetrics.toolFontSize,
+                                                                            color:
+                                                                                Colors.blueAccent,
+                                                                          ),
+                                                                        ],
+                                                                      ],
+                                                                    ),
+                                                                  ),
+                                                                );
+                                                              },
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+
+                                                    IconButton(
+                                                      iconSize: iconSize,
+                                                      style:
+                                                          bottomIconButtonStyle,
+                                                      icon: Icon(
+                                                        widget.showSubtitles
+                                                            ? Icons.subtitles
+                                                            : Icons
+                                                                  .subtitles_off,
+                                                        color:
+                                                            widget.showSubtitles
+                                                            ? Colors.blueAccent
+                                                            : Colors.white70,
+                                                      ),
+                                                      onPressed: () {
+                                                        _startAutoHideTimer();
+                                                        widget
+                                                            .onToggleSubtitles();
+                                                      },
+                                                      tooltip: _tooltipWithShortcut(
+                                                        widget.showSubtitles
+                                                            ? "隐藏字幕"
+                                                            : "显示字幕",
+                                                        DesktopPlayerShortcutAction
+                                                            .toggleSubtitles,
+                                                      ),
+                                                    ),
+
+                                                    Selector<
+                                                      MediaPlaybackService,
+                                                      bool
+                                                    >(
+                                                      selector: (_, s) =>
+                                                          s.isMuted,
+                                                      builder: (context, isMuted, _) {
+                                                        return IconButton(
+                                                          iconSize: iconSize,
+                                                          style:
+                                                              bottomIconButtonStyle,
+                                                          icon: Icon(
+                                                            isMuted
+                                                                ? Icons
+                                                                      .volume_off
+                                                                : Icons
+                                                                      .volume_up,
+                                                            color: isMuted
+                                                                ? Colors
+                                                                      .redAccent
+                                                                : Colors.white,
+                                                          ),
+                                                          onPressed: () {
+                                                            _startAutoHideTimer();
+                                                            unawaited(
+                                                              playbackService
+                                                                  .toggleMute(),
+                                                            );
+                                                          },
+                                                          tooltip:
+                                                              _tooltipWithShortcut(
+                                                                isMuted
+                                                                    ? "取消静音"
+                                                                    : "静音",
+                                                                DesktopPlayerShortcutAction
+                                                                    .toggleMute,
+                                                              ),
+                                                        );
+                                                      },
                                                     ),
                                                   ],
                                                 ],
                                               ),
                                             ),
-
-                                          // Right: Tools (Speed, Subtitles, Volume)
-                                          Align(
-                                            alignment: toolsAlignment,
-                                            child: Row(
-                                              mainAxisSize: MainAxisSize.min,
-                                              children: [
-                                                if (!widget.isPreviewMode) ...[
-                                                  PopupMenuButton<double>(
-                                                    initialValue: widget
-                                                        .controller
-                                                        .value
-                                                        .playbackSpeed,
-                                                    tooltip: "倍速",
-                                                    onSelected: (speed) {
-                                                      _startAutoHideTimer();
-                                                      widget.onSpeedUpdate(
-                                                        speed,
-                                                      );
-                                                    },
-                                                    constraints:
-                                                        const BoxConstraints(
-                                                          maxHeight: 400,
-                                                        ), // Limit height to ensure scrolling behavior is obvious
-                                                    itemBuilder: (context) =>
-                                                        [
-                                                          0.25,
-                                                          0.5,
-                                                          0.75,
-                                                          1.0,
-                                                          1.25,
-                                                          1.5,
-                                                          2.0,
-                                                          2.5,
-                                                          3.0,
-                                                          4.0,
-                                                          5.0,
-                                                        ].map((speed) {
-                                                          return _buildPlaybackSpeedMenuItem(
-                                                            context,
-                                                            settings,
-                                                            speed,
-                                                          );
-                                                        }).toList(),
-                                                    child: Padding(
-                                                      padding:
-                                                          const EdgeInsets.symmetric(
-                                                            horizontal: 8,
-                                                          ),
-                                                      child: Row(
-                                                        mainAxisSize:
-                                                            MainAxisSize.min,
-                                                        children: [
-                                                          Text(
-                                                            "${widget.controller.value.playbackSpeed}x",
-                                                            style:
-                                                                const TextStyle(
-                                                                  color: Colors
-                                                                      .white,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                ),
-                                                          ),
-                                                          if (settings
-                                                              .isLockedPlaybackSpeed(
-                                                                widget
-                                                                    .controller
-                                                                    .value
-                                                                    .playbackSpeed,
-                                                              )) ...[
-                                                            const SizedBox(
-                                                              width: 4,
-                                                            ),
-                                                            const Icon(
-                                                              Icons.lock,
-                                                              size: 14,
-                                                              color: Colors
-                                                                  .blueAccent,
-                                                            ),
-                                                          ],
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ),
-
-                                                  IconButton(
-                                                    icon: Icon(
-                                                      widget.showSubtitles
-                                                          ? Icons.subtitles
-                                                          : Icons.subtitles_off,
-                                                      color:
-                                                          widget.showSubtitles
-                                                          ? Colors.blueAccent
-                                                          : Colors.white70,
-                                                    ),
-                                                    onPressed: () {
-                                                      _startAutoHideTimer();
-                                                      widget
-                                                          .onToggleSubtitles();
-                                                    },
-                                                    tooltip: _tooltipWithShortcut(
-                                                      widget.showSubtitles
-                                                          ? "隐藏字幕"
-                                                          : "显示字幕",
-                                                      DesktopPlayerShortcutAction
-                                                          .toggleSubtitles,
-                                                    ),
-                                                  ),
-
-                                                  Selector<MediaPlaybackService, bool>(
-                                                    selector: (_, s) => s.isMuted,
-                                                    builder: (context, isMuted, _) {
-                                                      return IconButton(
-                                                        icon: Icon(
-                                                          isMuted
-                                                              ? Icons.volume_off
-                                                              : Icons.volume_up,
-                                                          color: isMuted
-                                                              ? Colors.redAccent
-                                                              : Colors.white,
-                                                        ),
-                                                        onPressed: () {
-                                                          _startAutoHideTimer();
-                                                          unawaited(
-                                                            playbackService
-                                                                .toggleMute(),
-                                                          );
-                                                        },
-                                                        tooltip: _tooltipWithShortcut(
-                                                          isMuted
-                                                              ? "取消静音"
-                                                              : "静音",
-                                                          DesktopPlayerShortcutAction
-                                                              .toggleMute,
-                                                        ),
-                                                      );
-                                                    },
-                                                  ),
-                                                ],
-                                              ],
-                                            ),
-                                          ),
-                                        ],
+                                          ],
+                                        ),
                                       ),
-                                    ),
                                     ), // 底部控制栏 RepaintBoundary 结束
                                   ],
-                                );
-                              },
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                if (_showControls &&
-                    !widget.isLocked &&
-                    !hideControlsForGestureSeek &&
-                    widget.showBottomBar &&
-                    widget.showResetScreenButton &&
-                    widget.onResetScreenTransform != null)
-                  Positioned(
-                    left: 0,
-                    right: 0,
-                    bottom: bottomBarVerticalPadding + (bigIconSize * 1.5) + 48,
-                    child: SizedBox(
-                      height: resetButtonRowHeight,
-                      child: Stack(
-                        alignment: Alignment.center,
-                        children: [
-                          Positioned.fill(
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.translucent,
-                              onTap: () {
-                                widget.onClearSelection?.call();
-                                setState(() {
-                                  _showControls = false;
-                                });
-                                _cancelAutoHideTimer();
-                              },
-                            ),
-                          ),
-                          TextButton.icon(
-                            onPressed: () {
-                              widget.onResetScreenTransform?.call();
-                              _startAutoHideTimer();
-                            },
-                            style: TextButton.styleFrom(
-                              foregroundColor: Colors.white,
-                              backgroundColor: Colors.black54,
-                              padding: resetButtonPadding,
-                              minimumSize: Size.zero,
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(18),
-                                side: const BorderSide(color: Colors.white24),
-                              ),
-                            ),
-                            icon: Icon(
-                              Icons.center_focus_strong,
-                              size: resetButtonIconSize,
-                            ),
-                            label: Text(
-                              "还原屏幕",
-                              style: TextStyle(
-                                fontSize: resetButtonFontSize,
-                                fontWeight: FontWeight.w600,
+                                ),
                               ),
                             ),
                           ),
-                        ],
-                      ),
-                    ),
-                  ),
                       ],
                     ),
                   ),
@@ -3094,14 +4347,26 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           ),
         );
 
+        // 桌面端：用 Listener 包裹整个播放器区域，捕获鼠标滚轮事件调节音量
+        // 必须在 MouseRegion 之前包裹，确保滚轮事件被优先处理
+        if (!kIsWeb &&
+            (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
+          focusChild = Listener(
+            onPointerSignal: _onPointerSignal,
+            behavior: HitTestBehavior.translucent,
+            child: focusChild,
+          );
+        }
+
         // Desktop: Wrap with MouseRegion to show controls on mouse movement
         // and hide cursor when controls are hidden for full immersion
         if (isDesktop) {
           return MouseRegion(
+            key: const ValueKey('video-controls-player-mouse-region'),
+            onEnter: _onMouseEnter,
             onHover: _onMouseHover,
-            cursor: _showControls
-                ? MouseCursor.defer
-                : SystemMouseCursors.none,
+            onExit: _onMouseExit,
+            cursor: _showControls ? MouseCursor.defer : SystemMouseCursors.none,
             child: focusChild,
           );
         }
@@ -3126,19 +4391,122 @@ class _VideoControlsOverlayState extends State<VideoControlsOverlay> {
           scrollDirection: Axis.horizontal,
           reverse: alignRight,
           physics: const BouncingScrollPhysics(),
-          child: Text(
-            mediaTitle,
-            textAlign: textAlign,
-            maxLines: 1,
-            overflow: TextOverflow.visible,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: fontSize,
-              fontWeight: FontWeight.w500,
+          child: ExperimentalTapGateway(
+            onTrigger: () => widget.onExperimentalTrigger?.call(),
+            child: Text(
+              mediaTitle,
+              textAlign: textAlign,
+              maxLines: 1,
+              overflow: TextOverflow.visible,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: fontSize,
+                fontWeight: FontWeight.w500,
+              ),
             ),
           ),
         ),
       ),
     );
   }
+}
+
+class _PlayerSideControlButton extends StatelessWidget {
+  final double extent;
+  final String tooltip;
+  final bool highlighted;
+  final VoidCallback onPressed;
+  final Widget child;
+
+  const _PlayerSideControlButton({
+    super.key,
+    required this.extent,
+    required this.tooltip,
+    this.highlighted = false,
+    required this.onPressed,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final borderRadius = BorderRadius.circular(extent * 0.36);
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: highlighted
+            ? _danmakuControlAccent.withValues(alpha: 0.18)
+            : Colors.black.withValues(alpha: 0.52),
+        shape: RoundedRectangleBorder(
+          borderRadius: borderRadius,
+          side: BorderSide(
+            color: highlighted
+                ? _danmakuControlAccent.withValues(alpha: 0.58)
+                : Colors.white.withValues(alpha: 0.13),
+            width: 0.8,
+          ),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: borderRadius,
+          splashColor: Colors.white.withValues(alpha: 0.12),
+          highlightColor: Colors.white.withValues(alpha: 0.06),
+          child: SizedBox.square(
+            dimension: extent,
+            child: Center(child: child),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DanmakuToggleGlyph extends StatelessWidget {
+  final bool enabled;
+  final double size;
+
+  const _DanmakuToggleGlyph({required this.enabled, required this.size});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = enabled ? _danmakuControlAccent : Colors.white54;
+    return SizedBox.square(
+      dimension: size * 1.12,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Text(
+            '弹',
+            style: TextStyle(
+              color: color,
+              fontSize: size * 0.82,
+              height: 1,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          if (!enabled)
+            Transform.rotate(
+              angle: -math.pi / 4,
+              child: Container(
+                width: size * 1.05,
+                height: math.max(1.2, size * 0.09),
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(size),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black54, blurRadius: 1),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _KeyboardPressState {
+  Timer? timer;
+  bool longPressTriggered = false;
+  bool speedBoostStarted = false;
 }

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
@@ -12,10 +13,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
+import '../services/app_haptics.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import '../widgets/folder_drop_target.dart';
 import '../widgets/cached_thumbnail_widget.dart';
+import '../widgets/media_library_list_tile.dart';
+import '../widgets/media_library_item_interaction_wrapper.dart';
+import '../widgets/media_list_layout_metrics.dart';
+import '../widgets/media_library_settings_sheet.dart';
+import '../widgets/media_library_search_prompt.dart';
+import '../widgets/media_library_compact_app_bar.dart';
+import '../widgets/media_library_locate_button.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../services/thumbnail_preload_manager.dart';
 import 'portrait_video_screen.dart';
@@ -28,19 +37,35 @@ import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
 import '../services/playlist_manager.dart';
 import 'video_player_screen.dart';
+import 'home_screen.dart';
 import '../utils/app_toast.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
 
 class CollectionScreen extends StatefulWidget {
   final String collectionId;
+  final String? searchQuery;
+  final String? revealItemId;
+  final bool returnToSearchResults;
 
-  const CollectionScreen({super.key, required this.collectionId});
+  const CollectionScreen({
+    super.key,
+    required this.collectionId,
+    this.revealItemId,
+    this.returnToSearchResults = false,
+  }) : searchQuery = null;
+
+  const CollectionScreen.search({super.key, required String query})
+    : collectionId = '',
+      searchQuery = query,
+      revealItemId = null,
+      returnToSearchResults = false;
 
   @override
   State<CollectionScreen> createState() => _CollectionScreenState();
 }
 
-class _CollectionScreenState extends State<CollectionScreen> {
+class _CollectionScreenState extends State<CollectionScreen>
+    with SingleTickerProviderStateMixin {
   bool _isSelectionMode = false;
   bool _showExportSettingsButton = false;
   final Set<String> _selectedIds = {};
@@ -73,9 +98,250 @@ class _CollectionScreenState extends State<CollectionScreen> {
   List<VideoItem> _videoItems = [];
   Timer? _scrollPrecacheTimer;
   bool _didInitialDecodePrecache = false;
+  late final AnimationController _revealHighlightController;
+  Timer? _revealHighlightTimer;
+  bool _didScheduleReveal = false;
   static const double _cardTitleScaleReferenceWidth = 170.0;
   static const double _cardTitleScaleMin = 0.045;
   static const double _cardTitleScaleMax = 0.18;
+
+  bool get _isSearchResults => widget.searchQuery != null;
+
+  List<dynamic> _visibleContents(LibraryService library) {
+    return _isSearchResults
+        ? library.searchContents(widget.searchQuery!)
+        : library.getContents(widget.collectionId);
+  }
+
+  Future<void> _openSearch() async {
+    final query = await showMediaLibrarySearchPrompt(context);
+    if (!mounted || query == null) return;
+    await Navigator.of(context).push(
+      buildMediaLibrarySearchResultsRoute(
+        CollectionScreen.search(query: query),
+      ),
+    );
+    if (mounted && _supportsDesktopManagementShortcuts) {
+      _shortcutFocusNode.requestFocus();
+    }
+  }
+
+  Route<void> _buildDirectoryLocationRoute(Widget page) {
+    return PageRouteBuilder<void>(
+      pageBuilder: (context, animation, secondaryAnimation) => page,
+      transitionDuration: const Duration(milliseconds: 280),
+      reverseTransitionDuration: const Duration(milliseconds: 240),
+      transitionsBuilder: (context, animation, secondaryAnimation, child) {
+        final eased = CurvedAnimation(
+          parent: animation,
+          curve: Curves.easeOutCubic,
+          reverseCurve: Curves.easeInCubic,
+        );
+        return FadeTransition(
+          opacity: eased,
+          child: SlideTransition(
+            position: Tween<Offset>(
+              begin: const Offset(0.018, 0),
+              end: Offset.zero,
+            ).animate(eased),
+            child: child,
+          ),
+        );
+      },
+    );
+  }
+
+  void _showInParentDirectory(dynamic item) {
+    final itemId = (item as dynamic).id as String;
+    final parentId = (item as dynamic).parentId as String?;
+    final Widget page = parentId == null
+        ? HomeScreen(revealItemId: itemId, returnToSearchResults: true)
+        : CollectionScreen(
+            collectionId: parentId,
+            revealItemId: itemId,
+            returnToSearchResults: true,
+          );
+    Navigator.of(context).push(_buildDirectoryLocationRoute(page));
+  }
+
+  void _openParentDirectory(VideoCollection currentCollection) {
+    final Widget page = currentCollection.parentId == null
+        ? HomeScreen(
+            revealItemId: currentCollection.id,
+            returnToSearchResults: true,
+          )
+        : CollectionScreen(
+            collectionId: currentCollection.parentId!,
+            revealItemId: currentCollection.id,
+            returnToSearchResults: true,
+          );
+    Navigator.of(context).pushReplacement(_buildDirectoryLocationRoute(page));
+  }
+
+  void _scheduleRevealIfNeeded(List<dynamic> contents) {
+    final targetId = widget.revealItemId;
+    if (_didScheduleReveal || targetId == null) return;
+    final targetIndex = contents.indexWhere(
+      (item) => (item as dynamic).id == targetId,
+    );
+    if (targetIndex < 0) return;
+    _didScheduleReveal = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final targetRect = _getItemRect(targetIndex);
+      if (targetRect == null) return;
+
+      final position = _scrollController.position;
+      final viewportTop = position.pixels;
+      final viewportBottom = viewportTop + position.viewportDimension;
+      final isFullyVisible =
+          targetRect.top >= viewportTop && targetRect.bottom <= viewportBottom;
+
+      if (!isFullyVisible) {
+        final desiredOffset =
+            targetRect.center.dy - position.viewportDimension / 2;
+        final targetOffset = desiredOffset.clamp(
+          position.minScrollExtent,
+          position.maxScrollExtent,
+        );
+        final distance = (targetOffset - position.pixels).abs();
+        final durationMs = (280 + distance * 0.22).round().clamp(280, 620);
+        unawaited(
+          _scrollController.animateTo(
+            targetOffset,
+            duration: Duration(milliseconds: durationMs),
+            curve: Curves.easeOutCubic,
+          ),
+        );
+      }
+
+      _revealHighlightController.forward(from: 0);
+      _revealHighlightTimer?.cancel();
+      _revealHighlightTimer = Timer(const Duration(milliseconds: 1700), () {
+        if (mounted) _revealHighlightController.reverse();
+      });
+    });
+  }
+
+  Widget _buildRevealHighlight(String itemId, Widget child) {
+    if (widget.revealItemId != itemId) return child;
+    return AnimatedBuilder(
+      animation: _revealHighlightController,
+      child: child,
+      builder: (context, highlightedChild) {
+        final value = Curves.easeOut.transform(
+          _revealHighlightController.value,
+        );
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            highlightedChild!,
+            IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: const Color(
+                    0xFF6EA8FF,
+                  ).withValues(alpha: 0.09 * value),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: const Color(
+                      0xFF8DBBFF,
+                    ).withValues(alpha: 0.72 * value),
+                    width: 1 + value,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  List<Widget> _buildCompactTopBarActions(SettingsService settings) {
+    if (_isSelectionMode) {
+      return [
+        MediaLibraryCompactIconButton(
+          icon: Icons.select_all,
+          tooltip: '全选',
+          onPressed: _toggleSelectAllInCollection,
+        ),
+        const SizedBox(width: 2),
+      ];
+    }
+
+    return [
+      if (widget.returnToSearchResults)
+        MediaLibraryCompactIconButton(
+          icon: Icons.drive_folder_upload_outlined,
+          tooltip: '上一级目录',
+          onPressed: () {
+            final library = Provider.of<LibraryService>(context, listen: false);
+            final current = library.getCollection(widget.collectionId);
+            if (current != null) _openParentDirectory(current);
+          },
+        ),
+      MediaLibraryCompactIconButton(
+        icon: Icons.search_rounded,
+        tooltip: '搜索媒体库',
+        onPressed: _openSearch,
+      ),
+      MediaLibraryCompactIconButton(
+        icon: Icons.delete_outline,
+        tooltip: '回收站',
+        onPressed: () {
+          Navigator.of(
+            context,
+          ).push(MaterialPageRoute(builder: (_) => const RecycleBinScreen()));
+        },
+      ),
+      SizedBox(
+        width: 40,
+        height: 48,
+        child: MediaLibraryCompactMoreButton(
+          itemBuilder: (menuContext) => [
+            mediaLibraryCompactMenuItem(
+              icon: settings.mediaLibraryViewMode == 0
+                  ? Icons.view_list_rounded
+                  : Icons.grid_view_rounded,
+              label: settings.mediaLibraryViewMode == 0 ? '切换列表视图' : '切换卡片视图',
+              onSelected: () {
+                final nextMode = settings.mediaLibraryViewMode == 0 ? 1 : 0;
+                settings.updateSetting('mediaLibraryViewMode', nextMode);
+              },
+            ),
+            if (_showExportSettingsButton)
+              mediaLibraryCompactMenuItem(
+                icon: Icons.file_download,
+                label: '导出设置',
+                onSelected: _exportSettingsSnapshot,
+              ),
+            mediaLibraryCompactMenuItem(
+              icon: Icons.tune,
+              label: '调整卡片样式',
+              onSelected: () => _showCardStyleBottomSheet(context, settings),
+            ),
+            mediaLibraryCompactMenuItem(
+              icon: Icons.settings_outlined,
+              label: '媒体库设置',
+              onSelected: () =>
+                  showMediaLibrarySettingsBottomSheet(context, settings),
+            ),
+            mediaLibraryCompactMenuItem(
+              icon: Icons.checklist,
+              label: '批量管理',
+              onSelected: () {
+                if (!mounted) return;
+                setState(() => _isSelectionMode = true);
+              },
+            ),
+          ],
+        ),
+      ),
+      const SizedBox(width: 2),
+    ];
+  }
 
   double _normalizeCardTitleScale(double value) {
     if (value <= 1.0) {
@@ -94,6 +360,45 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
   double _resolveCardMetaFontSize(double titleFontSize) {
     return (titleFontSize * 0.82).clamp(2.0, 100.0);
+  }
+
+  double _resolveGridLocateButtonHeight({
+    required BuildContext context,
+    required BoxConstraints constraints,
+    required double cardWidth,
+    required String title,
+    required double titleFontSize,
+    required double metaFontSize,
+    required double informationGap,
+    required FontWeight titleWeight,
+  }) {
+    // Card uses its default four-pixel outer margin. Work with the clipped
+    // interior so the button can grow up to the rendered title, but never
+    // cover it.
+    final innerWidth = math.max(0.0, cardWidth - 8.0);
+    final innerHeight = math.max(0.0, constraints.maxHeight - 8.0);
+    final informationHeight = math.max(0.0, innerHeight - innerWidth * 0.75);
+    final titlePainter = TextPainter(
+      text: TextSpan(
+        text: title,
+        style: DefaultTextStyle.of(context).style.merge(
+          TextStyle(fontSize: titleFontSize, fontWeight: titleWeight),
+        ),
+      ),
+      maxLines: 10,
+      ellipsis: '…',
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout(maxWidth: math.max(0.0, innerWidth - 20.0));
+
+    final metadataHeight = metaFontSize * 1.2;
+    final minimumMetadataBand = 6.0 + informationGap + metadataHeight;
+    final availableBelowTitle = math.max(
+      minimumMetadataBand,
+      informationHeight - 6.0 - titlePainter.height,
+    );
+    final desiredHeight = math.max(cardWidth * 0.19, minimumMetadataBand);
+    return math.min(desiredHeight, availableBelowTitle);
   }
 
   Duration get _mediaCardLongPressDelay {
@@ -143,7 +448,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
     VideoCollection collection, {
     int? draggedIndex,
   }) async {
-    final contents = library.getContents(widget.collectionId);
+    final contents = _visibleContents(library);
     List<String> itemsToMove = [];
 
     if (draggedIndex != null) {
@@ -192,13 +497,13 @@ class _CollectionScreenState extends State<CollectionScreen> {
   /// Helper: Get total item count safely
   int _getItemCount() {
     final library = Provider.of<LibraryService>(context, listen: false);
-    return library.getContents(widget.collectionId).length;
+    return _visibleContents(library).length;
   }
 
   /// Helper: Get content ID at index
   String? _getItemId(int index) {
     final library = Provider.of<LibraryService>(context, listen: false);
-    final contents = library.getContents(widget.collectionId);
+    final contents = _visibleContents(library);
     if (index < 0 || index >= contents.length) return null;
     return (contents[index] as dynamic).id;
   }
@@ -207,81 +512,56 @@ class _CollectionScreenState extends State<CollectionScreen> {
   /// Returns the index of the item, or null if in spacing/padding
   int? _getIndexAt(Offset contentOffset) {
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final crossAxisCount = settings.videoCardCrossAxisCount;
     final count = _getItemCount();
-    if (crossAxisCount <= 0 || count == 0) return null;
-
-    final mediaQuery = MediaQuery.of(context);
-    final screenWidth = mediaQuery.size.width;
-
-    // Grid Parameters (Must match GridView layout)
-    const double spacing = 16.0;
-    const double hPadding = 16.0;
-    const double topPadding = 16.0;
-
-    final double totalSpacing = (crossAxisCount - 1) * spacing + (hPadding * 2);
-    final double itemWidth = (screenWidth - totalSpacing) / crossAxisCount;
-    final double itemHeight = itemWidth / settings.videoCardAspectRatio;
-
-    // Check horizontal bounds
-    if (contentOffset.dx < hPadding ||
-        contentOffset.dx > screenWidth - hPadding) {
-      return null;
-    }
-
-    // Check top bound
-    if (contentOffset.dy < topPadding) return null;
-
-    // Calculate Col
-    double relativeX = contentOffset.dx - hPadding;
-    int col = (relativeX / (itemWidth + spacing)).floor();
-
-    // Check if in horizontal spacing
-    double remainderX = relativeX % (itemWidth + spacing);
-    if (remainderX > itemWidth) return null;
-    if (col >= crossAxisCount) return null;
-
-    // Calculate Row
-    double relativeY = contentOffset.dy - topPadding;
-    int row = (relativeY / (itemHeight + spacing)).floor();
-
-    // Check if in vertical spacing
-    double remainderY = relativeY % (itemHeight + spacing);
-    if (remainderY > itemHeight) return null;
-
-    int index = row * crossAxisCount + col;
-    if (index >= 0 && index < count) {
-      return index;
-    }
-    return null;
+    return _getMediaGridGeometry(settings).indexAt(contentOffset, count);
   }
 
   /// Helper: Get the Rect of an item at [index] relative to the scrollable content area
   Rect? _getItemRect(int index) {
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final crossAxisCount = settings.videoCardCrossAxisCount;
     final count = _getItemCount();
-    if (crossAxisCount <= 0 || index < 0 || index >= count) return null;
+    if (index < 0 || index >= count) return null;
+    return _getMediaGridGeometry(settings).rectForIndex(index);
+  }
 
-    final mediaQuery = MediaQuery.of(context);
-    final screenWidth = mediaQuery.size.width;
+  MediaLibraryGridGeometry _getMediaGridGeometry(SettingsService settings) {
+    final mediaSize = MediaQuery.sizeOf(context);
+    if (settings.mediaLibraryViewMode == 1) {
+      final columns = settings.mediaListCrossAxisCount.clamp(1, 15);
+      final metrics = MediaListLayoutMetrics.forGrid(
+        screenShortestSide: mediaSize.shortestSide,
+        availableWidth: mediaSize.width,
+        crossAxisCount: columns,
+        heightSetting: settings.mediaListItemHeightScale,
+        titleSetting: settings.mediaListTitleScale,
+        mainSpacingSetting: settings.mediaListMainSpacingScale,
+        crossSpacingSetting: settings.mediaListCrossSpacingScale,
+      );
+      return MediaLibraryGridGeometry(
+        crossAxisCount: columns,
+        itemWidth: metrics.cellWidth,
+        itemHeight: metrics.rowHeight,
+        horizontalSpacing: metrics.crossSpacing,
+        verticalSpacing: metrics.mainSpacing,
+        horizontalPadding: metrics.outerPadding,
+        topPadding: metrics.topPadding,
+      );
+    }
 
-    // Grid Parameters
-    const double spacing = 16.0;
-    const double hPadding = 16.0;
-    const double topPadding = 16.0;
-
-    final double totalSpacing = (crossAxisCount - 1) * spacing + (hPadding * 2);
-    final double itemWidth = (screenWidth - totalSpacing) / crossAxisCount;
-    final double itemHeight = itemWidth / settings.videoCardAspectRatio;
-
-    final int row = index ~/ crossAxisCount;
-    final int col = index % crossAxisCount;
-
-    final double x = hPadding + col * (itemWidth + spacing);
-    final double y = topPadding + row * (itemHeight + spacing);
-
-    return Rect.fromLTWH(x, y, itemWidth, itemHeight);
+    final columns = settings.videoCardCrossAxisCount.clamp(1, 15);
+    const spacing = 16.0;
+    const padding = 16.0;
+    final itemWidth =
+        (mediaSize.width - padding * 2 - (columns - 1) * spacing) / columns;
+    return MediaLibraryGridGeometry(
+      crossAxisCount: columns,
+      itemWidth: itemWidth,
+      itemHeight: itemWidth / settings.videoCardAspectRatio,
+      horizontalSpacing: spacing,
+      verticalSpacing: spacing,
+      horizontalPadding: padding,
+      topPadding: padding,
+    );
   }
 
   /// Handle Circle Drag Selection Update
@@ -377,9 +657,8 @@ class _CollectionScreenState extends State<CollectionScreen> {
           _selectedIds.clear();
           _selectedIds.addAll(newSelection);
         });
-        if (Platform.isAndroid || Platform.isIOS) {
-          HapticFeedback.selectionClick();
-        }
+        final settings = Provider.of<SettingsService>(context, listen: false);
+        unawaited(AppHaptics.selectionClick(settings));
       }
     }
   }
@@ -444,6 +723,20 @@ class _CollectionScreenState extends State<CollectionScreen> {
         context,
         listen: false,
       );
+      if (_isSearchResults) {
+        final library = Provider.of<LibraryService>(context, listen: false);
+        final searchItems = _visibleContents(
+          library,
+        ).whereType<VideoItem>().toList(growable: false);
+        final startIndex = searchItems.indexWhere(
+          (candidate) => candidate.id == item.id,
+        );
+        playlistManager.setPlaylist(
+          searchItems,
+          startIndex: startIndex < 0 ? 0 : startIndex,
+        );
+        return;
+      }
       if (playlistManager.matchesFolderPlaylist(widget.collectionId, item.id)) {
         return;
       }
@@ -464,6 +757,11 @@ class _CollectionScreenState extends State<CollectionScreen> {
   @override
   void initState() {
     super.initState();
+    _revealHighlightController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 360),
+      reverseDuration: const Duration(milliseconds: 560),
+    );
     _preloadManager = ThumbnailPreloadManager();
     _scrollController.addListener(_onScroll);
     _startInitialPreload();
@@ -484,6 +782,8 @@ class _CollectionScreenState extends State<CollectionScreen> {
   void dispose() {
     _preloadManager.cancelAll();
     _scrollPrecacheTimer?.cancel();
+    _revealHighlightTimer?.cancel();
+    _revealHighlightController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     _shortcutFocusNode.dispose();
@@ -523,7 +823,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
   void _toggleSelectAllInCollection() {
     final library = Provider.of<LibraryService>(context, listen: false);
-    final contents = library.getContents(widget.collectionId);
+    final contents = _visibleContents(library);
     setState(() {
       if (_selectedIds.length == contents.length) {
         _selectedIds.clear();
@@ -593,6 +893,9 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
   KeyEventResult _handleShortcutKeyEvent(KeyEvent event) {
     if (!_supportsDesktopManagementShortcuts) return KeyEventResult.ignored;
+    // 当视频播放页或其他子页面活跃时，不处理键盘事件，避免与播放器快捷键冲突
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return KeyEventResult.ignored;
     if (_isTextInputFocused()) {
       return KeyEventResult.ignored;
     }
@@ -668,7 +971,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
   void _startInitialPreload() {
     final library = Provider.of<LibraryService>(context, listen: false);
-    final contents = library.getContents(widget.collectionId);
+    final contents = _visibleContents(library);
     _videoItems = contents.whereType<VideoItem>().toList();
 
     if (_videoItems.isNotEmpty) {
@@ -683,15 +986,12 @@ class _CollectionScreenState extends State<CollectionScreen> {
     _didInitialDecodePrecache = true;
 
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final crossAxisCount = settings.videoCardCrossAxisCount;
+    final geometry = _getMediaGridGeometry(settings);
+    final crossAxisCount = geometry.crossAxisCount;
     if (crossAxisCount <= 0 || _videoItems.isEmpty) return;
 
     final mediaQuery = MediaQuery.of(context);
-    final itemWidth =
-        (mediaQuery.size.width - 32 - (16 * (crossAxisCount - 1))) /
-        crossAxisCount;
-    final itemHeight = itemWidth / settings.videoCardAspectRatio;
-    final rowHeight = itemHeight + 16;
+    final rowHeight = geometry.itemHeight + geometry.verticalSpacing;
     final visibleRows = (mediaQuery.size.height / rowHeight).ceil().clamp(1, 8);
     final precacheCount = (crossAxisCount * (visibleRows + 1)).clamp(
       0,
@@ -706,19 +1006,25 @@ class _CollectionScreenState extends State<CollectionScreen> {
     if (_videoItems.isEmpty) return;
 
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final crossAxisCount = settings.videoCardCrossAxisCount;
-    if (crossAxisCount <= 0) return;
+    final geometry = _getMediaGridGeometry(settings);
 
     startIndex = startIndex.clamp(0, _videoItems.length);
     endIndex = endIndex.clamp(0, _videoItems.length);
     if (startIndex >= endIndex) return;
 
     final mediaQuery = MediaQuery.of(context);
-    final itemWidth =
-        (mediaQuery.size.width - 32 - (16 * (crossAxisCount - 1))) /
-        crossAxisCount;
-    final thumbWidth = itemWidth;
-    final thumbHeight = thumbWidth * 3 / 4;
+    final tileMetrics = MediaListLayoutMetrics.forTile(
+      screenShortestSide: mediaQuery.size.shortestSide,
+      cellWidth: geometry.itemWidth,
+      rowHeight: geometry.itemHeight,
+      titleSetting: settings.mediaListTitleScale,
+    );
+    final thumbWidth = settings.mediaLibraryViewMode == 1
+        ? tileMetrics.thumbnailExtent(geometry.itemWidth)
+        : geometry.itemWidth;
+    final thumbHeight = settings.mediaLibraryViewMode == 1
+        ? thumbWidth
+        : thumbWidth * 3 / 4;
     final dpr = mediaQuery.devicePixelRatio;
 
     final cacheWidth = (thumbWidth * dpr).round().clamp(1, 4096);
@@ -756,12 +1062,12 @@ class _CollectionScreenState extends State<CollectionScreen> {
 
     // 计算当前可见的视频索引范围
     final settings = Provider.of<SettingsService>(context, listen: false);
-    final crossAxisCount = settings.videoCardCrossAxisCount;
+    final geometry = _getMediaGridGeometry(settings);
+    final crossAxisCount = geometry.crossAxisCount;
 
     // 估算当前滚动位置对应的索引
     final scrollOffset = _scrollController.offset;
-    final itemHeight = 200.0; // 估算的卡片高度
-    final rowHeight = itemHeight + 16; // 包含间距
+    final rowHeight = geometry.itemHeight + geometry.verticalSpacing;
 
     final currentRow = (scrollOffset / rowHeight).floor();
     final currentIndex = currentRow * crossAxisCount;
@@ -855,786 +1161,884 @@ class _CollectionScreenState extends State<CollectionScreen> {
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsService>(context);
+    final useCompactTopBar = useCompactMediaLibraryTopBar(context);
 
     return Consumer<LibraryService>(
       builder: (context, library, child) {
-        final collection =
-            library.getCollection(widget.collectionId) ??
-            VideoCollection(id: '', name: '未知合集', createTime: 0);
+        final collection = _isSearchResults
+            ? VideoCollection(
+                id: '',
+                name: '搜索：“${widget.searchQuery}”',
+                createTime: 0,
+              )
+            : library.getCollection(widget.collectionId) ??
+                  VideoCollection(id: '', name: '未知合集', createTime: 0);
 
-        final contents = library.getContents(widget.collectionId);
+        final contents = _visibleContents(library);
+        _scheduleRevealIfNeeded(contents);
+        final baseTheme = Theme.of(context);
 
-        return PopScope(
-          canPop: !_isSelectionMode,
-          onPopInvokedWithResult: (didPop, _) {
-            if (didPop) return;
-            _exitSelectionMode();
-          },
-          child: Scaffold(
-            backgroundColor: const Color(0xFF121212),
-            appBar: AppBar(
-              title: _isSelectionMode
-                  ? _buildMoveOutTarget(
-                      context,
-                      library,
-                      collection,
-                      height: kToolbarHeight - 8,
-                      margin: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 6,
-                      ),
-                    )
-                  : Row(
-                      children: [
-                        IconButton(
-                          icon: Icon(
-                            settings.mediaLibraryViewMode == 0
-                                ? Icons.view_list_rounded
-                                : Icons.grid_view_rounded,
-                            color: settings.mediaLibraryViewMode == 0
-                                ? Colors.white70
-                                : Colors.blueAccent,
-                          ),
-                          tooltip: settings.mediaLibraryViewMode == 0
-                              ? _managementTooltip(
-                                  "切换列表视图",
-                                  DesktopMediaManagementShortcutAction
-                                      .toggleViewMode,
-                                )
-                              : _managementTooltip(
-                                  "切换卡片视图",
-                                  DesktopMediaManagementShortcutAction
-                                      .toggleViewMode,
-                                ),
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints.tightFor(
-                            width: 36,
-                            height: 36,
-                          ),
-                          onPressed: () {
-                            final nextMode = settings.mediaLibraryViewMode == 0
-                                ? 1
-                                : 0;
-                            settings.updateSetting(
-                              'mediaLibraryViewMode',
-                              nextMode,
-                            );
-                          },
-                        ),
-                        const SizedBox(width: 4),
-                        Expanded(
-                          child: Column(
-                            children: [
-                              Text(
-                                collection.name,
-                                overflow: TextOverflow.ellipsis,
+        return Theme(
+          data: _isSearchResults
+              ? baseTheme.copyWith(
+                  textTheme: baseTheme.textTheme.apply(
+                    fontFamily: 'Noto Sans SC',
+                  ),
+                  primaryTextTheme: baseTheme.primaryTextTheme.apply(
+                    fontFamily: 'Noto Sans SC',
+                  ),
+                )
+              : baseTheme,
+          child: PopScope(
+            canPop: !_isSelectionMode,
+            onPopInvokedWithResult: (didPop, _) {
+              if (didPop) return;
+              _exitSelectionMode();
+            },
+            child: Scaffold(
+              backgroundColor: const Color(0xFF121212),
+              // Only the search prompt follows the Android keyboard. The
+              // folder/search-result grid stays at its original dimensions
+              // underneath the IME to avoid a full card-grid relayout.
+              resizeToAvoidBottomInset: false,
+              appBar: AppBar(
+                toolbarHeight: useCompactTopBar ? 50 : kToolbarHeight,
+                leadingWidth: useCompactTopBar ? 40 : null,
+                titleSpacing: useCompactTopBar
+                    ? 3
+                    : NavigationToolbar.kMiddleSpacing,
+                title: _isSelectionMode
+                    ? (_isSearchResults
+                          ? (useCompactTopBar
+                                ? MediaLibraryCompactTitle(
+                                    text: '已选择 ${_selectedIds.length} 项',
+                                  )
+                                : Text('已选择 ${_selectedIds.length} 项'))
+                          : _buildMoveOutTarget(
+                              context,
+                              library,
+                              collection,
+                              height: kToolbarHeight - 8,
+                              margin: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 6,
                               ),
-                              ValueListenableBuilder<bool>(
-                                valueListenable: library.isImporting,
-                                builder: (context, isImporting, _) {
-                                  if (!isImporting) {
-                                    return const SizedBox.shrink();
-                                  }
-                                  return ValueListenableBuilder<String>(
-                                    valueListenable: library.importStatus,
-                                    builder: (context, status, _) {
-                                      return Text(
-                                        status,
-                                        style: const TextStyle(
-                                          fontSize: 10,
-                                          color: Colors.white70,
-                                        ),
-                                        overflow: TextOverflow.ellipsis,
+                            ))
+                    : useCompactTopBar
+                    ? MediaLibraryCompactTitle(text: collection.name)
+                    : Row(
+                        children: [
+                          IconButton(
+                            icon: Icon(
+                              settings.mediaLibraryViewMode == 0
+                                  ? Icons.view_list_rounded
+                                  : Icons.grid_view_rounded,
+                              color: settings.mediaLibraryViewMode == 0
+                                  ? Colors.white70
+                                  : Colors.blueAccent,
+                            ),
+                            tooltip: settings.mediaLibraryViewMode == 0
+                                ? _managementTooltip(
+                                    "切换列表视图",
+                                    DesktopMediaManagementShortcutAction
+                                        .toggleViewMode,
+                                  )
+                                : _managementTooltip(
+                                    "切换卡片视图",
+                                    DesktopMediaManagementShortcutAction
+                                        .toggleViewMode,
+                                  ),
+                            visualDensity: VisualDensity.compact,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints.tightFor(
+                              width: 36,
+                              height: 36,
+                            ),
+                            onPressed: () {
+                              final nextMode =
+                                  settings.mediaLibraryViewMode == 0 ? 1 : 0;
+                              settings.updateSetting(
+                                'mediaLibraryViewMode',
+                                nextMode,
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Align(
+                                  alignment: _isSearchResults
+                                      ? Alignment.centerLeft
+                                      : Alignment.center,
+                                  child: Text(
+                                    collection.name,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                if (!_isSearchResults)
+                                  ValueListenableBuilder<bool>(
+                                    valueListenable: library.isImporting,
+                                    builder: (context, isImporting, _) {
+                                      if (!isImporting) {
+                                        return const SizedBox.shrink();
+                                      }
+                                      return ValueListenableBuilder<String>(
+                                        valueListenable: library.importStatus,
+                                        builder: (context, status, _) {
+                                          return Text(
+                                            status,
+                                            style: const TextStyle(
+                                              fontSize: 10,
+                                              color: Colors.white70,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          );
+                                        },
                                       );
                                     },
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                centerTitle: false,
+                leading: _isSelectionMode
+                    ? (useCompactTopBar
+                          ? MediaLibraryCompactIconButton(
+                              icon: Icons.close,
+                              tooltip: '退出选择',
+                              onPressed: _exitSelectionMode,
+                            )
+                          : IconButton(
+                              icon: const Icon(Icons.close),
+                              tooltip: _managementTooltip(
+                                "退出选择",
+                                DesktopMediaManagementShortcutAction
+                                    .backOrExitSelection,
+                              ),
+                              onPressed: _exitSelectionMode,
+                            ))
+                    : (useCompactTopBar
+                          ? MediaLibraryCompactIconButton(
+                              icon: Icons.arrow_back,
+                              tooltip: widget.returnToSearchResults
+                                  ? '返回搜索结果'
+                                  : '返回上一级',
+                              onPressed: () => Navigator.of(context).maybePop(),
+                            )
+                          : IconButton(
+                              icon: const Icon(Icons.arrow_back),
+                              tooltip: widget.returnToSearchResults
+                                  ? '返回搜索结果'
+                                  : _managementTooltip(
+                                      "返回上一级",
+                                      DesktopMediaManagementShortcutAction
+                                          .backOrExitSelection,
+                                    ),
+                              onPressed: () => Navigator.of(context).maybePop(),
+                            )),
+                actions: useCompactTopBar
+                    ? _buildCompactTopBarActions(settings)
+                    : [
+                        ResponsiveActionButtons(
+                          buttons: [
+                            if (!_isSelectionMode) ...[
+                              if (Platform.isWindows ||
+                                  Platform.isLinux ||
+                                  Platform.isMacOS)
+                                ResponsiveIconButton(
+                                  icon: settings.isFullScreen
+                                      ? Icons.fullscreen_exit
+                                      : Icons.fullscreen,
+                                  tooltip: _managementTooltip(
+                                    settings.isFullScreen ? "退出全屏" : "全屏",
+                                    DesktopMediaManagementShortcutAction
+                                        .toggleFullScreen,
+                                  ),
+                                  onPressed: () => settings.toggleFullScreen(),
+                                ),
+                              if (Platform.isWindows)
+                                ResponsiveIconButton(
+                                  icon: Icons.folder_open,
+                                  tooltip: _managementTooltip(
+                                    "大文件目录",
+                                    DesktopMediaManagementShortcutAction
+                                        .openLargeDataDirectory,
+                                  ),
+                                  onPressed: () =>
+                                      _showLargeDataPathDialog(context),
+                                ),
+                              if (_showExportSettingsButton)
+                                ResponsiveIconButton(
+                                  icon: Icons.file_download,
+                                  tooltip: _managementTooltip(
+                                    "导出设置",
+                                    DesktopMediaManagementShortcutAction
+                                        .exportSettings,
+                                  ),
+                                  onPressed: _exportSettingsSnapshot,
+                                ),
+                              if (widget.returnToSearchResults)
+                                ResponsiveIconButton(
+                                  icon: Icons.drive_folder_upload_outlined,
+                                  tooltip: '上一级目录',
+                                  onPressed: () =>
+                                      _openParentDirectory(collection),
+                                ),
+                              ResponsiveIconButton(
+                                icon: Icons.search_rounded,
+                                tooltip: '搜索媒体库',
+                                onPressed: _openSearch,
+                              ),
+                              ResponsiveIconButton(
+                                icon: Icons.delete_outline,
+                                tooltip: _managementTooltip(
+                                  "回收站",
+                                  DesktopMediaManagementShortcutAction
+                                      .openRecycleBin,
+                                ),
+                                onPressed: () {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => const RecycleBinScreen(),
+                                    ),
                                   );
                                 },
                               ),
+                              ResponsiveIconButton(
+                                icon: Icons.tune,
+                                tooltip: _managementTooltip(
+                                  "调整卡片样式",
+                                  DesktopMediaManagementShortcutAction
+                                      .openCardStyle,
+                                ),
+                                onPressed: () => _showCardStyleBottomSheet(
+                                  context,
+                                  settings,
+                                ),
+                              ),
+                              ResponsiveIconButton(
+                                icon: Icons.settings_outlined,
+                                tooltip: "媒体库设置",
+                                onPressed: () =>
+                                    showMediaLibrarySettingsBottomSheet(
+                                      context,
+                                      settings,
+                                    ),
+                              ),
+                              ResponsiveIconButton(
+                                icon: Icons.checklist,
+                                tooltip: _managementTooltip(
+                                  "批量管理",
+                                  DesktopMediaManagementShortcutAction
+                                      .enterSelectionMode,
+                                ),
+                                onPressed: () {
+                                  setState(() {
+                                    _isSelectionMode = true;
+                                  });
+                                },
+                              ),
+                            ] else ...[
+                              ResponsiveIconButton(
+                                icon: Icons.select_all,
+                                tooltip: _managementTooltip(
+                                  "全选",
+                                  DesktopMediaManagementShortcutAction
+                                      .toggleSelectAll,
+                                ),
+                                onPressed: _toggleSelectAllInCollection,
+                              ),
                             ],
-                          ),
+                          ],
                         ),
                       ],
-                    ),
-              centerTitle: false,
-              leading: _isSelectionMode
-                  ? IconButton(
-                      icon: const Icon(Icons.close),
-                      tooltip: _managementTooltip(
-                        "退出选择",
-                        DesktopMediaManagementShortcutAction
-                            .backOrExitSelection,
-                      ),
-                      onPressed: () {
-                        _exitSelectionMode();
-                      },
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.arrow_back),
-                      tooltip: _managementTooltip(
-                        "返回上一级",
-                        DesktopMediaManagementShortcutAction
-                            .backOrExitSelection,
-                      ),
-                      onPressed: () => Navigator.of(context).maybePop(),
-                    ),
-              actions: [
-                ResponsiveActionButtons(
-                  buttons: [
-                    if (!_isSelectionMode) ...[
-                      if (Platform.isWindows ||
-                          Platform.isLinux ||
-                          Platform.isMacOS)
-                        ResponsiveIconButton(
-                          icon: settings.isFullScreen
-                              ? Icons.fullscreen_exit
-                              : Icons.fullscreen,
-                          tooltip: _managementTooltip(
-                            settings.isFullScreen ? "退出全屏" : "全屏",
-                            DesktopMediaManagementShortcutAction
-                                .toggleFullScreen,
-                          ),
-                          onPressed: () => settings.toggleFullScreen(),
-                        ),
-                      if (Platform.isWindows)
-                        ResponsiveIconButton(
-                          icon: Icons.folder_open,
-                          tooltip: _managementTooltip(
-                            "大文件目录",
-                            DesktopMediaManagementShortcutAction
-                                .openLargeDataDirectory,
-                          ),
-                          onPressed: () => _showLargeDataPathDialog(context),
-                        ),
-                      if (_showExportSettingsButton)
-                        ResponsiveIconButton(
-                          icon: Icons.file_download,
-                          tooltip: _managementTooltip(
-                            "导出设置",
-                            DesktopMediaManagementShortcutAction.exportSettings,
-                          ),
-                          onPressed: _exportSettingsSnapshot,
-                        ),
-                      ResponsiveIconButton(
-                        icon: Icons.delete_outline,
-                        tooltip: _managementTooltip(
-                          "回收站",
-                          DesktopMediaManagementShortcutAction.openRecycleBin,
-                        ),
-                        onPressed: () {
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => const RecycleBinScreen(),
-                            ),
-                          );
-                        },
-                      ),
-                      ResponsiveIconButton(
-                        icon: Icons.tune,
-                        tooltip: _managementTooltip(
-                          "调整卡片样式",
-                          DesktopMediaManagementShortcutAction.openCardStyle,
-                        ),
-                        onPressed: () =>
-                            _showCardStyleBottomSheet(context, settings),
-                      ),
-                      ResponsiveIconButton(
-                        icon: Icons.checklist,
-                        tooltip: _managementTooltip(
-                          "批量管理",
-                          DesktopMediaManagementShortcutAction
-                              .enterSelectionMode,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            _isSelectionMode = true;
-                          });
-                        },
-                      ),
-                    ] else ...[
-                      ResponsiveIconButton(
-                        icon: Icons.select_all,
-                        tooltip: _managementTooltip(
-                          "全选",
-                          DesktopMediaManagementShortcutAction.toggleSelectAll,
-                        ),
-                        onPressed: _toggleSelectAllInCollection,
-                      ),
-                    ],
-                  ],
-                ),
-              ],
-              bottom: PreferredSize(
-                preferredSize: const Size.fromHeight(4),
-                child: ValueListenableBuilder<double>(
-                  valueListenable: library.importProgress,
-                  builder: (context, progress, _) {
-                    if (progress <= 0 || progress >= 1) {
-                      return const SizedBox.shrink();
-                    }
-                    return LinearProgressIndicator(
-                      value: progress,
-                      backgroundColor: Colors.transparent,
-                      minHeight: 4,
-                    );
-                  },
+                bottom: PreferredSize(
+                  preferredSize: const Size.fromHeight(4),
+                  child: ValueListenableBuilder<double>(
+                    valueListenable: library.importProgress,
+                    builder: (context, progress, _) {
+                      if (progress <= 0 || progress >= 1) {
+                        return const SizedBox.shrink();
+                      }
+                      return LinearProgressIndicator(
+                        value: progress,
+                        backgroundColor: Colors.transparent,
+                        minHeight: 4,
+                      );
+                    },
+                  ),
                 ),
               ),
-            ),
-            body: Focus(
-              focusNode: _shortcutFocusNode,
-              autofocus: _supportsDesktopManagementShortcuts,
-              onKeyEvent: (node, event) => _handleShortcutKeyEvent(event),
-              child: Listener(
-                behavior: HitTestBehavior.translucent,
-                onPointerDown: (_) {
-                  if (_supportsDesktopManagementShortcuts &&
-                      !_shortcutFocusNode.hasFocus) {
-                    _shortcutFocusNode.requestFocus();
-                  }
-                },
-                child: DropTarget(
-                  onDragDone: (details) {
-                    if (ModalRoute.of(context)?.isCurrent != true) return;
-                    setState(() {
-                      _isDraggingFiles = false;
-                    });
-                    final paths = details.files.map((f) => f.path).toList();
-                    if (paths.isNotEmpty) {
-                      VideoActionButtons.processDroppedPaths(
-                        context,
-                        paths,
-                        widget.collectionId,
-                      );
+              body: Focus(
+                focusNode: _shortcutFocusNode,
+                autofocus: _supportsDesktopManagementShortcuts,
+                onKeyEvent: (node, event) => _handleShortcutKeyEvent(event),
+                child: Listener(
+                  behavior: HitTestBehavior.translucent,
+                  onPointerDown: (_) {
+                    if (_supportsDesktopManagementShortcuts &&
+                        !_shortcutFocusNode.hasFocus) {
+                      _shortcutFocusNode.requestFocus();
                     }
                   },
-                  onDragEntered: (_) {
-                    if (ModalRoute.of(context)?.isCurrent != true) return;
-                    setState(() => _isDraggingFiles = true);
-                  },
-                  onDragExited: (_) => setState(() => _isDraggingFiles = false),
-                  child: Stack(
-                    children: [
-                      contents.isEmpty
-                          ? Center(
-                              child: Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  const Icon(
-                                    Icons.video_collection_outlined,
-                                    size: 80,
-                                    color: Colors.white24,
-                                  ),
-                                  const SizedBox(height: 16),
-                                  const Text(
-                                    "合集是空的",
-                                    style: TextStyle(color: Colors.white54),
-                                  ),
-                                  const SizedBox(height: 16),
-                                  VideoActionButtons(
-                                    collectionId: widget.collectionId,
-                                    isHorizontal: true,
-                                  ),
-                                ],
-                              ),
-                            )
-                          : GestureDetector(
-                              onScaleStart: (details) {
-                                // Allow box selection in two cases:
-                                // 1. Windows platform (Mouse drag) in non-selection mode (existing logic)
-                                // 2. ANY platform in selection mode (User request: "Start position can be non-card area")
+                  child: DropTarget(
+                    onDragDone: (details) {
+                      if (ModalRoute.of(context)?.isCurrent != true) return;
+                      if (_isSearchResults) return;
+                      setState(() {
+                        _isDraggingFiles = false;
+                      });
+                      final paths = details.files.map((f) => f.path).toList();
+                      if (paths.isNotEmpty) {
+                        VideoActionButtons.processDroppedPaths(
+                          context,
+                          paths,
+                          widget.collectionId,
+                        );
+                      }
+                    },
+                    onDragEntered: (_) {
+                      if (ModalRoute.of(context)?.isCurrent != true) return;
+                      if (_isSearchResults) return;
+                      setState(() => _isDraggingFiles = true);
+                    },
+                    onDragExited: (_) =>
+                        setState(() => _isDraggingFiles = false),
+                    child: Stack(
+                      children: [
+                        contents.isEmpty
+                            ? Center(
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      _isSearchResults
+                                          ? Icons.search_off_rounded
+                                          : Icons.video_collection_outlined,
+                                      size: 80,
+                                      color: Colors.white24,
+                                    ),
+                                    const SizedBox(height: 16),
+                                    Text(
+                                      _isSearchResults ? "没有找到匹配项目" : "合集是空的",
+                                      style: const TextStyle(
+                                        color: Colors.white54,
+                                      ),
+                                    ),
+                                    if (!_isSearchResults) ...[
+                                      const SizedBox(height: 16),
+                                      VideoActionButtons(
+                                        collectionId: widget.collectionId,
+                                        isHorizontal: true,
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              )
+                            : GestureDetector(
+                                onScaleStart: (details) {
+                                  // Allow box selection in two cases:
+                                  // 1. Windows platform (Mouse drag) in non-selection mode (existing logic)
+                                  // 2. ANY platform in selection mode (User request: "Start position can be non-card area")
 
-                                bool canStartBoxSelection = false;
+                                  bool canStartBoxSelection = false;
 
-                                if (_isSelectionMode) {
-                                  // In selection mode, any drag on empty space starts a box selection
-                                  // But we need to distinguish from scrolling.
-                                  // If it's a mouse drag, it's box selection.
-                                  // If it's a touch drag? User said "For all versions... start position can be non-card".
-                                  // If I touch and drag on phone, usually it scrolls.
-                                  // But if I touch empty space?
-                                  // Let's check if we hit an item.
-                                  // If we hit an item, the item's onTap/onLongPress/onPan handles it.
-                                  // If we are here, it means we likely didn't hit an item's interactive area?
-                                  // Or the item didn't claim the gesture.
-                                  canStartBoxSelection = true;
-                                } else if (Platform.isWindows &&
-                                    details.pointerCount == 1) {
-                                  canStartBoxSelection = true;
-                                }
+                                  if (_isSelectionMode) {
+                                    // In selection mode, any drag on empty space starts a box selection
+                                    // But we need to distinguish from scrolling.
+                                    // If it's a mouse drag, it's box selection.
+                                    // If it's a touch drag? User said "For all versions... start position can be non-card".
+                                    // If I touch and drag on phone, usually it scrolls.
+                                    // But if I touch empty space?
+                                    // Let's check if we hit an item.
+                                    // If we hit an item, the item's onTap/onLongPress/onPan handles it.
+                                    // If we are here, it means we likely didn't hit an item's interactive area?
+                                    // Or the item didn't claim the gesture.
+                                    canStartBoxSelection = true;
+                                  } else if (Platform.isWindows &&
+                                      details.pointerCount == 1) {
+                                    canStartBoxSelection = true;
+                                  }
 
-                                if (canStartBoxSelection) {
-                                  // Check if we hit an item to avoid conflict?
-                                  // In selection mode, if I touch an item, I toggle it (onTap) or drag it (onPan if circle).
-                                  // If I touch item body and drag? It should probably scroll or reorder?
-                                  // Reorder is handled by LongPressDraggable.
-                                  // So if I am here, maybe I hit empty space.
+                                  if (canStartBoxSelection) {
+                                    // Check if we hit an item to avoid conflict?
+                                    // In selection mode, if I touch an item, I toggle it (onTap) or drag it (onPan if circle).
+                                    // If I touch item body and drag? It should probably scroll or reorder?
+                                    // Reorder is handled by LongPressDraggable.
+                                    // So if I am here, maybe I hit empty space.
 
-                                  final renderBox =
-                                      context.findRenderObject() as RenderBox?;
-                                  if (renderBox != null) {
-                                    final contentOffset =
-                                        details.localFocalPoint +
-                                        Offset(0, _scrollController.offset);
-                                    if (_getIndexAt(contentOffset) == null) {
-                                      // Started on empty area
-                                      _isBoxSelecting = true;
-                                      _boxStartPos = details.localFocalPoint;
-                                      _boxCurrentPos = details.localFocalPoint;
-                                      _capturedIds
-                                          .clear(); // Clear capture history for new drag
+                                    final renderBox =
+                                        context.findRenderObject()
+                                            as RenderBox?;
+                                    if (renderBox != null) {
+                                      final contentOffset =
+                                          details.localFocalPoint +
+                                          Offset(0, _scrollController.offset);
+                                      if (_getIndexAt(contentOffset) == null) {
+                                        // Started on empty area
+                                        _isBoxSelecting = true;
+                                        _boxStartPos = details.localFocalPoint;
+                                        _boxCurrentPos =
+                                            details.localFocalPoint;
+                                        _capturedIds
+                                            .clear(); // Clear capture history for new drag
 
-                                      // If in selection mode, we might want to capture current selection as snapshot?
-                                      // Logic: "Drag selection level is higher".
-                                      // If I start dragging from empty space, do I keep existing selection?
-                                      // Usually yes (Add mode) or No (Replace mode).
-                                      // Windows default is Replace.
-                                      // But user said "For all versions".
-                                      // Let's assume Replace for empty space drag in selection mode too?
-                                      // Or Union?
-                                      // User's description of "Higher level" suggests Union with Capture logic.
-                                      // Let's Init snapshot.
-                                      if (_isSelectionMode) {
-                                        _dragSelectionSnapshot = Set.from(
-                                          _selectedIds,
-                                        );
-                                      } else {
-                                        _dragSelectionSnapshot.clear();
+                                        // If in selection mode, we might want to capture current selection as snapshot?
+                                        // Logic: "Drag selection level is higher".
+                                        // If I start dragging from empty space, do I keep existing selection?
+                                        // Usually yes (Add mode) or No (Replace mode).
+                                        // Windows default is Replace.
+                                        // But user said "For all versions".
+                                        // Let's assume Replace for empty space drag in selection mode too?
+                                        // Or Union?
+                                        // User's description of "Higher level" suggests Union with Capture logic.
+                                        // Let's Init snapshot.
+                                        if (_isSelectionMode) {
+                                          _dragSelectionSnapshot = Set.from(
+                                            _selectedIds,
+                                          );
+                                        } else {
+                                          _dragSelectionSnapshot.clear();
+                                        }
+
+                                        setState(() {});
+                                        return;
                                       }
-
-                                      setState(() {});
-                                      return;
                                     }
                                   }
-                                }
-                                _baseCrossAxisCount =
-                                    settings.videoCardCrossAxisCount;
-                              },
-                              onScaleUpdate: (details) {
-                                if (_isBoxSelecting) {
-                                  setState(() {
-                                    _boxCurrentPos = details.localFocalPoint;
-                                  });
+                                  _baseCrossAxisCount =
+                                      settings.mediaLibraryViewMode == 1
+                                      ? settings.mediaListCrossAxisCount
+                                      : settings.videoCardCrossAxisCount;
+                                },
+                                onScaleUpdate: (details) {
+                                  if (_isBoxSelecting) {
+                                    setState(() {
+                                      _boxCurrentPos = details.localFocalPoint;
+                                    });
 
-                                  // Real-time update for empty space drag
-                                  if (_boxStartPos != null &&
-                                      _boxCurrentPos != null) {
-                                    final rect = Rect.fromPoints(
-                                      _boxStartPos!,
-                                      _boxCurrentPos!,
-                                    );
-                                    final contentRect = rect.shift(
-                                      Offset(0, _scrollController.offset),
-                                    );
+                                    // Real-time update for empty space drag
+                                    if (_boxStartPos != null &&
+                                        _boxCurrentPos != null) {
+                                      final rect = Rect.fromPoints(
+                                        _boxStartPos!,
+                                        _boxCurrentPos!,
+                                      );
+                                      final contentRect = rect.shift(
+                                        Offset(0, _scrollController.offset),
+                                      );
 
-                                    final Set<String> currentInBox = {};
-                                    final count = _getItemCount();
+                                      final Set<String> currentInBox = {};
+                                      final count = _getItemCount();
 
-                                    // Optimization: Only check items in the visible range of the selection box
-                                    // Pre-calculate layout parameters to avoid repeated Provider/MediaQuery calls
-                                    final double screenWidth = MediaQuery.of(
-                                      context,
-                                    ).size.width;
-                                    const double spacing = 16.0;
-                                    const double hPadding = 16.0;
-                                    const double topPadding = 16.0;
+                                      // Optimization: Only check items in the visible range of the selection box
+                                      // Pre-calculate layout parameters to avoid repeated Provider/MediaQuery calls
+                                      final geometry = _getMediaGridGeometry(
+                                        settings,
+                                      );
 
-                                    final double totalSpacing =
-                                        (settings.videoCardCrossAxisCount - 1) *
-                                            spacing +
-                                        (hPadding * 2);
-                                    final double itemWidth =
-                                        (screenWidth - totalSpacing) /
-                                        settings.videoCardCrossAxisCount;
-                                    final double itemHeight =
-                                        itemWidth /
-                                        settings.videoCardAspectRatio;
+                                      // Calculate grid range affected by contentRect
+                                      int minRow =
+                                          ((contentRect.top -
+                                                      geometry.topPadding) /
+                                                  (geometry.itemHeight +
+                                                      geometry.verticalSpacing))
+                                              .floor();
+                                      int maxRow =
+                                          ((contentRect.bottom -
+                                                      geometry.topPadding) /
+                                                  (geometry.itemHeight +
+                                                      geometry.verticalSpacing))
+                                              .floor();
+                                      int minCol =
+                                          ((contentRect.left -
+                                                      geometry
+                                                          .horizontalPadding) /
+                                                  (geometry.itemWidth +
+                                                      geometry
+                                                          .horizontalSpacing))
+                                              .floor();
+                                      int maxCol =
+                                          ((contentRect.right -
+                                                      geometry
+                                                          .horizontalPadding) /
+                                                  (geometry.itemWidth +
+                                                      geometry
+                                                          .horizontalSpacing))
+                                              .floor();
 
-                                    // Calculate grid range affected by contentRect
-                                    int minRow =
-                                        ((contentRect.top - topPadding) /
-                                                (itemHeight + spacing))
-                                            .floor();
-                                    int maxRow =
-                                        ((contentRect.bottom - topPadding) /
-                                                (itemHeight + spacing))
-                                            .floor();
-                                    int minCol =
-                                        ((contentRect.left - hPadding) /
-                                                (itemWidth + spacing))
-                                            .floor();
-                                    int maxCol =
-                                        ((contentRect.right - hPadding) /
-                                                (itemWidth + spacing))
-                                            .floor();
+                                      // Clamp ranges
+                                      if (minRow < 0) minRow = 0;
+                                      if (minCol < 0) minCol = 0;
+                                      if (maxCol >= geometry.crossAxisCount) {
+                                        maxCol = geometry.crossAxisCount - 1;
+                                      }
 
-                                    // Clamp ranges
-                                    if (minRow < 0) minRow = 0;
-                                    if (minCol < 0) minCol = 0;
-                                    if (maxCol >=
-                                        settings.videoCardCrossAxisCount) {
-                                      maxCol =
-                                          settings.videoCardCrossAxisCount - 1;
-                                    }
-
-                                    // Iterate only through potentially overlapping items
-                                    for (
-                                      int row = minRow;
-                                      row <= maxRow;
-                                      row++
-                                    ) {
+                                      // Iterate only through potentially overlapping items
                                       for (
-                                        int col = minCol;
-                                        col <= maxCol;
-                                        col++
+                                        int row = minRow;
+                                        row <= maxRow;
+                                        row++
                                       ) {
-                                        final index =
-                                            row *
-                                                settings
-                                                    .videoCardCrossAxisCount +
-                                            col;
-                                        if (index >= 0 && index < count) {
-                                          final double x =
-                                              hPadding +
-                                              col * (itemWidth + spacing);
-                                          final double y =
-                                              topPadding +
-                                              row * (itemHeight + spacing);
-                                          final itemRect = Rect.fromLTWH(
-                                            x,
-                                            y,
-                                            itemWidth,
-                                            itemHeight,
-                                          );
+                                        for (
+                                          int col = minCol;
+                                          col <= maxCol;
+                                          col++
+                                        ) {
+                                          final index =
+                                              row * geometry.crossAxisCount +
+                                              col;
+                                          if (index >= 0 && index < count) {
+                                            final itemRect = geometry
+                                                .rectForIndex(index);
 
-                                          if (itemRect.overlaps(contentRect)) {
-                                            final id = _getItemId(index);
-                                            if (id != null) {
-                                              currentInBox.add(id);
+                                            if (itemRect.overlaps(
+                                              contentRect,
+                                            )) {
+                                              final id = _getItemId(index);
+                                              if (id != null) {
+                                                currentInBox.add(id);
+                                              }
                                             }
                                           }
                                         }
                                       }
-                                    }
 
-                                    // Logic for Empty Space Drag:
-                                    // If not in selection mode -> Replace (Standard Windows)
-                                    // If in selection mode -> Union with Capture Logic (User Requirement)
+                                      // Logic for Empty Space Drag:
+                                      // If not in selection mode -> Replace (Standard Windows)
+                                      // If in selection mode -> Union with Capture Logic (User Requirement)
 
-                                    if (!_isSelectionMode) {
-                                      // Just visualize, don't select yet?
-                                      // Windows behavior: Visual only until release?
-                                      // User said: "松开鼠标后...如果选择到了卡片，则进入选择模式"
-                                      // So Real-time update is NOT needed for selection state, ONLY visual.
-                                      // Correct.
-                                    } else {
-                                      // In selection mode: Real-time update IS needed.
-                                      // Apply Capture Logic
-                                      _capturedIds.addAll(currentInBox);
+                                      if (!_isSelectionMode) {
+                                        // Just visualize, don't select yet?
+                                        // Windows behavior: Visual only until release?
+                                        // User said: "松开鼠标后...如果选择到了卡片，则进入选择模式"
+                                        // So Real-time update is NOT needed for selection state, ONLY visual.
+                                        // Correct.
+                                      } else {
+                                        // In selection mode: Real-time update IS needed.
+                                        // Apply Capture Logic
+                                        _capturedIds.addAll(currentInBox);
 
-                                      final Set<String> newSelection = {};
-                                      for (final id in _dragSelectionSnapshot) {
-                                        if (!_capturedIds.contains(id)) {
-                                          newSelection.add(id);
+                                        final Set<String> newSelection = {};
+                                        for (final id
+                                            in _dragSelectionSnapshot) {
+                                          if (!_capturedIds.contains(id)) {
+                                            newSelection.add(id);
+                                          }
+                                        }
+                                        newSelection.addAll(currentInBox);
+
+                                        if (newSelection.length !=
+                                                _selectedIds.length ||
+                                            !_selectedIds.containsAll(
+                                              newSelection,
+                                            )) {
+                                          _selectedIds.clear();
+                                          _selectedIds.addAll(newSelection);
+                                          final settings =
+                                              Provider.of<SettingsService>(
+                                                context,
+                                                listen: false,
+                                              );
+                                          unawaited(
+                                            AppHaptics.selectionClick(settings),
+                                          );
                                         }
                                       }
-                                      newSelection.addAll(currentInBox);
+                                    }
+                                    return;
+                                  }
 
-                                      if (newSelection.length !=
-                                              _selectedIds.length ||
-                                          !_selectedIds.containsAll(
-                                            newSelection,
-                                          )) {
-                                        _selectedIds.clear();
-                                        _selectedIds.addAll(newSelection);
-                                        if (Platform.isAndroid ||
-                                            Platform.isIOS) {
-                                          HapticFeedback.selectionClick();
+                                  double newScale = details.scale;
+                                  int newCount = _baseCrossAxisCount;
+
+                                  if (newScale > 1.3) {
+                                    newCount = (_baseCrossAxisCount - 1).clamp(
+                                      1,
+                                      15,
+                                    );
+                                  } else if (newScale < 0.7) {
+                                    newCount = (_baseCrossAxisCount + 1).clamp(
+                                      1,
+                                      15,
+                                    );
+                                  }
+
+                                  final currentCount =
+                                      settings.mediaLibraryViewMode == 1
+                                      ? settings.mediaListCrossAxisCount
+                                      : settings.videoCardCrossAxisCount;
+                                  if (newCount != currentCount) {
+                                    settings.updateSetting(
+                                      settings.mediaLibraryViewMode == 1
+                                          ? 'mediaListCrossAxisCount'
+                                          : 'videoCardCrossAxisCount',
+                                      newCount,
+                                    );
+                                  }
+                                },
+                                onScaleEnd: (details) {
+                                  if (_isBoxSelecting) {
+                                    // Calculate selected items (Only needed if NOT in selection mode, because in selection mode we update real-time)
+                                    // Actually, if we are not in selection mode, we need to apply selection now.
+
+                                    if (!_isSelectionMode &&
+                                        _boxStartPos != null &&
+                                        _boxCurrentPos != null) {
+                                      final rect = Rect.fromPoints(
+                                        _boxStartPos!,
+                                        _boxCurrentPos!,
+                                      );
+                                      final contentRect = rect.shift(
+                                        Offset(0, _scrollController.offset),
+                                      );
+
+                                      final Set<String> newSelected = {};
+                                      final count = _getItemCount();
+
+                                      for (int i = 0; i < count; i++) {
+                                        final itemRect = _getItemRect(i);
+                                        if (itemRect != null &&
+                                            itemRect.overlaps(contentRect)) {
+                                          final id = _getItemId(i);
+                                          if (id != null) newSelected.add(id);
                                         }
                                       }
-                                    }
-                                  }
-                                  return;
-                                }
 
-                                double newScale = details.scale;
-                                int newCount = _baseCrossAxisCount;
-
-                                if (newScale > 1.3) {
-                                  newCount = (_baseCrossAxisCount - 1).clamp(
-                                    1,
-                                    15,
-                                  );
-                                } else if (newScale < 0.7) {
-                                  newCount = (_baseCrossAxisCount + 1).clamp(
-                                    1,
-                                    15,
-                                  );
-                                }
-
-                                if (newCount !=
-                                    settings.videoCardCrossAxisCount) {
-                                  settings.updateSetting(
-                                    'videoCardCrossAxisCount',
-                                    newCount,
-                                  );
-                                }
-                              },
-                              onScaleEnd: (details) {
-                                if (_isBoxSelecting) {
-                                  // Calculate selected items (Only needed if NOT in selection mode, because in selection mode we update real-time)
-                                  // Actually, if we are not in selection mode, we need to apply selection now.
-
-                                  if (!_isSelectionMode &&
-                                      _boxStartPos != null &&
-                                      _boxCurrentPos != null) {
-                                    final rect = Rect.fromPoints(
-                                      _boxStartPos!,
-                                      _boxCurrentPos!,
-                                    );
-                                    final contentRect = rect.shift(
-                                      Offset(0, _scrollController.offset),
-                                    );
-
-                                    final Set<String> newSelected = {};
-                                    final count = _getItemCount();
-
-                                    for (int i = 0; i < count; i++) {
-                                      final itemRect = _getItemRect(i);
-                                      if (itemRect != null &&
-                                          itemRect.overlaps(contentRect)) {
-                                        final id = _getItemId(i);
-                                        if (id != null) newSelected.add(id);
+                                      if (newSelected.isNotEmpty) {
+                                        setState(() {
+                                          _isSelectionMode = true;
+                                          _selectedIds.addAll(newSelected);
+                                        });
                                       }
                                     }
 
-                                    if (newSelected.isNotEmpty) {
-                                      setState(() {
-                                        _isSelectionMode = true;
-                                        _selectedIds.addAll(newSelected);
-                                      });
-                                    }
+                                    setState(() {
+                                      _isBoxSelecting = false;
+                                      _boxStartPos = null;
+                                      _boxCurrentPos = null;
+                                      _capturedIds.clear();
+                                    });
+                                    return;
                                   }
-
-                                  setState(() {
-                                    _isBoxSelecting = false;
-                                    _boxStartPos = null;
-                                    _boxCurrentPos = null;
-                                    _capturedIds.clear();
-                                  });
-                                  return;
-                                }
-                              },
-                              child: Container(
-                                height: MediaQuery.of(context).size.height,
-                                color: Colors.transparent,
-                                child: _buildMediaGridOrList(
-                                  context: context,
-                                  library: library,
-                                  settings: settings,
-                                  contents: contents,
+                                },
+                                child: Container(
+                                  height: MediaQuery.of(context).size.height,
+                                  color: Colors.transparent,
+                                  child: _buildMediaGridOrList(
+                                    context: context,
+                                    library: library,
+                                    settings: settings,
+                                    contents: contents,
+                                  ),
+                                ),
+                              ),
+                        // Fill the rest of the screen with a transparent hit target to ensure GestureDetector catches taps in empty space
+                        if (contents.length <
+                            20) // Only if potentially empty space at bottom
+                          Positioned.fill(
+                            child: Listener(
+                              behavior: HitTestBehavior.translucent,
+                              onPointerDown:
+                                  (
+                                    _,
+                                  ) {}, // Consumes touch to pass to GestureDetector parent? No, Listener doesn't consume.
+                              // We need a widget that participates in hit test but lets events bubble up?
+                              // GestureDetector with translucent behavior catches it.
+                              // But GridView might not fill the height.
+                              // So we place this BEHIND GridView? No, GridView is in GestureDetector child.
+                              // If GridView shrinks, GestureDetector child shrinks.
+                              // So GestureDetector might not cover full screen.
+                              // FIX: Wrap GridView in a Container with double.infinity height.
+                            ),
+                          ),
+                        if (_isBoxSelecting &&
+                            _boxStartPos != null &&
+                            _boxCurrentPos != null &&
+                            !_isSelectionMode)
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              child: CustomPaint(
+                                painter: _BoxSelectionPainter(
+                                  selectionRect: Rect.fromPoints(
+                                    _boxStartPos!,
+                                    _boxCurrentPos!,
+                                  ),
                                 ),
                               ),
                             ),
-                      // Fill the rest of the screen with a transparent hit target to ensure GestureDetector catches taps in empty space
-                      if (contents.length <
-                          20) // Only if potentially empty space at bottom
-                        Positioned.fill(
-                          child: Listener(
-                            behavior: HitTestBehavior.translucent,
-                            onPointerDown:
-                                (
-                                  _,
-                                ) {}, // Consumes touch to pass to GestureDetector parent? No, Listener doesn't consume.
-                            // We need a widget that participates in hit test but lets events bubble up?
-                            // GestureDetector with translucent behavior catches it.
-                            // But GridView might not fill the height.
-                            // So we place this BEHIND GridView? No, GridView is in GestureDetector child.
-                            // If GridView shrinks, GestureDetector child shrinks.
-                            // So GestureDetector might not cover full screen.
-                            // FIX: Wrap GridView in a Container with double.infinity height.
                           ),
-                        ),
-                      if (_isBoxSelecting &&
-                          _boxStartPos != null &&
-                          _boxCurrentPos != null &&
-                          !_isSelectionMode)
-                        Positioned.fill(
-                          child: IgnorePointer(
-                            child: CustomPaint(
-                              painter: _BoxSelectionPainter(
-                                selectionRect: Rect.fromPoints(
-                                  _boxStartPos!,
-                                  _boxCurrentPos!,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      Positioned(
-                        left: 0,
-                        right: 0,
-                        bottom: 0,
-                        child: Consumer<MediaPlaybackService>(
-                          builder: (context, playbackService, child) {
-                            final isVisible =
-                                playbackService.currentItem != null &&
-                                (playbackService.state ==
-                                        PlaybackState.playing ||
-                                    playbackService.state ==
-                                        PlaybackState.paused);
-                            if (!isVisible) return const SizedBox.shrink();
-                            return Container(
-                              height: _getPlaybackCardVerticalOffset(),
-                              color: const Color(0xFF2C2C2C),
-                            );
-                          },
-                        ),
-                      ),
-                      Positioned(
-                        left: 0,
-                        right: 0,
-                        bottom: _getPlaybackCardVerticalOffset(),
-                        child: Consumer<MediaPlaybackService>(
-                          builder: (context, playbackService, child) {
-                            final isVisible =
-                                playbackService.currentItem != null &&
-                                (playbackService.state ==
-                                        PlaybackState.playing ||
-                                    playbackService.state ==
-                                        PlaybackState.paused);
-
-                            return MiniPlaybackCard(
-                              isVisible: isVisible,
-                              onTap: () async {
-                                final currentItem = playbackService.currentItem;
-                                if (currentItem == null) return;
-                                if (!File(currentItem.path).existsSync()) {
-                                  AppToast.show(
-                                    "媒体文件不存在，可能已被移动或删除",
-                                    type: AppToastType.error,
-                                  );
-                                  return;
-                                }
-                                if (playbackService.controller == null) {
-                                  AppToast.show(
-                                    "播放器尚未准备好，请稍后重试",
-                                    type: AppToastType.error,
-                                  );
-                                  return;
-                                }
-
-                                // 1. 立即触发一次 UI 刷新
-                                setState(() {});
-
-                                // 2. 短暂延迟
-                                await Future.delayed(
-                                  const Duration(milliseconds: 150),
-                                );
-                                if (!context.mounted) return;
-
-                                // 3. 再次强制刷新
-                                setState(() {});
-
-                                Navigator.of(context, rootNavigator: true).push(
-                                  _buildVideoPlayerRoute(
-                                    currentItem,
-                                    playbackService.controller,
-                                  ),
-                                );
-                              },
-                            );
-                          },
-                        ),
-                      ),
-                      if (_isDraggingFiles)
-                        Positioned.fill(
-                          child: Container(
-                            color: Colors.black54,
-                            child: const Center(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.cloud_upload,
-                                    size: 80,
-                                    color: Colors.blueAccent,
-                                  ),
-                                  SizedBox(height: 16),
-                                  Text(
-                                    "松开以导入媒体文件、压缩包或文件夹",
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 24,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            floatingActionButton: !_isSelectionMode
-                ? Padding(
-                    padding: EdgeInsets.only(
-                      bottom: _getPlaybackCardBottomPadding(),
-                    ),
-                    child: VideoActionButtons(
-                      collectionId: widget.collectionId,
-                    ),
-                  )
-                : null,
-            bottomNavigationBar: _isSelectionMode && _selectedIds.isNotEmpty
-                ? BottomAppBar(
-                    color: const Color(0xFF1E1E1E),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                      children: [
-                        TextButton.icon(
-                          icon: const Icon(
-                            Icons.delete,
-                            color: Colors.redAccent,
-                          ),
-                          label: const Text(
-                            "移入回收站",
-                            style: TextStyle(color: Colors.redAccent),
-                          ),
-                          onPressed: () {
-                            library.moveToRecycleBin(_selectedIds.toList());
-                            setState(() {
-                              _selectedIds.clear();
-                              _isSelectionMode = false;
-                            });
-                            AppToast.show("已移入回收站", type: AppToastType.success);
-                          },
-                        ),
-                        if (_selectedIds.length == 1)
-                          TextButton.icon(
-                            icon: const Icon(
-                              Icons.edit,
-                              color: Colors.blueAccent,
-                            ),
-                            label: const Text(
-                              "重命名",
-                              style: TextStyle(color: Colors.blueAccent),
-                            ),
-                            onPressed: () {
-                              final id = _selectedIds.first;
-                              final col = library.getCollection(id);
-                              final vid = library.getVideo(id);
-                              final name = col?.name ?? vid?.title ?? "";
-                              _showRenameDialog(context, id, name);
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: 0,
+                          child: Consumer<MediaPlaybackService>(
+                            builder: (context, playbackService, child) {
+                              final isVisible =
+                                  playbackService.currentItem != null &&
+                                  (playbackService.state ==
+                                          PlaybackState.playing ||
+                                      playbackService.state ==
+                                          PlaybackState.paused);
+                              if (!isVisible) return const SizedBox.shrink();
+                              return Container(
+                                height: _getPlaybackCardVerticalOffset(),
+                                color: const Color(0xFF2C2C2C),
+                              );
                             },
+                          ),
+                        ),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: _getPlaybackCardVerticalOffset(),
+                          child: Consumer<MediaPlaybackService>(
+                            builder: (context, playbackService, child) {
+                              final isVisible =
+                                  playbackService.currentItem != null &&
+                                  (playbackService.state ==
+                                          PlaybackState.playing ||
+                                      playbackService.state ==
+                                          PlaybackState.paused);
+
+                              return MiniPlaybackCard(
+                                isVisible: isVisible,
+                                onTap: () async {
+                                  final currentItem =
+                                      playbackService.currentItem;
+                                  if (currentItem == null) return;
+                                  if (playbackService.controller == null &&
+                                      !playbackService.isSourceMissing) {
+                                    AppToast.show(
+                                      "播放器尚未准备好，请稍后重试",
+                                      type: AppToastType.error,
+                                    );
+                                    return;
+                                  }
+
+                                  // 1. 立即触发一次 UI 刷新
+                                  setState(() {});
+
+                                  // 2. 短暂延迟
+                                  await Future.delayed(
+                                    const Duration(milliseconds: 150),
+                                  );
+                                  if (!context.mounted) return;
+
+                                  // 3. 再次强制刷新
+                                  setState(() {});
+
+                                  Navigator.of(
+                                    context,
+                                    rootNavigator: true,
+                                  ).push(
+                                    _buildVideoPlayerRoute(
+                                      currentItem,
+                                      playbackService.controller,
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ),
+                        if (_isDraggingFiles && !_isSearchResults)
+                          Positioned.fill(
+                            child: Container(
+                              color: Colors.black54,
+                              child: const Center(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.cloud_upload,
+                                      size: 80,
+                                      color: Colors.blueAccent,
+                                    ),
+                                    SizedBox(height: 16),
+                                    Text(
+                                      "松开以导入媒体文件、压缩包或文件夹",
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                           ),
                       ],
                     ),
-                  )
-                : null,
+                  ),
+                ),
+              ),
+              floatingActionButton: !_isSelectionMode && !_isSearchResults
+                  ? Padding(
+                      padding: EdgeInsets.only(
+                        bottom: _getPlaybackCardBottomPadding(),
+                      ),
+                      child: VideoActionButtons(
+                        collectionId: widget.collectionId,
+                      ),
+                    )
+                  : null,
+              bottomNavigationBar: _isSelectionMode && _selectedIds.isNotEmpty
+                  ? BottomAppBar(
+                      color: const Color(0xFF1E1E1E),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          TextButton.icon(
+                            icon: const Icon(
+                              Icons.delete,
+                              color: Colors.redAccent,
+                            ),
+                            label: const Text(
+                              "移入回收站",
+                              style: TextStyle(color: Colors.redAccent),
+                            ),
+                            onPressed: () {
+                              library.moveToRecycleBin(_selectedIds.toList());
+                              setState(() {
+                                _selectedIds.clear();
+                                _isSelectionMode = false;
+                              });
+                              AppToast.show(
+                                "已移入回收站",
+                                type: AppToastType.success,
+                              );
+                            },
+                          ),
+                          if (_selectedIds.length == 1)
+                            TextButton.icon(
+                              icon: const Icon(
+                                Icons.edit,
+                                color: Colors.blueAccent,
+                              ),
+                              label: const Text(
+                                "重命名",
+                                style: TextStyle(color: Colors.blueAccent),
+                              ),
+                              onPressed: () {
+                                final id = _selectedIds.first;
+                                final col = library.getCollection(id);
+                                final vid = library.getVideo(id);
+                                final name = col?.name ?? vid?.title ?? "";
+                                _showRenameDialog(context, id, name);
+                              },
+                            ),
+                        ],
+                      ),
+                    )
+                  : null,
+            ),
           ),
         );
       },
@@ -1667,479 +2071,346 @@ class _CollectionScreenState extends State<CollectionScreen> {
         itemBuilder: (context, index) {
           final item = contents[index];
           if (item is VideoCollection) {
-            return _buildCollectionCard(
-              context,
-              library,
-              item,
-              index,
-              settings,
-              contents,
+            return _buildRevealHighlight(
+              item.id,
+              _buildCollectionCard(
+                context,
+                library,
+                item,
+                index,
+                settings,
+                contents,
+              ),
             );
           } else if (item is VideoItem) {
-            return _buildVideoCard(context, item, index, settings, contents);
+            return _buildRevealHighlight(
+              item.id,
+              _buildVideoCard(context, item, index, settings, contents),
+            );
           }
           return const SizedBox.shrink();
         },
       );
     }
 
-    final size = MediaQuery.of(context).size;
-    final crossAxisCount = settings.mediaListCrossAxisCount.clamp(1, 15);
-    final rowHeight = (size.width * settings.mediaListItemHeightScale).clamp(
-      2.0,
-      320.0,
-    );
-    final mainSpacing = (size.width * settings.mediaListMainSpacingScale).clamp(
-      2.0,
-      36.0,
-    );
-    final crossSpacing = (size.width * settings.mediaListCrossSpacingScale)
-        .clamp(2.0, 40.0);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final crossAxisCount = settings.mediaListCrossAxisCount.clamp(1, 15);
+        final metrics = MediaListLayoutMetrics.forGrid(
+          screenShortestSide: MediaQuery.sizeOf(context).shortestSide,
+          availableWidth: constraints.maxWidth,
+          crossAxisCount: crossAxisCount,
+          heightSetting: settings.mediaListItemHeightScale,
+          titleSetting: settings.mediaListTitleScale,
+          mainSpacingSetting: settings.mediaListMainSpacingScale,
+          crossSpacingSetting: settings.mediaListCrossSpacingScale,
+        );
 
-    return GridView.builder(
-      controller: _scrollController,
-      padding: basePadding,
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: crossAxisCount,
-        childAspectRatio:
-            ((size.width - 32 - (crossAxisCount - 1) * crossSpacing) /
-                crossAxisCount) /
-            rowHeight,
-        crossAxisSpacing: crossSpacing,
-        mainAxisSpacing: mainSpacing,
-      ),
-      itemCount: contents.length,
-      itemBuilder: (context, index) {
-        final item = contents[index];
-        if (item is VideoCollection) {
-          return _buildCollectionListCard(
-            context: context,
-            collection: item,
-            index: index,
-            settings: settings,
-          );
-        } else if (item is VideoItem) {
-          return _buildVideoListCard(
-            context: context,
-            item: item,
-            index: index,
-            settings: settings,
-          );
-        }
-        return const SizedBox.shrink();
+        return GridView.builder(
+          controller: _scrollController,
+          padding: EdgeInsets.only(
+            left: metrics.outerPadding,
+            right: metrics.outerPadding,
+            top: metrics.topPadding,
+            bottom: metrics.outerPadding + _getPlaybackCardBottomPadding(),
+          ),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            mainAxisExtent: metrics.rowHeight,
+            crossAxisSpacing: metrics.crossSpacing,
+            mainAxisSpacing: metrics.mainSpacing,
+          ),
+          itemCount: contents.length,
+          itemBuilder: (context, index) {
+            final item = contents[index];
+            if (item is VideoCollection) {
+              return _buildRevealHighlight(
+                item.id,
+                _buildCollectionListCard(
+                  context: context,
+                  library: library,
+                  collection: item,
+                  index: index,
+                  settings: settings,
+                  contents: contents,
+                ),
+              );
+            } else if (item is VideoItem) {
+              return _buildRevealHighlight(
+                item.id,
+                _buildVideoListCard(
+                  context: context,
+                  library: library,
+                  item: item,
+                  index: index,
+                  settings: settings,
+                  contents: contents,
+                ),
+              );
+            }
+            return const SizedBox.shrink();
+          },
+        );
       },
     );
   }
 
   Widget _buildCollectionListCard({
     required BuildContext context,
+    required LibraryService library,
     required VideoCollection collection,
     required int index,
     required SettingsService settings,
+    required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(collection.id);
-    final titleScale = settings.mediaListTitleScale.clamp(0.0005, 0.2);
-    final titleFont = (MediaQuery.of(context).size.width * titleScale).clamp(
-      0.6,
-      60.0,
+    final tile = MediaLibraryListTile.collection(
+      collection: collection,
+      index: index,
+      showIndex: settings.mediaListShowIndex,
+      showThumbnail: settings.mediaListShowThumbnail,
+      isSelected: isSelected,
+      isSelectionMode: _isSelectionMode,
+      titleScale: settings.mediaListTitleScale,
+      onShowInParentFolder: _isSearchResults
+          ? () => _showInParentDirectory(collection)
+          : null,
+      onSelectionTap: () => _toggleListSelection(collection.id),
+      onSelectionPanStart: (details) => _startListSelectionGesture(
+        index,
+        collection.id,
+        details.globalPosition,
+      ),
+      onSelectionPanUpdate: (details) {
+        _updateDragSelection(details.globalPosition);
+      },
+      onSelectionPanEnd: (_) => _endListSelectionGesture(),
+      onSelectionLongPressStart: (details) => _startListSelectionGesture(
+        index,
+        collection.id,
+        details.globalPosition,
+      ),
+      onSelectionLongPressMoveUpdate: (details) {
+        _updateDragSelection(details.globalPosition);
+      },
+      onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
+      onTap: () {
+        if (_isSelectionMode) {
+          setState(() {
+            if (_selectedIds.contains(collection.id)) {
+              _selectedIds.remove(collection.id);
+            } else {
+              _selectedIds.add(collection.id);
+            }
+          });
+        } else {
+          Navigator.of(context).push(
+            MaterialPageRoute(
+              builder: (context) =>
+                  CollectionScreen(collectionId: collection.id),
+            ),
+          );
+        }
+      },
     );
-    final subFont = (titleFont * 0.84).clamp(0.5, 52.0);
-    final coverOffset = settings.mediaListCoverOffset.clamp(-1.0, 1.0);
-    final showIndex = settings.mediaListShowIndex;
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      color: isSelected
-          ? Colors.blueAccent.withValues(alpha: 0.2)
-          : const Color(0xFF2C2C2C),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: isSelected
-            ? const BorderSide(color: Colors.blueAccent, width: 1.6)
-            : BorderSide.none,
-      ),
-      child: InkWell(
-        onTap: () {
-          if (_isSelectionMode) {
-            setState(() {
-              if (isSelected) {
-                _selectedIds.remove(collection.id);
-              } else {
-                _selectedIds.add(collection.id);
-              }
-            });
-          } else {
-            Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (context) =>
-                    CollectionScreen(collectionId: collection.id),
-              ),
-            );
-          }
-        },
-        child: LayoutBuilder(
-          builder: (context, rowBox) {
-            final minThumbWidth = (rowBox.maxWidth * 0.2).clamp(56.0, 120.0);
-            final maxThumbWidth = (rowBox.maxWidth * 0.55).clamp(72.0, 280.0);
-            final thumbWidth = (rowBox.maxHeight * (4 / 3)).clamp(
-              minThumbWidth,
-              maxThumbWidth,
-            );
-            final thumbShift = settings.mediaListShowThumbnail
-                ? coverOffset * (thumbWidth * 0.26)
-                : 0.0;
-            final indexWidth = showIndex
-                ? (rowBox.maxWidth * 0.07).clamp(28.0, 36.0)
-                : 0.0;
-            final leadingGap = (rowBox.maxWidth * 0.012).clamp(2.0, 6.0);
-            final thumbnailBg = isSelected
-                ? const Color(0xFF2C2C2C).withValues(alpha: 0.9)
-                : const Color(0xFF2C2C2C);
-            return Row(
-              children: [
-                if (showIndex)
-                  SizedBox(
-                    width: indexWidth,
-                    child: Text(
-                      '${index + 1}',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: Colors.white54,
-                        fontSize: subFont,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                if (settings.mediaListShowThumbnail)
-                  Transform.translate(
-                    offset: Offset(thumbShift, 0),
-                    child: SizedBox(
-                      width: thumbWidth,
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          ColoredBox(color: thumbnailBg),
-                          collection.thumbnailPath != null &&
-                                  collection.thumbnailPath!.isNotEmpty
-                              ? CachedThumbnailWidget(
-                                  videoId: collection.id,
-                                  thumbnailPath: collection.thumbnailPath,
-                                  fit: BoxFit.cover,
-                                  placeholder: SizedBox.expand(
-                                    child: ColoredBox(color: thumbnailBg),
-                                  ),
-                                  errorWidget: const Icon(
-                                    Icons.folder,
-                                    color: Colors.blueAccent,
-                                  ),
-                                )
-                              : const Icon(
-                                  Icons.folder,
-                                  color: Colors.blueAccent,
-                                ),
-                        ],
-                      ),
-                    ),
-                  ),
-                SizedBox(width: leadingGap),
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, textBox) {
-                      final baseHorizontalPadding = (textBox.maxWidth * 0.024)
-                          .clamp(4.0, 12.0);
-                      final horizontalPadding =
-                          (baseHorizontalPadding + thumbShift).clamp(2.0, 24.0);
-                      final verticalPadding = (textBox.maxWidth * 0.018).clamp(
-                        3.0,
-                        8.0,
-                      );
-                      return Padding(
-                        padding: EdgeInsets.only(
-                          left: horizontalPadding,
-                          right: baseHorizontalPadding,
-                          top: verticalPadding,
-                          bottom: verticalPadding,
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                collection.name,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: titleFont,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            Align(
-                              alignment: Alignment.bottomLeft,
-                              child: Text(
-                                '${collection.childrenIds.length} 个项目',
-                                style: TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: subFont,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-      ),
+    return MediaLibraryItemInteractionWrapper(
+      index: index,
+      dragDelay: _mediaCardLongPressDelay,
+      isSelected: isSelected,
+      selectedCount: _selectedIds.length,
+      onDragStarted: () => _enterSelectionFromDrag(collection.id),
+      allowReorder: !_isSearchResults,
+      onReorder: (oldIndex, newIndex) {
+        if (_isSearchResults) return;
+        _reorderMediaItems(
+          library,
+          contents,
+          widget.collectionId,
+          oldIndex,
+          newIndex,
+        );
+      },
+      folderId: collection.id,
+      onMoveToFolder: (draggedIndex, targetId) async {
+        await _moveMediaItemsToFolder(
+          library,
+          contents,
+          currentParentId: widget.collectionId,
+          draggedIndex: draggedIndex,
+          targetId: targetId,
+        );
+      },
+      child: tile,
     );
   }
 
   Widget _buildVideoListCard({
     required BuildContext context,
+    required LibraryService library,
     required VideoItem item,
     required int index,
     required SettingsService settings,
+    required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(item.id);
-    final titleScale = settings.mediaListTitleScale.clamp(0.0005, 0.2);
-    final titleFont = (MediaQuery.of(context).size.width * titleScale).clamp(
-      0.6,
-      60.0,
+    final tile = MediaLibraryListTile.video(
+      item: item,
+      index: index,
+      showIndex: settings.mediaListShowIndex,
+      showThumbnail: settings.mediaListShowThumbnail,
+      isSelected: isSelected,
+      isSelectionMode: _isSelectionMode,
+      titleScale: settings.mediaListTitleScale,
+      onShowInParentFolder: _isSearchResults
+          ? () => _showInParentDirectory(item)
+          : null,
+      onSelectionTap: () => _toggleListSelection(item.id),
+      onSelectionPanStart: (details) =>
+          _startListSelectionGesture(index, item.id, details.globalPosition),
+      onSelectionPanUpdate: (details) {
+        _updateDragSelection(details.globalPosition);
+      },
+      onSelectionPanEnd: (_) => _endListSelectionGesture(),
+      onSelectionLongPressStart: (details) =>
+          _startListSelectionGesture(index, item.id, details.globalPosition),
+      onSelectionLongPressMoveUpdate: (details) {
+        _updateDragSelection(details.globalPosition);
+      },
+      onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
+      onTap: () async {
+        if (_isSelectionMode) {
+          setState(() {
+            if (_selectedIds.contains(item.id)) {
+              _selectedIds.remove(item.id);
+            } else {
+              _selectedIds.add(item.id);
+            }
+          });
+          return;
+        }
+        final playbackService = Provider.of<MediaPlaybackService>(
+          context,
+          listen: false,
+        );
+        if (!mounted) return;
+        final controller = playbackService.currentItem?.id == item.id
+            ? playbackService.controller
+            : null;
+        _openPlaybackScreen(item, existingController: controller);
+      },
     );
-    final subFont = (titleFont * 0.84).clamp(0.5, 52.0);
-    final coverOffset = settings.mediaListCoverOffset.clamp(-1.0, 1.0);
-    final showIndex = settings.mediaListShowIndex;
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      color: isSelected
-          ? Colors.blueAccent.withValues(alpha: 0.2)
-          : const Color(0xFF2C2C2C),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12),
-        side: isSelected
-            ? const BorderSide(color: Colors.blueAccent, width: 1.6)
-            : BorderSide.none,
-      ),
-      child: InkWell(
-        onTap: () async {
-          if (_isSelectionMode) {
-            setState(() {
-              if (isSelected) {
-                _selectedIds.remove(item.id);
-              } else {
-                _selectedIds.add(item.id);
-              }
-            });
-            return;
-          }
-
-          final playbackService = Provider.of<MediaPlaybackService>(
-            context,
-            listen: false,
-          );
-
-          final file = File(item.path);
-          if (!await file.exists()) {
-            if (!context.mounted) return;
-            AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
-            return;
-          }
-
-          final currentController = playbackService.currentItem?.id == item.id
-              ? playbackService.controller
-              : null;
-          _openPlaybackScreen(item, existingController: currentController);
-        },
-        child: LayoutBuilder(
-          builder: (context, rowBox) {
-            final minThumbWidth = (rowBox.maxWidth * 0.2).clamp(56.0, 120.0);
-            final maxThumbWidth = (rowBox.maxWidth * 0.55).clamp(72.0, 280.0);
-            final thumbWidth = (rowBox.maxHeight * (4 / 3)).clamp(
-              minThumbWidth,
-              maxThumbWidth,
-            );
-            final thumbShift = settings.mediaListShowThumbnail
-                ? coverOffset * (thumbWidth * 0.26)
-                : 0.0;
-            final indexWidth = showIndex
-                ? (rowBox.maxWidth * 0.07).clamp(28.0, 36.0)
-                : 0.0;
-            final leadingGap = (rowBox.maxWidth * 0.012).clamp(2.0, 6.0);
-            final thumbnailBg = isSelected
-                ? const Color(0xFF2C2C2C).withValues(alpha: 0.9)
-                : const Color(0xFF2C2C2C);
-            return Row(
-              children: [
-                if (showIndex)
-                  SizedBox(
-                    width: indexWidth,
-                    child: Text(
-                      '${index + 1}',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        color: Colors.white54,
-                        fontSize: subFont,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                if (settings.mediaListShowThumbnail)
-                  Transform.translate(
-                    offset: Offset(thumbShift, 0),
-                    child: SizedBox(
-                      width: thumbWidth,
-                      child: ColoredBox(
-                        color: thumbnailBg,
-                        child: item.type == MediaType.audio
-                            ? const Icon(
-                                Icons.music_note,
-                                size: 30,
-                                color: Colors.white30,
-                              )
-                            : CachedThumbnailWidget(
-                                videoId: item.id,
-                                thumbnailPath: item.thumbnailPath,
-                                fit: BoxFit.cover,
-                                placeholder: SizedBox.expand(
-                                  child: ColoredBox(color: thumbnailBg),
-                                ),
-                                errorWidget: const Icon(
-                                  Icons.movie,
-                                  size: 30,
-                                  color: Colors.white30,
-                                ),
-                              ),
-                      ),
-                    ),
-                  ),
-                SizedBox(width: leadingGap),
-                Expanded(
-                  child: LayoutBuilder(
-                    builder: (context, textBox) {
-                      final baseHorizontalPadding = (textBox.maxWidth * 0.024)
-                          .clamp(4.0, 12.0);
-                      final horizontalPadding =
-                          (baseHorizontalPadding + thumbShift).clamp(2.0, 24.0);
-                      final verticalPadding = (textBox.maxWidth * 0.018).clamp(
-                        3.0,
-                        8.0,
-                      );
-                      return Padding(
-                        padding: EdgeInsets.only(
-                          left: horizontalPadding,
-                          right: baseHorizontalPadding,
-                          top: verticalPadding,
-                          bottom: verticalPadding,
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Expanded(
-                              child: Text(
-                                item.title,
-                                maxLines: 3,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: titleFont,
-                                  fontWeight: FontWeight.w500,
-                                  height: 1.15,
-                                ),
-                              ),
-                            ),
-                            Selector<
-                              MediaPlaybackService,
-                              ({bool isCurrent, int positionMs, int durationMs})
-                            >(
-                              selector: (context, service) {
-                                final isCurrent =
-                                    service.currentItem?.id == item.id;
-                                if (!isCurrent) {
-                                  return (
-                                    isCurrent: false,
-                                    positionMs: item.lastPositionMs,
-                                    durationMs: item.durationMs,
-                                  );
-                                }
-                                return (
-                                  isCurrent: true,
-                                  positionMs: service.position.inMilliseconds,
-                                  durationMs:
-                                      service.duration.inMilliseconds > 0
-                                      ? service.duration.inMilliseconds
-                                      : item.durationMs,
-                                );
-                              },
-                              builder: (context, playbackData, _) {
-                                final durationMs = playbackData.durationMs;
-                                final positionMs = playbackData.positionMs;
-                                final shouldShowProgress =
-                                    durationMs > 0 &&
-                                    (playbackData.isCurrent || positionMs > 0);
-                                final progressValue = shouldShowProgress
-                                    ? (positionMs / durationMs).clamp(0.0, 1.0)
-                                    : 0.0;
-                                return Align(
-                                  alignment: Alignment.bottomLeft,
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        _formatMediaDuration(durationMs),
-                                        style: TextStyle(
-                                          color: Colors.white54,
-                                          fontSize: subFont,
-                                        ),
-                                      ),
-                                      if (shouldShowProgress) ...[
-                                        const SizedBox(height: 3),
-                                        ClipRRect(
-                                          borderRadius: BorderRadius.circular(
-                                            999,
-                                          ),
-                                          child: SizedBox(
-                                            height: 3,
-                                            child: LinearProgressIndicator(
-                                              value: progressValue,
-                                              backgroundColor: Colors.white24,
-                                              color: Colors.redAccent,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                );
-                              },
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-      ),
+    return MediaLibraryItemInteractionWrapper(
+      index: index,
+      dragDelay: _mediaCardLongPressDelay,
+      isSelected: isSelected,
+      selectedCount: _selectedIds.length,
+      onDragStarted: () => _enterSelectionFromDrag(item.id),
+      allowReorder: !_isSearchResults,
+      onReorder: (oldIndex, newIndex) {
+        if (_isSearchResults) return;
+        _reorderMediaItems(
+          library,
+          contents,
+          widget.collectionId,
+          oldIndex,
+          newIndex,
+        );
+      },
+      child: tile,
     );
   }
 
-  String _formatMediaDuration(int durationMs) {
-    if (durationMs <= 0) return '--:--';
-    final totalSec = durationMs ~/ 1000;
-    final min = totalSec ~/ 60;
-    final sec = totalSec % 60;
-    return '$min:${sec.toString().padLeft(2, '0')}';
+  void _toggleListSelection(String itemId) {
+    setState(() {
+      if (_selectedIds.contains(itemId)) {
+        _selectedIds.remove(itemId);
+      } else {
+        _selectedIds.add(itemId);
+      }
+    });
+  }
+
+  void _enterSelectionFromDrag(String itemId) {
+    if (_isSelectionMode) return;
+    setState(() {
+      _isSelectionMode = true;
+      _selectedIds.add(itemId);
+    });
+  }
+
+  void _startListSelectionGesture(
+    int index,
+    String itemId,
+    Offset globalPosition,
+  ) {
+    setState(() {
+      _dragSelectionStartIndex = index;
+      _dragSelectionSnapshot = Set.from(_selectedIds);
+      _capturedIds.clear();
+      _isBoxSelecting = false;
+      _boxStartPos = null;
+      _boxCurrentPos = null;
+      if (!_selectedIds.contains(itemId)) {
+        _selectedIds.add(itemId);
+        _dragSelectionSnapshot.add(itemId);
+      }
+      _updateDragSelection(globalPosition);
+    });
+  }
+
+  void _endListSelectionGesture() {
+    setState(() {
+      _dragSelectionStartIndex = null;
+      _dragSelectionSnapshot.clear();
+      _isBoxSelecting = false;
+      _boxStartPos = null;
+      _boxCurrentPos = null;
+      _capturedIds.clear();
+    });
+  }
+
+  void _reorderMediaItems(
+    LibraryService library,
+    List<dynamic> contents,
+    String? parentId,
+    int oldIndex,
+    int newIndex,
+  ) {
+    if (oldIndex < 0 || oldIndex >= contents.length) return;
+    final draggedId = (contents[oldIndex] as dynamic).id as String;
+    if (_selectedIds.contains(draggedId)) {
+      final itemIds = contents
+          .where((item) => _selectedIds.contains((item as dynamic).id))
+          .map((item) => (item as dynamic).id as String)
+          .toList();
+      library.reorderMultipleItems(parentId, itemIds, oldIndex, newIndex);
+    } else {
+      library.reorderItems(parentId, oldIndex, newIndex);
+    }
+  }
+
+  Future<void> _moveMediaItemsToFolder(
+    LibraryService library,
+    List<dynamic> contents, {
+    required String? currentParentId,
+    required int draggedIndex,
+    required String targetId,
+  }) async {
+    if (draggedIndex < 0 || draggedIndex >= contents.length) return;
+    final draggedId = (contents[draggedIndex] as dynamic).id as String;
+    final itemIds = _selectedIds.contains(draggedId)
+        ? contents
+              .where((item) => _selectedIds.contains((item as dynamic).id))
+              .map((item) => (item as dynamic).id as String)
+              .toList()
+        : <String>[draggedId];
+    await library.moveItemsToCollection(itemIds, targetId);
+    await _syncSelectionAfterMove(
+      library,
+      currentParentId: currentParentId,
+      attemptedItemIds: itemIds,
+    );
+    AppToast.show("已移动到文件夹", type: AppToastType.success);
   }
 
   Widget _buildCollectionCard(
@@ -2153,12 +2424,23 @@ class _CollectionScreenState extends State<CollectionScreen> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
+        final double locateButtonWidth = cardWidth * 0.23;
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.videoCardTitleFontSize,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
+        final double locateButtonHeight = _resolveGridLocateButtonHeight(
+          context: context,
+          constraints: constraints,
+          cardWidth: cardWidth,
+          title: collection.name,
+          titleFontSize: titleFontSize,
+          metaFontSize: metaFontSize,
+          informationGap: 2.0,
+          titleWeight: FontWeight.w600,
+        );
 
         final isSelected = _selectedIds.contains(collection.id);
         final thumbnailPath = collection.thumbnailPath;
@@ -2264,11 +2546,16 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       ),
                     ),
                     const SizedBox(height: 2),
-                    Text(
-                      "${collection.childrenIds.length} 个项目",
-                      style: TextStyle(
-                        fontSize: metaFontSize,
-                        color: Colors.white54,
+                    Padding(
+                      padding: EdgeInsets.only(
+                        right: _isSearchResults ? locateButtonWidth : 0,
+                      ),
+                      child: Text(
+                        "${collection.childrenIds.length} 个项目",
+                        style: TextStyle(
+                          fontSize: metaFontSize,
+                          color: Colors.white54,
+                        ),
                       ),
                     ),
                   ],
@@ -2310,13 +2597,29 @@ class _CollectionScreenState extends State<CollectionScreen> {
                 );
               }
             },
-            child: cardVisual,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                cardVisual,
+                if (_isSearchResults && !_isSelectionMode)
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    child: MediaLibraryLocateButton(
+                      cardWidth: cardWidth,
+                      width: locateButtonWidth,
+                      height: locateButtonHeight,
+                      onPressed: () => _showInParentDirectory(collection),
+                    ),
+                  ),
+              ],
+            ),
           ),
         );
 
         return Stack(
           children: [
-            LongPressDraggable<int>(
+            MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
               onDragStarted: () {
@@ -2371,6 +2674,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
               child: FolderDropTarget(
                 folderId: collection.id,
                 index: index,
+                allowReorder: !_isSearchResults,
                 onMoveToFolder: (draggedIndex, targetId) async {
                   if (draggedIndex >= 0 && draggedIndex < contents.length) {
                     final draggedItem = contents[draggedIndex];
@@ -2399,6 +2703,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   }
                 },
                 onReorder: (oldIndex, newIndex) {
+                  if (_isSearchResults) return;
                   final draggedItem = contents[oldIndex];
                   final draggedId = (draggedItem as dynamic).id;
 
@@ -2499,11 +2804,15 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   behavior: HitTestBehavior
                       .opaque, // Opaque to ensure it captures touches in this area
                   child: Padding(
-                    padding: const EdgeInsets.all(16.0),
+                    padding: EdgeInsets.all(
+                      MediaListLayoutMetrics.gridSelectionHitPadding(cardWidth),
+                    ),
                     child: Icon(
                       isSelected ? Icons.check_circle : Icons.circle_outlined,
                       color: isSelected ? Colors.blueAccent : Colors.white70,
-                      size: 24,
+                      size: MediaListLayoutMetrics.gridSelectionIconSize(
+                        cardWidth,
+                      ),
                     ),
                   ),
                 ),
@@ -2524,12 +2833,23 @@ class _CollectionScreenState extends State<CollectionScreen> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
+        final double locateButtonWidth = cardWidth * 0.23;
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.videoCardTitleFontSize,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
+        final double locateButtonHeight = _resolveGridLocateButtonHeight(
+          context: context,
+          constraints: constraints,
+          cardWidth: cardWidth,
+          title: item.title,
+          titleFontSize: titleFontSize,
+          metaFontSize: metaFontSize,
+          informationGap: item.durationMs > 0 ? 4.0 : 0.0,
+          titleWeight: FontWeight.w500,
+        );
 
         final isSelected = _selectedIds.contains(item.id);
 
@@ -2546,14 +2866,37 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   fit: StackFit.expand,
                   children: [
                     item.type == MediaType.audio
-                        ? Container(
-                            color: Colors.black,
-                            child: const Icon(
-                              Icons.music_note,
-                              size: 50,
-                              color: Colors.white24,
-                            ),
-                          )
+                        ? (item.thumbnailPath != null &&
+                                  item.thumbnailPath!.isNotEmpty
+                              ? CachedThumbnailWidget(
+                                  videoId: item.id,
+                                  thumbnailPath: item.thumbnailPath,
+                                  fit: BoxFit.cover,
+                                  placeholder: Container(
+                                    color: Colors.black,
+                                    child: const Icon(
+                                      Icons.music_note,
+                                      size: 50,
+                                      color: Colors.white24,
+                                    ),
+                                  ),
+                                  errorWidget: Container(
+                                    color: Colors.black,
+                                    child: const Icon(
+                                      Icons.music_note,
+                                      size: 50,
+                                      color: Colors.white24,
+                                    ),
+                                  ),
+                                )
+                              : Container(
+                                  color: Colors.black,
+                                  child: const Icon(
+                                    Icons.music_note,
+                                    size: 50,
+                                    color: Colors.white24,
+                                  ),
+                                ))
                         : LayoutBuilder(
                             builder: (context, constraints) {
                               final dpr = MediaQuery.of(
@@ -2594,21 +2937,16 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       child:
                           Selector<
                             MediaPlaybackService,
-                            ({bool isCurrent, int positionMs, int durationMs})
+                            ({bool isCurrent, int durationMs})
                           >(
                             selector: (context, service) {
                               final isCurrent =
                                   service.currentItem?.id == item.id;
                               if (!isCurrent) {
-                                return (
-                                  isCurrent: false,
-                                  positionMs: 0,
-                                  durationMs: 0,
-                                );
+                                return (isCurrent: false, durationMs: 0);
                               }
                               return (
                                 isCurrent: true,
-                                positionMs: service.position.inMilliseconds,
                                 durationMs: service.duration.inMilliseconds,
                               );
                             },
@@ -2617,26 +2955,35 @@ class _CollectionScreenState extends State<CollectionScreen> {
                               final int durationMs = isCurrent
                                   ? data.durationMs
                                   : item.durationMs;
-                              final int positionMs = isCurrent
-                                  ? data.positionMs
-                                  : item.lastPositionMs;
+                              Widget buildProgress(int positionMs) {
+                                final shouldShow =
+                                    durationMs > 0 &&
+                                    (isCurrent || positionMs > 0);
+                                if (!shouldShow) {
+                                  return const SizedBox.shrink();
+                                }
+                                return SizedBox(
+                                  height: 4,
+                                  child: LinearProgressIndicator(
+                                    value: (positionMs / durationMs).clamp(
+                                      0.0,
+                                      1.0,
+                                    ),
+                                    backgroundColor: Colors.white24,
+                                    color: Colors.redAccent,
+                                  ),
+                                );
+                              }
 
-                              final shouldShow =
-                                  durationMs > 0 &&
-                                  (isCurrent || positionMs > 0);
-                              if (!shouldShow) return const SizedBox.shrink();
-
-                              final value = (positionMs / durationMs).clamp(
-                                0.0,
-                                1.0,
-                              );
-                              return SizedBox(
-                                height: 4,
-                                child: LinearProgressIndicator(
-                                  value: value,
-                                  backgroundColor: Colors.white24,
-                                  color: Colors.redAccent,
-                                ),
+                              if (!isCurrent) {
+                                return buildProgress(item.lastPositionMs);
+                              }
+                              final service = context
+                                  .read<MediaPlaybackService>();
+                              return ValueListenableBuilder<Duration>(
+                                valueListenable: service.coarsePositionNotifier,
+                                builder: (_, position, _) =>
+                                    buildProgress(position.inMilliseconds),
                               );
                             },
                           ),
@@ -2647,10 +2994,7 @@ class _CollectionScreenState extends State<CollectionScreen> {
             ),
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 10,
-                  vertical: 6,
-                ),
+                padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -2668,18 +3012,23 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     ),
                     if (item.durationMs > 0) ...[
                       const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
-                              style: TextStyle(
-                                fontSize: metaFontSize,
-                                color: Colors.white54,
+                      Padding(
+                        padding: EdgeInsets.only(
+                          right: _isSearchResults ? locateButtonWidth : 0,
+                        ),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
+                                style: TextStyle(
+                                  fontSize: metaFontSize,
+                                  color: Colors.white54,
+                                ),
                               ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ],
                   ],
@@ -2717,13 +3066,6 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   listen: false,
                 );
 
-                final file = File(item.path);
-                if (!await file.exists()) {
-                  if (!context.mounted) return;
-                  AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
-                  return;
-                }
-
                 if (!context.mounted) return;
 
                 final currentController =
@@ -2736,13 +3078,29 @@ class _CollectionScreenState extends State<CollectionScreen> {
                 );
               }
             },
-            child: cardVisual,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                cardVisual,
+                if (_isSearchResults && !_isSelectionMode)
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    child: MediaLibraryLocateButton(
+                      cardWidth: cardWidth,
+                      width: locateButtonWidth,
+                      height: locateButtonHeight,
+                      onPressed: () => _showInParentDirectory(item),
+                    ),
+                  ),
+              ],
+            ),
           ),
         );
 
         return Stack(
           children: [
-            LongPressDraggable<int>(
+            MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
               onDragStarted: () {
@@ -2777,8 +3135,10 @@ class _CollectionScreenState extends State<CollectionScreen> {
               ),
               childWhenDragging: Opacity(opacity: 0.3, child: interactiveCard),
               child: DragTarget<int>(
-                onWillAcceptWithDetails: (details) => details.data != index,
+                onWillAcceptWithDetails: (details) =>
+                    !_isSearchResults && details.data != index,
                 onAcceptWithDetails: (details) {
+                  if (_isSearchResults) return;
                   final oldIndex = details.data;
                   final library = Provider.of<LibraryService>(
                     context,
@@ -2891,11 +3251,15 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   },
                   behavior: HitTestBehavior.opaque,
                   child: Padding(
-                    padding: const EdgeInsets.all(16.0),
+                    padding: EdgeInsets.all(
+                      MediaListLayoutMetrics.gridSelectionHitPadding(cardWidth),
+                    ),
                     child: Icon(
                       isSelected ? Icons.check_circle : Icons.circle_outlined,
                       color: isSelected ? Colors.blueAccent : Colors.white70,
-                      size: 24,
+                      size: MediaListLayoutMetrics.gridSelectionIconSize(
+                        cardWidth,
+                      ),
                     ),
                   ),
                 ),
@@ -3046,12 +3410,17 @@ class _CollectionScreenState extends State<CollectionScreen> {
                   Expanded(
                     child: ElevatedButton(
                       onPressed: () async {
-                        final result = await FilePicker.platform
-                            .getDirectoryPath();
-                        if (result != null && result.isNotEmpty) {
-                          setDialogState(() {
-                            tempPath = result;
-                          });
+                        try {
+                          final result = await FilePicker.platform
+                              .getDirectoryPath();
+                          if (result != null && result.isNotEmpty) {
+                            setDialogState(() {
+                              tempPath = result;
+                            });
+                          }
+                        } catch (e) {
+                          debugPrint('选择目录失败: $e');
+                          AppToast.show('选择目录失败: $e', type: AppToastType.error);
                         }
                       },
                       style: ElevatedButton.styleFrom(
@@ -3130,14 +3499,23 @@ class _CollectionScreenState extends State<CollectionScreen> {
         double tempHeightScale = 1.0 / settings.videoCardAspectRatio;
         double tempColumnCount = settings.videoCardCrossAxisCount.toDouble();
         double tempListColumnCount = settings.mediaListCrossAxisCount
+            .clamp(1, 15)
             .toDouble();
         bool tempShowThumb = settings.mediaListShowThumbnail;
         bool tempShowIndex = settings.mediaListShowIndex;
-        double tempListHeight = settings.mediaListItemHeightScale;
-        double tempListMainSpacing = settings.mediaListMainSpacingScale;
-        double tempListCrossSpacing = settings.mediaListCrossSpacingScale;
-        double tempListTitle = settings.mediaListTitleScale;
-        double tempListCoverOffset = settings.mediaListCoverOffset;
+        double tempListHeight = settings.mediaListItemHeightScale.clamp(
+          0.001,
+          0.15,
+        );
+        double tempListMainSpacing = settings.mediaListMainSpacingScale.clamp(
+          0.0,
+          0.04,
+        );
+        double tempListCrossSpacing = settings.mediaListCrossSpacingScale.clamp(
+          0.0,
+          0.05,
+        );
+        double tempListTitle = settings.mediaListTitleScale.clamp(0.001, 0.065);
 
         return StatefulBuilder(
           builder: (context, setSheetState) {
@@ -3320,12 +3698,13 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     ),
                     _buildListSliderRow(
                       title: "卡片高度",
-                      valueText: tempListHeight.toStringAsFixed(3),
+                      valueText:
+                          "${MediaListLayoutMetrics.referenceRowHeight(tempListTitle, tempListHeight).round()} px @390 · ×${MediaListLayoutMetrics.heightAdjustment(tempListHeight).toStringAsFixed(2)}",
                       slider: Slider(
                         value: tempListHeight,
-                        min: 0.0005,
-                        max: 0.6,
-                        divisions: 1200,
+                        min: 0.001,
+                        max: 0.15,
+                        divisions: 149,
                         onChanged: (v) {
                           setSheetState(() => tempListHeight = v);
                           settings.updateSetting('mediaListItemHeightScale', v);
@@ -3333,13 +3712,14 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       ),
                     ),
                     _buildListSliderRow(
-                      title: "纵向间距",
-                      valueText: tempListMainSpacing.toStringAsFixed(3),
+                      title: "行间距",
+                      valueText:
+                          "${MediaListLayoutMetrics.referenceMainSpacing(tempListMainSpacing).round()} px @390",
                       slider: Slider(
                         value: tempListMainSpacing,
                         min: 0.0,
-                        max: 0.1,
-                        divisions: 200,
+                        max: 0.04,
+                        divisions: 8,
                         onChanged: (v) {
                           setSheetState(() => tempListMainSpacing = v);
                           settings.updateSetting(
@@ -3350,13 +3730,14 @@ class _CollectionScreenState extends State<CollectionScreen> {
                       ),
                     ),
                     _buildListSliderRow(
-                      title: "横向间距",
-                      valueText: tempListCrossSpacing.toStringAsFixed(3),
+                      title: "列间距",
+                      valueText:
+                          "${MediaListLayoutMetrics.referenceCrossSpacing(tempListCrossSpacing).round()} px @390",
                       slider: Slider(
                         value: tempListCrossSpacing,
                         min: 0.0,
-                        max: 0.1,
-                        divisions: 200,
+                        max: 0.05,
+                        divisions: 10,
                         onChanged: (v) {
                           setSheetState(() => tempListCrossSpacing = v);
                           settings.updateSetting(
@@ -3368,29 +3749,16 @@ class _CollectionScreenState extends State<CollectionScreen> {
                     ),
                     _buildListSliderRow(
                       title: "标题字号",
-                      valueText: tempListTitle.toStringAsFixed(3),
+                      valueText:
+                          "${MediaListLayoutMetrics.referenceTitleSize(tempListTitle).toStringAsFixed(1)} px @390",
                       slider: Slider(
                         value: tempListTitle,
-                        min: 0.0005,
-                        max: 0.2,
-                        divisions: 1600,
+                        min: 0.001,
+                        max: 0.065,
+                        divisions: 64,
                         onChanged: (v) {
                           setSheetState(() => tempListTitle = v);
                           settings.updateSetting('mediaListTitleScale', v);
-                        },
-                      ),
-                    ),
-                    _buildListSliderRow(
-                      title: "封面水平偏移",
-                      valueText: tempListCoverOffset.toStringAsFixed(2),
-                      slider: Slider(
-                        value: tempListCoverOffset,
-                        min: -1.0,
-                        max: 1.0,
-                        divisions: 200,
-                        onChanged: (v) {
-                          setSheetState(() => tempListCoverOffset = v);
-                          settings.updateSetting('mediaListCoverOffset', v);
                         },
                       ),
                     ),
