@@ -2213,19 +2213,68 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   bool _shouldTopAlignArticle({
+    required BuildContext context,
+    required double maxWidth,
     required double maxHeight,
     required bool isSmallScreen,
     required int chunkCount,
   }) {
-    if (chunkCount <= 1) return true;
-    final int lineCount = _lineFilterMode == 0 && _isBilingualMode ? 2 : 1;
+    if (chunkCount == 0) return true;
+
     final double fontSize = _subtitleTextFontSize(isSmallScreen);
-    final double textHeight = fontSize * 1.6 * lineCount;
-    final double estimatedChunkHeight =
-        textHeight * _articleChunkSize * 0.75 + (isSmallScreen ? 20 : 32);
-    final double estimatedTotalHeight =
-        estimatedChunkHeight * chunkCount + (isSmallScreen ? 24 : 40);
-    return estimatedTotalHeight <= maxHeight;
+    final double horizontalInset = _subtitleTextHorizontalInset(isSmallScreen);
+    final double contentWidth = maxWidth - horizontalInset * 2;
+    if (contentWidth <= 0) return false;
+
+    final TextStyle defaultTextStyle = DefaultTextStyle.of(context).style;
+    final TextStyle articleTextStyle = const TextStyle().copyWith(
+      fontSize: fontSize,
+      height: 1.6,
+      fontWeight: FontWeight.normal,
+    );
+    final StrutStyle strutStyle = StrutStyle(
+      fontSize: fontSize,
+      height: 1.6,
+      forceStrutHeight: true,
+    );
+    double laidOutHeight = (isSmallScreen ? 12 : 20) * 2;
+
+    for (int chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
+      final int startIndex = chunkIndex * _articleChunkSize;
+      final int endIndex = (startIndex + _articleChunkSize).clamp(
+        0,
+        _displaySubtitles.length,
+      );
+      final List<InlineSpan> spans = <InlineSpan>[];
+      for (int index = startIndex; index < endIndex; index++) {
+        final SubtitleItem item = _displaySubtitles[index];
+        String text = index < _displayTextCache.length
+            ? _displayTextCache[index]
+            : '';
+        if (text.isEmpty && item.imageLoader != null) {
+          text = '[图片字幕]';
+        }
+        text = text.replaceAll('\n', ' ').trim();
+        if (text.isEmpty) continue;
+        if (spans.isNotEmpty) {
+          spans.add(const TextSpan(text: '  '));
+        }
+        spans.add(TextSpan(text: text, style: articleTextStyle));
+      }
+
+      final TextPainter painter = TextPainter(
+        text: TextSpan(style: defaultTextStyle, children: spans),
+        strutStyle: strutStyle,
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+        locale: Localizations.maybeLocaleOf(context),
+      )..layout(maxWidth: contentWidth);
+      laidOutHeight += painter.height;
+      painter.dispose();
+
+      if (laidOutHeight + precisionErrorTolerance > maxHeight) return false;
+    }
+    return laidOutHeight + precisionErrorTolerance <= maxHeight;
   }
 
   // 列表模式视图
@@ -2406,6 +2455,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       builder: (context, constraints) {
         _handleScrollableViewportLayout(constraints);
         final bool shouldTopAlign = _shouldTopAlignArticle(
+          context: context,
+          maxWidth: constraints.maxWidth,
           maxHeight: constraints.maxHeight,
           isSmallScreen: isSmallScreen,
           chunkCount: chunkCount,

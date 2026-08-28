@@ -144,8 +144,12 @@ class AppDelegate: FlutterAppDelegate {
       - \(Bundle.main.resourceURL?.path ?? "n/a")
       - \(appSupportDirectory().appendingPathComponent("yt_dlp", isDirectory: true).path)
       """
-    let ytVersion = ytDlpPath.flatMap { try? runProcess(executable: $0, arguments: ["--version"]).stdoutText }
-      ?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let ytVersion = ytDlpPath.flatMap { path -> String? in
+      guard let output = try? runProcess(executable: path, arguments: ["--version"]).stdoutText else {
+        return nil
+      }
+      return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     let ffmpegVersion = ffmpegPath.flatMap { path -> String? in
       let output = try? runProcess(executable: path, arguments: ["-version"]).stdoutText
       return output?

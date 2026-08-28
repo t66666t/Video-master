@@ -9,6 +9,75 @@ import 'package:video_player_app/widgets/subtitle_sidebar.dart';
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets(
+    'short article content stays at the top at a late playback position',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({
+        'autoScrollSubtitles': true,
+        'subtitleViewMode': 1,
+        'subtitleArticleSentencesPerParagraph': 4,
+      });
+      final settings = SettingsService();
+      settings.resetForTest();
+      await settings.init();
+
+      final controller = VideoPlayerController.networkUrl(
+        Uri.parse('https://example.invalid/short-article.mp4'),
+      );
+      controller.value = const VideoPlayerValue(
+        duration: Duration(minutes: 1),
+        position: Duration(seconds: 33),
+        isInitialized: true,
+        isPlaying: true,
+      );
+      final subtitles = List<SubtitleItem>.generate(12, (index) {
+        final start = Duration(seconds: index * 3);
+        return SubtitleItem(
+          index: index,
+          startTime: start,
+          endTime: start + const Duration(seconds: 2),
+          text: '$index',
+        );
+      });
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 320,
+              height: 280,
+              child: SubtitleSidebar(
+                subtitles: subtitles,
+                controller: controller,
+                isCompact: true,
+              ),
+            ),
+          ),
+        ),
+      );
+      await _pumpPostFrameCallbacks(tester);
+
+      final articleList = find.byKey(const ValueKey('subtitle-article-list-4'));
+      final firstParagraph = find.byType(SubtitleArticleChunk).first;
+      final lastParagraph = find.byType(SubtitleArticleChunk).last;
+      expect(articleList, findsOneWidget);
+      expect(firstParagraph, findsOneWidget);
+      expect(lastParagraph, findsOneWidget);
+      expect(
+        tester.getTopLeft(firstParagraph).dy -
+            tester.getTopLeft(articleList).dy,
+        lessThanOrEqualTo(20.1),
+      );
+      expect(
+        tester.getBottomRight(lastParagraph).dy,
+        lessThanOrEqualTo(tester.getBottomRight(articleList).dy),
+      );
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await controller.dispose();
+    },
+  );
+
   for (final articleMode in <bool>[false, true]) {
     testWidgets(
       '${articleMode ? 'article' : 'list'} view animates when seek updates before pointer-up',
