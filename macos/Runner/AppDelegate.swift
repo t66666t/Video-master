@@ -2,6 +2,16 @@ import Cocoa
 import FlutterMacOS
 import Darwin
 
+private struct MacYtDlpChannelError: Error {
+  let code: String
+  let message: String
+  let details: Any?
+
+  var flutterError: FlutterError {
+    FlutterError(code: code, message: message, details: details)
+  }
+}
+
 @main
 class AppDelegate: FlutterAppDelegate {
   private let resolveTimeoutSeconds: TimeInterval = 90
@@ -31,9 +41,10 @@ class AppDelegate: FlutterAppDelegate {
   private func registerYtDlpChannels(controller: FlutterViewController) {
     let methodChannel = FlutterMethodChannel(
       name: ytDlpChannelName,
-      binaryMessenger: controller.binaryMessenger
+      binaryMessenger: controller.engine.binaryMessenger
     )
-    methodChannel.setMethodCallHandler { [weak self] call, result in
+    methodChannel.setMethodCallHandler {
+      [weak self] (call: FlutterMethodCall, result: @escaping FlutterResult) in
       guard let self = self else {
         result(nil)
         return
@@ -74,9 +85,9 @@ class AppDelegate: FlutterAppDelegate {
             DispatchQueue.main.async {
               result(payload)
             }
-          } catch let error as FlutterError {
+          } catch let error as MacYtDlpChannelError {
             DispatchQueue.main.async {
-              result(error)
+              result(error.flutterError)
             }
           } catch {
             DispatchQueue.main.async {
@@ -94,8 +105,8 @@ class AppDelegate: FlutterAppDelegate {
         let args = call.arguments as? [String: Any]
         do {
           result(try self.startYoutubeDownload(args))
-        } catch let error as FlutterError {
-          result(error)
+        } catch let error as MacYtDlpChannelError {
+          result(error.flutterError)
         } catch {
           result(
             FlutterError(
@@ -130,7 +141,7 @@ class AppDelegate: FlutterAppDelegate {
 
     let eventChannel = FlutterEventChannel(
       name: ytDlpEventChannelName,
-      binaryMessenger: controller.binaryMessenger
+      binaryMessenger: controller.engine.binaryMessenger
     )
     eventChannel.setStreamHandler(_MacYtDlpStreamProxy(owner: self))
   }
@@ -201,10 +212,14 @@ class AppDelegate: FlutterAppDelegate {
 
   private func resolveYoutubeMeta(_ args: [String: Any]?) throws -> [String: Any] {
     guard let url = args?["url"] as? String, !url.isEmpty else {
-      throw FlutterError(code: "INVALID_ARGS", message: "missing url", details: nil)
+      throw MacYtDlpChannelError(code: "INVALID_ARGS", message: "missing url", details: nil)
     }
     guard let ytDlpPath = findExecutable(candidates: ["yt-dlp", "resources/yt-dlp"]) else {
-      throw FlutterError(code: "YT_DLP_NOT_FOUND", message: "yt-dlp executable not found", details: nil)
+      throw MacYtDlpChannelError(
+        code: "YT_DLP_NOT_FOUND",
+        message: "yt-dlp executable not found",
+        details: nil
+      )
     }
     let sessionConfig = args?["sessionConfig"] as? [String: Any]
     var commandArgs = buildSessionArgs(sessionConfig)
@@ -215,7 +230,7 @@ class AppDelegate: FlutterAppDelegate {
       timeout: resolveTimeoutSeconds
     )
     guard result.exitCode == 0 else {
-      throw FlutterError(
+      throw MacYtDlpChannelError(
         code: "YT_DLP_RESOLVE_FAILED",
         message: result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
           ?? (result.timedOut ? "yt-dlp resolve timed out" : "yt-dlp resolve failed"),
@@ -235,10 +250,18 @@ class AppDelegate: FlutterAppDelegate {
       let rawArgs = args["args"] as? [String],
       !rawArgs.isEmpty
     else {
-      throw FlutterError(code: "INVALID_ARGS", message: "missing download request", details: nil)
+      throw MacYtDlpChannelError(
+        code: "INVALID_ARGS",
+        message: "missing download request",
+        details: nil
+      )
     }
     guard let ytDlpPath = findExecutable(candidates: ["yt-dlp", "resources/yt-dlp"]) else {
-      throw FlutterError(code: "YT_DLP_NOT_FOUND", message: "yt-dlp executable not found", details: nil)
+      throw MacYtDlpChannelError(
+        code: "YT_DLP_NOT_FOUND",
+        message: "yt-dlp executable not found",
+        details: nil
+      )
     }
 
     let outputUrl = URL(fileURLWithPath: outputDir, isDirectory: true)
