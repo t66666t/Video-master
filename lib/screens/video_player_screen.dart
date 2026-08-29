@@ -17,6 +17,7 @@ import '../services/embedded_subtitle_service.dart';
 import '../services/audio_playback_compatibility_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
+import '../services/playback_exit_guard.dart';
 import '../services/playback_orientation_transition.dart';
 import '../services/playlist_manager.dart';
 import '../services/system_media_session_service.dart';
@@ -24,6 +25,7 @@ import '../services/subtitle_timeline_resolver.dart';
 import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
 import '../models/media_chapter.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/ocr_subtitle_models.dart';
@@ -54,6 +56,7 @@ import '../services/ocr_subtitle_manager.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
+import '../utils/device_form_factor.dart';
 import '../utils/subtitle_drag_snap.dart';
 import '../utils/subtitle_file_matcher.dart';
 import '../utils/subtitle_file_picker.dart';
@@ -92,7 +95,7 @@ class VideoPlayerScreen extends StatefulWidget {
 }
 
 class _VideoPlayerScreenState extends State<VideoPlayerScreen>
-    with WidgetsBindingObserver, TickerProviderStateMixin {
+    with WidgetsBindingObserver, TickerProviderStateMixin, RouteAware {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final GlobalKey<SelectableRegionState> _selectionKey =
       GlobalKey<SelectableRegionState>();
@@ -120,6 +123,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool _initialControllerConsumed = false;
   bool _isLandscapeViewportReady = true;
   bool _isOrientationTransitioning = false;
+  bool _routeObserverSubscribed = false;
+  int _danmakuRevision = 0;
   bool get _supportsOcrSubtitle =>
       Platform.isAndroid ||
       Platform.isIOS ||
@@ -142,6 +147,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool _isResizingSidebar = false;
   double? _subtitleSidebarWidthOverride;
   bool _forceExit = false;
+  final PlaybackExitGuard _exitGuard = PlaybackExitGuard();
   bool _iosBackSwipeActive = false;
   double _iosBackSwipeDistance = 0.0;
   static const double _iosBackSwipeEdgeWidth = 20.0;
@@ -175,6 +181,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     return pixelRatio > 0 && display.size.shortestSide / pixelRatio < 600;
   }
 
+  /// 本页是否由竖屏播放页推入（路由栈中仍存在竖屏播放路由）。
+  ///
+  /// 开启「跳过竖屏播放页」后，横屏页也可能携带控制器从媒体库直入（如点击正在播放的卡片或迷你播放条），
+  /// 此时下方没有竖屏页，方向决策不能再依赖 existingController 是否为空。
+  bool get _enteredFromPortraitPage {
+    return PlaybackNavigationService.instance.observer.routes.any(
+      (route) =>
+          route.settings.name == PlaybackNavigationService.portraitRouteName,
+    );
+  }
+
   Future<bool> _waitForPlaybackViewport(PlaybackViewportOrientation target) {
     final view = View.of(context);
     return PlaybackOrientationTransition.waitForViewport(
@@ -183,6 +200,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       target: target,
       readStabilitySignature: () =>
           PlaybackOrientationTransition.metricsSignature(view),
+    );
+  }
+
+  /// 直入横屏（无竖屏页交接）时退出播放器，恢复媒体库期望的屏幕方向：
+  /// 桌面端交还系统默认；手机恢复竖屏；平板允许全方向。
+  Future<void> _restoreHomeScreenOrientations() async {
+    if (kIsWeb || !(Platform.isAndroid || Platform.isIOS)) {
+      await SystemChrome.setPreferredOrientations(<DeviceOrientation>[]);
+      return;
+    }
+    await SystemChrome.setPreferredOrientations(
+      DeviceFormFactor.homeScreenPreferredOrientations(isMobile: true),
     );
   }
 
@@ -195,12 +224,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   Future<void> _returnToPortrait({bool saveExitState = true}) async {
-    if (_isOrientationTransitioning) return;
+    if (_isOrientationTransitioning || !_exitGuard.tryStart()) return;
     final navigator = Navigator.of(context);
-    final useOrientationBridge = _usesAndroidPhoneOrientationBridge;
+    // 触发返回的瞬间立即恢复系统栏（状态栏/底部触控条），
+    // 而不是等退出动画结束后的 dispose 才恢复，
+    // 避免系统栏在动画完成后才弹出把底部卡片往上顶一下。
+    _restoreSystemUIMode();
+    final bool fromPortraitPage = _enteredFromPortraitPage;
+    final useOrientationBridge =
+        fromPortraitPage && _usesAndroidPhoneOrientationBridge;
     if (useOrientationBridge) {
       await _showOrientationBridge();
       if (!mounted) return;
+    }
+
+    // 桌面/网页直入横屏的退出：先启动退出动画，保存与方向恢复与转场并行，
+    // 避免异步 IO（暂停、进度落盘、方向通道调用）阻塞动画造成明显卡顿。
+    // dispose() 内置的同名清理作为兜底，进度落盘不依赖活动控制器，无丢失风险。
+    final bool popBeforeCleanup =
+        !fromPortraitPage &&
+        (kIsWeb || !(Platform.isAndroid || Platform.isIOS));
+    if (popBeforeCleanup) {
+      if (mounted) navigator.pop();
+      if (saveExitState) {
+        try {
+          await _cancelPendingPlaybackIfNeeded();
+          await _handleExit();
+        } catch (error) {
+          debugPrint('Saving landscape exit state failed: $error');
+        }
+      }
+      try {
+        await _restoreHomeScreenOrientations();
+      } catch (error) {
+        debugPrint(
+          'Playback orientation transition: portrait request failed: $error',
+        );
+      }
+      return;
     }
 
     try {
@@ -214,8 +275,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
 
     try {
-      if (widget.existingController == null) {
-        await SystemChrome.setPreferredOrientations(<DeviceOrientation>[]);
+      if (!fromPortraitPage) {
+        await _restoreHomeScreenOrientations();
       } else {
         await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
           DeviceOrientation.portraitUp,
@@ -749,6 +810,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       listen: false,
     ).positionNotifier;
     final overlay = DanmakuOverlay(
+      key: ValueKey('$path:$_danmakuRevision'),
       path: path,
       position: position,
       displayArea: settings.bilibiliDanmakuDisplayArea,
@@ -1241,6 +1303,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool? _lastVideoContinuousSubtitle;
   bool? _lastAudioContinuousSubtitle;
   bool? _lastGhostModeEnabled;
+  bool? _lastSkipPortraitPlayer;
   int _subtitleRefreshToken = 0;
   int _postInitWorkToken = 0;
 
@@ -1274,12 +1337,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         kIsWeb ||
         !(Platform.isAndroid || Platform.isIOS) ||
         _isCurrentPhysicalLandscape();
-    // A handed-off controller means the source page already completed the
-    // physical orientation change. Repeating the platform request here can
-    // make some OEMs start a second window transition after the route appears.
+    // A handed-off controller from the portrait page means that page already
+    // completed the physical orientation change. Repeating the platform
+    // request here can make some OEMs start a second window transition after
+    // the route appears. Direct entries (including ones carrying a
+    // controller, e.g. tapping the playing card) still need the request.
     if (!kIsWeb &&
         (Platform.isAndroid || Platform.isIOS) &&
-        widget.existingController == null) {
+        !_enteredFromPortraitPage) {
       unawaited(
         SystemChrome.setPreferredOrientations([
           DeviceOrientation.landscapeLeft,
@@ -1335,6 +1400,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
       _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
       _lastGhostModeEnabled = settings.isGhostModeEnabled;
+      _lastSkipPortraitPlayer = settings.skipPortraitPlayer;
       settings.addListener(_onSettingsChanged);
       _onSettingsChanged();
     });
@@ -1390,6 +1456,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     final settings = _settingsService;
     if (settings == null) return;
 
+    // 「跳过竖屏播放页」需独立于字幕缓存比对，在字幕无关的设置变更中
+    // 也能即时响应（off→on 边沿触发一次）。
+    _handleSkipPortraitPlayerChanged(settings.skipPortraitPlayer);
+
     final bool showSubtitlesBecameTrue =
         (_lastShowSubtitles == false || _lastShowSubtitles == null) &&
         settings.showSubtitles;
@@ -1435,6 +1505,34 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     if (showSubtitlesBecameTrue) {
       unawaited(_maybeLoadSubtitlesForCurrentItem(force: true));
+    }
+  }
+
+  /// 「跳过竖屏播放页」在横屏页内被打开时，移除正下方的竖屏播放路由，
+  /// 使退出横屏后直接回到媒体库而不是竖屏页。
+  ///
+  /// 仅在 off→on 边沿触发一次。竖屏页在跳转横屏前已将控制器所有权让出
+  /// （_isControllerOwner == false），移除其路由只会触发状态同步，不会
+  /// 释放仍在播放的控制器。
+  void _handleSkipPortraitPlayerChanged(bool enabled) {
+    final bool? previous = _lastSkipPortraitPlayer;
+    _lastSkipPortraitPlayer = enabled;
+    if (previous != false || !enabled) return;
+    if (!mounted) return;
+
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final portraitRoutes = PlaybackNavigationService.instance.observer.routes
+        .where(
+          (route) =>
+              route.settings.name ==
+              PlaybackNavigationService.portraitRouteName,
+        )
+        .toList(growable: false);
+    for (final route in portraitRoutes) {
+      PlaybackNavigationService.instance.removeRouteSuppressed(
+        navigator,
+        route,
+      );
     }
   }
 
@@ -1874,10 +1972,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       await settings.saveLandscapeSubtitleSidebarVisible(
         _isSubtitleSidebarVisible,
       );
-      if (!_controllerAssigned) return;
+      if (!_controllerAssigned) {
+        final itemId = _currentItem?.id;
+        if (itemId != null) {
+          await playbackService.persistCurrentProgress(expectedItemId: itemId);
+        }
+        return;
+      }
 
       final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
-      if (!PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup &&
+      final suppressRouteCleanup =
+          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      if (!suppressRouteCleanup &&
           !shouldSkipAutoPause &&
           settings.autoPauseOnExit &&
           _controller.value.isPlaying) {
@@ -1889,9 +1995,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       }
 
       // Force sync state
-      if (!_isControllerOwner) {
+      if (!_isControllerOwner && playbackService.controller != _controller) {
         playbackService.updatePlaybackStateFromController();
       }
+      await _saveProgress();
     } catch (e) {
       debugPrint("Exit sync error: $e");
     }
@@ -1913,12 +2020,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     );
     // Try to sync one last time (fire and forget)
     _handleExit();
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
+    if (_routeObserverSubscribed) {
+      AppToast.routeObserver.unsubscribe(this);
+    }
 
     _transcriptionManager?.removeListener(_onTranscriptionUpdate);
     _ocrSubtitleManager?.removeListener(_onOcrSubtitleUpdate);
     _settingsService?.removeListener(_onSettingsChanged);
-    if (widget.existingController == null) {
-      SystemChrome.setPreferredOrientations([]);
+    if (!_enteredFromPortraitPage) {
+      unawaited(_restoreHomeScreenOrientations());
     }
     _restoreSystemUIMode();
 
@@ -2062,6 +2173,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
   }
 
+  @override
+  void didPush() {
+    MediaPlaybackService().setPlaybackPageVisible(this, true);
+  }
+
+  @override
+  void didPopNext() {
+    MediaPlaybackService().setPlaybackPageVisible(this, true);
+  }
+
+  @override
+  void didPushNext() {
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
+  }
+
+  @override
+  void didPop() {
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
+  }
+
   double _readBottomViewInset() {
     final view = WidgetsBinding.instance.platformDispatcher.views.first;
     return view.viewInsets.bottom / view.devicePixelRatio;
@@ -2088,17 +2219,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   Future<void> _saveProgress() async {
     if (!_initialized || _currentItem == null) return;
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+    if (playbackService.currentItem?.id == _currentItem!.id) {
+      await playbackService.persistCurrentProgress(
+        expectedItemId: _currentItem!.id,
+      );
+      return;
+    }
     if (!_controller.value.isInitialized) return;
-    final position = _controller.value.position.inMilliseconds;
     await Provider.of<LibraryService>(
       context,
       listen: false,
-    ).updateVideoProgress(_currentItem!.id, position);
+    ).updateVideoProgress(
+      _currentItem!.id,
+      _controller.value.position.inMilliseconds,
+    );
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+
+    if (!_routeObserverSubscribed) {
+      final route = ModalRoute.of(context);
+      if (route is PageRoute) {
+        AppToast.routeObserver.subscribe(this, route);
+        _routeObserverSubscribed = true;
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      MediaPlaybackService().setPlaybackPageVisible(
+        this,
+        ModalRoute.of(context)?.isCurrent == true,
+      );
+    });
 
     // Listen to TranscriptionManager
     final manager = Provider.of<TranscriptionManager>(context, listen: false);
@@ -2521,8 +2679,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         );
         _isPlaying = playbackService.isPlaying;
 
-        // 强制同步 controller 状态与 MediaPlaybackService 一致
-        playbackService.updatePlaybackStateFromController();
+        // MediaPlaybackService already owns this controller and its
+        // authoritative position. Avoid replacing it with a transient native
+        // byte-zero sample while an online stream is being handed off.
         if (_isPlaying) {
           if (!_controller.value.isPlaying) playbackService.resume();
         } else {
@@ -2632,7 +2791,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
             // Sync state logic
             if (_controller.value.isInitialized) {
-              playbackService.updatePlaybackStateFromController();
+              // The service is already the source of truth for this reused
+              // controller; only repair an actual play/pause mismatch.
               if (_isPlaying) {
                 if (!_controller.value.isPlaying) playbackService.resume();
               } else {
@@ -3964,9 +4124,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               constraints.maxWidth,
               constraints.maxHeight,
             );
-            final aspectRatio = _controller.value.aspectRatio > 0
-                ? _controller.value.aspectRatio
-                : 16 / 9;
+            final aspectRatio = _effectiveVideoAspectRatio();
             final videoSize = _computeContainedVideoSize(
               viewportSize,
               aspectRatio,
@@ -3988,6 +4146,27 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         ),
       ),
     );
+  }
+
+  double _effectiveVideoAspectRatio() {
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      final streamRatio = playbackService.streamDisplayAspectRatio;
+      if (playbackService.currentItem?.id == _currentItem?.id &&
+          playbackService.isCurrentItemBilibiliStream &&
+          streamRatio != null &&
+          streamRatio.isFinite &&
+          streamRatio > 0) {
+        return streamRatio;
+      }
+    } catch (_) {}
+    if (_controllerAssigned && _controller.value.aspectRatio > 0) {
+      return _controller.value.aspectRatio;
+    }
+    return 16 / 9;
   }
 
   void _onIosBackSwipeStart(DragStartDetails details) {
@@ -4085,10 +4264,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                     IconButton(
                       icon: const Icon(Icons.close, color: Colors.white),
                       tooltip: "退出播放 (Esc)",
-                      onPressed: () {
-                        _forceExit = true;
-                        unawaited(_handleExit());
-                      },
+                      onPressed: () => unawaited(_forceExitPlayer()),
                     )
                   else
                     IconButton(
@@ -4322,13 +4498,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                           // 在 Release 下 ErrorWidget 渲染为空白 → 白屏。
                                           // 加载期间用 16:9 占位（此时仅渲染 loading 态，不渲染视频）。
                                           final double videoAspectRatio =
-                                              (_controllerAssigned &&
-                                                  _controller
-                                                          .value
-                                                          .aspectRatio >
-                                                      0)
-                                              ? _controller.value.aspectRatio
-                                              : 16 / 9;
+                                              _effectiveVideoAspectRatio();
                                           final Size containedVideoSize =
                                               _computeContainedVideoSize(
                                                 playerSurfaceSize,
@@ -4635,6 +4805,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                   RepaintBoundary(
                                                     child: VideoControlsOverlay(
                                                       key: _controlsKey,
+                                                      enableSeekThumbnailPreview:
+                                                          _currentItem
+                                                                  ?.sourceRef
+                                                                  ?.kind !=
+                                                              MediaSourceKind
+                                                                  .bilibiliStream ||
+                                                          (_currentItem
+                                                                  ?.bilibiliVideoShot
+                                                                  ?.hasLocalSprites ??
+                                                              false),
+                                                      bilibiliVideoShot:
+                                                          _currentItem
+                                                                  ?.bilibiliVideoShot
+                                                                  ?.hasLocalSprites ==
+                                                              true
+                                                          ? _currentItem!
+                                                                .bilibiliVideoShot
+                                                          : null,
                                                       playbackControlsVisibility:
                                                           _playbackControlsVisibility,
                                                       controller: _controller,
@@ -4756,6 +4944,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                           () => unawaited(
                                                             showDanmakuSettingsDialog(
                                                               context,
+                                                              videoItem:
+                                                                  _currentItem!,
+                                                              onDanmakuUpdated: () {
+                                                                if (mounted) {
+                                                                  setState(
+                                                                    () =>
+                                                                        _danmakuRevision++,
+                                                                  );
+                                                                }
+                                                              },
                                                             ),
                                                           ),
                                                       onSpeedUpdate:
@@ -5741,6 +5939,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onSyncAudioSubtitleStyleWithVideoChanged: _isAudio
               ? (value) => settings.setAudioSubtitleStyleSyncWithVideo(value)
               : null,
+          showSkipPortraitPlayerSetting:
+              !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+          skipPortraitPlayer: settings.skipPortraitPlayer,
+          onSkipPortraitPlayerChanged: (value) =>
+              settings.saveSkipPortraitPlayer(value),
           showSubtitles: settings.showSubtitles,
           isMirroredH: _resolvedVideoMirrorH(settings),
           isMirroredV: _resolvedVideoMirrorV(settings),

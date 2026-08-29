@@ -3,6 +3,21 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/settings_service.dart';
+import '../services/bilibili/bilibili_streaming_service.dart';
+import 'package:provider/provider.dart';
+
+String _formatStorageBytes(int bytes) {
+  if (bytes <= 0) return '0 KB';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var value = bytes / 1024;
+  var unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  final digits = unit == 0 ? 0 : (value >= 100 ? 0 : 1);
+  return '${value.toStringAsFixed(digits)} ${units[unit]}';
+}
 
 /// Opens the global media-library settings using the same bottom-sheet
 /// presentation as the card-style controls.
@@ -10,6 +25,12 @@ void showMediaLibrarySettingsBottomSheet(
   BuildContext context,
   SettingsService settings,
 ) {
+  final streamService = Provider.of<BilibiliStreamingService>(
+    context,
+    listen: false,
+  );
+  Future<BilibiliStreamCacheReport> cacheReportFuture = streamService
+      .inspectCache();
   showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
@@ -21,7 +42,7 @@ void showMediaLibrarySettingsBottomSheet(
       var copyImportedMedia = settings.copyImportedMediaToPrivateStorage;
       return StatefulBuilder(
         builder: (context, setSheetState) {
-          final maxHeight = MediaQuery.sizeOf(context).height * 0.5;
+          final maxHeight = MediaQuery.sizeOf(context).height * 0.65;
           return ConstrainedBox(
             constraints: BoxConstraints(maxHeight: maxHeight),
             child: ListView(
@@ -70,6 +91,58 @@ void showMediaLibrarySettingsBottomSheet(
                         settings.updateSetting(
                           'copyImportedMediaToPrivateStorage',
                           value,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
+                  child: FutureBuilder<BilibiliStreamCacheReport>(
+                    future: cacheReportFuture,
+                    builder: (context, snapshot) {
+                      final report = snapshot.data;
+                      return ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 4,
+                        ),
+                        leading: const Icon(
+                          Icons.cloud_download_outlined,
+                          color: Colors.white70,
+                        ),
+                        title: const Text(
+                          'Bilibili 在线播放缓存',
+                          style: TextStyle(color: Colors.white, fontSize: 15),
+                        ),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            snapshot.connectionState == ConnectionState.waiting
+                                ? '正在统计...'
+                                : '${_formatStorageBytes(report?.bytes ?? 0)} · ${report?.fileCount ?? 0} 个缓存片段',
+                            style: const TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                        trailing: TextButton(
+                          onPressed:
+                              snapshot.connectionState ==
+                                  ConnectionState.waiting
+                              ? null
+                              : () async {
+                                  await streamService.clearCache();
+                                  setSheetState(() {
+                                    cacheReportFuture = streamService
+                                        .inspectCache();
+                                  });
+                                },
+                          child: const Text('清除'),
                         ),
                       );
                     },

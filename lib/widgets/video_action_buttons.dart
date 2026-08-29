@@ -1278,6 +1278,29 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
               },
             ),
             ListTile(
+              leading: const Icon(
+                Icons.live_tv_outlined,
+                color: Color(0xFFFB7299),
+              ),
+              title: const Text('导入 Bilibili 链接（在线播放）'),
+              subtitle: const Text('仅导入播放链接；下载请使用小电视按钮'),
+              onTap: () {
+                Navigator.pop(context);
+                Navigator.push(
+                  mainContext,
+                  MaterialPageRoute(
+                    builder: (_) => BilibiliDownloadScreen(
+                      targetFolderId: collectionId,
+                      initialStreamingMode: true,
+                    ),
+                    settings: const RouteSettings(
+                      name: '/bilibili_stream_import',
+                    ),
+                  ),
+                );
+              },
+            ),
+            ListTile(
               leading: const Icon(Icons.archive_outlined),
               title: const Text('从文件管理导入压缩包'),
               onTap: () {

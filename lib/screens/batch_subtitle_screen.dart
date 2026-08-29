@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import '../models/batch_subtitle_task_view.dart';
 import '../models/subtitle_output_path_strategy.dart';
 import '../models/transcription_status.dart';
+import '../services/playback_navigation_service.dart';
 import '../services/transcription_manager.dart';
 import '../services/settings_service.dart';
 import '../services/library_service.dart';
@@ -16,8 +17,6 @@ import '../utils/app_toast.dart';
 import '../utils/media_folder_scanner.dart';
 import '../widgets/internal_video_picker_dialog.dart';
 import '../widgets/task_queue_table.dart';
-import 'portrait_video_screen.dart';
-import 'video_player_screen.dart';
 
 class BatchSubtitleScreen extends StatefulWidget {
   final String? collectionId;
@@ -1542,30 +1541,9 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     if (!mounted) return;
 
     final navigator = Navigator.of(context);
-    final isDesktop =
-        Platform.isWindows || Platform.isLinux || Platform.isMacOS;
 
-    if (isDesktop) {
-      // 桌面端：进入横屏播放页
-      await navigator.push(
-        PageRouteBuilder(
-          pageBuilder: (context, animation, secondaryAnimation) =>
-              VideoPlayerScreen(videoItem: item),
-          transitionsBuilder: (context, animation, secondaryAnimation, child) =>
-              child,
-          transitionDuration: Duration.zero,
-          reverseTransitionDuration: Duration.zero,
-          opaque: true,
-        ),
-      );
-    } else {
-      // 移动端：进入竖屏播放页
-      await navigator.push(
-        MaterialPageRoute(
-          builder: (context) => PortraitVideoScreen(videoItem: item),
-        ),
-      );
-    }
+    // 桌面端或开启"跳过竖屏播放页"时直入横屏播放页，否则进入竖屏播放页
+    await navigator.push(PlaybackNavigationService.buildPlaybackEntryRoute(item));
   }
 
   /// 打开外部视频文件

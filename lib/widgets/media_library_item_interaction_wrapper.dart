@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'custom_drag.dart';
 import 'folder_drop_target.dart';
 
 /// Uses movement-gated desktop dragging while preserving long-press dragging
@@ -16,6 +17,7 @@ class MediaLibraryAdaptiveDraggable<T extends Object> extends StatelessWidget {
     required this.child,
     required this.childWhenDragging,
     required this.onDragStarted,
+    this.onTap,
   });
 
   final T data;
@@ -25,6 +27,9 @@ class MediaLibraryAdaptiveDraggable<T extends Object> extends StatelessWidget {
   final Widget childWhenDragging;
   final VoidCallback onDragStarted;
 
+  /// 位移未达拖拽阈值时补偿点击的回调（桌面端）。
+  final VoidCallback? onTap;
+
   bool get _usesDesktopPointerGesture {
     return Platform.isWindows || Platform.isLinux || Platform.isMacOS;
   }
@@ -32,11 +37,12 @@ class MediaLibraryAdaptiveDraggable<T extends Object> extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (_usesDesktopPointerGesture) {
-      return Draggable<T>(
+      return GatedDraggable<T>(
         data: data,
         feedback: feedback,
-        childWhenDragging: childWhenDragging,
         onDragStarted: onDragStarted,
+        onTap: onTap,
+        longPressDuration: delay,
         child: child,
       );
     }
@@ -65,6 +71,7 @@ class MediaLibraryItemInteractionWrapper extends StatelessWidget {
     required this.onReorder,
     this.folderId,
     this.onMoveToFolder,
+    this.onTap,
     this.allowReorder = true,
   });
 
@@ -77,6 +84,10 @@ class MediaLibraryItemInteractionWrapper extends StatelessWidget {
   final void Function(int oldIndex, int newIndex) onReorder;
   final String? folderId;
   final void Function(int draggedIndex, String targetFolderId)? onMoveToFolder;
+
+  /// 位移未达拖拽阈值时补偿点击的回调（桌面端），通常与子项点击行为一致。
+  final VoidCallback? onTap;
+
   final bool allowReorder;
 
   @override
@@ -94,14 +105,15 @@ class MediaLibraryItemInteractionWrapper extends StatelessWidget {
                 allowReorder: allowReorder,
                 child: child,
               )
-            : DragTarget<int>(
-                onWillAcceptWithDetails: (details) =>
-                    allowReorder && details.data != index,
-                onAcceptWithDetails: (details) {
+            : DropZone<int>(
+                data: index,
+                onWillAccept: (draggedData) =>
+                    allowReorder && draggedData != index,
+                onAcceptWithDetails: (draggedData, _) {
                   if (!allowReorder) return;
-                  onReorder(details.data, index);
+                  onReorder(draggedData, index);
                 },
-                builder: (context, candidateData, rejectedData) {
+                builder: (context, candidateData) {
                   if (candidateData.isEmpty) return child;
                   return Stack(
                     fit: StackFit.expand,
@@ -127,6 +139,7 @@ class MediaLibraryItemInteractionWrapper extends StatelessWidget {
           delay: dragDelay,
           data: index,
           onDragStarted: onDragStarted,
+          onTap: onTap,
           feedback: SizedBox(
             width: size.width,
             height: size.height,

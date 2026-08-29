@@ -167,7 +167,31 @@ void main() {
     expect(phoneButtonSize, greaterThanOrEqualTo(40));
     expect(phoneButtonSize, lessThan(tabletButtonSize));
     await pumpAt(const Size(800, 360), compactTopRightButtons: true);
+    await pumpAt(const Size(800, 360));
+    final danmakuToggleBeforeReset = tester.getRect(
+      find.byKey(const ValueKey('player-side-danmaku-toggle')),
+    );
+    final danmakuSettingsBeforeReset = tester.getRect(
+      find.byKey(const ValueKey('player-side-danmaku-settings')),
+    );
+    final lockButton = find.byKey(const ValueKey('player-side-lock'));
+    final Rect? lockBeforeReset = lockButton.evaluate().isNotEmpty
+        ? tester.getRect(lockButton)
+        : null;
     await pumpAt(const Size(800, 360), showResetScreenButton: true);
+    expect(
+      tester.getRect(find.byKey(const ValueKey('player-side-danmaku-toggle'))),
+      danmakuToggleBeforeReset,
+    );
+    expect(
+      tester.getRect(
+        find.byKey(const ValueKey('player-side-danmaku-settings')),
+      ),
+      danmakuSettingsBeforeReset,
+    );
+    if (lockBeforeReset != null) {
+      expect(tester.getRect(lockButton), lockBeforeReset);
+    }
     final resetTopWithoutChapters = tester
         .getRect(find.byKey(const ValueKey('player-side-reset-screen')))
         .top;

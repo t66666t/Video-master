@@ -264,17 +264,87 @@ class BilibiliApiService {
       params['try_look'] = 1;
     }
 
-    final signedParams = WbiSigner.sign(params, _imgKey!, _subKey!);
-
     try {
-      final response = await _dio.get(
-        "https://api.bilibili.com/x/player/wbi/playurl",
-        queryParameters: signedParams,
+      for (var attempt = 0; attempt < 2; attempt++) {
+        final signedParams = WbiSigner.sign(params, _imgKey!, _subKey!);
+        final response = await _dio.get(
+          "https://api.bilibili.com/x/player/wbi/playurl",
+          queryParameters: signedParams,
+        );
+        final payload = response.data;
+        final code = payload is Map ? payload['code'] : null;
+        if (code == 0 && payload is Map) {
+          final parsed = BilibiliStreamInfo.fromJson(
+            Map<String, dynamic>.from(payload),
+          );
+          if (parsed.videoStreams.isNotEmpty) return parsed;
+        }
+        // Only a signature failure refreshes WBI, and only once. Account,
+        // payment and region restrictions are deterministic results.
+        if (attempt == 0 && code == -403) {
+          _imgKey = null;
+          _subKey = null;
+          await _fetchWbiKeys();
+          continue;
+        }
+        break;
+      }
+
+      // PGC episodes use a separate adapter even when bvid/cid are present.
+      final pgcResponse = await _dio.get(
+        'https://api.bilibili.com/pgc/player/web/playurl',
+        queryParameters: {
+          'bvid': bvid,
+          'cid': cid,
+          'qn': 0,
+          'fnval': 4048,
+          'fnver': 0,
+          'fourk': 1,
+        },
       );
-      return BilibiliStreamInfo.fromJson(response.data);
+      final pgcPayload = pgcResponse.data;
+      if (pgcPayload is Map && pgcPayload['code'] == 0) {
+        final result = pgcPayload['result'] ?? pgcPayload['data'];
+        if (result is Map) {
+          return BilibiliStreamInfo.fromJson({
+            'data': Map<String, dynamic>.from(result),
+          });
+        }
+      }
+      return BilibiliStreamInfo(
+        videoStreams: const [],
+        audioStreams: const [],
+        qualityMap: const {},
+      );
     } catch (e) {
       developer.log('Error fetching play url', error: e);
       rethrow;
+    }
+  }
+
+  /// Returns Bilibili's pre-generated seek-preview sprite metadata.
+  /// A null result means that the video has no published preview sprites.
+  Future<Map<String, dynamic>?> fetchVideoShot(String bvid, int cid) async {
+    try {
+      final response = await _dio.get(
+        'https://api.bilibili.com/x/player/videoshot',
+        queryParameters: <String, dynamic>{
+          'bvid': bvid,
+          'cid': cid,
+          'index': 1,
+        },
+      );
+      final payload = response.data;
+      if (payload is! Map || payload['code'] != 0 || payload['data'] is! Map) {
+        return null;
+      }
+      return Map<String, dynamic>.from(payload['data'] as Map);
+    } catch (error) {
+      developer.log(
+        'Error fetching Bilibili video-shot metadata',
+        error: error,
+      );
+      return null;
     }
   }
 

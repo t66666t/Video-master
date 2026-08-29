@@ -186,6 +186,7 @@ class SystemMediaSessionService {
   }
 
   void dispose() {
+    _playbackService?.setMediaNotificationVisible(false);
     _scheduledSyncTimer?.cancel();
     _scheduledSyncTimer = null;
     _scheduledSubtitleBoundaryTimer?.cancel();
@@ -361,6 +362,11 @@ class SystemMediaSessionService {
       );
       return;
     }
+    _playbackService?.setMediaNotificationVisible(
+      isSupportedPlatform &&
+          resolvedSnapshot.itemId != null &&
+          resolvedSnapshot.state != PlaybackState.idle,
+    );
     _lastSnapshot = resolvedSnapshot;
     _lastPublishedAt = DateTime.now();
     if (resolvedSnapshot.itemId == null) {
@@ -678,19 +684,11 @@ class SystemMediaSessionService {
   }
 
   Duration? _resolveLivePosition(MediaPlaybackService? playbackService) {
-    final controller = playbackService?.controller;
-    if (controller == null) {
-      return null;
-    }
-    try {
-      final value = controller.value;
-      if (!value.isInitialized) {
-        return null;
-      }
-      return value.position;
-    } catch (_) {
-      return null;
-    }
+    // MediaPlaybackService is the single source of truth. In particular, a
+    // network controller can expose its byte-zero probe while an initial seek
+    // is still being committed; reading the raw controller here would publish
+    // (and later restore) that transient zero position.
+    return playbackService?.position;
   }
 
   Duration? _resolveLiveBufferedPosition(
@@ -885,8 +883,6 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     with audio_service.QueueHandler, audio_service.SeekHandler {
   MediaPlaybackService? _playbackService;
   PlaylistManager? _playlistManager;
-  bool? _pendingQueueSkipAutoPlay;
-  int _queueSkipRequestId = 0;
 
   bool _shouldHandleRemoteCommand(String command) {
     final enabled = SystemMediaSessionService.instance.headsetControlsEnabled;
@@ -997,7 +993,10 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote queue item command received',
       data: <String, Object?>{'index': index, 'itemId': playlist[index].id},
     );
-    await playbackService.playPlaylistItem(playlist[index], autoPlay: true);
+    await playbackService.playPlaylistItem(
+      playlist[index],
+      autoPlay: SettingsService().autoPlayNextVideo,
+    );
   }
 
   @override
@@ -1018,7 +1017,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     );
     await playbackService.playPlaylistItem(
       playlistManager.playlist[index],
-      autoPlay: true,
+      autoPlay: SettingsService().autoPlayNextVideo,
     );
   }
 
@@ -1054,46 +1053,16 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
 
   Future<void> _handleQueueSkip({required bool isNext}) async {
     final playbackService = _playbackService;
-    final playlistManager = _playlistManager;
-    if (playbackService == null || playlistManager == null) {
+    if (playbackService == null) {
       return;
     }
-    final int requestId = ++_queueSkipRequestId;
-    // Preserve the user's play/pause intent across an overlapping controller
-    // hand-off. Loading temporarily reports isPlaying=false, so a second
-    // notification action must inherit the first action's intent instead of
-    // loading the final item paused.
-    final bool autoPlay = playbackService.state == PlaybackState.loading
-        ? (_pendingQueueSkipAutoPlay ?? false)
-        : playbackService.isPlaying;
-    _pendingQueueSkipAutoPlay = autoPlay;
-    try {
-      playlistManager.reloadPlaylist();
-      final playlist = playlistManager.playlist;
-      if (playlist.isEmpty) {
-        return;
-      }
-      if (playlist.length == 1) {
-        await playbackService.play(
-          playlist.first,
-          autoPlay: autoPlay,
-          startPosition: playbackService.position,
-        );
-        return;
-      }
-      final currentIndex = playlistManager.currentIndex;
-      final fallbackIndex = currentIndex >= 0 ? currentIndex : 0;
-      final targetIndex = isNext
-          ? (fallbackIndex + 1) % playlist.length
-          : (fallbackIndex - 1 + playlist.length) % playlist.length;
-      await playbackService.playPlaylistItem(
-        playlist[targetIndex],
-        autoPlay: autoPlay,
-      );
-    } finally {
-      if (requestId == _queueSkipRequestId) {
-        _pendingQueueSkipAutoPlay = null;
-      }
+    // Use the same entry point as the playback pages. It reads the persisted
+    // manual episode-switch auto-play setting and retains play()'s request
+    // generation guards for overlapping notification commands.
+    if (isNext) {
+      await playbackService.playNext();
+    } else {
+      await playbackService.playPrevious();
     }
   }
 }

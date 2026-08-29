@@ -27,7 +27,6 @@ import '../widgets/media_library_compact_app_bar.dart';
 import '../widgets/media_library_locate_button.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../services/thumbnail_preload_manager.dart';
-import 'portrait_video_screen.dart';
 import '../widgets/mini_playback_card.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'recycle_bin_screen.dart';
@@ -36,7 +35,6 @@ import '../widgets/responsive_icon_button.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
 import '../services/playlist_manager.dart';
-import 'video_player_screen.dart';
 import 'home_screen.dart';
 import '../utils/app_toast.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
@@ -694,25 +692,10 @@ class _CollectionScreenState extends State<CollectionScreen>
     VideoItem item,
     VideoPlayerController? existingController,
   ) {
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-      return PageRouteBuilder(
-        pageBuilder: (context, animation, secondaryAnimation) {
-          return VideoPlayerScreen(
-            videoItem: item,
-            existingController: existingController,
-          );
-        },
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return child;
-        },
-        transitionDuration: Duration.zero,
-        reverseTransitionDuration: Duration.zero,
-        opaque: true,
-      );
-    }
-    return MaterialPageRoute(
-      settings: PlaybackNavigationService.portraitRouteSettings(item),
-      builder: (context) => PortraitVideoScreen(videoItem: item),
+    // 桌面端或开启"跳过竖屏播放页"时直入横屏播放页，否则进入竖屏播放页
+    return PlaybackNavigationService.buildPlaybackEntryRoute(
+      item,
+      existingController: existingController,
     );
   }
 
@@ -2164,6 +2147,24 @@ class _CollectionScreenState extends State<CollectionScreen>
     required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(collection.id);
+    void handleTap() {
+      if (_isSelectionMode) {
+        setState(() {
+          if (_selectedIds.contains(collection.id)) {
+            _selectedIds.remove(collection.id);
+          } else {
+            _selectedIds.add(collection.id);
+          }
+        });
+      } else {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (context) => CollectionScreen(collectionId: collection.id),
+          ),
+        );
+      }
+    }
+
     final tile = MediaLibraryListTile.collection(
       collection: collection,
       index: index,
@@ -2194,24 +2195,7 @@ class _CollectionScreenState extends State<CollectionScreen>
         _updateDragSelection(details.globalPosition);
       },
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
-      onTap: () {
-        if (_isSelectionMode) {
-          setState(() {
-            if (_selectedIds.contains(collection.id)) {
-              _selectedIds.remove(collection.id);
-            } else {
-              _selectedIds.add(collection.id);
-            }
-          });
-        } else {
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (context) =>
-                  CollectionScreen(collectionId: collection.id),
-            ),
-          );
-        }
-      },
+      onTap: handleTap,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2219,6 +2203,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       isSelected: isSelected,
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(collection.id),
+      onTap: handleTap,
       allowReorder: !_isSearchResults,
       onReorder: (oldIndex, newIndex) {
         if (_isSearchResults) return;
@@ -2253,6 +2238,28 @@ class _CollectionScreenState extends State<CollectionScreen>
     required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(item.id);
+    void handleTap() {
+      if (_isSelectionMode) {
+        setState(() {
+          if (_selectedIds.contains(item.id)) {
+            _selectedIds.remove(item.id);
+          } else {
+            _selectedIds.add(item.id);
+          }
+        });
+        return;
+      }
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (!mounted) return;
+      final controller = playbackService.currentItem?.id == item.id
+          ? playbackService.controller
+          : null;
+      _openPlaybackScreen(item, existingController: controller);
+    }
+
     final tile = MediaLibraryListTile.video(
       item: item,
       index: index,
@@ -2277,27 +2284,7 @@ class _CollectionScreenState extends State<CollectionScreen>
         _updateDragSelection(details.globalPosition);
       },
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
-      onTap: () async {
-        if (_isSelectionMode) {
-          setState(() {
-            if (_selectedIds.contains(item.id)) {
-              _selectedIds.remove(item.id);
-            } else {
-              _selectedIds.add(item.id);
-            }
-          });
-          return;
-        }
-        final playbackService = Provider.of<MediaPlaybackService>(
-          context,
-          listen: false,
-        );
-        if (!mounted) return;
-        final controller = playbackService.currentItem?.id == item.id
-            ? playbackService.controller
-            : null;
-        _openPlaybackScreen(item, existingController: controller);
-      },
+      onTap: handleTap,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2305,6 +2292,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       isSelected: isSelected,
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(item.id),
+      onTap: handleTap,
       allowReorder: !_isSearchResults,
       onReorder: (oldIndex, newIndex) {
         if (_isSearchResults) return;
@@ -2566,6 +2554,25 @@ class _CollectionScreenState extends State<CollectionScreen>
         );
 
         // 2. Interaction Wrapper
+        void handleTap() {
+          if (_isSelectionMode) {
+            setState(() {
+              if (isSelected) {
+                _selectedIds.remove(collection.id);
+              } else {
+                _selectedIds.add(collection.id);
+              }
+            });
+          } else {
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (context) =>
+                    CollectionScreen(collectionId: collection.id),
+              ),
+            );
+          }
+        }
+
         Widget interactiveCard = Card(
           color: isSelected
               ? Colors.blueAccent.withValues(alpha: 0.2)
@@ -2579,24 +2586,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                 : BorderSide.none,
           ),
           child: InkWell(
-            onTap: () {
-              if (_isSelectionMode) {
-                setState(() {
-                  if (isSelected) {
-                    _selectedIds.remove(collection.id);
-                  } else {
-                    _selectedIds.add(collection.id);
-                  }
-                });
-              } else {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (context) =>
-                        CollectionScreen(collectionId: collection.id),
-                  ),
-                );
-              }
-            },
+            onTap: handleTap,
             child: Stack(
               fit: StackFit.expand,
               children: [
@@ -2622,6 +2612,7 @@ class _CollectionScreenState extends State<CollectionScreen>
             MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
+              onTap: handleTap,
               onDragStarted: () {
                 if (!_isSelectionMode) {
                   setState(() {
@@ -3039,6 +3030,33 @@ class _CollectionScreenState extends State<CollectionScreen>
         );
 
         // 2. Interaction Wrapper
+        void handleTap() {
+          if (_isSelectionMode) {
+            setState(() {
+              if (isSelected) {
+                _selectedIds.remove(item.id);
+              } else {
+                _selectedIds.add(item.id);
+              }
+            });
+          } else {
+            final playbackService = Provider.of<MediaPlaybackService>(
+              context,
+              listen: false,
+            );
+
+            if (!context.mounted) return;
+
+            final currentController = playbackService.currentItem?.id == item.id
+                ? playbackService.controller
+                : null;
+            _openPlaybackScreen(
+              item,
+              existingController: currentController,
+            );
+          }
+        }
+
         Widget interactiveCard = Card(
           clipBehavior: Clip.antiAlias,
           color: isSelected
@@ -3051,33 +3069,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                 : BorderSide.none,
           ),
           child: InkWell(
-            onTap: () async {
-              if (_isSelectionMode) {
-                setState(() {
-                  if (isSelected) {
-                    _selectedIds.remove(item.id);
-                  } else {
-                    _selectedIds.add(item.id);
-                  }
-                });
-              } else {
-                final playbackService = Provider.of<MediaPlaybackService>(
-                  context,
-                  listen: false,
-                );
-
-                if (!context.mounted) return;
-
-                final currentController =
-                    playbackService.currentItem?.id == item.id
-                    ? playbackService.controller
-                    : null;
-                _openPlaybackScreen(
-                  item,
-                  existingController: currentController,
-                );
-              }
-            },
+            onTap: handleTap,
             child: Stack(
               fit: StackFit.expand,
               children: [
@@ -3103,6 +3095,7 @@ class _CollectionScreenState extends State<CollectionScreen>
             MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
+              onTap: handleTap,
               onDragStarted: () {
                 if (!_isSelectionMode) {
                   setState(() {

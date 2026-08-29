@@ -33,6 +33,8 @@ import '../utils/subtitle_file_matcher.dart';
 import 'subtitle_discovery_service.dart';
 import 'task_subtitle_storage_service.dart';
 import 'chapter_thumbnail_service.dart';
+import 'bilibili/bilibili_streaming_service.dart';
+import 'bilibili/bilibili_video_shot_service.dart';
 
 enum StructuredImportSortField { fileName, modifiedTime }
 
@@ -169,6 +171,35 @@ class LibraryService extends ChangeNotifier {
   static final LibraryService _instance = LibraryService._internal();
   factory LibraryService() => _instance;
   LibraryService._internal();
+
+  BilibiliStreamingService? _bilibiliStreamingService;
+
+  /// Connects library ownership operations to the live Bilibili gateway.
+  ///
+  /// The filesystem fallback in [BilibiliStreamingService] keeps recycle-bin
+  /// accounting correct during startup/tests, while this live connection also
+  /// closes active gateway sessions before a card's cache is deleted.
+  void attachBilibiliStreamingService(BilibiliStreamingService? service) {
+    if (identical(_bilibiliStreamingService, service)) return;
+    _bilibiliStreamingService
+      ?..onCacheChanged = null
+      ..onVideoShotChanged = null;
+    _bilibiliStreamingService = service;
+    if (service != null) {
+      service.onCacheChanged = notifyOnlineCacheChanged;
+      service.onVideoShotChanged = _persistBilibiliVideoShot;
+    }
+  }
+
+  Future<void> _persistBilibiliVideoShot(VideoItem item) async {
+    final stored = _videos[item.id];
+    if (stored == null || item.bilibiliVideoShot == null) return;
+    stored.bilibiliVideoShot = item.bilibiliVideoShot;
+    _invalidateVideoSizeCache(item.id);
+    await _saveLibrary();
+    notifyListeners();
+  }
+
   static const Set<String> supportedVideoExtensions = {
     '.mp4',
     '.mov',
@@ -883,6 +914,10 @@ class LibraryService extends ChangeNotifier {
       Directory(p.join(oldRoot.path, 'subtitles')),
       Directory(p.join(targetDir.path, 'subtitles')),
     );
+    await _moveDirectoryIfExists(
+      Directory(p.join(oldRoot.path, BilibiliVideoShotService.directoryName)),
+      Directory(p.join(targetDir.path, BilibiliVideoShotService.directoryName)),
+    );
 
     await _moveFileIfExists(
       File(p.join(oldRoot.path, 'library.json')),
@@ -952,6 +987,12 @@ class LibraryService extends ChangeNotifier {
       }
       if (vid.danmakuPath != null) {
         vid.danmakuPath = _replaceRootPath(vid.danmakuPath!, oldRoot, newRoot);
+      }
+      if (vid.bilibiliVideoShot != null) {
+        vid.bilibiliVideoShot = vid.bilibiliVideoShot!.replaceRoot(
+          oldRoot,
+          newRoot,
+        );
       }
       if (vid.additionalSubtitles != null) {
         vid.additionalSubtitles = vid.additionalSubtitles!.map(
@@ -3125,6 +3166,21 @@ class LibraryService extends ChangeNotifier {
   }
 
   Future<void> _deleteVideoFiles(VideoItem vid) async {
+    // Online playback has no media file at [vid.path]. Its complete cache is
+    // owned by the card id and must be removed with the card itself.
+    if (_isBilibiliStreamItem(vid)) {
+      try {
+        final streaming = _bilibiliStreamingService;
+        if (streaming != null) {
+          await streaming.clearCacheForItem(vid.id);
+        } else {
+          await BilibiliStreamingService.clearCacheForItemOnDisk(vid.id);
+        }
+      } catch (e) {
+        developer.log('Error deleting Bilibili stream cache', error: e);
+      }
+    }
+
     // 清理缩略图缓存
     ThumbnailCacheService().evictFromCache(vid.id);
 
@@ -3189,6 +3245,15 @@ class LibraryService extends ChangeNotifier {
       developer.log('Error deleting chapter thumbnails', error: e);
     }
 
+    try {
+      await BilibiliVideoShotService.instance.deleteForVideo(
+        vid.id,
+        dataRootOverride: _dataRootDir,
+      );
+    } catch (e) {
+      developer.log('Error deleting Bilibili video-shot sprites', error: e);
+    }
+
     // OCR frames are disposable working data and never participate in task
     // recovery. Permanently deleting a video card must also remove any frames
     // left by an interrupted or crashed OCR job for that video.
@@ -3202,60 +3267,63 @@ class LibraryService extends ChangeNotifier {
       developer.log('Error deleting OCR temporary frames', error: e);
     }
 
-    // 3. Delete Video File (Only if it's inside app storage)
-    // This handles the "cache" user mentioned if the video was copied internally.
-    try {
-      bool shouldDelete = await _isBilibiliExportedCandidate(vid);
+    // 3. Delete Video File (Only if it's inside app storage). Online cards use
+    // a URI marker, so their card-owned cache was handled above and must never
+    // be passed through local-file cleanup.
+    if (!_isBilibiliStreamItem(vid)) {
+      try {
+        bool shouldDelete = await _isBilibiliExportedCandidate(vid);
 
-      // Check 1: Internal Doc Dir (App Data)
-      if (p.isWithin(_dataRootDir.path, vid.path)) {
-        shouldDelete = true;
-      }
-
-      // Check 2: Internal Temp Dir (Cache)
-      if (!shouldDelete) {
-        final tempDir = await getTemporaryDirectory();
-        if (p.isWithin(tempDir.path, vid.path)) shouldDelete = true;
-      }
-
-      // Check 3: Android External Storage (Android/data/pkg/files & cache)
-      if (!shouldDelete && Platform.isAndroid) {
-        // External Files
-        final extDir = await getExternalStorageDirectory();
-        if (extDir != null && p.isWithin(extDir.path, vid.path)) {
+        // Check 1: Internal Doc Dir (App Data)
+        if (p.isWithin(_dataRootDir.path, vid.path)) {
           shouldDelete = true;
         }
 
-        // External Caches
+        // Check 2: Internal Temp Dir (Cache)
         if (!shouldDelete) {
-          final extCacheDirs = await getExternalCacheDirectories();
-          if (extCacheDirs != null) {
-            for (var dir in extCacheDirs) {
-              if (p.isWithin(dir.path, vid.path)) {
-                shouldDelete = true;
-                break;
+          final tempDir = await getTemporaryDirectory();
+          if (p.isWithin(tempDir.path, vid.path)) shouldDelete = true;
+        }
+
+        // Check 3: Android External Storage (Android/data/pkg/files & cache)
+        if (!shouldDelete && Platform.isAndroid) {
+          // External Files
+          final extDir = await getExternalStorageDirectory();
+          if (extDir != null && p.isWithin(extDir.path, vid.path)) {
+            shouldDelete = true;
+          }
+
+          // External Caches
+          if (!shouldDelete) {
+            final extCacheDirs = await getExternalCacheDirectories();
+            if (extCacheDirs != null) {
+              for (var dir in extCacheDirs) {
+                if (p.isWithin(dir.path, vid.path)) {
+                  shouldDelete = true;
+                  break;
+                }
               }
             }
           }
+
+          // Check 4: Bilibili Download Directory (User Request)
+          // Allow deleting files in Bilibili download directory (e.g., merged files we created)
+          if (!shouldDelete && vid.path.contains("tv.danmaku.bili")) {
+            shouldDelete = true;
+          }
         }
 
-        // Check 4: Bilibili Download Directory (User Request)
-        // Allow deleting files in Bilibili download directory (e.g., merged files we created)
-        if (!shouldDelete && vid.path.contains("tv.danmaku.bili")) {
-          shouldDelete = true;
+        if (shouldDelete) {
+          final file = File(vid.path);
+          if (await file.exists() &&
+              !_isMediaFilePathReferencedByOtherVideo(vid.path, vid.id)) {
+            await file.delete();
+            debugPrint("Deleted internal video file: ${vid.path}");
+          }
         }
+      } catch (e) {
+        debugPrint("Error deleting internal video: $e");
       }
-
-      if (shouldDelete) {
-        final file = File(vid.path);
-        if (await file.exists() &&
-            !_isMediaFilePathReferencedByOtherVideo(vid.path, vid.id)) {
-          await file.delete();
-          debugPrint("Deleted internal video file: ${vid.path}");
-        }
-      }
-    } catch (e) {
-      debugPrint("Error deleting internal video: $e");
     }
   }
 
@@ -3989,6 +4057,23 @@ class LibraryService extends ChangeNotifier {
 
   Future<void> saveProgress() async {
     await _saveLibrary();
+  }
+
+  /// Persists the stable sidecar location before a danmaku refresh starts.
+  /// A missing file at this path is harmless and lets an interrupted refresh
+  /// retry without leaving an unreferenced sidecar behind.
+  Future<bool> updateVideoDanmakuPath(
+    String videoId,
+    String danmakuPath,
+  ) async {
+    final item = _videos[videoId];
+    if (item == null) return false;
+    if (item.danmakuPath == danmakuPath) return true;
+    item.danmakuPath = danmakuPath;
+    item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+    await _saveLibrary();
+    notifyListeners();
+    return true;
   }
 
   Future<void> updateVideoSubtitles(
@@ -4838,8 +4923,12 @@ class LibraryService extends ChangeNotifier {
     // #endregion
     item.title = _normalizeImportedName(item.title);
     item.sourceFingerprint ??= await _computeSourceFingerprint(item.path);
+    final isBilibiliStream = _isBilibiliStreamItem(item);
 
-    if (reuseExistingItem) {
+    // Every Bilibili streaming import is an explicit card instance. Its URL
+    // identifies the playback source, never whether another card already
+    // exists, so path/fingerprint deduplication must not apply here.
+    if (reuseExistingItem && !isBilibiliStream) {
       final existingId = await _findExistingVideoIdByPathOrFingerprint(
         item.path,
         sourceFingerprint: item.sourceFingerprint,
@@ -4857,23 +4946,25 @@ class LibraryService extends ChangeNotifier {
 
     // 2. Handle file persistence for temp/cache files
     // 如果 useOriginalPath 为 true，则跳过文件持久化处理，直接使用原始路径
-    if (copyImportedMediaToPrivateStorage) {
-      item.path = await _copyImportedMediaToPrivateStorage(
-        item.path,
-        fileNamePrefix: item.id,
-      );
-    } else if (!useOriginalPath) {
-      await _ensureFilePersistence(item);
-    } else {
-      debugPrint(
-        "Using original path for single video (no copy): ${item.path}",
-      );
+    if (!isBilibiliStream) {
+      if (copyImportedMediaToPrivateStorage) {
+        item.path = await _copyImportedMediaToPrivateStorage(
+          item.path,
+          fileNamePrefix: item.id,
+        );
+      } else if (!useOriginalPath) {
+        await _ensureFilePersistence(item);
+      } else {
+        debugPrint(
+          "Using original path for single video (no copy): ${item.path}",
+        );
+      }
     }
 
-    if (item.durationMs <= 0) {
+    if (!isBilibiliStream && item.durationMs <= 0) {
       item.durationMs = await _probeMediaDurationMs(item.path);
     }
-    if (!item.hasProbedChapters) {
+    if (!isBilibiliStream && !item.hasProbedChapters) {
       if (item.chapters.isEmpty) {
         item.chapters = await MediaChapterProbe.probe(
           item.path,
@@ -4945,7 +5036,8 @@ class LibraryService extends ChangeNotifier {
     // #endregion
 
     // Generate thumbnail asynchronously (video thumbnail + audio cover art)
-    if ((item.type == MediaType.video &&
+    if ((!isBilibiliStream &&
+            item.type == MediaType.video &&
             (item.thumbnailPath == null ||
                 _requiresWindowsThumbnailRepair(item.thumbnailPath))) ||
         (item.type == MediaType.audio && item.thumbnailPath == null)) {
@@ -5214,9 +5306,21 @@ class LibraryService extends ChangeNotifier {
   Future<int> _calculateVideoItemSize(VideoItem item) async {
     int size = 0;
 
+    if (_isBilibiliStreamItem(item)) {
+      try {
+        final report = _bilibiliStreamingService != null
+            ? await _bilibiliStreamingService!.inspectItemCache(item.id)
+            : await BilibiliStreamingService.inspectCacheForItem(item.id);
+        size += report.bytes;
+      } catch (e) {
+        developer.log('Error calculating Bilibili stream cache size', error: e);
+      }
+    }
+
     // Check Video File
-    if (_isInternalPath(item.path) ||
-        await _isBilibiliExportedCandidate(item)) {
+    if (!_isBilibiliStreamItem(item) &&
+        (_isInternalPath(item.path) ||
+            await _isBilibiliExportedCandidate(item))) {
       size += await _getFileSize(item.path);
     }
     if (item.playbackPath != null &&
@@ -5233,6 +5337,10 @@ class LibraryService extends ChangeNotifier {
       size += await _getFileSize(item.thumbnailPath!);
     }
     size += await ChapterThumbnailService.instance.directorySize(item.id);
+    size += await BilibiliVideoShotService.instance.directorySize(
+      item.id,
+      dataRootOverride: _dataRootDir,
+    );
 
     return size;
   }
@@ -5276,6 +5384,21 @@ class LibraryService extends ChangeNotifier {
       _invalidateVideoSizeCache(videoId);
     }
     notifyListeners();
+  }
+
+  /// Invalidates recycle-bin size labels when the live online cache changes.
+  void notifyOnlineCacheChanged(String videoId) {
+    if (videoId.isEmpty) {
+      _invalidateSizeCaches();
+    } else {
+      _invalidateVideoSizeCache(videoId);
+    }
+    notifyListeners();
+  }
+
+  bool _isBilibiliStreamItem(VideoItem item) {
+    return item.sourceRef?.kind == MediaSourceKind.bilibiliStream ||
+        item.path.startsWith('bilibili://stream/');
   }
 
   int get _maxConcurrentSizeCalculations => Platform.isWindows ? 3 : 2;

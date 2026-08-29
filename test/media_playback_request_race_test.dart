@@ -9,6 +9,7 @@ import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playlist_manager.dart';
 import 'package:video_player_app/services/progress_tracker.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart';
 
 class _ControlledVideoPlatform extends VideoPlayerPlatform {
@@ -123,6 +124,13 @@ Future<void> _waitForPlayerId(
     await Future<void>.delayed(const Duration(milliseconds: 1));
   }
   expect(platform.playerIds, contains(playerId));
+}
+
+Future<void> _waitForNoPlayers(_ControlledVideoPlatform platform) async {
+  for (var i = 0; i < 100 && platform.playerIds.isNotEmpty; i++) {
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+  }
+  expect(platform.playerIds, isEmpty);
 }
 
 Future<void> _waitForPlaybackSpeedCalls(
@@ -410,6 +418,83 @@ void main() {
       await _waitForPlayerId(platform, 3);
       platform.initializePlayer(3);
       await thirdPlay;
+    },
+  );
+
+  test(
+    'episode navigation defaults to the persisted auto-play setting',
+    () async {
+      final originalPlatform = VideoPlayerPlatform.instance;
+      final platform = _ControlledVideoPlatform();
+      VideoPlayerPlatform.instance = platform;
+      final tempDir = await Directory.systemTemp.createTemp(
+        'episode_navigation_autoplay_test_',
+      );
+      final firstFile = File(
+        '${tempDir.path}${Platform.pathSeparator}first.mp4',
+      );
+      final secondFile = File(
+        '${tempDir.path}${Platform.pathSeparator}second.mp4',
+      );
+      await firstFile.writeAsBytes(<int>[0]);
+      await secondFile.writeAsBytes(<int>[0]);
+
+      final settings = SettingsService();
+      final originalAutoPlay = settings.autoPlayNextVideo;
+      final playlist = PlaylistManager();
+      final service = MediaPlaybackService();
+      await service.stop();
+      await service.initialize(
+        playlistManager: playlist,
+        progressTracker: ProgressTracker(),
+      );
+      final items = <VideoItem>[
+        VideoItem(
+          id: 'autoplay-first',
+          path: firstFile.path,
+          title: 'First',
+          durationMs: 0,
+          lastUpdated: 0,
+        ),
+        VideoItem(
+          id: 'autoplay-second',
+          path: secondFile.path,
+          title: 'Second',
+          durationMs: 0,
+          lastUpdated: 0,
+        ),
+      ];
+      playlist.setPlaylist(items);
+
+      addTearDown(() async {
+        settings.autoPlayNextVideo = originalAutoPlay;
+        await service.stop();
+        await _waitForNoPlayers(platform);
+        VideoPlayerPlatform.instance = originalPlatform;
+        if (await tempDir.exists()) await tempDir.delete(recursive: true);
+      });
+
+      final initialPlay = service.play(items.first, autoPlay: false);
+      await _waitForPlayers(platform, 1);
+      platform.initializePlayer(platform.playerIds.single);
+      await initialPlay;
+      expect(service.state, PlaybackState.paused);
+
+      settings.autoPlayNextVideo = true;
+      final next = service.playNext();
+      await _waitForPlayerId(platform, 2);
+      platform.initializePlayer(2);
+      await next;
+      expect(service.currentItem?.id, 'autoplay-second');
+      expect(service.state, PlaybackState.playing);
+
+      settings.autoPlayNextVideo = false;
+      final previous = service.playPrevious();
+      await _waitForPlayerId(platform, 3);
+      platform.initializePlayer(3);
+      await previous;
+      expect(service.currentItem?.id, 'autoplay-first');
+      expect(service.state, PlaybackState.paused);
     },
   );
 

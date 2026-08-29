@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/widgets/media_library_item_interaction_wrapper.dart';
 
 void main() {
-  testWidgets('桌面端原地按住再松开仍然执行点击而不进入拖拽', (tester) async {
+  testWidgets('桌面端原地长按超过阈值时间后触发选中而不是点击', (tester) async {
     var taps = 0;
     var dragStarts = 0;
     await tester.pumpWidget(
@@ -20,6 +20,45 @@ void main() {
               selectedCount: 0,
               onDragStarted: () => dragStarts++,
               onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: const ColoredBox(color: Colors.black),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('stationary-source'))),
+    );
+    // 按住不动超过长按阈值（100ms），应触发选中而不是点击。
+    await tester.pump(const Duration(milliseconds: 800));
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 0);
+    expect(dragStarts, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端快速点击不进入拖拽', (tester) async {
+    var taps = 0;
+    var dragStarts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('quick-tap-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () => dragStarts++,
+              onReorder: (_, _) {},
+              onTap: () => taps++,
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: () => taps++,
@@ -32,9 +71,10 @@ void main() {
     );
 
     final gesture = await tester.startGesture(
-      tester.getCenter(find.byKey(const ValueKey('stationary-source'))),
+      tester.getCenter(find.byKey(const ValueKey('quick-tap-source'))),
     );
-    await tester.pump(const Duration(milliseconds: 800));
+    // 快速点击（< 长按阈值 100ms）不移动，应正常触发点击而不进入拖拽。
+    await tester.pump(const Duration(milliseconds: 40));
     await gesture.up();
     await tester.pump();
 
@@ -69,7 +109,8 @@ void main() {
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(const ValueKey('source'))),
     );
-    await tester.pump(const Duration(milliseconds: 120));
+    // 长按阈值之前移动（50ms < 100ms），验证位移门控本身生效。
+    await tester.pump(const Duration(milliseconds: 50));
     await gesture.moveBy(const Offset(20, 0));
     await tester.pump();
 
@@ -260,6 +301,88 @@ void main() {
     expect(movedIndex, 0);
     expect(targetFolder, 'folder-2');
     expect(reorderCount, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端轻微移动但未达阈值时不进入拖拽并补偿点击', (tester) async {
+    var taps = 0;
+    var dragStarts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('slight-move-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () => dragStarts++,
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: const ColoredBox(color: Colors.black),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('slight-move-source'))),
+    );
+    await tester.pump(const Duration(milliseconds: 60));
+    // 位移 5px，未达到拖拽阈值（10px）。
+    await gesture.moveBy(const Offset(5, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 1);
+    expect(dragStarts, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端位移超过阈值后即使回到原位仍保持拖拽不触发点击', (tester) async {
+    var taps = 0;
+    var dragStarts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('return-move-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () => dragStarts++,
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: const ColoredBox(color: Colors.black),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('return-move-source'))),
+    );
+    await tester.pump(const Duration(milliseconds: 60));
+    await gesture.moveBy(const Offset(30, 0));
+    await tester.pump();
+    // 超过阈值后移回原位再松开，仍然是一次拖拽。
+    await gesture.moveBy(const Offset(-30, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 0);
+    expect(dragStarts, 1);
     expect(tester.takeException(), isNull);
   });
 }

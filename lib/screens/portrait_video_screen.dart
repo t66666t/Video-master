@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
 import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/managed_subtitle_asset.dart';
@@ -16,6 +17,7 @@ import '../services/task_subtitle_storage_service.dart';
 import '../services/settings_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
+import '../services/playback_exit_guard.dart';
 import '../services/playback_orientation_transition.dart';
 import '../services/subtitle_timeline_resolver.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
@@ -89,6 +91,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _initialized = false;
   bool _isControllerAssigned = false;
   bool _isSourceMissing = false;
+  int _danmakuRevision = 0;
   bool _isControllerOwner = true; // 跟踪是否拥有 controller（是否应该在 dispose 时释放）
   bool get _supportsOcrSubtitle =>
       Platform.isAndroid ||
@@ -148,6 +151,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _pendingSubtitleSidebarViewportRestore = false;
   bool _subtitleSidebarRestoreCallbackScheduled = false;
   bool _forceExit = false;
+  final PlaybackExitGuard _exitGuard = PlaybackExitGuard();
   bool _iosBackSwipeActive = false;
   double _iosBackSwipeDistance = 0.0;
   static const double _iosBackSwipeEdgeWidth = 20.0;
@@ -164,6 +168,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool? _lastSplitSubtitleByLine;
   bool? _lastVideoContinuousSubtitle;
   bool? _lastAudioContinuousSubtitle;
+  bool? _lastSkipPortraitPlayer;
   bool? _lastIsPlayingForServiceSync;
   String? _autoEmbeddedAttemptedForItemId;
   bool _isLoadingEmbeddedSubtitle = false;
@@ -213,6 +218,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       _lastSplitSubtitleByLine = settings.splitSubtitleByLine;
       _lastVideoContinuousSubtitle = settings.videoContinuousSubtitle;
       _lastAudioContinuousSubtitle = settings.audioContinuousSubtitle;
+      _lastSkipPortraitPlayer = settings.skipPortraitPlayer;
       settings.addListener(_onSettingsChanged);
       _onSettingsChanged();
     });
@@ -236,6 +242,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     final settings = _settingsService;
     if (settings == null) return;
 
+    // 「跳过竖屏播放页」需独立于字幕缓存比对，在字幕无关的设置变更中也
+    // 能即时响应（off→on 边沿触发一次）。
+    _handleSkipPortraitPlayerChanged(settings.skipPortraitPlayer);
+
     final bool changed =
         _lastShowSubtitles != settings.showSubtitles ||
         _lastSubtitleOffset != settings.subtitleOffset ||
@@ -254,6 +264,19 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     if (_initialized) {
       _updateSubtitle();
     }
+  }
+
+  /// 「跳过竖屏播放页」在竖屏页内被打开时，立即切入横屏播放页。
+  ///
+  /// 仅在 off→on 边沿触发一次，且要求当前路由位于栈顶、没有正在进行的
+  /// 横屏跳转，避免横屏页覆盖本页时误触发或重复导航。
+  void _handleSkipPortraitPlayerChanged(bool enabled) {
+    final bool? previous = _lastSkipPortraitPlayer;
+    _lastSkipPortraitPlayer = enabled;
+    if (previous != false || !enabled) return;
+    if (!mounted || _isPushingLandscape) return;
+    if (ModalRoute.of(context)?.isCurrent != true) return;
+    _goToLandscape();
   }
 
   void _applyItemSubtitlePreference(VideoItem item, {bool force = false}) {
@@ -635,6 +658,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         _routeObserverSubscribed = true;
       }
     }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      MediaPlaybackService().setPlaybackPageVisible(
+        this,
+        ModalRoute.of(context)?.isCurrent == true,
+      );
+    });
 
     // Listen to TranscriptionManager for auto-mounting subtitles
     final manager = Provider.of<TranscriptionManager>(context, listen: false);
@@ -846,11 +876,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
   @override
   void didPush() {
+    MediaPlaybackService().setPlaybackPageVisible(this, true);
     _scheduleUpdateOrientations();
   }
 
   @override
   void didPopNext() {
+    MediaPlaybackService().setPlaybackPageVisible(this, true);
     _scheduleUpdateOrientations();
     _scheduleVideoFocusRestore();
     // RouteAware also reports dialogs and unrelated child pages. Only a
@@ -864,7 +896,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   @override
   void didPushNext() {
     if (_isPushingLandscape) return;
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
     SystemChrome.setPreferredOrientations([]);
+  }
+
+  @override
+  void didPop() {
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
   }
 
   Future<void> _checkAndLoadEmbeddedSubtitle({
@@ -1091,9 +1129,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         _bindControllerListener();
         _scheduleDeferredPostInitWork(currentItem);
 
-        // 不需要再次调用 play()，因为 MediaPlaybackService 已经在管理播放状态
-        // 但为了保险起见，同步一次状态
-        playbackService.updatePlaybackStateFromController();
+        // MediaPlaybackService owns the authoritative position and state for
+        // this controller. Do not read the native position here: an online
+        // backend can briefly expose its byte-zero probe during hand-off.
         if (playbackService.isPlaying) {
           if (!_controller.value.isPlaying) playbackService.resume();
         } else {
@@ -1184,8 +1222,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         await playbackService.updateMetadata(currentItem);
         if (shouldResumeAfterAttach) {
           await playbackService.resume();
-        } else {
-          playbackService.updatePlaybackStateFromController();
         }
       } catch (e) {
         debugPrint("Failed to register controller with service: $e");
@@ -1646,6 +1682,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
             viewportSize,
           ).destination;
           final overlay = DanmakuOverlay(
+            key: ValueKey('$path:$_danmakuRevision'),
             path: path,
             position: position,
             displayArea: settings.bilibiliDanmakuDisplayArea,
@@ -2264,9 +2301,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         context,
         listen: false,
       );
-      await _saveProgress();
-
-      if (!PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup &&
+      final suppressRouteCleanup =
+          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      if (!suppressRouteCleanup &&
           settings.autoPauseOnExit &&
           _controller.value.isPlaying) {
         if (playbackService.controller == _controller) {
@@ -2277,9 +2314,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       }
 
       // Force sync state
-      if (!_isControllerOwner) {
+      if (!_isControllerOwner && playbackService.controller != _controller) {
         playbackService.updatePlaybackStateFromController();
       }
+      await _saveProgress();
     } catch (e) {
       debugPrint("Exit sync error: $e");
     }
@@ -2288,8 +2326,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   Future<void> _handleBackRequest() async {
     final navigator = Navigator.of(context);
     if (_forceExit) {
+      if (!_exitGuard.tryStart()) return;
+      await _handleExit();
+      if (!mounted) return;
       _updateOrientations();
-      if (mounted) navigator.pop();
+      navigator.pop();
       return;
     }
 
@@ -2337,6 +2378,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       return;
     }
 
+    if (!_exitGuard.tryStart()) return;
     await _handleExit();
     if (!mounted) return;
     _updateOrientations();
@@ -2379,6 +2421,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     );
     // Try to sync one last time (fire and forget)
     _handleExit();
+    MediaPlaybackService().setPlaybackPageVisible(this, false);
 
     if (_routeObserverSubscribed) {
       AppToast.routeObserver.unsubscribe(this);
@@ -2442,12 +2485,24 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   Future<void> _saveProgress() async {
+    final playbackService = Provider.of<MediaPlaybackService>(
+      context,
+      listen: false,
+    );
+    if (playbackService.currentItem?.id == _currentItem.id) {
+      await playbackService.persistCurrentProgress(
+        expectedItemId: _currentItem.id,
+      );
+      return;
+    }
     if (_isControllerAssigned && _controller.value.isInitialized) {
-      final position = _controller.value.position.inMilliseconds;
       await Provider.of<LibraryService>(
         context,
         listen: false,
-      ).updateVideoProgress(_currentItem.id, position);
+      ).updateVideoProgress(
+        _currentItem.id,
+        _controller.value.position.inMilliseconds,
+      );
     }
   }
 
@@ -2768,6 +2823,20 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   double _nativeVideoAspectRatio() {
+    try {
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      final streamRatio = playbackService.streamDisplayAspectRatio;
+      if (playbackService.currentItem?.id == _currentItem.id &&
+          playbackService.isCurrentItemBilibiliStream &&
+          streamRatio != null &&
+          streamRatio.isFinite &&
+          streamRatio > 0) {
+        return streamRatio;
+      }
+    } catch (_) {}
     if (_isControllerAssigned &&
         _controller.value.isInitialized &&
         _controller.value.aspectRatio > 0) {
@@ -2819,7 +2888,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     }
 
     const double portraitThreshold = 1.0 - 0.0001;
-    final double nativeRatio = _controller.value.aspectRatio;
+    final double nativeRatio = _nativeVideoAspectRatio();
     if (nativeRatio <= 0) return;
 
     final double? manual = _currentItem.portraitDisplayAspectRatio;
@@ -3405,6 +3474,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         final double currentPos = position.inMilliseconds.toDouble();
         final double sliderMax = maxDuration > 0 ? maxDuration : 1.0;
         final double sliderValue = currentPos.clamp(0.0, sliderMax);
+        var bufferedValue = sliderValue;
+        for (final range in value.buffered) {
+          final end = range.end.inMilliseconds.toDouble();
+          if (end > bufferedValue) bufferedValue = end;
+        }
+        bufferedValue = bufferedValue.clamp(sliderValue, sliderMax);
 
         return Container(
           color: const Color(0xFF1E1E1E),
@@ -3448,6 +3523,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                           ? Colors.grey
                           : const Color(0xFF0D47A1),
                       inactiveTrackColor: Colors.white24,
+                      secondaryActiveTrackColor: Colors.white54,
                       thumbColor: _isProgressDragCanceling
                           ? Colors.grey
                           : const Color(0xFF1565C0),
@@ -3466,6 +3542,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                       value: _isDraggingProgress
                           ? _dragProgressValue
                           : sliderValue,
+                      secondaryTrackValue: _isDraggingProgress
+                          ? (_dragProgressValue > bufferedValue
+                                ? _dragProgressValue
+                                : bufferedValue)
+                          : bufferedValue,
                       onChanged: value.isInitialized
                           ? (newValue) {
                               setState(() {
@@ -3883,6 +3964,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       0.0,
       sliderMax,
     );
+    final bufferedValue = playbackService.bufferedPosition.inMilliseconds
+        .toDouble()
+        .clamp(sliderValue, sliderMax);
 
     return Container(
       key: const ValueKey('portrait-loading-bottom-control-bar'),
@@ -3901,6 +3985,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               data: SliderTheme.of(context).copyWith(
                 disabledActiveTrackColor: const Color(0xFF0D47A1),
                 disabledInactiveTrackColor: Colors.white24,
+                disabledSecondaryActiveTrackColor: Colors.white38,
                 disabledThumbColor: const Color(0xFF1565C0),
                 thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
                 trackHeight: 2,
@@ -3910,6 +3995,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                 min: 0,
                 max: sliderMax,
                 value: sliderValue,
+                secondaryTrackValue: bufferedValue,
                 onChanged: null,
               ),
             ),
@@ -4131,6 +4217,24 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       !_isSubtitleDragMode)
                                                     VideoControlsOverlay(
                                                       key: _controlsKey,
+                                                      enableSeekThumbnailPreview:
+                                                          _currentItem
+                                                                  .sourceRef
+                                                                  ?.kind !=
+                                                              MediaSourceKind
+                                                                  .bilibiliStream ||
+                                                          (_currentItem
+                                                                  .bilibiliVideoShot
+                                                                  ?.hasLocalSprites ??
+                                                              false),
+                                                      bilibiliVideoShot:
+                                                          _currentItem
+                                                                  .bilibiliVideoShot
+                                                                  ?.hasLocalSprites ==
+                                                              true
+                                                          ? _currentItem
+                                                                .bilibiliVideoShot
+                                                          : null,
                                                       controller: _controller,
                                                       isLocked: _isLocked,
                                                       onTogglePlay: _togglePlay,
@@ -4143,18 +4247,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       },
                                                       onExitPressed: () async {
                                                         _forceExit = true;
-                                                        await _handleExit();
-                                                        SystemChrome.setPreferredOrientations(
-                                                          [
-                                                            DeviceOrientation
-                                                                .portraitUp,
-                                                          ],
-                                                        );
-                                                        if (context.mounted) {
-                                                          Navigator.of(
-                                                            context,
-                                                          ).pop();
-                                                        }
+                                                        await _handleBackRequest();
                                                       },
                                                       onToggleSidebar: null,
                                                       onToggleFullScreen: () =>
@@ -4185,6 +4278,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                           () => unawaited(
                                                             showDanmakuSettingsDialog(
                                                               context,
+                                                              videoItem:
+                                                                  _currentItem,
+                                                              onDanmakuUpdated: () {
+                                                                if (mounted) {
+                                                                  setState(
+                                                                    () =>
+                                                                        _danmakuRevision++,
+                                                                  );
+                                                                }
+                                                              },
                                                             ),
                                                           ),
                                                       onSpeedUpdate:
@@ -4877,6 +4980,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           onSyncAudioSubtitleStyleWithVideoChanged: _isAudio
               ? (value) => settings.setAudioSubtitleStyleSyncWithVideo(value)
               : null,
+          showSkipPortraitPlayerSetting:
+              !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+          skipPortraitPlayer: settings.skipPortraitPlayer,
+          onSkipPortraitPlayerChanged: (value) =>
+              settings.saveSkipPortraitPlayer(value),
           isPlaybackSpeedLocked: settings.isPlaybackSpeedLocked,
           lockedPlaybackSpeed: settings.isPlaybackSpeedLocked
               ? settings.playbackSpeed

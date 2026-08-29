@@ -18,6 +18,7 @@ import 'services/transcription_manager.dart';
 import 'services/batch_import_service.dart';
 import 'services/embedded_subtitle_service.dart';
 import 'services/bilibili/bilibili_download_service.dart';
+import 'services/bilibili/bilibili_streaming_service.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/playback_navigation_service.dart';
@@ -46,6 +47,7 @@ void main() async {
   final transcriptionManager = TranscriptionManager();
   final embeddedSubtitleService = EmbeddedSubtitleService();
   final bilibiliService = BilibiliDownloadService();
+  library.attachBilibiliStreamingService(bilibiliService.streamingService);
   final ytDlpService = YtDlpDownloadService();
   final videoComposeManager = VideoComposeManager();
   final ocrSubtitleManager = OcrSubtitleManager(library: library);
@@ -93,6 +95,7 @@ void main() async {
     progressTracker: progressTracker,
     library: library,
     embeddedSubtitleService: embeddedSubtitleService,
+    bilibiliStreamingService: bilibiliService.streamingService,
   );
 
   // Android already owns a native launch surface. Keep that single cover on
@@ -114,6 +117,9 @@ void main() async {
             ChangeNotifierProvider.value(value: batch),
             ChangeNotifierProvider.value(value: embeddedSubtitleService),
             ChangeNotifierProvider.value(value: bilibiliService),
+            ChangeNotifierProvider<BilibiliStreamingService>.value(
+              value: bilibiliService.streamingService,
+            ),
             ChangeNotifierProvider.value(value: ytDlpService),
             ChangeNotifierProvider.value(value: videoComposeManager),
             ChangeNotifierProvider.value(value: ocrSubtitleManager),
@@ -165,6 +171,7 @@ Future<void> _initializeStartupServices({
   required ProgressTracker progressTracker,
   required LibraryService library,
   required EmbeddedSubtitleService embeddedSubtitleService,
+  required BilibiliStreamingService bilibiliStreamingService,
 }) async {
   Future<void> safely(String name, Future<void> Function() operation) async {
     try {
@@ -196,6 +203,7 @@ Future<void> _initializeStartupServices({
       progressTracker: progressTracker,
       libraryService: library,
       embeddedSubtitleService: embeddedSubtitleService,
+      bilibiliStreamingService: bilibiliStreamingService,
     ),
   );
 

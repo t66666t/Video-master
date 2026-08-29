@@ -1,14 +1,22 @@
-enum MediaSourceKind { url, bilibiliBv, bilibiliId }
+enum MediaSourceKind { url, bilibiliBv, bilibiliId, bilibiliStream }
 
 class MediaSourceRef {
   final String value;
   final MediaSourceKind kind;
   final String? originalValue;
+  final String? bvid;
+  final String? aid;
+  final int? cid;
+  final int? page;
 
   const MediaSourceRef({
     required this.value,
     required this.kind,
     this.originalValue,
+    this.bvid,
+    this.aid,
+    this.cid,
+    this.page,
   });
 
   Map<String, dynamic> toJson() {
@@ -16,6 +24,10 @@ class MediaSourceRef {
       'value': value,
       'kind': kind.name,
       'originalValue': originalValue,
+      'bvid': bvid,
+      'aid': aid,
+      'cid': cid,
+      'page': page,
     };
   }
 
@@ -28,6 +40,10 @@ class MediaSourceRef {
         orElse: () => MediaSourceKind.url,
       ),
       originalValue: _nullableTrimmedString(json['originalValue']),
+      bvid: _nullableTrimmedString(json['bvid']),
+      aid: _nullableTrimmedString(json['aid']),
+      cid: _nullablePositiveInt(json['cid']),
+      page: _nullablePositiveInt(json['page']),
     );
   }
 
@@ -35,6 +51,10 @@ class MediaSourceRef {
     String? value,
     MediaSourceKind? kind,
     Object? originalValue = _unset,
+    Object? bvid = _unset,
+    Object? aid = _unset,
+    Object? cid = _unset,
+    Object? page = _unset,
   }) {
     return MediaSourceRef(
       value: value ?? this.value,
@@ -42,6 +62,10 @@ class MediaSourceRef {
       originalValue: identical(originalValue, _unset)
           ? this.originalValue
           : originalValue as String?,
+      bvid: identical(bvid, _unset) ? this.bvid : bvid as String?,
+      aid: identical(aid, _unset) ? this.aid : aid as String?,
+      cid: identical(cid, _unset) ? this.cid : cid as int?,
+      page: identical(page, _unset) ? this.page : page as int?,
     );
   }
 
@@ -62,4 +86,9 @@ String? _nullableTrimmedString(Object? value) {
   }
   final text = value.toString().trim();
   return text.isEmpty ? null : text;
+}
+
+int? _nullablePositiveInt(Object? value) {
+  final parsed = value is int ? value : int.tryParse(value?.toString() ?? '');
+  return parsed != null && parsed > 0 ? parsed : null;
 }

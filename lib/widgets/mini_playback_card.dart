@@ -6,6 +6,7 @@ import '../services/playlist_manager.dart';
 import 'playback_card_layout.dart';
 import 'playlist_bottom_sheet.dart';
 import 'cached_thumbnail_widget.dart';
+import '../utils/app_toast.dart';
 
 /// 底部播放卡片组件
 class MiniPlaybackCard extends StatefulWidget {
@@ -22,7 +23,7 @@ class MiniPlaybackCard extends StatefulWidget {
 }
 
 class _MiniPlaybackCardState extends State<MiniPlaybackCard>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, RouteAware {
   late AnimationController _slideController;
   late Animation<Offset> _slideAnimation;
   late AnimationController _scrollController;
@@ -32,6 +33,8 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   bool _isDraggingProgress = false;
   bool _isProgressDragCanceling = false;
   double _dragProgressValue = 0.0;
+  bool _routeObserverSubscribed = false;
+  bool _routeIsCurrent = true;
 
   static const Duration _tooltipWaitDuration = Duration(milliseconds: 450);
 
@@ -64,10 +67,37 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
       end: 1.0,
     ).animate(_scrollController);
 
-    // 根据初始可见性状态设置动画
+    // 根据初始可见性状态设置动画：
+    // 挂载时已可见则从底部播放滑入动画，而不是直接跳到最终位置，
+    // 保证退出播放页返回媒体库、或卡片因状态更新重新出现时平滑过渡。
     if (widget.isVisible) {
-      _slideController.value = 1.0;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && widget.isVisible) {
+          _slideController.forward();
+        }
+      });
     }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_routeObserverSubscribed) {
+      final route = ModalRoute.of(context);
+      if (route is PageRoute) {
+        AppToast.routeObserver.subscribe(this, route);
+        _routeObserverSubscribed = true;
+      }
+      _routeIsCurrent = route?.isCurrent ?? true;
+    }
+    _syncMiniPlaybackVisibility();
+  }
+
+  void _syncMiniPlaybackVisibility() {
+    MediaPlaybackService().setMiniPlaybackCardVisible(
+      this,
+      widget.isVisible && _routeIsCurrent,
+    );
   }
 
   @override
@@ -76,6 +106,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
 
     // 当可见性改变时触发动画
     if (widget.isVisible != oldWidget.isVisible) {
+      _syncMiniPlaybackVisibility();
       if (widget.isVisible) {
         _slideController.forward();
       } else {
@@ -86,9 +117,37 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
 
   @override
   void dispose() {
+    MediaPlaybackService().setMiniPlaybackCardVisible(this, false);
+    if (_routeObserverSubscribed) {
+      AppToast.routeObserver.unsubscribe(this);
+    }
     _slideController.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didPush() {
+    _routeIsCurrent = true;
+    _syncMiniPlaybackVisibility();
+  }
+
+  @override
+  void didPopNext() {
+    _routeIsCurrent = true;
+    _syncMiniPlaybackVisibility();
+  }
+
+  @override
+  void didPushNext() {
+    _routeIsCurrent = false;
+    _syncMiniPlaybackVisibility();
+  }
+
+  @override
+  void didPop() {
+    _routeIsCurrent = false;
+    _syncMiniPlaybackVisibility();
   }
 
   /// 判断拖动是否处于取消区域

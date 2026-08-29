@@ -54,6 +54,11 @@
 	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于从相册选择视频导入</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
 	<key>CFBundleDocumentTypes</key>

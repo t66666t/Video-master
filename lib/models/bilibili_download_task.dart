@@ -159,6 +159,7 @@ class BilibiliDownloadTask {
   // If Collection Task: this list has N items (videos in collection).
   final List<BilibiliVideoItem> videos;
   final MediaSourceRef? sourceRef;
+  bool isStreamingImport;
 
   bool isExpanded;
   bool isSelected;
@@ -169,6 +170,7 @@ class BilibiliDownloadTask {
     this.singleVideoInfo,
     required this.videos,
     this.sourceRef,
+    this.isStreamingImport = false,
     this.isExpanded = true,
     this.isSelected = false,
   }) : taskId = taskId ?? _generateBilibiliTaskId();
@@ -186,6 +188,7 @@ class BilibiliDownloadTask {
       'singleVideoInfo': singleVideoInfo?.toJson(),
       'videos': videos.map((v) => v.toJson()).toList(),
       'sourceRef': sourceRef?.toJson(),
+      'isStreamingImport': isStreamingImport,
       'isExpanded': isExpanded,
       'isSelected': isSelected,
     };
@@ -206,6 +209,7 @@ class BilibiliDownloadTask {
           .map((e) => BilibiliVideoItem.fromJson(e))
           .toList(),
       sourceRef: MediaSourceRef.fromJsonOrNull(json['sourceRef']),
+      isStreamingImport: json['isStreamingImport'] == true,
       isExpanded: json['isExpanded'] ?? true,
       isSelected: json['isSelected'] ?? false,
     );

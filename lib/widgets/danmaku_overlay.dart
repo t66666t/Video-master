@@ -13,6 +13,11 @@ import '../models/danmaku_style.dart';
 import '../utils/danmaku_ass_parser.dart';
 import '../utils/subtitle_parser.dart';
 
+const int _unrestrictedDanmakuAdmissions = 0x3fffffff;
+const int _normalDanmakuAdmissionCap = 640;
+const int _adaptiveDanmakuAdmissionCap = 320;
+const int _severeDanmakuAdmissionCap = 200;
+
 DanmakuDocument _parseDanmakuBytes(Uint8List bytes) {
   return DanmakuAssParser.parse(SubtitleParser.decodeBytes(bytes));
 }
@@ -53,7 +58,7 @@ class DanmakuOverlay extends StatefulWidget {
 
 class _DanmakuOverlayState extends State<DanmakuOverlay> {
   DanmakuDocument? _document;
-  _DanmakuActiveSet? _activeSet;
+  DanmakuActiveSet? _activeSet;
   int _loadToken = 0;
   late final _DanmakuAtlasManager _atlasManager;
   late final _DanmakuPerformanceGovernor _performanceGovernor;
@@ -63,6 +68,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
   int? _completedPrefetchGeneration;
   bool _prefetchScheduled = false;
   bool _prefetchRunning = false;
+  double _viewportWidth = 1920;
 
   @override
   void initState() {
@@ -107,7 +113,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
       _invalidatePrefetchProgress();
       setState(() {
         _document = document;
-        _activeSet = _DanmakuActiveSet(document.items);
+        _activeSet = DanmakuActiveSet(document.items);
       });
       _schedulePrefetch();
     } catch (_) {
@@ -181,6 +187,8 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
           document.items,
           positionUs: positionUs,
           speed: widget.speed,
+          viewportWidth: _viewportWidth,
+          referenceWidth: document.referenceWidth,
         );
         final indices = _performanceGovernor.pauseLookAhead
             ? <int>[
@@ -201,11 +209,11 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
           ];
           final pinsCurrentFrame = items.any((item) {
             final elapsedUs = positionUs - item.startTime.inMicroseconds;
-            final durationUs = math.max(
-              1,
-              (item.duration.inMicroseconds /
-                      widget.speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax))
-                  .round(),
+            final durationUs = resolveDanmakuDurationUs(
+              item,
+              speed: widget.speed,
+              viewportWidth: _viewportWidth,
+              referenceWidth: document.referenceWidth,
             );
             return elapsedUs >= 0 && elapsedUs < durationUs;
           });
@@ -241,6 +249,9 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
 
   @override
   Widget build(BuildContext context) {
+    _performanceGovernor.updateRefreshRate(
+      View.of(context).display.refreshRate,
+    );
     final document = _document;
     final activeSet = _activeSet;
     if (document == null || document.items.isEmpty || activeSet == null) {
@@ -261,27 +272,42 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
     _preparedStyle = style;
     _schedulePrefetch();
 
-    return IgnorePointer(
-      child: RepaintBoundary(
-        child: CustomPaint(
-          painter: _DanmakuPainter(
-            document: document,
-            position: widget.position,
-            displayArea: widget.displayArea,
-            opacity: widget.opacity,
-            speed: widget.speed,
-            requestedFontSize: style.fontSize,
-            activeSet: activeSet,
-            atlasManager: _atlasManager,
-            performanceGovernor: _performanceGovernor,
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final viewportWidth =
+            constraints.hasBoundedWidth &&
+                constraints.maxWidth.isFinite &&
+                constraints.maxWidth > 0
+            ? constraints.maxWidth
+            : document.referenceWidth;
+        if ((_viewportWidth - viewportWidth).abs() >= 0.5) {
+          _viewportWidth = viewportWidth;
+          _invalidatePrefetchProgress();
+          _schedulePrefetch();
+        }
+        return IgnorePointer(
+          child: RepaintBoundary(
+            child: CustomPaint(
+              painter: _DanmakuPainter(
+                document: document,
+                position: widget.position,
+                displayArea: widget.displayArea,
+                opacity: widget.opacity,
+                speed: widget.speed,
+                requestedFontSize: style.fontSize,
+                activeSet: activeSet,
+                atlasManager: _atlasManager,
+                performanceGovernor: _performanceGovernor,
+              ),
+              // The overlay changes on every VSync. Marking it as complex
+              // invites a raster-cache attempt which cannot be reused.
+              isComplex: false,
+              willChange: true,
+              size: Size.infinite,
+            ),
           ),
-          // The overlay changes on every VSync. Marking it as complex invites
-          // a raster-cache attempt which can never be reused as a static layer.
-          isComplex: false,
-          willChange: true,
-          size: Size.infinite,
-        ),
-      ),
+        );
+      },
     );
   }
 }
@@ -293,12 +319,15 @@ class _DanmakuPainter extends CustomPainter {
   final double opacity;
   final double speed;
   final double requestedFontSize;
-  final _DanmakuActiveSet activeSet;
+  final DanmakuActiveSet activeSet;
   final _DanmakuAtlasManager atlasManager;
   final _DanmakuPerformanceGovernor performanceGovernor;
   late final Paint _atlasPaint = Paint()
-    ..isAntiAlias = true
-    ..filterQuality = FilterQuality.low;
+    ..isAntiAlias = false
+    // Atlas pixels are generated at the display DPR and drawn back 1:1.
+    // Filtering a fractional destination on Windows blends neighbouring alpha
+    // pixels and can look like a faint duplicate edge while text is moving.
+    ..filterQuality = FilterQuality.none;
 
   _DanmakuPainter({
     required this.document,
@@ -342,6 +371,8 @@ class _DanmakuPainter extends CustomPainter {
       positionUs: positionUs,
       speed: speed,
       admissionCap: performanceGovernor.admissionCap,
+      viewportWidth: renderRect.width,
+      referenceWidth: document.referenceWidth,
     );
     if (activeIndices.isEmpty) return;
 
@@ -358,11 +389,11 @@ class _DanmakuPainter extends CustomPainter {
     for (var active = activeIndices.length - 1; active >= 0; active--) {
       final item = document.items[activeIndices[active]];
       final elapsedUs = positionUs - item.startTime.inMicroseconds;
-      final durationUs = math.max(
-        1,
-        (item.duration.inMicroseconds /
-                speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax))
-            .round(),
+      final durationUs = resolveDanmakuDurationUs(
+        item,
+        speed: speed,
+        viewportWidth: renderRect.width,
+        referenceWidth: document.referenceWidth,
       );
       if (elapsedUs < 0 || elapsedUs >= durationUs) continue;
 
@@ -389,7 +420,7 @@ class _DanmakuPainter extends CustomPainter {
         DanmakuType.bottom => contentRect.center.dx - layoutWidth / 2,
       };
       if (sprite != null) {
-        sprite.page.addSprite(sprite, x, y);
+        atlasManager.addSprite(sprite, x, y);
       } else {
         fallback!.paintTextAt(canvas, x, y);
       }
@@ -442,6 +473,36 @@ double resolveDanmakuFontSize({
       .clamp(2.0, 160.0);
 }
 
+/// Resolves motion duration from the stage width instead of assigning every
+/// window the same travel time. The source duration remains unchanged at the
+/// ASS reference width, while wider stages receive proportionally more time.
+@visibleForTesting
+int resolveDanmakuDurationUs(
+  DanmakuItem item, {
+  required double speed,
+  required double viewportWidth,
+  required double referenceWidth,
+}) {
+  final safeSpeed = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax);
+  final widthScale = item.type == DanmakuType.scroll
+      ? _safeDanmakuWidthScale(viewportWidth, referenceWidth)
+      : 1.0;
+  return math.max(
+    1,
+    (item.duration.inMicroseconds * widthScale / safeSpeed).round(),
+  );
+}
+
+double _safeDanmakuWidthScale(double viewportWidth, double referenceWidth) {
+  final safeReference = referenceWidth.isFinite && referenceWidth > 0
+      ? referenceWidth
+      : 1920.0;
+  final safeViewport = viewportWidth.isFinite && viewportWidth > 0
+      ? viewportWidth
+      : safeReference;
+  return (safeViewport / safeReference).clamp(0.1, 8.0);
+}
+
 @visibleForTesting
 class DanmakuIndexRange {
   final int start;
@@ -458,10 +519,17 @@ DanmakuIndexRange resolveDanmakuActiveRange(
   List<DanmakuItem> items, {
   required int positionUs,
   required double speed,
+  double viewportWidth = 1920,
+  double referenceWidth = 1920,
 }) {
   if (items.isEmpty) return const DanmakuIndexRange(0, 0);
   final safeSpeed = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax);
-  final earliestStartUs = positionUs - (16000000 / safeSpeed).round();
+  final widthScale = math.max(
+    1.0,
+    _safeDanmakuWidthScale(viewportWidth, referenceWidth),
+  );
+  final earliestStartUs =
+      positionUs - (16000000 * widthScale / safeSpeed).round();
   return DanmakuIndexRange(
     _firstStartAtOrAfter(items, earliestStartUs),
     _firstStartAfter(items, positionUs),
@@ -473,6 +541,8 @@ List<int> resolveDanmakuPrefetchIndices(
   List<DanmakuItem> items, {
   required int positionUs,
   required double speed,
+  double viewportWidth = 1920,
+  double referenceWidth = 1920,
 }) {
   const maximumActiveItems = 640;
   const maximumUpcomingItems = 800;
@@ -483,6 +553,8 @@ List<int> resolveDanmakuPrefetchIndices(
     items,
     positionUs: positionUs,
     speed: speed,
+    viewportWidth: viewportWidth,
+    referenceWidth: referenceWidth,
   );
   for (
     var i = active.endExclusive - 1;
@@ -537,61 +609,123 @@ int _firstStartAfter(List<DanmakuItem> items, int positionUs) {
   return low;
 }
 
-class _DanmakuActiveSet {
-  _DanmakuActiveSet(this.items)
-    : _maximumDurationUs = items.fold<int>(
+/// Incremental media-time index used by the painter's hot path.
+///
+/// This is public only so the overload behavior can be regression-tested
+/// without pumping a platform-specific raster surface.
+@visibleForTesting
+class DanmakuActiveSet {
+  DanmakuActiveSet(this.items)
+    : _maximumScrollDurationUs = items.fold<int>(
         0,
-        (maximum, item) => math.max(maximum, item.duration.inMicroseconds),
+        (maximum, item) => item.type == DanmakuType.scroll
+            ? math.max(maximum, item.duration.inMicroseconds)
+            : maximum,
+      ),
+      _maximumFixedDurationUs = items.fold<int>(
+        0,
+        (maximum, item) => item.type != DanmakuType.scroll
+            ? math.max(maximum, item.duration.inMicroseconds)
+            : maximum,
       );
 
   final List<DanmakuItem> items;
-  final int _maximumDurationUs;
+  final int _maximumScrollDurationUs;
+  final int _maximumFixedDurationUs;
   final List<int> _active = <int>[];
   final Map<String, int> _activeTextCounts = <String, int>{};
   int _nextStartIndex = 0;
   int? _lastPositionUs;
   double? _lastSpeed;
+  double? _lastWidthScale;
 
   List<int> update({
     required int positionUs,
     required double speed,
     required int admissionCap,
+    double viewportWidth = 1920,
+    double referenceWidth = 1920,
   }) {
     final safeSpeed = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax);
+    final widthScale = _safeDanmakuWidthScale(viewportWidth, referenceWidth);
     final mustReset =
         _lastPositionUs == null ||
         positionUs < _lastPositionUs! ||
         positionUs - _lastPositionUs! > 2000000 ||
-        _lastSpeed != safeSpeed;
+        _lastSpeed != safeSpeed ||
+        _lastWidthScale == null ||
+        (_lastWidthScale! - widthScale).abs() >= 0.001;
     if (mustReset) {
-      _reset(positionUs, safeSpeed, admissionCap);
+      _reset(
+        positionUs,
+        safeSpeed,
+        admissionCap,
+        viewportWidth,
+        referenceWidth,
+      );
     } else {
-      _removeExpired(positionUs, safeSpeed);
-      _addNew(positionUs, safeSpeed, admissionCap);
+      _removeExpired(positionUs, safeSpeed, viewportWidth, referenceWidth);
+      _addNew(
+        positionUs,
+        safeSpeed,
+        admissionCap,
+        viewportWidth,
+        referenceWidth,
+      );
+      // A performance-policy change can lower the cap while a dense burst is
+      // already on screen. Only applying the cap in _addNew leaves all of the
+      // existing items alive for their full duration, which is exactly when
+      // the raster thread most needs relief.
+      _trimToAdmissionCap(admissionCap);
     }
     _lastPositionUs = positionUs;
     _lastSpeed = safeSpeed;
+    _lastWidthScale = widthScale;
     return _active;
   }
 
-  void _reset(int positionUs, double speed, int admissionCap) {
+  void _reset(
+    int positionUs,
+    double speed,
+    int admissionCap,
+    double viewportWidth,
+    double referenceWidth,
+  ) {
     _active.clear();
     _activeTextCounts.clear();
-    final earliest = positionUs - (_maximumDurationUs / speed).ceil();
+    final widthScale = _safeDanmakuWidthScale(viewportWidth, referenceWidth);
+    final maximumDurationUs = math.max(
+      _maximumFixedDurationUs,
+      (_maximumScrollDurationUs * widthScale).ceil(),
+    );
+    final earliest = positionUs - (maximumDurationUs / speed).ceil();
     final first = _firstStartAtOrAfter(items, earliest);
     _nextStartIndex = _firstStartAfter(items, positionUs);
     final candidates = <int>[];
     for (var index = first; index < _nextStartIndex; index++) {
-      if (_isActive(items[index], positionUs, speed)) candidates.add(index);
+      if (_isActive(
+        items[index],
+        positionUs,
+        speed,
+        viewportWidth,
+        referenceWidth,
+      )) {
+        candidates.add(index);
+      }
     }
     _admit(candidates, admissionCap);
   }
 
-  void _removeExpired(int positionUs, double speed) {
+  void _removeExpired(
+    int positionUs,
+    double speed,
+    double viewportWidth,
+    double referenceWidth,
+  ) {
     var write = 0;
     for (final index in _active) {
       final item = items[index];
-      if (_isActive(item, positionUs, speed)) {
+      if (_isActive(item, positionUs, speed, viewportWidth, referenceWidth)) {
         _active[write++] = index;
       } else {
         final count = _activeTextCounts[item.text] ?? 0;
@@ -605,19 +739,34 @@ class _DanmakuActiveSet {
     _active.length = write;
   }
 
-  void _addNew(int positionUs, double speed, int admissionCap) {
+  void _addNew(
+    int positionUs,
+    double speed,
+    int admissionCap,
+    double viewportWidth,
+    double referenceWidth,
+  ) {
     final candidates = <int>[];
     while (_nextStartIndex < items.length &&
         items[_nextStartIndex].startTime.inMicroseconds <= positionUs) {
       final index = _nextStartIndex++;
-      if (_isActive(items[index], positionUs, speed)) candidates.add(index);
+      if (_isActive(
+        items[index],
+        positionUs,
+        speed,
+        viewportWidth,
+        referenceWidth,
+      )) {
+        candidates.add(index);
+      }
     }
     _admit(candidates, admissionCap);
   }
 
   void _admit(List<int> candidates, int admissionCap) {
     if (candidates.isEmpty) return;
-    if (admissionCap < 0x3fffffff) {
+    final isAdaptiveOverload = admissionCap < _normalDanmakuAdmissionCap;
+    if (isAdaptiveOverload) {
       candidates.sort((left, right) {
         final leftDuplicate = _activeTextCounts.containsKey(items[left].text);
         final rightDuplicate = _activeTextCounts.containsKey(items[right].text);
@@ -630,7 +779,7 @@ class _DanmakuActiveSet {
     for (final index in candidates) {
       if (_active.length >= admissionCap) break;
       final item = items[index];
-      if (admissionCap < 0x3fffffff &&
+      if (isAdaptiveOverload &&
           _active.length >= admissionCap * 3 ~/ 4 &&
           _activeTextCounts.containsKey(item.text)) {
         continue;
@@ -644,11 +793,74 @@ class _DanmakuActiveSet {
     }
   }
 
-  bool _isActive(DanmakuItem item, int positionUs, double speed) {
+  void _trimToAdmissionCap(int admissionCap) {
+    if (admissionCap >= _unrestrictedDanmakuAdmissions ||
+        _active.length <= admissionCap) {
+      return;
+    }
+    if (admissionCap <= 0) {
+      _active.clear();
+      _activeTextCounts.clear();
+      return;
+    }
+
+    // Keep the reduction deterministic so a policy transition never causes
+    // random-looking flicker. Prefer one copy of each text before duplicates,
+    // then use the same stable priority as admission for both groups.
+    final ranked = List<int>.of(_active)
+      ..sort(
+        (left, right) => _stablePriority(
+          items[right],
+        ).compareTo(_stablePriority(items[left])),
+      );
+    final selected = <int>[];
+    final selectedIndices = <int>{};
+    final selectedTexts = <String>{};
+    for (final index in ranked) {
+      if (selectedTexts.add(items[index].text)) {
+        selected.add(index);
+        selectedIndices.add(index);
+      }
+      if (selected.length == admissionCap) break;
+    }
+    if (selected.length < admissionCap) {
+      for (final index in ranked) {
+        if (!selectedIndices.add(index)) continue;
+        selected.add(index);
+        if (selected.length == admissionCap) break;
+      }
+    }
+    selected.sort();
+    _active
+      ..clear()
+      ..addAll(selected);
+    _rebuildTextCounts();
+  }
+
+  void _rebuildTextCounts() {
+    _activeTextCounts.clear();
+    for (final index in _active) {
+      _activeTextCounts.update(
+        items[index].text,
+        (count) => count + 1,
+        ifAbsent: () => 1,
+      );
+    }
+  }
+
+  bool _isActive(
+    DanmakuItem item,
+    int positionUs,
+    double speed,
+    double viewportWidth,
+    double referenceWidth,
+  ) {
     final elapsedUs = positionUs - item.startTime.inMicroseconds;
-    final durationUs = math.max(
-      1,
-      (item.duration.inMicroseconds / speed).round(),
+    final durationUs = resolveDanmakuDurationUs(
+      item,
+      speed: speed,
+      viewportWidth: viewportWidth,
+      referenceWidth: referenceWidth,
     );
     return elapsedUs >= 0 && elapsedUs < durationUs;
   }
@@ -799,6 +1011,10 @@ class _DanmakuAtlasManager extends ChangeNotifier {
 
   void beginFrame() => _active?.beginFrame();
 
+  void addSprite(_DanmakuSprite sprite, double x, double y) {
+    _active?.addSprite(sprite, x, y);
+  }
+
   void paintFrame(Canvas canvas, Paint paint, double opacity) {
     if (_fallbackEnabled) return;
     try {
@@ -889,6 +1105,7 @@ class _DanmakuAtlasCache {
       <_DanmakuSpriteKey, _DanmakuSprite>{};
   final Map<int, _DanmakuSprite> _itemSprites = <int, _DanmakuSprite>{};
   final List<_DanmakuAtlasPage> _pages = <_DanmakuAtlasPage>[];
+  final List<_DanmakuAtlasPage> _framePages = <_DanmakuAtlasPage>[];
   int _byteSize = 0;
   int _touchSequence = 0;
   bool _disposed = false;
@@ -1032,13 +1249,25 @@ class _DanmakuAtlasCache {
   }
 
   void beginFrame() {
-    for (final page in _pages) {
+    // Cached pages can far outnumber the pages visible in one frame. Reset
+    // only pages used by the previous frame and collect this frame lazily.
+    for (final page in _framePages) {
       page.beginFrame();
     }
+    _framePages.clear();
+  }
+
+  void addSprite(_DanmakuSprite sprite, double x, double y) {
+    final page = sprite.page;
+    if (!page.inFrame) {
+      page.inFrame = true;
+      _framePages.add(page);
+    }
+    page.addSprite(sprite, x, y);
   }
 
   void paintFrame(Canvas canvas, Paint paint, double opacity) {
-    for (final page in _pages) {
+    for (final page in _framePages) {
       page.paint(canvas, paint, opacity);
     }
   }
@@ -1050,6 +1279,7 @@ class _DanmakuAtlasCache {
       page.dispose();
     }
     _pages.clear();
+    _framePages.clear();
     _sprites.clear();
     _itemSprites.clear();
     _byteSize = 0;
@@ -1254,21 +1484,33 @@ class _DanmakuAtlasPage {
   final int byteSize;
   bool pinned;
   int lastTouch;
+  bool inFrame = false;
   Float32List _transforms = Float32List(64 * 4);
   Float32List _rects = Float32List(64 * 4);
   Int32List _colors = Int32List(64);
   int _spriteCount = 0;
 
-  void beginFrame() => _spriteCount = 0;
+  void beginFrame() {
+    _spriteCount = 0;
+    inFrame = false;
+  }
 
   void addSprite(_DanmakuSprite sprite, double x, double y) {
     _ensureCapacity(_spriteCount + 1);
     final offset = _spriteCount * 4;
     final scale = 1 / devicePixelRatio;
+    final destinationX = _snapDanmakuLogicalPixel(
+      x - sprite.imagePadding,
+      devicePixelRatio,
+    );
+    final destinationY = _snapDanmakuLogicalPixel(
+      y - sprite.imagePadding,
+      devicePixelRatio,
+    );
     _transforms[offset] = scale;
     _transforms[offset + 1] = 0;
-    _transforms[offset + 2] = x - sprite.imagePadding;
-    _transforms[offset + 3] = y - sprite.imagePadding;
+    _transforms[offset + 2] = destinationX;
+    _transforms[offset + 3] = destinationY;
     _rects[offset] = sprite.sourceLeft;
     _rects[offset + 1] = sprite.sourceTop;
     _rects[offset + 2] = sprite.sourceLeft + sprite.sourceWidth;
@@ -1316,17 +1558,38 @@ class _DanmakuAtlasPage {
   void dispose() => image.dispose();
 }
 
+@visibleForTesting
+double snapDanmakuLogicalPixel(double value, double devicePixelRatio) {
+  return _snapDanmakuLogicalPixel(value, devicePixelRatio);
+}
+
+double _snapDanmakuLogicalPixel(double value, double devicePixelRatio) {
+  final dpr = devicePixelRatio.isFinite && devicePixelRatio > 0
+      ? devicePixelRatio
+      : 1.0;
+  return (value * dpr).round() / dpr;
+}
+
 class _DanmakuPerformanceGovernor extends ChangeNotifier {
-  static const int _unlimitedAdmissions = 0x3fffffff;
   final Queue<bool> _overBudgetWindow = Queue<bool>();
+  final Queue<int> _vsyncIntervalsUs = Queue<int>();
   TimingsCallback? _callback;
   int? _lastVsyncUs;
   int _level = 0;
-  int _admissionCap = _unlimitedAdmissions;
+  int _admissionCap = _unrestrictedDanmakuAdmissions;
   int _recoveryFrames = 0;
+  int _consecutiveSevereFrames = 0;
+  double? _refreshRate;
 
   bool get pauseLookAhead => _level >= 1;
   int get admissionCap => _admissionCap;
+
+  void updateRefreshRate(double refreshRate) {
+    _refreshRate =
+        refreshRate.isFinite && refreshRate >= 20 && refreshRate <= 500
+        ? refreshRate
+        : null;
+  }
 
   void start() {
     if (_callback != null) return;
@@ -1340,9 +1603,11 @@ class _DanmakuPerformanceGovernor extends ChangeNotifier {
       final vsyncUs = timing.timestampInMicroseconds(ui.FramePhase.vsyncStart);
       final intervalUs = _lastVsyncUs == null ? 16667 : vsyncUs - _lastVsyncUs!;
       _lastVsyncUs = vsyncUs;
-      final budgetUs = intervalUs >= 5000 && intervalUs <= 34000
-          ? intervalUs
-          : 16667;
+      if (intervalUs >= 5000 && intervalUs <= 34000) {
+        _vsyncIntervalsUs.addLast(intervalUs);
+        if (_vsyncIntervalsUs.length > 60) _vsyncIntervalsUs.removeFirst();
+      }
+      final budgetUs = _resolveFrameBudgetUs();
       final workUs = math.max(
         timing.buildDuration.inMicroseconds,
         timing.rasterDuration.inMicroseconds,
@@ -1357,16 +1622,42 @@ class _DanmakuPerformanceGovernor extends ChangeNotifier {
         _recoveryFrames = 0;
       }
 
-      if (_overBudgetWindow.length == 12 &&
+      if (workUs > budgetUs * 1.2) {
+        _consecutiveSevereFrames++;
+      } else {
+        _consecutiveSevereFrames = 0;
+      }
+
+      if (_consecutiveSevereFrames >= 3) {
+        _consecutiveSevereFrames = 0;
+        _recoveryFrames = 0;
+        _overBudgetWindow.clear();
+        if (_level == 0) {
+          _level = 1;
+          _admissionCap = _adaptiveDanmakuAdmissionCap;
+          changed = true;
+        } else if (_level == 1) {
+          _level = 2;
+          _admissionCap = _severeDanmakuAdmissionCap;
+          changed = true;
+        } else {
+          final reduced = math.max(32, (_admissionCap * 0.8).floor());
+          if (reduced != _admissionCap) {
+            _admissionCap = reduced;
+            changed = true;
+          }
+        }
+      } else if (_overBudgetWindow.length == 12 &&
           _overBudgetWindow.where((value) => value).length >= 8) {
         _recoveryFrames = 0;
         _overBudgetWindow.clear();
         if (_level == 0) {
           _level = 1;
+          _admissionCap = _adaptiveDanmakuAdmissionCap;
           changed = true;
         } else if (_level == 1) {
           _level = 2;
-          _admissionCap = 200;
+          _admissionCap = _severeDanmakuAdmissionCap;
           changed = true;
         } else {
           final reduced = math.max(32, (_admissionCap * 0.8).floor());
@@ -1379,15 +1670,33 @@ class _DanmakuPerformanceGovernor extends ChangeNotifier {
         _recoveryFrames = 0;
         _overBudgetWindow.clear();
         if (_level == 2) {
-          _level = 1;
-          _admissionCap = _unlimitedAdmissions;
+          if (_admissionCap < _severeDanmakuAdmissionCap) {
+            _admissionCap = math.min(
+              _severeDanmakuAdmissionCap,
+              math.max(_admissionCap + 1, (_admissionCap * 1.25).ceil()),
+            );
+          } else {
+            _level = 1;
+            _admissionCap = _adaptiveDanmakuAdmissionCap;
+          }
         } else {
           _level = 0;
+          _admissionCap = _unrestrictedDanmakuAdmissions;
         }
         changed = true;
       }
     }
     if (changed) notifyListeners();
+  }
+
+  int _resolveFrameBudgetUs() {
+    final refreshRate = _refreshRate;
+    if (refreshRate != null) return (1000000 / refreshRate).round();
+    if (_vsyncIntervalsUs.length < 4) return 16667;
+    final samples = _vsyncIntervalsUs.toList()..sort();
+    // The lower quartile represents the panel's actual VSync interval while
+    // ignoring doubled intervals caused by frames that were already missed.
+    return samples[((samples.length - 1) * 0.25).round()].clamp(5000, 34000);
   }
 
   @override

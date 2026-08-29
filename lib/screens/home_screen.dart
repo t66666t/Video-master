@@ -28,8 +28,6 @@ import '../services/bilibili/bilibili_api_service.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../models/bilibili_download_task.dart';
 import '../models/bilibili_models.dart';
-import 'portrait_video_screen.dart';
-import 'video_player_screen.dart';
 
 import 'bilibili_download_screen.dart';
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
@@ -54,6 +52,8 @@ class _ClipboardDisplayInfo {
   final String? collectionTitle;
   final String? collectionCover;
   final bool showCollectionBadge;
+  final BilibiliVideoItem? targetVideo;
+  final BilibiliDownloadEpisode? targetEpisode;
 
   const _ClipboardDisplayInfo({
     required this.title,
@@ -61,7 +61,16 @@ class _ClipboardDisplayInfo {
     required this.collectionTitle,
     required this.collectionCover,
     required this.showCollectionBadge,
+    required this.targetVideo,
+    required this.targetEpisode,
   });
+}
+
+class _ClipboardBilibiliTarget {
+  final String? id;
+  final int page;
+
+  const _ClipboardBilibiliTarget({this.id, this.page = 1});
 }
 
 class _BoxSelectionPainter extends CustomPainter {
@@ -136,6 +145,9 @@ class _HomeScreenState extends State<HomeScreen>
 
   // Clipboard
   String? _lastProcessedClipboard;
+  bool _isCheckingClipboard = false;
+  bool _isClipboardDialogVisible = false;
+  bool _isClipboardExporting = false;
 
   // Added variables for missing definitions
   bool _hasPendingPlaybackState = false;
@@ -543,25 +555,10 @@ class _HomeScreenState extends State<HomeScreen>
     VideoItem item,
     VideoPlayerController? existingController,
   ) {
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-      return PageRouteBuilder(
-        pageBuilder: (context, animation, secondaryAnimation) {
-          return VideoPlayerScreen(
-            videoItem: item,
-            existingController: existingController,
-          );
-        },
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return child;
-        },
-        transitionDuration: Duration.zero,
-        reverseTransitionDuration: Duration.zero,
-        opaque: true,
-      );
-    }
-    return MaterialPageRoute(
-      settings: PlaybackNavigationService.portraitRouteSettings(item),
-      builder: (context) => PortraitVideoScreen(videoItem: item),
+    // 桌面端或开启"跳过竖屏播放页"时直入横屏播放页，否则进入竖屏播放页
+    return PlaybackNavigationService.buildPlaybackEntryRoute(
+      item,
+      existingController: existingController,
     );
   }
 
@@ -1269,6 +1266,12 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _checkClipboard() async {
+    if (_isCheckingClipboard ||
+        _isClipboardDialogVisible ||
+        _isClipboardExporting) {
+      return;
+    }
+    _isCheckingClipboard = true;
     try {
       // 1. Check Login
       if (!mounted) return;
@@ -1276,6 +1279,12 @@ class _HomeScreenState extends State<HomeScreen>
         context,
         listen: false,
       );
+
+      // Cold starts can reach the first frame before the deferred Bilibili
+      // service has restored its cookie jar. Reuse the existing initialization
+      // future so the startup clipboard check sees the persisted login state.
+      await service.init();
+      if (!mounted) return;
 
       // 添加超时处理
       final hasCookie = await service.apiService.hasCookie().timeout(
@@ -1310,12 +1319,14 @@ class _HomeScreenState extends State<HomeScreen>
         if (mounted) {
           final displayInfo = await _buildClipboardDisplayInfo(content, task);
           if (!mounted) return;
-          _showClipboardDialog(content, task, displayInfo);
+          await _showClipboardDialog(content, task, displayInfo);
         }
       }
     } catch (e) {
       // Ignore - 不影响应用启动
       debugPrint('剪贴板检查失败: $e');
+    } finally {
+      _isCheckingClipboard = false;
     }
   }
 
@@ -1325,33 +1336,42 @@ class _HomeScreenState extends State<HomeScreen>
   ) async {
     final collectionTitle = task.collectionInfo?.title;
     final collectionCover = task.collectionInfo?.cover;
-    BilibiliVideoInfo? targetVideo;
+    BilibiliVideoItem? targetVideo;
+    final linkTarget = await _extractBilibiliTargetFromContent(content);
     if (task.singleVideoInfo != null) {
-      targetVideo = task.singleVideoInfo;
+      targetVideo = task.videos.isEmpty ? null : task.videos.first;
     } else if (task.collectionInfo != null) {
-      final id = await _extractBilibiliIdFromContent(content);
+      final id = linkTarget.id;
       if (id != null) {
         final lowerId = id.toLowerCase();
+        final normalizedAid = lowerId.startsWith('av')
+            ? lowerId.substring(2)
+            : lowerId;
         for (final video in task.videos) {
           final bvid = video.videoInfo.bvid.toLowerCase();
           final aid = video.videoInfo.aid.toLowerCase();
-          if (bvid == lowerId || aid == lowerId) {
-            targetVideo = video.videoInfo;
+          if (bvid == lowerId || aid == normalizedAid) {
+            targetVideo = video;
             break;
           }
         }
       }
-      targetVideo ??= task.videos.length == 1
-          ? task.videos.first.videoInfo
-          : null;
+      targetVideo ??= task.videos.length == 1 ? task.videos.first : null;
+    }
+    BilibiliDownloadEpisode? targetEpisode;
+    if (targetVideo != null && targetVideo.episodes.isNotEmpty) {
+      targetEpisode = targetVideo.episodes.firstWhere(
+        (episode) => episode.page.page == linkTarget.page,
+        orElse: () => targetVideo!.episodes.first,
+      );
     }
     final title =
-        targetVideo?.title ??
+        targetVideo?.videoInfo.title ??
         task.singleVideoInfo?.title ??
         task.collectionInfo?.title ??
         "未知标题";
     final cover =
-        targetVideo?.pic ??
+        targetVideo?.videoInfo.pic ??
         task.singleVideoInfo?.pic ??
         task.collectionInfo?.cover ??
         "";
@@ -1363,10 +1383,14 @@ class _HomeScreenState extends State<HomeScreen>
       collectionTitle: collectionTitle,
       collectionCover: collectionCover,
       showCollectionBadge: showCollectionBadge,
+      targetVideo: targetVideo,
+      targetEpisode: targetEpisode,
     );
   }
 
-  Future<String?> _extractBilibiliIdFromContent(String content) async {
+  Future<_ClipboardBilibiliTarget> _extractBilibiliTargetFromContent(
+    String content,
+  ) async {
     try {
       String cleanInput = content.trim();
       final linkMatch = RegExp(r'(https?://[^\s]+)').firstMatch(content);
@@ -1410,167 +1434,421 @@ class _HomeScreenState extends State<HomeScreen>
         cleanInput = resolvedUrl;
         type = BilibiliUrlParser.determineType(cleanInput);
       }
-      return BilibiliUrlParser.extractId(cleanInput, type);
+      final uri = Uri.tryParse(cleanInput);
+      final page = int.tryParse(uri?.queryParameters['p'] ?? '') ?? 1;
+      return _ClipboardBilibiliTarget(
+        id: BilibiliUrlParser.extractId(cleanInput, type),
+        page: page > 0 ? page : 1,
+      );
     } catch (_) {
-      return null;
+      return const _ClipboardBilibiliTarget();
     }
   }
 
-  void _showClipboardDialog(
+  Future<void> _showClipboardDialog(
     String content,
     BilibiliDownloadTask task,
     _ClipboardDisplayInfo displayInfo,
-  ) {
+  ) async {
+    if (_isClipboardDialogVisible || !mounted) return;
     final title = displayInfo.title;
     final cover = displayInfo.cover;
 
     final parentContext = context;
-    showDialog(
-      context: parentContext,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: const Color(0xFF2C2C2C),
-        contentPadding: EdgeInsets.zero,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (cover.isNotEmpty)
-              ClipRRect(
-                borderRadius: const BorderRadius.vertical(
-                  top: Radius.circular(16),
-                ),
-                child: Image.network(
-                  cover,
-                  height: 160,
-                  fit: BoxFit.cover,
-                  errorBuilder: (context, error, stackTrace) => Container(
+    _isClipboardDialogVisible = true;
+    try {
+      await showDialog<void>(
+        context: parentContext,
+        builder: (dialogContext) => AlertDialog(
+          backgroundColor: const Color(0xFF2C2C2C),
+          contentPadding: EdgeInsets.zero,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (cover.isNotEmpty)
+                ClipRRect(
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(16),
+                  ),
+                  child: Image.network(
+                    cover,
                     height: 160,
-                    color: Colors.grey[800],
-                    child: const Icon(Icons.broken_image),
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, error, stackTrace) => Container(
+                      height: 160,
+                      color: Colors.grey[800],
+                      child: const Icon(Icons.broken_image),
+                    ),
                   ),
                 ),
-              ),
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    "检测到 Bilibili 视频",
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Colors.blueAccent,
-                      fontWeight: FontWeight.bold,
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "检测到 Bilibili 视频",
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.blueAccent,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  if (displayInfo.showCollectionBadge) ...[
                     const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        if ((displayInfo.collectionCover ?? '').isNotEmpty)
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(3),
-                            child: Image.network(
-                              displayInfo.collectionCover!,
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (displayInfo.showCollectionBadge) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          if ((displayInfo.collectionCover ?? '').isNotEmpty)
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(3),
+                              child: Image.network(
+                                displayInfo.collectionCover!,
+                                width: 22,
+                                height: 16,
+                                fit: BoxFit.cover,
+                                errorBuilder: (context, error, stackTrace) =>
+                                    Container(
+                                      width: 22,
+                                      height: 16,
+                                      color: Colors.grey[800],
+                                    ),
+                              ),
+                            )
+                          else
+                            Container(
                               width: 22,
                               height: 16,
-                              fit: BoxFit.cover,
-                              errorBuilder: (context, error, stackTrace) =>
-                                  Container(
-                                    width: 22,
-                                    height: 16,
-                                    color: Colors.grey[800],
-                                  ),
+                              color: Colors.grey[800],
                             ),
-                          )
-                        else
-                          Container(
-                            width: 22,
-                            height: 16,
-                            color: Colors.grey[800],
-                          ),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            "来自合集：${displayInfo.collectionTitle ?? ''}",
-                            style: const TextStyle(
-                              fontSize: 11,
-                              color: Colors.white54,
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              "来自合集：${displayInfo.collectionTitle ?? ''}",
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.white54,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                             ),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    const Text(
+                      "请选择添加方式",
+                      style: TextStyle(fontSize: 13, color: Colors.white70),
                     ),
                   ],
-                  const SizedBox(height: 12),
-                  const Text(
-                    "是否前往下载页导入该视频？",
-                    style: TextStyle(fontSize: 13, color: Colors.white70),
-                  ),
-                ],
+                ),
+              ),
+            ],
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          actionsOverflowButtonSpacing: 6,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text(
+                "忽略",
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+                unawaited(
+                  _exportClipboardTaskAsStreamingCard(task, displayInfo),
+                );
+              },
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.pinkAccent.withValues(alpha: 0.16),
+                foregroundColor: Colors.pinkAccent.shade100,
+                minimumSize: const Size(0, 42),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                elevation: 0,
+                side: BorderSide(
+                  color: Colors.pinkAccent.withValues(alpha: 0.4),
+                ),
+              ),
+              icon: const Icon(Icons.play_circle_outline_rounded, size: 17),
+              label: const FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  "添加为在线播放卡片",
+                  maxLines: 1,
+                  style: TextStyle(fontWeight: FontWeight.w500),
+                ),
+              ),
+            ),
+            ElevatedButton.icon(
+              onPressed: () async {
+                final playbackService = Provider.of<MediaPlaybackService>(
+                  parentContext,
+                  listen: false,
+                );
+                final navigator = Navigator.of(parentContext);
+                Navigator.pop(dialogContext);
+                if (playbackService.isPlaying) {
+                  await playbackService.pause();
+                }
+                if (!mounted || !navigator.mounted) return;
+                const routeName = '/bilibili_download';
+                if (AppToast.isCurrentRoute(routeName)) {
+                  navigator.pushReplacement(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          BilibiliDownloadScreen(initialInput: content),
+                      settings: const RouteSettings(name: routeName),
+                    ),
+                  );
+                } else {
+                  navigator.push(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          BilibiliDownloadScreen(initialInput: content),
+                      settings: const RouteSettings(name: routeName),
+                    ),
+                  );
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueAccent,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(0, 42),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                elevation: 0,
+              ),
+              icon: const Icon(Icons.download_outlined, size: 17),
+              label: const FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  "导入下载页",
+                  maxLines: 1,
+                  style: TextStyle(fontWeight: FontWeight.w500),
+                ),
               ),
             ),
           ],
         ),
+      );
+    } finally {
+      _isClipboardDialogVisible = false;
+    }
+  }
+
+  Future<bool?> _showClipboardExportScopeDialog({
+    required String title,
+    required String message,
+    required String singleLabel,
+    required String allLabel,
+  }) {
+    return showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF2C2C2C),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(color: Colors.white70, height: 1.45),
+        ),
+        actionsOverflowButtonSpacing: 6,
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: const Text("忽略", style: TextStyle(color: Colors.grey)),
+            child: const Text('取消', style: TextStyle(color: Colors.white54)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(
+              singleLabel,
+              style: const TextStyle(
+                color: Colors.pinkAccent,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
           ),
           ElevatedButton(
-            onPressed: () async {
-              final playbackService = Provider.of<MediaPlaybackService>(
-                parentContext,
-                listen: false,
-              );
-              final navigator = Navigator.of(parentContext);
-              Navigator.pop(dialogContext);
-              if (playbackService.isPlaying) {
-                await playbackService.pause();
-              }
-              if (!mounted || !navigator.mounted) return;
-              const routeName = '/bilibili_download';
-              if (AppToast.isCurrentRoute(routeName)) {
-                navigator.pushReplacement(
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        BilibiliDownloadScreen(initialInput: content),
-                    settings: const RouteSettings(name: routeName),
-                  ),
-                );
-              } else {
-                navigator.push(
-                  MaterialPageRoute(
-                    builder: (_) =>
-                        BilibiliDownloadScreen(initialInput: content),
-                    settings: const RouteSettings(name: routeName),
-                  ),
-                );
-              }
-            },
+            onPressed: () => Navigator.pop(dialogContext, true),
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.blueAccent,
               foregroundColor: Colors.white,
+              elevation: 0,
             ),
-            child: const Text("导入"),
+            child: Text(
+              allLabel,
+              style: const TextStyle(fontWeight: FontWeight.w500),
+            ),
           ),
         ],
       ),
     );
+  }
+
+  BilibiliVideoItem? _findClipboardTargetVideo(
+    BilibiliDownloadTask task,
+    BilibiliVideoItem target,
+  ) {
+    final targetBvid = target.videoInfo.bvid.toLowerCase();
+    final targetAid = target.videoInfo.aid.toLowerCase();
+    for (final video in task.videos) {
+      if ((targetBvid.isNotEmpty &&
+              video.videoInfo.bvid.toLowerCase() == targetBvid) ||
+          (targetAid.isNotEmpty &&
+              video.videoInfo.aid.toLowerCase() == targetAid)) {
+        return video;
+      }
+    }
+    return null;
+  }
+
+  Future<BilibiliDownloadTask?> _chooseClipboardStreamingTask(
+    BilibiliDownloadTask task,
+    _ClipboardDisplayInfo displayInfo,
+  ) async {
+    final clonedTask = BilibiliDownloadTask.fromJson(task.toJson());
+    BilibiliVideoItem? targetVideo;
+
+    if (task.collectionInfo != null) {
+      if (displayInfo.targetVideo == null) {
+        final addWholeCollection = await _showClipboardExportScopeDialog(
+          title: '发现合集',
+          message:
+              '当前链接属于合集“${task.collectionInfo!.title}”，但无法准确定位合集中的当前视频。\n\n是否添加整个合集？',
+          singleLabel: '返回',
+          allLabel: '添加整个合集',
+        );
+        return addWholeCollection == true ? clonedTask : null;
+      }
+
+      final addWholeCollection = await _showClipboardExportScopeDialog(
+        title: '发现合集',
+        message:
+            '此视频属于合集：\n${task.collectionInfo!.title}\n\n请选择添加当前视频，还是添加整个合集。',
+        singleLabel: '仅添加此视频',
+        allLabel: '添加整个合集',
+      );
+      if (addWholeCollection == null) return null;
+      if (addWholeCollection) return clonedTask;
+      targetVideo = _findClipboardTargetVideo(
+        clonedTask,
+        displayInfo.targetVideo!,
+      );
+    } else if (clonedTask.videos.isNotEmpty) {
+      targetVideo = clonedTask.videos.first;
+    }
+
+    if (targetVideo == null) return null;
+    var scopedTask = BilibiliDownloadTask(
+      singleVideoInfo: targetVideo.videoInfo,
+      videos: <BilibiliVideoItem>[targetVideo],
+      sourceRef: targetVideo.sourceRef ?? clonedTask.sourceRef,
+      isStreamingImport: true,
+      isSelected: true,
+    );
+    if (targetVideo.episodes.length <= 1) return scopedTask;
+
+    final addAllParts = await _showClipboardExportScopeDialog(
+      title: '发现分P视频',
+      message:
+          '“${targetVideo.videoInfo.title}”包含 ${targetVideo.episodes.length} 个分P。\n\n请选择仅添加当前分P，还是添加全部分P。',
+      singleLabel: '仅添加当前分P',
+      allLabel: '添加全部分P',
+    );
+    if (addAllParts == null) return null;
+    if (addAllParts) return scopedTask;
+
+    final requestedPage = displayInfo.targetEpisode?.page.page ?? 1;
+    final targetEpisode = targetVideo.episodes.firstWhere(
+      (episode) => episode.page.page == requestedPage,
+      orElse: () => targetVideo!.episodes.first,
+    );
+    final originalInfo = targetVideo.videoInfo;
+    final partTitle = targetEpisode.page.part.trim();
+    final partInfo = BilibiliVideoInfo(
+      title: partTitle.isEmpty ? originalInfo.title : partTitle,
+      desc: originalInfo.desc,
+      pic: originalInfo.pic,
+      bvid: originalInfo.bvid,
+      aid: originalInfo.aid,
+      ownerName: originalInfo.ownerName,
+      ownerMid: originalInfo.ownerMid,
+      pubDate: originalInfo.pubDate,
+      pages: <BilibiliPage>[targetEpisode.page],
+    );
+    final partVideo = BilibiliVideoItem(
+      videoInfo: partInfo,
+      episodes: <BilibiliDownloadEpisode>[targetEpisode],
+      sourceRef: targetVideo.sourceRef,
+      isExpanded: true,
+      isSelected: true,
+    );
+    scopedTask = BilibiliDownloadTask(
+      singleVideoInfo: partInfo,
+      videos: <BilibiliVideoItem>[partVideo],
+      sourceRef: targetVideo.sourceRef ?? clonedTask.sourceRef,
+      isStreamingImport: true,
+      isSelected: true,
+    );
+    return scopedTask;
+  }
+
+  Future<void> _exportClipboardTaskAsStreamingCard(
+    BilibiliDownloadTask task,
+    _ClipboardDisplayInfo displayInfo,
+  ) async {
+    if (_isClipboardExporting || !mounted) return;
+    _isClipboardExporting = true;
+    try {
+      // Let the preview dialog finish popping before pushing the scope dialog
+      // on the same Navigator.
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted) return;
+      final scopedTask = await _chooseClipboardStreamingTask(task, displayInfo);
+      if (scopedTask == null || !mounted) return;
+      final service = Provider.of<BilibiliDownloadService>(
+        context,
+        listen: false,
+      );
+      final library = Provider.of<LibraryService>(context, listen: false);
+      await service.importParsedStreamingTaskToLibrary(library, scopedTask);
+    } catch (error) {
+      debugPrint('剪贴板 Bilibili 在线播放卡片添加失败: $error');
+    } finally {
+      _isClipboardExporting = false;
+      unawaited(
+        Future<void>.delayed(Duration.zero, () {
+          if (mounted) return _checkClipboard();
+        }),
+      );
+    }
   }
 
   @override
@@ -2484,6 +2762,24 @@ class _HomeScreenState extends State<HomeScreen>
     required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(collection.id);
+    void handleTap() {
+      if (_isSelectionMode) {
+        setState(() {
+          if (_selectedIds.contains(collection.id)) {
+            _selectedIds.remove(collection.id);
+          } else {
+            _selectedIds.add(collection.id);
+          }
+        });
+      } else {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (context) => CollectionScreen(collectionId: collection.id),
+          ),
+        );
+      }
+    }
+
     final tile = MediaLibraryListTile.collection(
       collection: collection,
       index: index,
@@ -2511,24 +2807,7 @@ class _HomeScreenState extends State<HomeScreen>
         _updateDragSelection(details.globalPosition);
       },
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
-      onTap: () {
-        if (_isSelectionMode) {
-          setState(() {
-            if (_selectedIds.contains(collection.id)) {
-              _selectedIds.remove(collection.id);
-            } else {
-              _selectedIds.add(collection.id);
-            }
-          });
-        } else {
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (context) =>
-                  CollectionScreen(collectionId: collection.id),
-            ),
-          );
-        }
-      },
+      onTap: handleTap,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2536,6 +2815,7 @@ class _HomeScreenState extends State<HomeScreen>
       isSelected: isSelected,
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(collection.id),
+      onTap: handleTap,
       onReorder: (oldIndex, newIndex) {
         _reorderMediaItems(library, contents, null, oldIndex, newIndex);
       },
@@ -2562,6 +2842,28 @@ class _HomeScreenState extends State<HomeScreen>
     required List<dynamic> contents,
   }) {
     final isSelected = _selectedIds.contains(item.id);
+    void handleTap() {
+      if (_isSelectionMode) {
+        setState(() {
+          if (_selectedIds.contains(item.id)) {
+            _selectedIds.remove(item.id);
+          } else {
+            _selectedIds.add(item.id);
+          }
+        });
+        return;
+      }
+      final playbackService = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (!mounted) return;
+      final controller = playbackService.currentItem?.id == item.id
+          ? playbackService.controller
+          : null;
+      _openPlaybackScreen(item, existingController: controller);
+    }
+
     final tile = MediaLibraryListTile.video(
       item: item,
       index: index,
@@ -2583,27 +2885,7 @@ class _HomeScreenState extends State<HomeScreen>
         _updateDragSelection(details.globalPosition);
       },
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
-      onTap: () async {
-        if (_isSelectionMode) {
-          setState(() {
-            if (_selectedIds.contains(item.id)) {
-              _selectedIds.remove(item.id);
-            } else {
-              _selectedIds.add(item.id);
-            }
-          });
-          return;
-        }
-        final playbackService = Provider.of<MediaPlaybackService>(
-          context,
-          listen: false,
-        );
-        if (!mounted) return;
-        final controller = playbackService.currentItem?.id == item.id
-            ? playbackService.controller
-            : null;
-        _openPlaybackScreen(item, existingController: controller);
-      },
+      onTap: handleTap,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2611,6 +2893,7 @@ class _HomeScreenState extends State<HomeScreen>
       isSelected: isSelected,
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(item.id),
+      onTap: handleTap,
       onReorder: (oldIndex, newIndex) {
         _reorderMediaItems(library, contents, null, oldIndex, newIndex);
       },
@@ -2848,6 +3131,25 @@ class _HomeScreenState extends State<HomeScreen>
         );
 
         // 2. Interaction Wrapper
+        void handleTap() {
+          if (_isSelectionMode) {
+            setState(() {
+              if (isSelected) {
+                _selectedIds.remove(collection.id);
+              } else {
+                _selectedIds.add(collection.id);
+              }
+            });
+          } else {
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (context) =>
+                    CollectionScreen(collectionId: collection.id),
+              ),
+            );
+          }
+        }
+
         Widget interactiveCard = Card(
           color: isSelected
               ? Colors.blueAccent.withValues(alpha: 0.2)
@@ -2860,27 +3162,7 @@ class _HomeScreenState extends State<HomeScreen>
                 ? const BorderSide(color: Colors.blueAccent, width: 2)
                 : BorderSide.none,
           ),
-          child: InkWell(
-            onTap: () {
-              if (_isSelectionMode) {
-                setState(() {
-                  if (isSelected) {
-                    _selectedIds.remove(collection.id);
-                  } else {
-                    _selectedIds.add(collection.id);
-                  }
-                });
-              } else {
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (context) =>
-                        CollectionScreen(collectionId: collection.id),
-                  ),
-                );
-              }
-            },
-            child: cardVisual,
-          ),
+          child: InkWell(onTap: handleTap, child: cardVisual),
         );
 
         return Stack(
@@ -2888,6 +3170,7 @@ class _HomeScreenState extends State<HomeScreen>
             MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
+              onTap: handleTap,
               onDragStarted: () {
                 if (!_isSelectionMode) {
                   setState(() {
@@ -3285,6 +3568,34 @@ class _HomeScreenState extends State<HomeScreen>
         );
 
         // 2. Interaction Wrapper
+        void handleTap() {
+          if (_isSelectionMode) {
+            setState(() {
+              if (isSelected) {
+                _selectedIds.remove(item.id);
+              } else {
+                _selectedIds.add(item.id);
+              }
+            });
+          } else {
+            // 通过 MediaPlaybackService 开始播放
+            final playbackService = Provider.of<MediaPlaybackService>(
+              context,
+              listen: false,
+            );
+            // 进入播放页面
+            if (!mounted) return;
+
+            // 仅当当前播放的视频与点击的视频一致时，才复用控制器
+            // 否则传入 null，让 VideoPlayerScreen 自行处理初始化（它会调用 MediaPlaybackService.play）
+            final currentController = playbackService.currentItem?.id == item.id
+                ? playbackService.controller
+                : null;
+
+            _openPlaybackScreen(item, existingController: currentController);
+          }
+        }
+
         Widget interactiveCard = Card(
           clipBehavior: Clip.antiAlias,
           color: isSelected
@@ -3296,40 +3607,7 @@ class _HomeScreenState extends State<HomeScreen>
                 ? const BorderSide(color: Colors.blueAccent, width: 2)
                 : BorderSide.none,
           ),
-          child: InkWell(
-            onTap: () async {
-              if (_isSelectionMode) {
-                setState(() {
-                  if (isSelected) {
-                    _selectedIds.remove(item.id);
-                  } else {
-                    _selectedIds.add(item.id);
-                  }
-                });
-              } else {
-                // 通过 MediaPlaybackService 开始播放
-                final playbackService = Provider.of<MediaPlaybackService>(
-                  context,
-                  listen: false,
-                );
-                // 进入播放页面
-                if (!mounted) return;
-
-                // 仅当当前播放的视频与点击的视频一致时，才复用控制器
-                // 否则传入 null，让 VideoPlayerScreen 自行处理初始化（它会调用 MediaPlaybackService.play）
-                final currentController =
-                    playbackService.currentItem?.id == item.id
-                    ? playbackService.controller
-                    : null;
-
-                _openPlaybackScreen(
-                  item,
-                  existingController: currentController,
-                );
-              }
-            },
-            child: cardVisual,
-          ),
+          child: InkWell(onTap: handleTap, child: cardVisual),
         );
 
         return Stack(
@@ -3337,6 +3615,7 @@ class _HomeScreenState extends State<HomeScreen>
             MediaLibraryAdaptiveDraggable<int>(
               delay: _mediaCardLongPressDelay,
               data: index,
+              onTap: handleTap,
               onDragStarted: () {
                 if (!_isSelectionMode) {
                   setState(() {

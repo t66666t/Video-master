@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
@@ -10,6 +11,7 @@ import '../models/subtitle_style.dart';
 import '../models/subtitle_output_path_strategy.dart';
 import '../models/danmaku_style.dart';
 import '../models/video_compose_models.dart';
+import '../utils/device_form_factor.dart';
 import '../utils/subtitle_file_matcher.dart';
 
 enum PlaybackSpeedLockAction { locked, switched, unlocked }
@@ -402,6 +404,11 @@ class SettingsService extends ChangeNotifier {
   // New: Auto Pause on Exit
   bool autoPauseOnExit = true;
 
+  // Skip the portrait player on mobile and open the landscape player
+  // directly. Tablets default to on, phones to off; desktop always skips
+  // regardless of this flag.
+  bool skipPortraitPlayer = false;
+
   // Keep the complete primary/secondary subtitle group clear of visible
   // playback controls. Enabled by default on every platform.
   bool avoidPlaybackControlsWithSubtitles = true;
@@ -745,6 +752,14 @@ class SettingsService extends ChangeNotifier {
         key: 'autoPauseOnExit',
         defaultValue: true,
         apply: (service, value) => service.autoPauseOnExit = value,
+      ),
+      _boolSetting(
+        key: 'skipPortraitPlayer',
+        defaultValue:
+            !kIsWeb &&
+            (Platform.isAndroid || Platform.isIOS) &&
+            DeviceFormFactor.isTabletLikeDevice(),
+        apply: (service, value) => service.skipPortraitPlayer = value,
       ),
       _boolSetting(
         key: 'avoidPlaybackControlsWithSubtitles',
@@ -2163,6 +2178,10 @@ class SettingsService extends ChangeNotifier {
 
   Future<void> saveAutoPlayNextVideo(bool value) async {
     await _updateRegisteredSetting<bool>('autoPlayNextVideo', value);
+  }
+
+  Future<void> saveSkipPortraitPlayer(bool value) async {
+    await _updateRegisteredSetting<bool>('skipPortraitPlayer', value);
   }
 
   Future<void> saveEnableVideoPreload(bool value) async {

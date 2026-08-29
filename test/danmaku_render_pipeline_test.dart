@@ -77,4 +77,152 @@ void main() {
     expect(indices, contains(25));
     expect(indices, isNot(contains(26)));
   });
+
+  test('scroll duration scales with viewport width and speed multiplier', () {
+    final item = _item(0, 0);
+
+    expect(
+      resolveDanmakuDurationUs(
+        item,
+        speed: 1,
+        viewportWidth: 1920,
+        referenceWidth: 1920,
+      ),
+      const Duration(seconds: 6).inMicroseconds,
+    );
+    expect(
+      resolveDanmakuDurationUs(
+        item,
+        speed: 1,
+        viewportWidth: 3840,
+        referenceWidth: 1920,
+      ),
+      const Duration(seconds: 12).inMicroseconds,
+    );
+    expect(
+      resolveDanmakuDurationUs(
+        item,
+        speed: 2,
+        viewportWidth: 3840,
+        referenceWidth: 1920,
+      ),
+      const Duration(seconds: 6).inMicroseconds,
+    );
+  });
+
+  test('fixed danmaku dwell time does not scale with viewport width', () {
+    final source = _item(0, 0);
+    final item = DanmakuItem(
+      index: source.index,
+      startTime: source.startTime,
+      duration: source.duration,
+      text: source.text,
+      type: DanmakuType.top,
+      colorValue: source.colorValue,
+      sourceY: source.sourceY,
+    );
+
+    expect(
+      resolveDanmakuDurationUs(
+        item,
+        speed: 1,
+        viewportWidth: 3840,
+        referenceWidth: 1920,
+      ),
+      const Duration(seconds: 6).inMicroseconds,
+    );
+
+    final activeSet = DanmakuActiveSet(<DanmakuItem>[item]);
+    expect(
+      activeSet.update(
+        positionUs: const Duration(seconds: 5).inMicroseconds,
+        speed: 1,
+        admissionCap: 0x3fffffff,
+        viewportWidth: 320,
+        referenceWidth: 1920,
+      ),
+      <int>[0],
+    );
+  });
+
+  test('wide viewport keeps scrolling items active for the longer travel', () {
+    final activeSet = DanmakuActiveSet(<DanmakuItem>[_item(0, 10)]);
+
+    expect(
+      activeSet.update(
+        positionUs: const Duration(seconds: 17).inMicroseconds,
+        speed: 1,
+        admissionCap: 0x3fffffff,
+        viewportWidth: 3840,
+        referenceWidth: 1920,
+      ),
+      <int>[0],
+    );
+  });
+
+  test('atlas destinations snap to physical pixels', () {
+    expect(snapDanmakuLogicalPixel(10.3, 1.25), closeTo(10.4, 0.0001));
+    expect(snapDanmakuLogicalPixel(10.3, double.nan), 10);
+  });
+
+  test('lowering the overload cap immediately trims an active burst', () {
+    final items = <DanmakuItem>[for (var i = 0; i < 1000; i++) _item(i, 10)];
+    final activeSet = DanmakuActiveSet(items);
+
+    expect(
+      activeSet.update(
+        positionUs: const Duration(seconds: 11).inMicroseconds,
+        speed: 1,
+        admissionCap: 0x3fffffff,
+      ),
+      hasLength(1000),
+    );
+
+    final trimmed = activeSet.update(
+      positionUs: const Duration(seconds: 11, milliseconds: 16).inMicroseconds,
+      speed: 1,
+      admissionCap: 200,
+    );
+    expect(trimmed, hasLength(200));
+    expect(trimmed, orderedEquals(List<int>.of(trimmed)..sort()));
+  });
+
+  test('overload trimming prefers unique text and remains deterministic', () {
+    final items = <DanmakuItem>[
+      for (var i = 0; i < 20; i++)
+        DanmakuItem(
+          index: i,
+          startTime: const Duration(seconds: 10),
+          duration: const Duration(seconds: 6),
+          text: i < 10 ? '重复' : '弹幕 $i',
+          type: DanmakuType.scroll,
+          colorValue: 0xFFFFFFFF,
+          sourceY: 40,
+        ),
+    ];
+
+    List<int> resolve() {
+      final activeSet = DanmakuActiveSet(items);
+      activeSet.update(
+        positionUs: const Duration(seconds: 11).inMicroseconds,
+        speed: 1,
+        admissionCap: 0x3fffffff,
+      );
+      return List<int>.of(
+        activeSet.update(
+          positionUs: const Duration(
+            seconds: 11,
+            milliseconds: 16,
+          ).inMicroseconds,
+          speed: 1,
+          admissionCap: 8,
+        ),
+      );
+    }
+
+    final first = resolve();
+    final second = resolve();
+    expect(first, second);
+    expect(first.map((index) => items[index].text).toSet(), hasLength(8));
+  });
 }

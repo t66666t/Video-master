@@ -13,6 +13,11 @@ import 'pitch_preserving_audio_pipeline.dart';
 import '../services/settings_service.dart';
 
 class NativeVideoPlayerMediaKit {
+  /// Private transport metadata understood only by this native video_player
+  /// adapter. It is stripped before any HTTP request is sent.
+  static const String externalAudioSourceHeader =
+      'x-fluent-player-external-audio-source';
+
   static bool get supportsHardwareVideoDecodingControl =>
       UniversalPlatform.isAndroid ||
       UniversalPlatform.isIOS ||
@@ -257,7 +262,12 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     _streamSubscriptions[textureId] = streamSubscriptions;
 
     final String resource;
-    final Map<String, String> httpHeaders = dataSource.httpHeaders;
+    final Map<String, String> httpHeaders = Map<String, String>.from(
+      dataSource.httpHeaders,
+    );
+    final externalAudioUri = httpHeaders.remove(
+      NativeVideoPlayerMediaKit.externalAudioSourceHeader,
+    );
 
     switch (dataSource.sourceType) {
       case DataSourceType.asset:
@@ -282,6 +292,7 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     final media = Media(resource, httpHeaders: httpHeaders);
     final decoderFallbackState = _DecoderFallbackState(
       media: media,
+      externalAudioUri: externalAudioUri,
       enabled: UniversalPlatform.isAndroid && useHardwareDecoding,
     );
     _decoderFallbackStates[textureId] = decoderFallbackState;
@@ -299,7 +310,11 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     // is inaudible while paused, but still needlessly rebuilds the native graph.
     await PitchPreservingAudioPipeline.configure(player);
     await _configureHighResolutionPlayback(player);
+    if (externalAudioUri != null) {
+      await _configureStreamingBuffer(player);
+    }
     await player.open(media, play: false);
+    await _attachExternalAudio(player, externalAudioUri);
     await _disableSubtitleOutput(player);
 
     if (decoderFallbackState.enabled) {
@@ -410,6 +425,11 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     return Video(
       key: ValueKey(_videoControllers[textureId]!),
       controller: _videoControllers[textureId]!,
+      // The video_player widget's parent already owns aspect-ratio/layout
+      // containment. A second BoxFit.contain here can expose rounding or padded
+      // dimensions from a 480P texture as an extra black border after switching
+      // qualities. Fill only this already aspect-correct viewport.
+      fit: BoxFit.fill,
       wakelock: false,
       controls: NoVideoControls,
       fill: const Color(0x00000000),
@@ -492,6 +512,7 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
           }
 
           await player.open(state.media, play: false);
+          await _attachExternalAudio(player, state.externalAudioUri);
           await _disableSubtitleOutput(player);
           if (resumePosition > Duration.zero &&
               resumePosition < player.state.duration) {
@@ -687,6 +708,50 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     }
   }
 
+  Future<void> _attachExternalAudio(Player player, String? uri) async {
+    if (uri == null || uri.isEmpty) return;
+    final parsed = Uri.tryParse(uri);
+    if (parsed == null ||
+        !parsed.isAbsolute ||
+        (parsed.scheme != 'http' && parsed.scheme != 'https')) {
+      throw ArgumentError.value(uri, 'externalAudioUri', 'Invalid media URI');
+    }
+    await player.setAudioTrack(
+      AudioTrack.uri(uri, title: 'Bilibili audio', language: 'und'),
+    );
+  }
+
+  Future<void> _configureStreamingBuffer(Player player) async {
+    final platform = player.platform;
+    if (platform is! NativePlayer) return;
+    final maxForwardBytes =
+        UniversalPlatform.isAndroid || UniversalPlatform.isIOS
+        ? 32 * 1024 * 1024
+        : 64 * 1024 * 1024;
+    final maxBackBytes = UniversalPlatform.isAndroid || UniversalPlatform.isIOS
+        ? 8 * 1024 * 1024
+        : 16 * 1024 * 1024;
+    await Future.wait<void>([
+      platform.setProperty('cache', 'yes', waitForInitialization: false),
+      platform.setProperty('cache-secs', '30', waitForInitialization: false),
+      platform.setProperty(
+        'demuxer-readahead-secs',
+        '30',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'demuxer-max-bytes',
+        '$maxForwardBytes',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'demuxer-max-back-bytes',
+        '$maxBackBytes',
+        waitForInitialization: false,
+      ),
+    ]);
+  }
+
   Future<void> _configureHighResolutionPlayback(Player player) async {
     final platform = player.platform;
     if (platform is! NativePlayer) return;
@@ -803,9 +868,14 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
 }
 
 class _DecoderFallbackState {
-  _DecoderFallbackState({required this.media, required this.enabled});
+  _DecoderFallbackState({
+    required this.media,
+    required this.externalAudioUri,
+    required this.enabled,
+  });
 
   final Media media;
+  final String? externalAudioUri;
   final bool enabled;
   bool fallbackAttempted = false;
   bool firstFrameRendered = false;

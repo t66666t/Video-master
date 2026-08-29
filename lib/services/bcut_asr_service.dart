@@ -7,10 +7,14 @@ import 'package:video_player_app/models/subtitle_model.dart';
 class BcutAsrService {
   static const String _baseUrl =
       "https://member.bilibili.com/x/bcut/rubick-interface";
+  // 必剪接口受 B 站风控保护，伪造 UA 会被拦截返回 412，必须使用真实浏览器 UA
+  static const String _userAgent =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
   final Dio _dio = Dio(
     BaseOptions(
       headers: {
-        "User-Agent": "Bilibili/1.0.0 (https://www.bilibili.com)",
+        "User-Agent": _userAgent,
         "Content-Type": "application/json",
       },
       // 增加超时时间，因为上传可能较慢
@@ -91,6 +95,9 @@ class BcutAsrService {
         rethrow;
       }
       if (e is DioException) {
+        if (e.response?.statusCode == 412) {
+          throw Exception("网络请求失败: 请求被 B 站风控拦截 (412)，请稍后重试");
+        }
         throw Exception("网络请求失败: ${e.message} [${e.response?.statusCode}]");
       }
       rethrow;

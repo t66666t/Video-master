@@ -4,20 +4,81 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/danmaku_style.dart';
+import '../models/video_item.dart';
+import '../services/bilibili/bilibili_download_service.dart';
+import '../services/library_service.dart';
 import '../services/settings_service.dart';
+import 'bilibili_login_dialogs.dart';
 
 const _accent = Color(0xFFFF6699);
 
-Future<void> showDanmakuSettingsDialog(BuildContext context) {
+Future<void> showDanmakuSettingsDialog(
+  BuildContext context, {
+  VideoItem? videoItem,
+  VoidCallback? onDanmakuUpdated,
+}) {
   return showDialog<void>(
     context: context,
     barrierColor: Colors.black54,
-    builder: (context) => const _DanmakuSettingsDialog(),
+    builder: (context) => _DanmakuSettingsDialog(
+      videoItem: videoItem,
+      onDanmakuUpdated: onDanmakuUpdated,
+    ),
   );
 }
 
-class _DanmakuSettingsDialog extends StatelessWidget {
-  const _DanmakuSettingsDialog();
+class _DanmakuSettingsDialog extends StatefulWidget {
+  final VideoItem? videoItem;
+  final VoidCallback? onDanmakuUpdated;
+
+  const _DanmakuSettingsDialog({this.videoItem, this.onDanmakuUpdated});
+
+  @override
+  State<_DanmakuSettingsDialog> createState() => _DanmakuSettingsDialogState();
+}
+
+class _DanmakuSettingsDialogState extends State<_DanmakuSettingsDialog> {
+  bool _updating = false;
+  String? _status;
+  bool _statusIsError = false;
+
+  Future<void> _updateDanmaku() async {
+    if (_updating) return;
+    final videoItem = widget.videoItem;
+    if (videoItem == null) {
+      setState(() {
+        _status = '缺少B站视频信息';
+        _statusIsError = true;
+      });
+      return;
+    }
+    setState(() {
+      _updating = true;
+      _status = '正在获取最新弹幕…';
+      _statusIsError = false;
+    });
+    try {
+      final service = context.read<BilibiliDownloadService>();
+      final library = context.read<LibraryService>();
+      await service.updateDanmakuForVideo(videoItem, library);
+      if (!mounted) return;
+      widget.onDanmakuUpdated?.call();
+      setState(() {
+        _updating = false;
+        _status = '弹幕已更新';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      final message = error is BilibiliDanmakuUpdateException
+          ? error.message
+          : '获取最新弹幕失败，请重试';
+      setState(() {
+        _updating = false;
+        _status = message;
+        _statusIsError = true;
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -25,19 +86,34 @@ class _DanmakuSettingsDialog extends StatelessWidget {
     return _SettingsDialogFrame(
       title: '弹幕设置',
       maxWidth: 460,
-      headerAction: TextButton.icon(
-        onPressed: () => showDialog<void>(
-          context: context,
-          barrierColor: Colors.black54,
-          builder: (_) => const _DanmakuAdvancedSettingsDialog(),
-        ),
-        icon: const Icon(Icons.tune_rounded, size: 17),
-        label: const Text('高级设置'),
-        style: TextButton.styleFrom(
-          foregroundColor: _accent,
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
-          visualDensity: VisualDensity.compact,
-        ),
+      headerAction: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextButton.icon(
+            onPressed: () => showDialog<void>(
+              context: context,
+              barrierColor: Colors.black54,
+              builder: (_) => const _DanmakuAdvancedSettingsDialog(),
+            ),
+            icon: const Icon(Icons.tune_rounded, size: 17),
+            label: const Text('高级设置'),
+            style: TextButton.styleFrom(
+              foregroundColor: _accent,
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 7),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+          TextButton.icon(
+            onPressed: () => unawaited(showBilibiliLoginDialog(context)),
+            icon: const Icon(Icons.person_rounded, size: 17),
+            label: const Text('登录/Cookie'),
+            style: TextButton.styleFrom(
+              foregroundColor: _accent,
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 7),
+              visualDensity: VisualDensity.compact,
+            ),
+          ),
+        ],
       ),
       child: Flexible(
         child: SingleChildScrollView(
@@ -93,6 +169,82 @@ class _DanmakuSettingsDialog extends StatelessWidget {
                 divisions: 79,
                 onChanged: (value) =>
                     unawaited(settings.saveBilibiliDanmakuSpeed(value)),
+              ),
+              const SizedBox(height: 8),
+              const Divider(color: Colors.white12, height: 1),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      '更新弹幕',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  FilledButton.icon(
+                    onPressed: _updating ? null : _updateDanmaku,
+                    icon: _updating
+                        ? const SizedBox(
+                            width: 15,
+                            height: 15,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.refresh_rounded, size: 18),
+                    label: Text(_updating ? '更新中' : '立即更新'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _accent,
+                      foregroundColor: Colors.white,
+                      disabledBackgroundColor: _accent.withValues(alpha: 0.55),
+                      disabledForegroundColor: Colors.white70,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ),
+                ],
+              ),
+              SizedBox(
+                height: 28,
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: _status == null
+                      ? const SizedBox.shrink()
+                      : Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                _status!,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: _statusIsError
+                                      ? const Color(0xFFFF8A80)
+                                      : Colors.white60,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                            if (_statusIsError)
+                              InkWell(
+                                onTap: () => setState(() => _status = null),
+                                borderRadius: BorderRadius.circular(12),
+                                child: const Padding(
+                                  padding: EdgeInsets.all(3),
+                                  child: Icon(
+                                    Icons.close_rounded,
+                                    size: 15,
+                                    color: Colors.white54,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                ),
               ),
             ],
           ),

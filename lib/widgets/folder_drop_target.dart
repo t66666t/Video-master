@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 
+import 'custom_drag.dart';
+
 class FolderDropTarget extends StatefulWidget {
   final Widget child;
   final String folderId;
@@ -65,16 +67,15 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final unit = constraints.biggest.shortestSide;
-        return DragTarget<int>(
-          onWillAcceptWithDetails: (details) {
-            final data = details.data;
-            if (data == widget.index) return false;
+        return DropZone<int>(
+          data: widget.index,
+          onWillAccept: (draggedIndex) {
+            if (draggedIndex == widget.index) return false;
             _handleDragEnter();
             return true;
           },
-          onLeave: (_) => _handleDragLeave(),
-          onAcceptWithDetails: (details) {
-            final draggedIndex = details.data;
+          onLeave: _handleDragLeave,
+          onAcceptWithDetails: (draggedIndex, _) {
             _hoverTimer?.cancel();
 
             if (_isMoveMode || !widget.allowReorder) {
@@ -88,7 +89,7 @@ class _FolderDropTargetState extends State<FolderDropTarget> {
               _isMoveMode = false;
             });
           },
-          builder: (context, candidateData, rejectedData) {
+          builder: (context, candidateData) {
             if (!_isHovering || candidateData.isEmpty) {
               return widget.child;
             }

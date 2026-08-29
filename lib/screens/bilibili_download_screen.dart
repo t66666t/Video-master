@@ -12,9 +12,7 @@ import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
-import 'package:video_player_app/screens/portrait_video_screen.dart';
 import 'package:video_player_app/screens/bilibili_download_list_projection.dart';
-import 'package:video_player_app/screens/video_player_screen.dart';
 import 'package:video_player_app/services/app_haptics.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/library_service.dart';
@@ -28,10 +26,12 @@ import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 class BilibiliDownloadScreen extends StatefulWidget {
   final String? initialInput;
   final String? targetFolderId;
+  final bool initialStreamingMode;
   const BilibiliDownloadScreen({
     super.key,
     this.initialInput,
     this.targetFolderId,
+    this.initialStreamingMode = false,
   });
 
   @override
@@ -71,6 +71,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   Timer? _taskDragCollapseTimer;
   Timer? _taskDragAutoScrollTimer;
   int _taskDragSession = 0;
+  late bool _streamingMode;
 
   // Dialog helpers need access to API service, which is now in BilibiliDownloadService
 
@@ -274,6 +275,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   @override
   void initState() {
     super.initState();
+    _streamingMode = widget.initialStreamingMode;
     _keepAwakeBannerController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 240),
@@ -321,6 +323,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
           context,
           listen: false,
         );
+        service.clearSelection();
 
         _parseVideo(service);
       });
@@ -335,6 +338,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
           context,
           listen: false,
         );
+        service.clearSelection();
       });
     }
   }
@@ -369,11 +373,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }
 
   Future<void> _showCookieDialog(BilibiliDownloadService service) async {
-    await showBilibiliLoginDialog(context);
+    await showBilibiliLoginDialog(context, suppressToasts: _streamingMode);
   }
 
   void _showQrCodeLoginDialog(BilibiliDownloadService service) {
-    showBilibiliQrCodeDialog(context);
+    showBilibiliQrCodeDialog(context, suppressToasts: _streamingMode);
   }
 
   Future<void> _parseVideo(BilibiliDownloadService service) async {
@@ -383,7 +387,9 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     final hasCookie = await service.apiService.hasCookie();
     if (!hasCookie) {
       if (mounted) {
-        AppToast.show("解析前请先扫码登录 Bilibili", type: AppToastType.error);
+        if (!_streamingMode) {
+          AppToast.show("解析前请先扫码登录 Bilibili", type: AppToastType.error);
+        }
         _showQrCodeLoginDialog(service);
       }
       return;
@@ -392,6 +398,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     // Call service to parse
     final success = await service.parseVideo(
       rawInput,
+      asStreamingImport: _streamingMode,
       onConfirmCollection: (title) async {
         // Show Dialog
         return await showDialog<bool>(
@@ -453,6 +460,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }
 
   Future<void> _showDownloadSettings(BilibiliDownloadService service) async {
+    if (_streamingMode) {
+      await _showStreamingSettings(service);
+      return;
+    }
     bool tempDownloadDanmaku = service.downloadDanmaku;
     int tempMax = service.maxConcurrentDownloads;
     int tempVideoConnections = service.maxConnectionsPerVideo;
@@ -746,6 +757,83 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
   }
 
+  Future<void> _showStreamingSettings(BilibiliDownloadService service) async {
+    var subtitleLanguage = service.preferredSubtitleLang;
+    var preferAi = service.preferAiSubtitles;
+    var autoDelete = service.autoDeleteTaskAfterImport;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('解析设置'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  const Expanded(child: Text('默认字幕偏好')),
+                  DropdownButton<String>(
+                    value: subtitleLanguage,
+                    items: const [
+                      DropdownMenuItem(value: 'none', child: Text('无')),
+                      DropdownMenuItem(value: 'zh', child: Text('中文')),
+                      DropdownMenuItem(value: 'en', child: Text('English')),
+                      DropdownMenuItem(value: 'ja', child: Text('日本語')),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        setDialogState(() => subtitleLanguage = value);
+                      }
+                    },
+                  ),
+                ],
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('AI 字幕优先'),
+                subtitle: const Text('仅影响导出时默认绑定的字幕'),
+                value: preferAi,
+                onChanged: (value) =>
+                    setDialogState(() => preferAi = value ?? false),
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('导出后自动删除解析任务'),
+                value: autoDelete,
+                onChanged: (value) =>
+                    setDialogState(() => autoDelete = value ?? false),
+              ),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  '视频清晰度在播放时选择；这里只解析稳定的 BV/cid 身份、封面、字幕和章节。',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                service
+                  ..preferredSubtitleLang = subtitleLanguage
+                  ..preferAiSubtitles = preferAi
+                  ..autoDeleteTaskAfterImport = autoDelete;
+                unawaited(service.saveSettings());
+                Navigator.pop(dialogContext);
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _importToLibrary(
     BilibiliDownloadService service, {
     BilibiliDownloadEpisode? episode,
@@ -769,6 +857,18 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     } else {
       AppToast.show("导入失败或无已完成任务", type: AppToastType.error);
     }
+  }
+
+  Future<void> _exportStreaming(
+    BilibiliDownloadService service, {
+    BilibiliDownloadEpisode? episode,
+  }) async {
+    final library = Provider.of<LibraryService>(context, listen: false);
+    await service.importStreamingToLibrary(
+      library,
+      episode: episode,
+      targetFolderId: widget.targetFolderId,
+    );
   }
 
   void _showSubtitlePreview(
@@ -808,30 +908,19 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     } catch (e) {
       if (!mounted) return;
       Navigator.pop(context);
-      AppToast.show("预览失败", type: AppToastType.error);
+      if (!_streamingMode) {
+        AppToast.show("预览失败", type: AppToastType.error);
+      }
     }
   }
 
   Future<void> _openVideoPlayer(VideoItem videoItem) async {
     if (!mounted) return;
     FocusScope.of(context).unfocus();
-    final route = (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
-        ? PageRouteBuilder<void>(
-            pageBuilder: (context, animation, secondaryAnimation) =>
-                VideoPlayerScreen(videoItem: videoItem),
-            transitionsBuilder:
-                (context, animation, secondaryAnimation, child) => child,
-            transitionDuration: Duration.zero,
-            reverseTransitionDuration: Duration.zero,
-            opaque: true,
-          )
-        : MaterialPageRoute<void>(
-            settings: PlaybackNavigationService.portraitRouteSettings(
-              videoItem,
-            ),
-            builder: (context) => PortraitVideoScreen(videoItem: videoItem),
-          );
-    await Navigator.push(context, route);
+    await Navigator.push(
+      context,
+      PlaybackNavigationService.buildPlaybackEntryRoute(videoItem),
+    );
   }
 
   List<String?> _findMatchingCollectionIds(
@@ -959,19 +1048,25 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
         ep.outputPath != null &&
         ep.importedOutputPath != null &&
         p.normalize(ep.outputPath!) == p.normalize(ep.importedOutputPath!)) {
-      AppToast.show("已导入的视频不存在，可能已被删除或移入回收站", type: AppToastType.error);
+      if (!_streamingMode) {
+        AppToast.show("已导入的视频不存在，可能已被删除或移入回收站", type: AppToastType.error);
+      }
       return;
     }
 
     if (ep.outputPath == null) {
-      AppToast.show("文件路径为空，无法播放", type: AppToastType.error);
+      if (!_streamingMode) {
+        AppToast.show("文件路径为空，无法播放", type: AppToastType.error);
+      }
       return;
     }
 
     final file = File(ep.outputPath!);
     if (!await file.exists()) {
       if (!mounted) return;
-      AppToast.show("视频文件不存在，可能已被删除或移动", type: AppToastType.error);
+      if (!_streamingMode) {
+        AppToast.show("视频文件不存在，可能已被删除或移动", type: AppToastType.error);
+      }
       return;
     }
 
@@ -1006,7 +1101,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
           TextButton(
             onPressed: () {
               Navigator.pop(ctx);
-              service.deleteAllTasks();
+              service.deleteAllTasksForMode(_streamingMode);
             },
             child: const Text("删除", style: TextStyle(color: Colors.red)),
           ),
@@ -1468,7 +1563,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   List<BilibiliDownloadListRow> _buildVirtualRows(
     BilibiliDownloadService service,
   ) => BilibiliDownloadListProjection.build(
-    service.taskIds.map(service.getTaskById).whereType<BilibiliDownloadTask>(),
+    service
+        .taskIdsForMode(_streamingMode)
+        .map(service.getTaskById)
+        .whereType<BilibiliDownloadTask>(),
     forceTasksCollapsed: _taskDragProjectionCollapsed,
   );
 
@@ -2052,37 +2150,46 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                 backgroundColor: const Color(0xFF121212),
                 appBar: AppBar(
                   titleSpacing: isCompactAppBar ? 8 : null,
-                  title: Text(
-                    "BBDown 下载",
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
+                  title: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onDoubleTap: () {
+                      service.clearSelection();
+                      setState(() => _streamingMode = !_streamingMode);
+                    },
+                    child: Text(
+                      _streamingMode ? 'Bilibili 在线导入' : 'BBDown 下载',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
+                    ),
                   ),
                   backgroundColor: const Color(0xFF1E1E1E),
                   actions: [
-                    Selector<
-                      BilibiliDownloadService,
-                      ({bool supported, bool enabled, bool active})
-                    >(
-                      selector: (_, currentService) => (
-                        supported:
-                            currentService.supportsProcessingKeepAwakeToggle,
-                        enabled: currentService.keepScreenAwakeDuringProcessing,
-                        active: currentService.isProcessingKeepAwakeActive,
+                    if (!_streamingMode)
+                      Selector<
+                        BilibiliDownloadService,
+                        ({bool supported, bool enabled, bool active})
+                      >(
+                        selector: (_, currentService) => (
+                          supported:
+                              currentService.supportsProcessingKeepAwakeToggle,
+                          enabled:
+                              currentService.keepScreenAwakeDuringProcessing,
+                          active: currentService.isProcessingKeepAwakeActive,
+                        ),
+                        builder: (context, state, _) {
+                          final currentService = context
+                              .read<BilibiliDownloadService>();
+                          _syncKeepAwakeBannerVisibility(currentService);
+                          if (!state.supported) {
+                            return const SizedBox.shrink();
+                          }
+                          return _buildProcessingKeepAwakeAction(
+                            currentService,
+                            isCompactAppBar: isCompactAppBar,
+                          );
+                        },
                       ),
-                      builder: (context, state, _) {
-                        final currentService = context
-                            .read<BilibiliDownloadService>();
-                        _syncKeepAwakeBannerVisibility(currentService);
-                        if (!state.supported) {
-                          return const SizedBox.shrink();
-                        }
-                        return _buildProcessingKeepAwakeAction(
-                          currentService,
-                          isCompactAppBar: isCompactAppBar,
-                        );
-                      },
-                    ),
                     IconButton(
                       icon: Icon(Icons.delete_sweep, size: appBarIconSize),
                       tooltip: "清空任务",
@@ -2092,7 +2199,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     ),
                     IconButton(
                       icon: Icon(Icons.settings, size: appBarIconSize),
-                      tooltip: "下载设置",
+                      tooltip: _streamingMode ? "解析设置" : "下载设置",
                       padding: appBarIconPadding,
                       constraints: appBarIconConstraints,
                       onPressed: () => _showDownloadSettings(service),
@@ -2279,20 +2386,22 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                         );
                       },
                     ),
-                    Selector<
-                      BilibiliDownloadService,
-                      ({bool enabled, bool active})
-                    >(
-                      selector: (_, service) => (
-                        enabled: service.keepScreenAwakeDuringProcessing,
-                        active: service.isProcessingKeepAwakeActive,
+                    if (!_streamingMode)
+                      Selector<
+                        BilibiliDownloadService,
+                        ({bool enabled, bool active})
+                      >(
+                        selector: (_, service) => (
+                          enabled: service.keepScreenAwakeDuringProcessing,
+                          active: service.isProcessingKeepAwakeActive,
+                        ),
+                        builder: (context, _, _) {
+                          final service = context
+                              .read<BilibiliDownloadService>();
+                          _syncKeepAwakeBannerVisibility(service);
+                          return _buildProcessingKeepAwakeBanner(service);
+                        },
                       ),
-                      builder: (context, _, _) {
-                        final service = context.read<BilibiliDownloadService>();
-                        _syncKeepAwakeBannerVisibility(service);
-                        return _buildProcessingKeepAwakeBanner(service);
-                      },
-                    ),
                     Expanded(
                       child:
                           Selector<
@@ -2300,7 +2409,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                             ({List<String> ids, int structureRevision})
                           >(
                             selector: (_, service) => (
-                              ids: service.taskIds,
+                              ids: service.taskIdsForMode(_streamingMode),
                               structureRevision: service.listStructureRevision,
                             ),
                             builder: (context, snapshot, _) {
@@ -2418,8 +2527,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       ({int taskCount, BilibiliSelectionSummary selection})
                     >(
                       selector: (_, service) => (
-                        taskCount: service.taskCount,
-                        selection: service.selectionSummary,
+                        taskCount: service
+                            .taskIdsForMode(_streamingMode)
+                            .length,
+                        selection: service.selectionSummaryForMode(
+                          _streamingMode,
+                        ),
                       ),
                       builder: (context, summary, _) {
                         final service = context.read<BilibiliDownloadService>();
@@ -2488,7 +2601,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                   Expanded(
                     child: InkWell(
                       onTap:
-                          (isSingle &&
+                          (!_streamingMode &&
+                              isSingle &&
                               task.videos.first.episodes.first.status ==
                                   DownloadStatus.completed)
                           ? () => _previewVideo(
@@ -2503,7 +2617,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                           color: Colors.white,
                           fontWeight: FontWeight.bold,
                           decoration:
-                              (isSingle &&
+                              (!_streamingMode &&
+                                  isSingle &&
                                   task.videos.first.episodes.first.status ==
                                       DownloadStatus.completed)
                               ? TextDecoration.underline
@@ -2560,7 +2675,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     BilibiliVideoItem video,
     BilibiliDownloadTask task,
   ) {
-    bool hasInfo = ep.availableVideoQualities.isNotEmpty;
+    bool hasInfo = _streamingMode || ep.availableVideoQualities.isNotEmpty;
     final episodeStatusText = _episodeStatusText(ep);
     final media = MediaQuery.of(context);
     final isCompact =
@@ -2593,34 +2708,69 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     mainAxisAlignment: MainAxisAlignment.start,
                     children: [
                       // Quality
-                      Flexible(
-                        flex: 3,
-                        child: Container(
-                          height: 28,
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.05),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: DropdownButtonHideUnderline(
-                            child: DropdownButton<StreamItem>(
-                              value: ep.selectedVideoQuality,
-                              isDense: true,
-                              isExpanded: true,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: Colors.white,
-                              ),
-                              dropdownColor: const Color(0xFF333333),
-                              icon: const Icon(
-                                Icons.arrow_drop_down,
-                                size: 16,
-                                color: Colors.white54,
-                              ),
-                              selectedItemBuilder: (BuildContext context) {
-                                return ep.availableVideoQualities.map<Widget>((
-                                  StreamItem s,
-                                ) {
+                      if (!_streamingMode)
+                        Flexible(
+                          flex: 3,
+                          child: Container(
+                            height: 28,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.05),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: DropdownButtonHideUnderline(
+                              child: DropdownButton<StreamItem>(
+                                value: ep.selectedVideoQuality,
+                                isDense: true,
+                                isExpanded: true,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.white,
+                                ),
+                                dropdownColor: const Color(0xFF333333),
+                                icon: const Icon(
+                                  Icons.arrow_drop_down,
+                                  size: 16,
+                                  color: Colors.white54,
+                                ),
+                                selectedItemBuilder: (BuildContext context) {
+                                  return ep.availableVideoQualities.map<Widget>(
+                                    (StreamItem s) {
+                                      String label =
+                                          s.qualityName?.replaceAll("高清", "") ??
+                                          "Q${s.id}";
+                                      String codec = "";
+                                      if (s.codecs.startsWith("avc1")) {
+                                        codec = "AVC";
+                                      } else if (s.codecs.startsWith("hev1") ||
+                                          s.codecs.contains("hevc")) {
+                                        codec = "HEVC";
+                                      } else if (s.codecs.startsWith("av01")) {
+                                        codec = "AV1";
+                                      } else {
+                                        codec = s.codecs.split('.')[0];
+                                      }
+                                      String detailedLabel = "$label ($codec)";
+                                      return Container(
+                                        alignment: Alignment.centerLeft,
+                                        constraints: const BoxConstraints(
+                                          minWidth: 50,
+                                        ),
+                                        child: SingleChildScrollView(
+                                          scrollDirection: Axis.horizontal,
+                                          child: Text(
+                                            detailedLabel,
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ).toList();
+                                },
+                                items: ep.availableVideoQualities.map((s) {
                                   String label =
                                       s.qualityName?.replaceAll("高清", "") ??
                                       "Q${s.id}";
@@ -2636,63 +2786,29 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                     codec = s.codecs.split('.')[0];
                                   }
                                   String detailedLabel = "$label ($codec)";
-                                  return Container(
-                                    alignment: Alignment.centerLeft,
-                                    constraints: const BoxConstraints(
-                                      minWidth: 50,
-                                    ),
-                                    child: SingleChildScrollView(
-                                      scrollDirection: Axis.horizontal,
-                                      child: Text(
-                                        detailedLabel,
-                                        style: const TextStyle(
-                                          fontSize: 11,
-                                          color: Colors.white,
-                                        ),
-                                      ),
+                                  return DropdownMenuItem(
+                                    value: s,
+                                    child: Text(
+                                      detailedLabel,
+                                      overflow: TextOverflow.ellipsis,
                                     ),
                                   );
-                                }).toList();
-                              },
-                              items: ep.availableVideoQualities.map((s) {
-                                String label =
-                                    s.qualityName?.replaceAll("高清", "") ??
-                                    "Q${s.id}";
-                                String codec = "";
-                                if (s.codecs.startsWith("avc1")) {
-                                  codec = "AVC";
-                                } else if (s.codecs.startsWith("hev1") ||
-                                    s.codecs.contains("hevc")) {
-                                  codec = "HEVC";
-                                } else if (s.codecs.startsWith("av01")) {
-                                  codec = "AV1";
-                                } else {
-                                  codec = s.codecs.split('.')[0];
-                                }
-                                String detailedLabel = "$label ($codec)";
-                                return DropdownMenuItem(
-                                  value: s,
-                                  child: Text(
-                                    detailedLabel,
-                                    overflow: TextOverflow.ellipsis,
+                                }).toList(),
+                                onChanged: (val) {
+                                  service.setEpisodeVideoQuality(task, ep, val);
+                                },
+                                hint: const Text(
+                                  "清晰度",
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.white54,
                                   ),
-                                );
-                              }).toList(),
-                              onChanged: (val) {
-                                service.setEpisodeVideoQuality(task, ep, val);
-                              },
-                              hint: const Text(
-                                "清晰度",
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Colors.white54,
                                 ),
                               ),
                             ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 4),
+                      if (!_streamingMode) const SizedBox(width: 4),
                       // Subtitle
                       Flexible(
                         flex: 2,
@@ -2749,7 +2865,21 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       ),
                       const SizedBox(width: 2),
                       // Action Button
-                      if (ep.status == DownloadStatus.downloading)
+                      if (_streamingMode)
+                        IconButton(
+                          icon: Icon(
+                            Icons.file_upload_outlined,
+                            size: compactIconSize,
+                            color: Colors.white70,
+                          ),
+                          tooltip: '导出在线播放条目',
+                          padding: iconPadding,
+                          constraints: iconConstraints,
+                          visualDensity: iconDensity,
+                          onPressed: () =>
+                              _exportStreaming(service, episode: ep),
+                        )
+                      else if (ep.status == DownloadStatus.downloading)
                         IconButton(
                           icon: Icon(
                             Icons.pause,
@@ -2799,7 +2929,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                               service.startSingleDownload(ep, toTop: true);
                               break;
                             case 'export':
-                              _importToLibrary(service, episode: ep);
+                              if (_streamingMode) {
+                                _exportStreaming(service, episode: ep);
+                              } else {
+                                _importToLibrary(service, episode: ep);
+                              }
                               break;
                             case 'delete':
                               service.removeEpisode(ep, task);
@@ -2815,9 +2949,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                           }
                         },
                         itemBuilder: (context) => [
-                          if (ep.status == DownloadStatus.pending ||
-                              ep.status == DownloadStatus.failed ||
-                              ep.status == DownloadStatus.queued)
+                          if (!_streamingMode &&
+                              (ep.status == DownloadStatus.pending ||
+                                  ep.status == DownloadStatus.failed ||
+                                  ep.status == DownloadStatus.queued))
                             const PopupMenuItem(
                               value: 'top',
                               height: 36,
@@ -2829,7 +2964,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                 ],
                               ),
                             ),
-                          if (ep.status == DownloadStatus.completed)
+                          if (_streamingMode ||
+                              ep.status == DownloadStatus.completed)
                             const PopupMenuItem(
                               value: 'export',
                               height: 36,
@@ -3024,7 +3160,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     BilibiliVideoItem video,
     BilibiliDownloadTask task,
   ) {
-    bool hasInfo = ep.availableVideoQualities.isNotEmpty;
+    bool hasInfo = _streamingMode || ep.availableVideoQualities.isNotEmpty;
     bool isCompleted = ep.status == DownloadStatus.completed;
     final episodeStatusText = _episodeStatusText(ep);
     final media = MediaQuery.of(context);
@@ -3103,7 +3239,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                         children: [
                           Expanded(
                             child: InkWell(
-                              onTap: isCompleted
+                              onTap: isCompleted && !_streamingMode
                                   ? () => _previewVideo(
                                       ep,
                                       task: task,
@@ -3167,7 +3303,21 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                           // Action Buttons (Download/Pause/More) moved here
                           if (hasInfo ||
                               ep.status == DownloadStatus.completed) ...[
-                            if (ep.status == DownloadStatus.downloading)
+                            if (_streamingMode)
+                              IconButton(
+                                icon: Icon(
+                                  Icons.file_upload_outlined,
+                                  size: compactIconSize,
+                                  color: Colors.white70,
+                                ),
+                                tooltip: '导出在线播放条目',
+                                padding: iconPadding,
+                                constraints: iconConstraints,
+                                visualDensity: iconDensity,
+                                onPressed: () =>
+                                    _exportStreaming(service, episode: ep),
+                              )
+                            else if (ep.status == DownloadStatus.downloading)
                               IconButton(
                                 icon: Icon(
                                   Icons.pause,
@@ -3225,7 +3375,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                       );
                                       break;
                                     case 'export':
-                                      _importToLibrary(service, episode: ep);
+                                      if (_streamingMode) {
+                                        _exportStreaming(service, episode: ep);
+                                      } else {
+                                        _importToLibrary(service, episode: ep);
+                                      }
                                       break;
                                     case 'delete':
                                       service.removeEpisode(ep, task);
@@ -3241,9 +3395,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                   }
                                 },
                                 itemBuilder: (context) => [
-                                  if (ep.status == DownloadStatus.pending ||
-                                      ep.status == DownloadStatus.failed ||
-                                      ep.status == DownloadStatus.queued)
+                                  if (!_streamingMode &&
+                                      (ep.status == DownloadStatus.pending ||
+                                          ep.status == DownloadStatus.failed ||
+                                          ep.status == DownloadStatus.queued))
                                     const PopupMenuItem(
                                       value: 'top',
                                       height: 36,
@@ -3262,7 +3417,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                       ),
                                     ),
 
-                                  if (ep.status == DownloadStatus.completed)
+                                  if (_streamingMode ||
+                                      ep.status == DownloadStatus.completed)
                                     const PopupMenuItem(
                                       value: 'export',
                                       height: 36,
@@ -3329,143 +3485,148 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                           child: Row(
                             children: [
                               // Quality
-                              Flexible(
-                                flex: 3,
-                                child: Container(
-                                  height: 28,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white.withValues(alpha: 0.05),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: DropdownButtonHideUnderline(
-                                    child: DropdownButton<StreamItem>(
-                                      value: ep.selectedVideoQuality,
-                                      isDense: true,
-                                      isExpanded: true,
-                                      style: const TextStyle(
-                                        fontSize: 11,
-                                        color: Colors.white,
+                              if (!_streamingMode)
+                                Flexible(
+                                  flex: 3,
+                                  child: Container(
+                                    height: 28,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.05,
                                       ),
-                                      dropdownColor: const Color(0xFF333333),
-                                      icon: const Icon(
-                                        Icons.arrow_drop_down,
-                                        size: 16,
-                                        color: Colors.white54,
-                                      ),
-                                      selectedItemBuilder:
-                                          (BuildContext context) {
-                                            return ep.availableVideoQualities
-                                                .map<Widget>((StreamItem s) {
-                                                  String label =
-                                                      s.qualityName?.replaceAll(
-                                                        "高清",
-                                                        "",
-                                                      ) ??
-                                                      "Q${s.id}";
-                                                  String codec = "";
-                                                  if (s.codecs.startsWith(
-                                                    "avc1",
-                                                  )) {
-                                                    codec = "AVC";
-                                                  } else if (s.codecs
-                                                          .startsWith("hev1") ||
-                                                      s.codecs.contains(
-                                                        "hevc",
-                                                      )) {
-                                                    codec = "HEVC";
-                                                  } else if (s.codecs
-                                                      .startsWith("av01")) {
-                                                    codec = "AV1";
-                                                  } else {
-                                                    codec = s.codecs.split(
-                                                      '.',
-                                                    )[0];
-                                                  }
-                                                  String detailedLabel =
-                                                      "$label ($codec)";
-                                                  return Container(
-                                                    alignment:
-                                                        Alignment.centerLeft,
-                                                    constraints:
-                                                        const BoxConstraints(
-                                                          minWidth: 50,
-                                                        ),
-                                                    child:
-                                                        SingleChildScrollView(
-                                                          scrollDirection:
-                                                              Axis.horizontal,
-                                                          child: Text(
-                                                            detailedLabel,
-                                                            style:
-                                                                const TextStyle(
-                                                                  fontSize: 11,
-                                                                  color: Colors
-                                                                      .white,
-                                                                ),
-                                                          ),
-                                                        ),
-                                                  );
-                                                })
-                                                .toList();
-                                          },
-                                      items: ep.availableVideoQualities.map((
-                                        s,
-                                      ) {
-                                        String label =
-                                            s.qualityName?.replaceAll(
-                                              "高清",
-                                              "",
-                                            ) ??
-                                            "Q${s.id}";
-                                        String codec = "";
-                                        if (s.codecs.startsWith("avc1")) {
-                                          codec = "AVC";
-                                        } else if (s.codecs.startsWith(
-                                              "hev1",
-                                            ) ||
-                                            s.codecs.contains("hevc")) {
-                                          codec = "HEVC";
-                                        } else if (s.codecs.startsWith(
-                                          "av01",
-                                        )) {
-                                          codec = "AV1";
-                                        } else {
-                                          codec = s.codecs.split('.')[0];
-                                        }
-                                        String detailedLabel =
-                                            "$label ($codec)";
-
-                                        return DropdownMenuItem(
-                                          value: s,
-                                          child: Text(
-                                            detailedLabel,
-                                            overflow: TextOverflow.ellipsis,
-                                          ),
-                                        );
-                                      }).toList(),
-                                      onChanged: (val) {
-                                        service.setEpisodeVideoQuality(
-                                          task,
-                                          ep,
-                                          val,
-                                        );
-                                      },
-                                      hint: const Text(
-                                        "清晰度",
-                                        style: TextStyle(
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: DropdownButtonHideUnderline(
+                                      child: DropdownButton<StreamItem>(
+                                        value: ep.selectedVideoQuality,
+                                        isDense: true,
+                                        isExpanded: true,
+                                        style: const TextStyle(
                                           fontSize: 11,
+                                          color: Colors.white,
+                                        ),
+                                        dropdownColor: const Color(0xFF333333),
+                                        icon: const Icon(
+                                          Icons.arrow_drop_down,
+                                          size: 16,
                                           color: Colors.white54,
+                                        ),
+                                        selectedItemBuilder:
+                                            (BuildContext context) {
+                                              return ep.availableVideoQualities
+                                                  .map<Widget>((StreamItem s) {
+                                                    String label =
+                                                        s.qualityName
+                                                            ?.replaceAll(
+                                                              "高清",
+                                                              "",
+                                                            ) ??
+                                                        "Q${s.id}";
+                                                    String codec = "";
+                                                    if (s.codecs.startsWith(
+                                                      "avc1",
+                                                    )) {
+                                                      codec = "AVC";
+                                                    } else if (s.codecs
+                                                            .startsWith(
+                                                              "hev1",
+                                                            ) ||
+                                                        s.codecs.contains(
+                                                          "hevc",
+                                                        )) {
+                                                      codec = "HEVC";
+                                                    } else if (s.codecs
+                                                        .startsWith("av01")) {
+                                                      codec = "AV1";
+                                                    } else {
+                                                      codec = s.codecs.split(
+                                                        '.',
+                                                      )[0];
+                                                    }
+                                                    String detailedLabel =
+                                                        "$label ($codec)";
+                                                    return Container(
+                                                      alignment:
+                                                          Alignment.centerLeft,
+                                                      constraints:
+                                                          const BoxConstraints(
+                                                            minWidth: 50,
+                                                          ),
+                                                      child: SingleChildScrollView(
+                                                        scrollDirection:
+                                                            Axis.horizontal,
+                                                        child: Text(
+                                                          detailedLabel,
+                                                          style:
+                                                              const TextStyle(
+                                                                fontSize: 11,
+                                                                color: Colors
+                                                                    .white,
+                                                              ),
+                                                        ),
+                                                      ),
+                                                    );
+                                                  })
+                                                  .toList();
+                                            },
+                                        items: ep.availableVideoQualities.map((
+                                          s,
+                                        ) {
+                                          String label =
+                                              s.qualityName?.replaceAll(
+                                                "高清",
+                                                "",
+                                              ) ??
+                                              "Q${s.id}";
+                                          String codec = "";
+                                          if (s.codecs.startsWith("avc1")) {
+                                            codec = "AVC";
+                                          } else if (s.codecs.startsWith(
+                                                "hev1",
+                                              ) ||
+                                              s.codecs.contains("hevc")) {
+                                            codec = "HEVC";
+                                          } else if (s.codecs.startsWith(
+                                            "av01",
+                                          )) {
+                                            codec = "AV1";
+                                          } else {
+                                            codec = s.codecs.split('.')[0];
+                                          }
+                                          String detailedLabel =
+                                              "$label ($codec)";
+
+                                          return DropdownMenuItem(
+                                            value: s,
+                                            child: Text(
+                                              detailedLabel,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          );
+                                        }).toList(),
+                                        onChanged: (val) {
+                                          service.setEpisodeVideoQuality(
+                                            task,
+                                            ep,
+                                            val,
+                                          );
+                                        },
+                                        hint: const Text(
+                                          "清晰度",
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.white54,
+                                          ),
                                         ),
                                       ),
                                     ),
                                   ),
                                 ),
-                              ),
 
-                              const SizedBox(width: 4),
+                              if (!_streamingMode) const SizedBox(width: 4),
 
                               // Subtitle
                               Flexible(
@@ -3674,20 +3835,28 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
             _buildSelectionAction(
               Icons.select_all,
               "全选",
-              service.selectAll,
+              () => service.selectAllForMode(_streamingMode),
               selection,
             ),
-            _buildBottomAction(
-              Icons.download,
-              "下载并合并",
-              service.startDownloadSelected,
-            ),
-            _buildBottomAction(Icons.pause, "暂停下载", service.pauseSelected),
-            _buildBottomAction(
-              Icons.file_upload,
-              "导入到媒体库",
-              () => _importToLibrary(service),
-            ),
+            if (_streamingMode)
+              _buildBottomAction(
+                Icons.file_upload_outlined,
+                "导出到媒体库",
+                () => _exportStreaming(service),
+              )
+            else ...[
+              _buildBottomAction(
+                Icons.download,
+                "下载并合并",
+                service.startDownloadSelected,
+              ),
+              _buildBottomAction(Icons.pause, "暂停下载", service.pauseSelected),
+              _buildBottomAction(
+                Icons.file_upload,
+                "导入到媒体库",
+                () => _importToLibrary(service),
+              ),
+            ],
             _buildBottomAction(
               Icons.delete,
               "移除",

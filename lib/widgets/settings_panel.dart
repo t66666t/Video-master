@@ -68,6 +68,10 @@ class SettingsPanel extends StatefulWidget {
 
   final bool showMobilePlaybackControls;
 
+  final bool showSkipPortraitPlayerSetting;
+  final bool skipPortraitPlayer;
+  final ValueChanged<bool> onSkipPortraitPlayerChanged;
+
   final bool autoPlayNextVideo;
   final ValueChanged<bool> onAutoPlayNextVideoChanged;
 
@@ -134,6 +138,9 @@ class SettingsPanel extends StatefulWidget {
     required this.enableHeadsetMediaControls,
     required this.onEnableHeadsetMediaControlsChanged,
     this.showMobilePlaybackControls = false,
+    this.showSkipPortraitPlayerSetting = false,
+    required this.skipPortraitPlayer,
+    required this.onSkipPortraitPlayerChanged,
     required this.autoPlayNextVideo,
     required this.onAutoPlayNextVideoChanged,
     required this.autoPlayOnCompletion,
@@ -736,6 +743,23 @@ class _SettingsPanelState extends State<SettingsPanel> {
           ),
           child: Column(
             children: [
+              if (widget.showSkipPortraitPlayerSetting)
+                SwitchListTile(
+                  title: const Text(
+                    "跳过竖屏播放页",
+                    style: TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+                  subtitle: const Text(
+                    "点击媒体卡片后直接进入横屏播放页",
+                    style: TextStyle(color: Colors.white30, fontSize: 10),
+                  ),
+                  value: widget.skipPortraitPlayer,
+                  onChanged: widget.onSkipPortraitPlayerChanged,
+                  activeThumbColor: Colors.blueAccent,
+                  dense: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                  visualDensity: VisualDensity.compact,
+                ),
               SwitchListTile(
                 title: const Text(
                   "字幕避让播放控件",

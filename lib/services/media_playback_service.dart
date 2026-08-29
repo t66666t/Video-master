@@ -8,6 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/subtitle_model.dart';
 import '../platform/windows_video_player_media_kit.dart';
@@ -19,6 +20,7 @@ import 'playback_timeline_clock.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
+import '../services/bilibili/bilibili_streaming_service.dart';
 import '../services/task_subtitle_storage_service.dart';
 import '../services/subtitle_timeline_resolver.dart';
 import '../services/subtitle_discovery_service.dart';
@@ -66,6 +68,10 @@ class MediaPlaybackService extends ChangeNotifier {
   ProgressTracker? _progressTracker;
   LibraryService? _libraryService;
   EmbeddedSubtitleService? _embeddedSubtitleService;
+  BilibiliStreamingService? _bilibiliStreamingService;
+  final Set<Object> _playbackPageOwners = <Object>{};
+  final Set<Object> _miniPlaybackCardOwners = <Object>{};
+  bool _mediaNotificationVisible = false;
 
   // 播放状态
   PlaybackState _state = PlaybackState.idle;
@@ -79,6 +85,10 @@ class MediaPlaybackService extends ChangeNotifier {
   VideoPlayerController? _controller;
   bool _serviceOwnsController = false;
   bool _isSourceMissing = false;
+  List<BilibiliStreamQuality> _streamQualities = const [];
+  BilibiliStreamQuality? _selectedStreamQuality;
+  double? _streamDisplayAspectRatio;
+  bool _isSwitchingStreamQuality = false;
 
   // 字幕相关
   List<SubtitleItem> _subtitles = [];
@@ -128,6 +138,9 @@ class MediaPlaybackService extends ChangeNotifier {
   int _seekRequestId = 0;
   int? _pendingSeekRequestId;
   bool _preservePlayingStateAfterSeek = false;
+  bool _initialPositionSeekInFlight = false;
+  Duration? _initialPositionGuardTarget;
+  DateTime? _initialPositionGuardUntil;
   bool? _lastControllerIsPlaying;
   Timer? _externalSeekResetTimer;
   int _externalSubtitleSeekAccumulator = 0;
@@ -162,6 +175,12 @@ class MediaPlaybackService extends ChangeNotifier {
   final Set<VideoPlayerController> _disposingControllers =
       <VideoPlayerController>{};
 
+  /// Mobile hardware decoders are a scarce resource. A new controller must
+  /// not race the native disposal of the controller it replaces, otherwise
+  /// the new player can intermittently fail to acquire a decoder while the
+  /// app is backgrounded. Later play requests wait on the same barrier too.
+  Future<void> _mobileControllerReleaseBarrier = Future<void>.value();
+
   /// 后台 dispose 完成后自动移除的 Future 数量上限
   static const int _maxDisposingControllers = 3;
 
@@ -181,6 +200,7 @@ class MediaPlaybackService extends ChangeNotifier {
     milliseconds: 650,
   );
   static const int _seekVerificationToleranceMs = 450;
+  static const Duration _initialPositionGuardDuration = Duration(seconds: 2);
   static const Duration _backgroundMediaSyncInterval = Duration(
     milliseconds: 900,
   );
@@ -205,6 +225,53 @@ class MediaPlaybackService extends ChangeNotifier {
       AppWakelockCoordinator.mediaPlaybackReason,
       _state == PlaybackState.playing && _isAppInForeground,
     );
+    _syncBilibiliCachePolicy();
+  }
+
+  void _syncBilibiliCachePolicy() {
+    final streaming = _bilibiliStreamingService;
+    if (streaming == null) return;
+    final item = _currentItem;
+    streaming.updateCachePolicy(
+      itemId: item?.id,
+      isOnlineItem: item?.sourceRef?.kind == MediaSourceKind.bilibiliStream,
+      isPlaying: _state == PlaybackState.playing,
+      playbackPageVisible: _isAppInForeground && _playbackPageOwners.isNotEmpty,
+      miniPlaybackCardVisible:
+          _isAppInForeground && _miniPlaybackCardOwners.isNotEmpty,
+      mediaNotificationVisible: _mediaNotificationVisible,
+    );
+  }
+
+  /// Registers whether a full playback page is currently visible. The owner
+  /// token is the State object, so portrait/landscape hand-offs can overlap
+  /// without one page accidentally disabling the other page's cache policy.
+  void setPlaybackPageVisible(Object owner, bool visible) {
+    if (visible) {
+      _playbackPageOwners.add(owner);
+    } else {
+      _playbackPageOwners.remove(owner);
+    }
+    _syncBilibiliCachePolicy();
+  }
+
+  /// Registers the mini playback card independently from the full page.
+  void setMiniPlaybackCardVisible(Object owner, bool visible) {
+    if (visible) {
+      _miniPlaybackCardOwners.add(owner);
+    } else {
+      _miniPlaybackCardOwners.remove(owner);
+    }
+    _syncBilibiliCachePolicy();
+  }
+
+  /// The system media notification is a cache context only on phones. The
+  /// system-media service supplies this flag after it has published a current
+  /// item notification.
+  void setMediaNotificationVisible(bool visible) {
+    if (_mediaNotificationVisible == visible) return;
+    _mediaNotificationVisible = visible;
+    _syncBilibiliCachePolicy();
   }
 
   static VideoPlayerOptions buildVideoPlayerOptions({
@@ -247,6 +314,124 @@ class MediaPlaybackService extends ChangeNotifier {
     String? itemId,
   ) {
     return identical(_controller, controller) && _currentItem?.id == itemId;
+  }
+
+  void _clearInitialPositionGuard() {
+    _initialPositionGuardTarget = null;
+    _initialPositionGuardUntil = null;
+  }
+
+  void _armInitialPositionGuard(Duration target) {
+    if (target <= Duration.zero) {
+      _clearInitialPositionGuard();
+      return;
+    }
+    _initialPositionGuardTarget = target;
+    _initialPositionGuardUntil = DateTime.now().add(
+      _initialPositionGuardDuration,
+    );
+  }
+
+  bool _shouldIgnoreInitialPositionSample(Duration sample) {
+    final target = _initialPositionGuardTarget;
+    final until = _initialPositionGuardUntil;
+    if (target == null || until == null) return false;
+    if (DateTime.now().isAfter(until)) {
+      _clearInitialPositionGuard();
+      return false;
+    }
+    if ((sample.inMilliseconds - target.inMilliseconds).abs() <=
+        _seekVerificationToleranceMs) {
+      _clearInitialPositionGuard();
+      return false;
+    }
+    // A stale low sample is the exact native transition that caused the
+    // online stream to flash its intro. Keep the confirmed service position
+    // until the native player catches up or the bounded guard expires.
+    return sample < target;
+  }
+
+  /// Establishes a deterministic starting point before playback is allowed to
+  /// start. Some native backends probe a network source from byte zero during
+  /// initialize and briefly report it as playing; seeking while that probe is
+  /// still running can otherwise produce the visible "intro then saved
+  /// position" jump.
+  Future<void> _seekInitialPosition(
+    VideoPlayerController controller,
+    Duration requestedPosition,
+  ) async {
+    if (!controller.value.isInitialized) return;
+    final previous = _initialPositionSeekInFlight;
+    _initialPositionSeekInFlight = true;
+    try {
+      await _seekInitialPositionImpl(controller, requestedPosition);
+    } finally {
+      _initialPositionSeekInFlight = previous;
+    }
+  }
+
+  Future<void> _seekInitialPositionImpl(
+    VideoPlayerController controller,
+    Duration requestedPosition,
+  ) async {
+    if (!controller.value.isInitialized) return;
+
+    var target = requestedPosition < Duration.zero
+        ? Duration.zero
+        : requestedPosition;
+    final duration = controller.value.duration;
+    if (duration > Duration.zero && target >= duration) {
+      target = Duration.zero;
+    }
+
+    try {
+      // A new controller must be paused before both the zero seek and a
+      // resumed seek. This is intentionally done even when the backend says it
+      // is already paused, because it clears an implicit network-probe play.
+      await controller.pause();
+    } catch (_) {}
+
+    Duration actual = controller.value.position;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await controller.seekTo(target);
+      } catch (_) {
+        break;
+      }
+
+      // A few platform implementations acknowledge seekTo before their value
+      // object is updated. Give the native side one short turn, then retry a
+      // bounded number of times if it is still at the initial probe position.
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      actual = controller.value.position;
+      if ((actual.inMilliseconds - target.inMilliseconds).abs() <=
+          _seekVerificationToleranceMs) {
+        _position = target;
+        break;
+      }
+    }
+
+    actual = controller.value.position;
+    final accepted =
+        (actual.inMilliseconds - target.inMilliseconds).abs() <=
+        _seekVerificationToleranceMs;
+    if (accepted) {
+      _position = target;
+      _armInitialPositionGuard(target);
+    } else {
+      // Never persist a requested position that the native backend rejected.
+      // The next open will then resume from the actual confirmed position.
+      _position = actual;
+      _clearInitialPositionGuard();
+    }
+    try {
+      // Seeking must finish in a paused state. autoPlay is applied explicitly
+      // by the caller after this method returns.
+      if (controller.value.isPlaying) {
+        await controller.pause();
+      }
+    } catch (_) {}
+    _bufferedPosition = _readBufferedPosition(controller);
   }
 
   Future<void> _detachController(
@@ -356,6 +541,14 @@ class MediaPlaybackService extends ChangeNotifier {
 
     if (shouldPauseForBackground) {
       unawaited(pause());
+    } else if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      // Even when the user has enabled background playback, persist the
+      // authoritative service position before the process can be suspended or
+      // killed. The playback page must not write a competing raw-controller
+      // position during the same transition.
+      unawaited(persistCurrentProgress());
     }
   }
 
@@ -392,6 +585,12 @@ class MediaPlaybackService extends ChangeNotifier {
   Duration get bufferedPosition => _bufferedPosition;
   bool get isPlaying => _state == PlaybackState.playing;
   bool get isSourceMissing => _isSourceMissing;
+  List<BilibiliStreamQuality> get streamQualities => _streamQualities;
+  BilibiliStreamQuality? get selectedStreamQuality => _selectedStreamQuality;
+  double? get streamDisplayAspectRatio => _streamDisplayAspectRatio;
+  bool get isSwitchingStreamQuality => _isSwitchingStreamQuality;
+  bool get isCurrentItemBilibiliStream =>
+      _currentItem?.sourceRef?.kind == MediaSourceKind.bilibiliStream;
   bool get isMuted => _isMuted;
   double get volume => _volume;
   double get playbackSpeed => _playbackSpeed;
@@ -411,12 +610,43 @@ class MediaPlaybackService extends ChangeNotifier {
     required ProgressTracker progressTracker,
     LibraryService? libraryService,
     EmbeddedSubtitleService? embeddedSubtitleService,
+    BilibiliStreamingService? bilibiliStreamingService,
   }) async {
     _playlistManager = playlistManager;
     _progressTracker = progressTracker;
     _libraryService = libraryService;
     _embeddedSubtitleService = embeddedSubtitleService;
+    _bilibiliStreamingService = bilibiliStreamingService;
     await _restorePersistedMuteState(notify: false);
+    _syncBilibiliCachePolicy();
+  }
+
+  Future<void> switchBilibiliStreamQuality(int qualityId) async {
+    final item = _currentItem;
+    final streaming = _bilibiliStreamingService;
+    if (item == null ||
+        streaming == null ||
+        item.sourceRef?.kind != MediaSourceKind.bilibiliStream ||
+        _isSwitchingStreamQuality ||
+        _selectedStreamQuality?.id == qualityId) {
+      return;
+    }
+    final position = _position;
+    var autoPlay = _state == PlaybackState.playing;
+    _isSwitchingStreamQuality = true;
+    notifyListeners();
+    streaming.rememberQuality(item.id, qualityId);
+    try {
+      await play(
+        item,
+        startPosition: position,
+        autoPlay: autoPlay,
+        forceRecreate: true,
+      );
+    } finally {
+      _isSwitchingStreamQuality = false;
+      notifyListeners();
+    }
   }
 
   /// 设置字幕列表
@@ -1108,6 +1338,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// 清除当前控制器引用（当UI销毁控制器时调用）
   void clearController() {
+    _clearInitialPositionGuard();
     if (_controller != null) {
       _invalidatePlaybackSpeedCommands();
       _logPlaybackEvent(
@@ -1226,6 +1457,7 @@ class MediaPlaybackService extends ChangeNotifier {
     final int playRequestId = ++_playRequestId;
     _seekRequestId++;
     _pendingSeekRequestId = null;
+    _clearInitialPositionGuard();
     _seekVerificationTimer?.cancel();
     _seekVerificationTimer = null;
     VideoPlayerController? requestController;
@@ -1260,10 +1492,13 @@ class MediaPlaybackService extends ChangeNotifier {
 
       if (!forceRecreate && _controllerIsReusableForItem(item)) {
         final controller = _controller!;
+        final authoritativePosition = _position;
         _currentItem = item;
         _preloadTriggered = false;
         _duration = controller.value.duration;
-        _position = controller.value.position;
+        // Keep the service timeline as the source of truth. The native
+        // controller can briefly report byte-zero while a network stream is
+        // resuming, which must not overwrite a restored position.
         _bufferedPosition = _readBufferedPosition(controller);
         _lastControllerIsPlaying = controller.value.isPlaying;
 
@@ -1292,6 +1527,26 @@ class MediaPlaybackService extends ChangeNotifier {
             startPosition >= Duration.zero &&
             (_duration <= Duration.zero || startPosition < _duration)) {
           await seekTo(startPosition, source: 'play_same_item_reuse');
+          if (!_isCurrentPlayRequest(
+            playRequestId,
+            item.id,
+            controller: controller,
+          )) {
+            return;
+          }
+        }
+
+        // Re-opening an already restored online card must not trust a stale
+        // byte-zero native sample. Re-anchor the controller before allowing
+        // play so the first decoded fragment is the saved position.
+        if (startPosition == null &&
+            item.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
+            controller.value.isInitialized &&
+            (controller.value.position.inMilliseconds -
+                        authoritativePosition.inMilliseconds)
+                    .abs() >
+                _seekVerificationToleranceMs) {
+          await _seekInitialPosition(controller, authoritativePosition);
           if (!_isCurrentPlayRequest(
             playRequestId,
             item.id,
@@ -1336,7 +1591,12 @@ class MediaPlaybackService extends ChangeNotifier {
               return;
             }
           }
-          _position = controller.value.position;
+          final nativePosition = controller.value.position;
+          final positionDeltaMs =
+              (nativePosition.inMilliseconds - _position.inMilliseconds).abs();
+          if (positionDeltaMs <= _seekVerificationToleranceMs) {
+            _position = nativePosition;
+          }
           _bufferedPosition = _readBufferedPosition(controller);
           await _saveCurrentProgress(immediate: true);
           if (!_isCurrentPlayRequest(
@@ -1363,13 +1623,23 @@ class MediaPlaybackService extends ChangeNotifier {
 
       // 如果正在播放其他媒体，或当前控制器已失效，先保存进度并停止
       if (_currentItem != null || _controller != null) {
+        final bool hadController = _controller != null;
         clearSubtitleState();
         // 非阻塞保存进度：ProgressTracker 内存写入同步，落盘异步
         unawaited(_saveCurrentProgress());
         _seekPersistTimer?.cancel();
         _seekPersistTimer = null;
-        // 非阻塞释放旧控制器：不等待 pause/dispose 完成
-        unawaited(_disposeController());
+        if (hadController &&
+            !kIsWeb &&
+            (Platform.isAndroid || Platform.isIOS)) {
+          _mobileControllerReleaseBarrier = _disposeController(
+            awaitCompletion: true,
+          );
+        } else if (hadController) {
+          // Desktop decoders are not constrained by the mobile hardware codec
+          // pool, so retain the faster overlapping hand-off there.
+          unawaited(_disposeController());
+        }
       }
 
       // Publish the target item together with its own timeline snapshot.  The
@@ -1405,8 +1675,19 @@ class MediaPlaybackService extends ChangeNotifier {
       // require a controller, so overlap them with native disposal instead of
       // placing them behind the slowest part of media initialization.
       unawaited(_refreshKnownSubtitlesForCurrentItem(item));
+      final isBilibiliStream =
+          item.sourceRef?.kind == MediaSourceKind.bilibiliStream;
       final sourceFile = File(item.path);
+      final Future<BilibiliPreparedPlayback?> streamingPlaybackFuture =
+          isBilibiliStream
+          ? (_bilibiliStreamingService == null
+                ? Future<BilibiliPreparedPlayback?>.error(
+                    StateError('Bilibili 在线播放服务尚未初始化'),
+                  )
+                : _bilibiliStreamingService!.prepare(item))
+          : Future<BilibiliPreparedPlayback?>.value(null);
       final Future<File?> playbackFileFuture = () async {
+        if (isBilibiliStream) return null;
         if (!await sourceFile.exists()) return null;
         final playbackPath = _libraryService != null
             ? await _libraryService!.ensureCompatiblePlaybackFile(item)
@@ -1431,7 +1712,9 @@ class MediaPlaybackService extends ChangeNotifier {
       _preloadTriggered = false;
 
       // 尝试热替换：如果预加载控制器可用且匹配当前 item，跳过 initialize
-      if (!forceRecreate && _tryUsePreloadedController(item)) {
+      if (!isBilibiliStream &&
+          !forceRecreate &&
+          _tryUsePreloadedController(item)) {
         final controller = _controller!;
         if (playRequestId != _playRequestId) {
           unawaited(_disposeController());
@@ -1543,8 +1826,15 @@ class MediaPlaybackService extends ChangeNotifier {
       unawaited(_disposePreloadedController());
 
       // 创建新的控制器
+      if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+        await _mobileControllerReleaseBarrier;
+        if (!_isCurrentPlayRequest(playRequestId, item.id)) {
+          return;
+        }
+      }
+      final preparedStream = await streamingPlaybackFuture;
       final playbackFile = await playbackFileFuture;
-      if (playbackFile == null) {
+      if (!isBilibiliStream && playbackFile == null) {
         if (!_isCurrentPlayRequest(playRequestId, item.id)) {
           return;
         }
@@ -1568,10 +1858,28 @@ class MediaPlaybackService extends ChangeNotifier {
       if (!_isCurrentPlayRequest(playRequestId, item.id)) {
         return;
       }
-      final controller = VideoPlayerController.file(
-        playbackFile,
-        videoPlayerOptions: buildVideoPlayerOptions(),
-      );
+      if (isBilibiliStream && preparedStream != null) {
+        _streamQualities = List.unmodifiable(preparedStream.qualities);
+        _selectedStreamQuality = preparedStream.selectedQuality;
+        _streamDisplayAspectRatio = preparedStream.displayAspectRatio;
+      } else {
+        _streamQualities = const [];
+        _selectedStreamQuality = null;
+        _streamDisplayAspectRatio = null;
+      }
+      final controller = isBilibiliStream
+          ? VideoPlayerController.networkUrl(
+              preparedStream!.videoUri,
+              httpHeaders: {
+                NativeVideoPlayerMediaKit.externalAudioSourceHeader:
+                    preparedStream.audioUri.toString(),
+              },
+              videoPlayerOptions: buildVideoPlayerOptions(),
+            )
+          : VideoPlayerController.file(
+              playbackFile!,
+              videoPlayerOptions: buildVideoPlayerOptions(),
+            );
       requestController = controller;
       if (playRequestId != _playRequestId) {
         await _detachController(
@@ -1593,6 +1901,15 @@ class MediaPlaybackService extends ChangeNotifier {
         );
         return;
       }
+
+      // Network players may start their probe at byte zero while initialize()
+      // completes. Stop that implicit start before the saved-position seek so
+      // the user never sees the first fragment before the requested point.
+      try {
+        if (controller.value.isInitialized && controller.value.isPlaying) {
+          await controller.pause();
+        }
+      } catch (_) {}
 
       _controller = controller;
       _serviceOwnsController = true;
@@ -1632,7 +1949,6 @@ class MediaPlaybackService extends ChangeNotifier {
       }
 
       // 添加监听器
-      controller.addListener(_onControllerUpdate);
 
       // 确定起始位置
       Duration initialPosition = startPosition ?? Duration.zero;
@@ -1663,18 +1979,16 @@ class MediaPlaybackService extends ChangeNotifier {
       // 跳转到起始位置
       // 注意：即使initialPosition为0，也需要seekTo，确保控制器从开头开始播放
       // 避免控制器停留在末尾导致立即触发播放完成
-      if (initialPosition < _duration) {
-        await controller.seekTo(initialPosition);
-        if (!_isCurrentPlayRequest(
-          playRequestId,
-          item.id,
-          controller: controller,
-        )) {
-          return;
-        }
-        _position = initialPosition;
-        _bufferedPosition = _readBufferedPosition(controller);
+      await _seekInitialPosition(controller, initialPosition);
+      if (!_isCurrentPlayRequest(
+        playRequestId,
+        item.id,
+        controller: controller,
+      )) {
+        return;
       }
+
+      controller.addListener(_onControllerUpdate);
 
       _resetPlaybackTimeline(
         _position,
@@ -1742,7 +2056,10 @@ class MediaPlaybackService extends ChangeNotifier {
         }
         return;
       }
-      final bool sourceMissing = !kIsWeb && !await File(item.path).exists();
+      final bool sourceMissing =
+          item.sourceRef?.kind != MediaSourceKind.bilibiliStream &&
+          !kIsWeb &&
+          !await File(item.path).exists();
       _isSourceMissing = sourceMissing;
       _state = sourceMissing ? PlaybackState.paused : PlaybackState.error;
       _syncWakelockWithState();
@@ -1765,12 +2082,6 @@ class MediaPlaybackService extends ChangeNotifier {
 
     Duration position = _position;
     bool autoPlay = _state == PlaybackState.playing;
-    try {
-      if (controller.value.isInitialized) {
-        position = controller.value.position;
-        autoPlay = controller.value.isPlaying;
-      }
-    } catch (_) {}
 
     // A preloaded controller was created with the previous decoder policy and
     // must never be hot-swapped into this new session.
@@ -1793,6 +2104,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
     _playRequestId++;
     _subtitleLoadRequestId++;
+    _clearInitialPositionGuard();
     _hasPlaybackCompleted = false;
     _seekPersistTimer?.cancel();
     _seekPersistTimer = null;
@@ -1839,6 +2151,7 @@ class MediaPlaybackService extends ChangeNotifier {
     _playRequestId++;
     _seekRequestId++;
     _pendingSeekRequestId = null;
+    _clearInitialPositionGuard();
     _hasPlaybackCompleted = false;
     _stopProgressTracking();
     unawaited(_disposeController());
@@ -1888,9 +2201,15 @@ class MediaPlaybackService extends ChangeNotifier {
         return;
       }
 
-      // 更新最终位置
+      // Keep an authoritative timeline position when a network backend
+      // briefly reports byte zero during pause acknowledgement.
       if (controller.value.isInitialized) {
-        _position = controller.value.position;
+        final nativePosition = controller.value.position;
+        final positionDeltaMs =
+            (nativePosition.inMilliseconds - _position.inMilliseconds).abs();
+        if (positionDeltaMs <= _seekVerificationToleranceMs) {
+          _position = nativePosition;
+        }
         _bufferedPosition = _readBufferedPosition(controller);
       }
 
@@ -1935,7 +2254,7 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
 
-    if (_state != PlaybackState.paused) return;
+    if (_state != PlaybackState.paused || currentItem == null) return;
     final controller = _controller;
     final itemId = _currentItem?.id;
     if (controller == null || itemId == null) return;
@@ -1958,6 +2277,17 @@ class MediaPlaybackService extends ChangeNotifier {
       notifyListeners();
 
       // 重新启动进度追踪定时器
+      if (currentItem.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
+          controller.value.isInitialized &&
+          (controller.value.position.inMilliseconds - _position.inMilliseconds)
+                  .abs() >
+              _seekVerificationToleranceMs) {
+        await _seekInitialPosition(controller, _position);
+        if (!_isCurrentPlayRequest(requestId, itemId, controller: controller)) {
+          return;
+        }
+      }
+
       _startProgressTracking();
 
       await controller.play();
@@ -1966,7 +2296,10 @@ class MediaPlaybackService extends ChangeNotifier {
       }
 
       if (controller.value.isInitialized) {
-        _position = controller.value.position;
+        // Do not copy controller.value.position here. A network backend may
+        // expose its initial probe position for one callback after play().
+        // The authoritative service timeline already contains the resume
+        // position; native samples will catch up through _updatePosition().
         _setPlaybackTimelineRunning(true);
       }
 
@@ -1984,6 +2317,7 @@ class MediaPlaybackService extends ChangeNotifier {
   /// 这个方法不进行状态检查，直接更新状态并通知监听器
   void updatePlaybackStateFromController() {
     if (_controller == null || !_controller!.value.isInitialized) return;
+    if (_initialPositionSeekInFlight) return;
 
     // 直接从 controller 读取实际播放状态
     final controllerIsPlaying = _controller!.value.isPlaying;
@@ -1996,6 +2330,11 @@ class MediaPlaybackService extends ChangeNotifier {
     final controllerPosition = _controller!.value.position;
     final controllerDuration = _controller!.value.duration;
     final controllerBufferedPosition = _readBufferedPosition(_controller!);
+    if (_shouldIgnoreInitialPositionSample(controllerPosition)) {
+      _duration = controllerDuration;
+      _bufferedPosition = controllerBufferedPosition;
+      return;
+    }
     _capturePlaybackSpeedFromController(_controller!);
     final reachedPlaybackEnd = _hasReachedPlaybackEnd(
       controllerPosition,
@@ -2061,10 +2400,16 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// 停止播放
   Future<void> stop() async {
+    final stoppedItem = _currentItem;
+    final stoppedBilibiliStreamItemId =
+        stoppedItem?.sourceRef?.kind == MediaSourceKind.bilibiliStream
+        ? stoppedItem!.id
+        : null;
     final stopRequestId = ++_playRequestId;
     _seekRequestId++;
     _pendingSeekRequestId = null;
     _preservePlayingStateAfterSeek = false;
+    _clearInitialPositionGuard();
     _hasPlaybackCompleted = false;
     _logPlaybackEvent(
       'stop requested',
@@ -2096,12 +2441,20 @@ class MediaPlaybackService extends ChangeNotifier {
     _seekPersistTimer = null;
 
     // 释放控制器
-    await _disposeController();
+    await _disposeController(
+      awaitCompletion: stoppedBilibiliStreamItemId != null,
+    );
+    if (stoppedBilibiliStreamItemId != null) {
+      await _bilibiliStreamingService?.releaseItem(stoppedBilibiliStreamItemId);
+    }
     unawaited(_disposePreloadedController());
     _preloadTriggered = false;
 
     _state = PlaybackState.idle;
     _isSourceMissing = false;
+    _streamQualities = const [];
+    _selectedStreamQuality = null;
+    _streamDisplayAspectRatio = null;
     _syncWakelockWithState();
     clearSubtitleState();
     _currentItem = null;
@@ -2109,6 +2462,7 @@ class MediaPlaybackService extends ChangeNotifier {
     _duration = Duration.zero;
     _bufferedPosition = Duration.zero;
     _resetPlaybackTimeline(Duration.zero, running: false, rate: 1.0);
+    _syncBilibiliCachePolicy();
 
     notifyListeners();
   }
@@ -2123,6 +2477,10 @@ class MediaPlaybackService extends ChangeNotifier {
         !controller.value.isInitialized) {
       return;
     }
+
+    // A manual seek supersedes the bounded startup guard. Otherwise a stale
+    // native sample from the previous startup could hide the user's target.
+    _clearInitialPositionGuard();
 
     var requestId = -1;
     try {
@@ -2251,32 +2609,40 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   /// 播放下一个媒体
-  Future<void> playNext({bool autoPlay = true}) async {
+  Future<void> playNext({bool? autoPlay}) async {
+    final bool shouldAutoPlay = autoPlay ?? SettingsService().autoPlayNextVideo;
     _logPlaybackEvent(
       'skip to next requested',
-      data: <String, Object?>{'itemId': _currentItem?.id, 'autoPlay': autoPlay},
+      data: <String, Object?>{
+        'itemId': _currentItem?.id,
+        'autoPlay': shouldAutoPlay,
+      },
     );
     // 确保播放列表是最新的
     _playlistManager?.reloadPlaylist();
 
     final nextItem = _playlistManager?.getNext();
     if (nextItem != null) {
-      await _playPlaylistItem(nextItem, autoPlay: autoPlay);
+      await _playPlaylistItem(nextItem, autoPlay: shouldAutoPlay);
     }
   }
 
   /// 播放上一个媒体
-  Future<void> playPrevious({bool autoPlay = true}) async {
+  Future<void> playPrevious({bool? autoPlay}) async {
+    final bool shouldAutoPlay = autoPlay ?? SettingsService().autoPlayNextVideo;
     _logPlaybackEvent(
       'skip to previous requested',
-      data: <String, Object?>{'itemId': _currentItem?.id, 'autoPlay': autoPlay},
+      data: <String, Object?>{
+        'itemId': _currentItem?.id,
+        'autoPlay': shouldAutoPlay,
+      },
     );
     // 确保播放列表是最新的
     _playlistManager?.reloadPlaylist();
 
     final previousItem = _playlistManager?.getPrevious();
     if (previousItem != null) {
-      await _playPlaylistItem(previousItem, autoPlay: autoPlay);
+      await _playPlaylistItem(previousItem, autoPlay: shouldAutoPlay);
     }
   }
 
@@ -2344,8 +2710,10 @@ class MediaPlaybackService extends ChangeNotifier {
     if (controller == null || !controller.value.isInitialized) return;
     if (_state == PlaybackState.idle || _state == PlaybackState.error) return;
 
-    final currentPos = controller.value.position;
-    final duration = controller.value.duration;
+    final currentPos = _position;
+    final duration = _duration > Duration.zero
+        ? _duration
+        : controller.value.duration;
     Duration target = Duration.zero;
     final bool hasActiveSeekWindow = _externalSeekResetTimer?.isActive ?? false;
 
@@ -2458,6 +2826,8 @@ class MediaPlaybackService extends ChangeNotifier {
     if (bufferedPosition != _bufferedPosition) {
       _bufferedPosition = bufferedPosition;
     }
+
+    if (_initialPositionSeekInFlight) return;
 
     // seek 期间 native controller 可能先发出 isPlaying=false，完成后再恢复。
     // 不记录这个过渡状态，也不触发播放完成/暂停同步，避免按钮闪成三角形。
@@ -2879,6 +3249,12 @@ class MediaPlaybackService extends ChangeNotifier {
     final newBufferedPosition = _readBufferedPosition(_controller!);
     final durationChanged = newDuration != _duration;
 
+    if (_shouldIgnoreInitialPositionSample(newPosition)) {
+      _duration = newDuration;
+      _bufferedPosition = newBufferedPosition;
+      return;
+    }
+
     // controller.seekTo 是异步的。播放状态下等待 native seek 完成期间，
     // controller 仍可能上报跳转前的位置；接受该样本会让进度条先到目标、
     // 再退回旧位置、最后再次到目标。此时保留上面的乐观目标位置即可。
@@ -2955,6 +3331,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
     final nextItem = _playlistManager?.getNext();
     if (nextItem == null) return;
+    if (nextItem.sourceRef?.kind == MediaSourceKind.bilibiliStream) return;
 
     // 如果预加载的已经是目标 item，跳过
     if (_preloadedItemId == nextItem.id && _preloadedController != null) return;
@@ -3056,6 +3433,26 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   /// 保存当前播放进度
+  /// Persists the authoritative playback position for lifecycle and route
+  /// transitions. Playback pages must use this instead of reading the native
+  /// controller directly; the latter can briefly report zero during an online
+  /// stream's initial probe.
+  Future<void> persistCurrentProgress({String? expectedItemId}) async {
+    if (expectedItemId != null && _currentItem?.id != expectedItemId) return;
+    if (_progressTracker == null) {
+      final item = _currentItem;
+      if (item != null) {
+        await _libraryService?.updateVideoProgress(
+          item.id,
+          _position.inMilliseconds,
+        );
+      }
+      return;
+    }
+    await _saveCurrentProgress(immediate: true);
+    await _savePlaybackStateSnapshot();
+  }
+
   Future<void> _saveCurrentProgress({bool immediate = false}) async {
     if (_currentItem == null || _progressTracker == null) return;
 
@@ -3137,6 +3534,11 @@ class MediaPlaybackService extends ChangeNotifier {
 
   @override
   void dispose() {
+    unawaited(persistCurrentProgress());
+    _playbackPageOwners.clear();
+    _miniPlaybackCardOwners.clear();
+    _mediaNotificationVisible = false;
+    _syncBilibiliCachePolicy();
     _seekPersistTimer?.cancel();
     _seekPersistTimer = null;
     _seekVerificationTimer?.cancel();

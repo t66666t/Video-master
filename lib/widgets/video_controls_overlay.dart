@@ -14,11 +14,13 @@ import '../models/subtitle_style.dart';
 import '../models/subtitle_model.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../services/media_playback_service.dart';
+import '../services/bilibili/bilibili_streaming_service.dart';
 import '../services/settings_service.dart';
 import '../services/app_haptics.dart';
 import '../services/video_preview_service.dart';
 import '../utils/desktop_player_shortcuts.dart';
 import '../models/media_chapter.dart';
+import '../models/bilibili_video_shot.dart';
 import 'chapter_slider_track_shape.dart';
 import 'player_control_metrics.dart';
 import 'progress_interaction_geometry.dart';
@@ -93,6 +95,8 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onOpenChapters;
   final bool isChapterSidebarVisible;
   final ValueNotifier<bool>? playbackControlsVisibility;
+  final bool enableSeekThumbnailPreview;
+  final BilibiliVideoShot? bilibiliVideoShot;
 
   const VideoControlsOverlay({
     super.key,
@@ -157,6 +161,8 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onOpenChapters,
     this.isChapterSidebarVisible = false,
     this.playbackControlsVisibility,
+    this.enableSeekThumbnailPreview = true,
+    this.bilibiliVideoShot,
   });
 
   @override
@@ -259,6 +265,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isKeyboardLongPressing = false;
 
   Uint8List? _previewImage;
+  BilibiliVideoShotFrame? _videoShotFrame;
   int _previewRequestSerial = 0;
   Timer? _seekPreviewRefineTimer;
   Timer? _seekPreviewThrottleTimer;
@@ -286,6 +293,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   Timer? _autoHideTimer;
   static const Duration _autoHideDelay = Duration(seconds: 3);
   bool _isPlaybackSpeedDialogOpen = false;
+  bool _isStreamQualityDialogOpen = false;
 
   String? _resolvePreviewFilePath() {
     final path = widget.controller.dataSource;
@@ -324,7 +332,81 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     }
   }
 
+  Future<void> _showStreamQualityPicker(
+    MediaPlaybackService playbackService,
+    BuildContext anchorContext,
+  ) async {
+    if (_isStreamQualityDialogOpen || playbackService.streamQualities.isEmpty) {
+      return;
+    }
+    _isStreamQualityDialogOpen = true;
+    _autoHideTimer?.cancel();
+    try {
+      final anchorBox = anchorContext.findRenderObject() as RenderBox?;
+      final overlayBox =
+          Overlay.of(anchorContext).context.findRenderObject() as RenderBox?;
+      if (anchorBox == null || overlayBox == null) return;
+      final anchorTopLeft = anchorBox.localToGlobal(
+        Offset.zero,
+        ancestor: overlayBox,
+      );
+      final anchorRect = anchorTopLeft & anchorBox.size;
+      final selectedId = await showMenu<int>(
+        context: context,
+        color: const Color(0xF21D1D1F),
+        surfaceTintColor: Colors.transparent,
+        elevation: 10,
+        shadowColor: Colors.black87,
+        constraints: const BoxConstraints(minWidth: 176, maxWidth: 216),
+        menuPadding: const EdgeInsets.symmetric(vertical: 6),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(5)),
+        position: RelativeRect.fromRect(
+          anchorRect,
+          Offset.zero & overlayBox.size,
+        ),
+        initialValue: playbackService.selectedStreamQuality?.id,
+        items: [
+          for (final quality in playbackService.streamQualities)
+            PopupMenuItem<int>(
+              value: quality.id,
+              height: 42,
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: Text(
+                quality.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: quality.id == playbackService.selectedStreamQuality?.id
+                      ? const Color(0xFFFF6699)
+                      : Colors.white,
+                  fontSize: 15,
+                  fontWeight:
+                      quality.id == playbackService.selectedStreamQuality?.id
+                      ? FontWeight.w600
+                      : FontWeight.w400,
+                ),
+              ),
+            ),
+        ],
+      );
+      if (selectedId != null &&
+          selectedId != playbackService.selectedStreamQuality?.id &&
+          !playbackService.isSwitchingStreamQuality) {
+        await playbackService.switchBilibiliStreamQuality(selectedId);
+      }
+    } finally {
+      _isStreamQualityDialogOpen = false;
+      if (mounted) _startAutoHideTimer();
+    }
+  }
+
   void _warmSeekPreviewMetadata() {
+    if (!widget.enableSeekThumbnailPreview) {
+      return;
+    }
+    if (widget.bilibiliVideoShot?.isUsable == true) {
+      return;
+    }
     final settings = Provider.of<SettingsService>(context, listen: false);
     if (!settings.enableSeekPreview) {
       return;
@@ -337,6 +419,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _schedulePreciseSeekPreview(double value) {
+    if (!widget.enableSeekThumbnailPreview) {
+      return;
+    }
     _seekPreviewRefineTimer?.cancel();
     final int targetTimeMs = value.toInt();
     _seekPreviewRefineTimer = Timer(_seekPreviewRefineDelay, () {
@@ -368,7 +453,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _scheduleLiveSeekPreview(double value, {bool immediate = false}) {
-    if (!_isSeekPreviewInteractionActive) {
+    if (!widget.enableSeekThumbnailPreview ||
+        !_isSeekPreviewInteractionActive) {
       return;
     }
     final now = DateTime.now();
@@ -425,9 +511,40 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     bool precise = false,
     int? expectedTimeMs,
   }) {
+    if (!widget.enableSeekThumbnailPreview) {
+      _previewImage = null;
+      _videoShotFrame = null;
+      return;
+    }
     final settings = Provider.of<SettingsService>(context, listen: false);
     if (!settings.enableSeekPreview) {
       _previewImage = null;
+      _videoShotFrame = null;
+      return;
+    }
+
+    final requestTimeMs = value.toInt();
+    final videoShot = widget.bilibiliVideoShot;
+    if (videoShot?.isUsable == true) {
+      if (!precise) {
+        _lastSeekPreviewRequestAt = DateTime.now();
+        _lastSeekPreviewRequestTimeMs = requestTimeMs;
+        _pendingSeekPreviewValue = null;
+      }
+      final frame = videoShot!.frameAt(requestTimeMs);
+      if (mounted &&
+          _isSeekPreviewInteractionActive &&
+          (expectedTimeMs == null ||
+              _isCurrentSeekPreviewTarget(
+                expectedTimeMs.toDouble(),
+                tolerance: 1.0,
+              ))) {
+        setState(() {
+          _previewRequestSerial++;
+          _previewImage = null;
+          _videoShotFrame = frame;
+        });
+      }
       return;
     }
 
@@ -437,7 +554,6 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     }
 
     final int requestSerial = ++_previewRequestSerial;
-    final requestTimeMs = value.toInt();
     if (!precise) {
       _lastSeekPreviewRequestAt = DateTime.now();
       _lastSeekPreviewRequestTimeMs = requestTimeMs;
@@ -457,6 +573,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
           requestSerial == _previewRequestSerial &&
           (data != null)) {
         setState(() {
+          _videoShotFrame = null;
           _previewImage = data;
         });
       }
@@ -512,6 +629,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (!_isDraggingProgress) {
         _previewRequestSerial++;
         _previewImage = null;
+        _videoShotFrame = null;
       }
     });
     if (!_isDraggingProgress) {
@@ -585,6 +703,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         _hoverProgressValue = value;
       } else {
         _previewImage = null;
+        _videoShotFrame = null;
       }
       _isProgressDragCanceling = false;
       _progressDragWasCancelled = false;
@@ -609,6 +728,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (!_isProgressHovered) {
         _previewRequestSerial++;
         _previewImage = null;
+        _videoShotFrame = null;
       }
       _isProgressDragCanceling = false;
     });
@@ -687,7 +807,16 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                     child: AnimatedSwitcher(
                       duration: const Duration(milliseconds: 110),
                       switchInCurve: Curves.easeOut,
-                      child: _previewImage == null
+                      child:
+                          _videoShotFrame != null &&
+                              widget.bilibiliVideoShot != null
+                          ? _buildBilibiliVideoShotFrame(
+                              widget.bilibiliVideoShot!,
+                              _videoShotFrame!,
+                              previewWidth,
+                              previewHeight,
+                            )
+                          : _previewImage == null
                           ? const ColoredBox(
                               key: ValueKey('seek-preview-loading'),
                               color: Color(0xFF202020),
@@ -745,6 +874,45 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     );
   }
 
+  Widget _buildBilibiliVideoShotFrame(
+    BilibiliVideoShot videoShot,
+    BilibiliVideoShotFrame frame,
+    double width,
+    double height,
+  ) {
+    final spriteWidth = width * videoShot.columns;
+    final spriteHeight = height * videoShot.rows;
+    return SizedBox(
+      key: ValueKey<String>(
+        'bilibili-video-shot-${frame.spriteIndex}-${frame.row}-${frame.column}',
+      ),
+      width: width,
+      height: height,
+      child: ClipRect(
+        child: OverflowBox(
+          alignment: Alignment.topLeft,
+          minWidth: spriteWidth,
+          maxWidth: spriteWidth,
+          minHeight: spriteHeight,
+          maxHeight: spriteHeight,
+          child: Transform.translate(
+            offset: Offset(-frame.column * width, -frame.row * height),
+            child: Image.file(
+              File(frame.spritePath),
+              width: spriteWidth,
+              height: spriteHeight,
+              fit: BoxFit.fill,
+              gaplessPlayback: true,
+              filterQuality: FilterQuality.medium,
+              errorBuilder: (_, _, _) =>
+                  const ColoredBox(color: Color(0xFF202020)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -791,18 +959,30 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _hoverProgressValue = null;
       _dragChapterIndex = null;
       _previewImage = null;
+      _videoShotFrame = null;
       _isProgressDragCanceling = false;
       _progressDragWasCancelled = false;
     }
-    if (oldWidget.subtitles != widget.subtitles) {
-      _rebuildSubtitleIndex();
-    }
-    if (oldWidget.controller.dataSource != widget.controller.dataSource) {
+    if (oldWidget.enableSeekThumbnailPreview &&
+        !widget.enableSeekThumbnailPreview) {
       VideoPreviewService().markInteractionEnded();
       _cancelSeekPreviewRefine();
       _resetSeekPreviewRequestState();
       _previewRequestSerial++;
       _previewImage = null;
+      _videoShotFrame = null;
+    }
+    if (oldWidget.subtitles != widget.subtitles) {
+      _rebuildSubtitleIndex();
+    }
+    if (oldWidget.controller.dataSource != widget.controller.dataSource ||
+        oldWidget.bilibiliVideoShot != widget.bilibiliVideoShot) {
+      VideoPreviewService().markInteractionEnded();
+      _cancelSeekPreviewRefine();
+      _resetSeekPreviewRequestState();
+      _previewRequestSerial++;
+      _previewImage = null;
+      _videoShotFrame = null;
       _isDraggingProgress = false;
       _desktopProgressPointer = null;
       _isProgressHovered = false;
@@ -2177,27 +2357,42 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
             (kIsWeb || !(Platform.isWindows || Platform.isMacOS));
         final bool showInteractiveDanmakuControls =
             widget.showDanmakuControls && !widget.isLocked;
-        final bool reserveResetScreenControl =
+        final bool hasResetScreenControl =
             widget.showResetScreenButton &&
             widget.onResetScreenTransform != null;
         final bool showResetScreenControl =
-            reserveResetScreenControl && !widget.isLocked;
+            hasResetScreenControl && !widget.isLocked;
         final int visibleSideControlCount =
-            (showResetScreenControl ? 1 : 0) +
-            (showLockButton ? 1 : 0) +
-            (showInteractiveDanmakuControls ? 2 : 0);
+            (showLockButton ? 1 : 0) + (showInteractiveDanmakuControls ? 2 : 0);
         // Keep the unlocked group's footprint while locked. Centering only the
         // remaining lock button would otherwise make it jump vertically.
         final int reservedSideControlCount =
-            (reserveResetScreenControl ? 1 : 0) +
-            (showLockButton ? 1 : 0) +
-            (widget.showDanmakuControls ? 2 : 0);
+            (showLockButton ? 1 : 0) + (widget.showDanmakuControls ? 2 : 0);
         final double reservedSideControlGroupHeight =
             reservedSideControlCount == 0
             ? 0
             : sideControlButtonExtent * reservedSideControlCount +
                   controlMetrics.sideControlGap *
                       (reservedSideControlCount - 1);
+        final double sideControlGroupTop = math
+            .max(
+              controlMetrics.sideControlHorizontalInset,
+              (height - reservedSideControlGroupHeight) / 2,
+            )
+            .toDouble();
+        // The reset action is overlaid above the original rail. It is not
+        // included in either count or height, so appearing/disappearing can
+        // never move the lock or danmaku controls.
+        final double resetScreenControlTop = math
+            .max(
+              controlMetrics.sideControlHorizontalInset,
+              (reservedSideControlCount > 0
+                      ? sideControlGroupTop
+                      : (height - sideControlButtonExtent) / 2) -
+                  controlMetrics.sideControlGap -
+                  sideControlButtonExtent,
+            )
+            .toDouble();
         final bool hideControlsForGestureSeek =
             _isGestureSeeking && !_showControlsBeforeGestureSeek;
         final double brightnessOverlayAlpha = (1.0 - _currentBrightness)
@@ -2735,6 +2930,32 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
               // Volume Slider Overlay (Removed)
               // if (_showVolumeSlider && !widget.isLocked) ...
+              if (showResetScreenControl &&
+                  _showControls &&
+                  !hideControlsForGestureSeek)
+                Positioned(
+                  left: isLeftHandedMode
+                      ? null
+                      : controlMetrics.sideControlHorizontalInset,
+                  right: isLeftHandedMode
+                      ? controlMetrics.sideControlHorizontalInset
+                      : null,
+                  top: resetScreenControlTop,
+                  child: _PlayerSideControlButton(
+                    key: const ValueKey('player-side-reset-screen'),
+                    extent: sideControlButtonExtent,
+                    tooltip: '还原屏幕',
+                    onPressed: () {
+                      widget.onResetScreenTransform?.call();
+                      _startAutoHideTimer();
+                    },
+                    child: Icon(
+                      Icons.center_focus_strong,
+                      color: Colors.white70,
+                      size: sideControlIconSize,
+                    ),
+                  ),
+                ),
               if (visibleSideControlCount > 0 &&
                   (widget.isLocked ||
                       (_showControls && !hideControlsForGestureSeek)))
@@ -2745,35 +2966,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                   right: isLeftHandedMode
                       ? controlMetrics.sideControlHorizontalInset
                       : null,
-                  top: math
-                      .max(
-                        controlMetrics.sideControlHorizontalInset,
-                        (height - reservedSideControlGroupHeight) / 2,
-                      )
-                      .toDouble(),
+                  top: sideControlGroupTop,
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (reserveResetScreenControl)
-                        showResetScreenControl
-                            ? _PlayerSideControlButton(
-                                key: const ValueKey('player-side-reset-screen'),
-                                extent: sideControlButtonExtent,
-                                tooltip: '还原屏幕',
-                                onPressed: () {
-                                  widget.onResetScreenTransform?.call();
-                                  _startAutoHideTimer();
-                                },
-                                child: Icon(
-                                  Icons.center_focus_strong,
-                                  color: Colors.white70,
-                                  size: sideControlIconSize,
-                                ),
-                              )
-                            : SizedBox(height: sideControlButtonExtent),
-                      if (reserveResetScreenControl &&
-                          (showLockButton || showInteractiveDanmakuControls))
-                        SizedBox(height: controlMetrics.sideControlGap),
                       if (showLockButton)
                         _PlayerSideControlButton(
                           key: const ValueKey('player-side-lock'),
@@ -2978,6 +3174,23 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                   .toDouble()
                                                   .clamp(0.0, sliderMax)
                                             : 0.0;
+                                        final bufferedValue = isInitialized
+                                            ? math.max(
+                                                sliderValue,
+                                                widget.controller.value.buffered
+                                                    .fold<double>(0, (
+                                                      furthest,
+                                                      range,
+                                                    ) {
+                                                      return math.max(
+                                                        furthest,
+                                                        range.end.inMilliseconds
+                                                            .toDouble(),
+                                                      );
+                                                    })
+                                                    .clamp(0.0, sliderMax),
+                                              )
+                                            : 0.0;
 
                                         return RepaintBoundary(
                                           // 进度条区域（RepaintBoundary 隔离重绘，避免每帧重绘底部控制栏）
@@ -3013,8 +3226,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                     hasChapterButton,
                                                               ) +
                                                           6,
-                                                      showThumbnail: settings
-                                                          .enableSeekPreview,
+                                                      showThumbnail:
+                                                          widget
+                                                              .enableSeekThumbnailPreview &&
+                                                          settings
+                                                              .enableSeekPreview,
                                                     ),
 
                                                   if (hasChapterButton)
@@ -3522,6 +3738,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                             (interaction *
                                                                                 0.12),
                                                                       ),
+                                                                      secondaryActiveTrackColor: Colors.white.withValues(
+                                                                        alpha:
+                                                                            0.48 +
+                                                                            (interaction *
+                                                                                0.12),
+                                                                      ),
                                                                       thumbColor:
                                                                           isInitialized
                                                                           ? (_isProgressDragCanceling
@@ -3582,6 +3804,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 max: sliderMax,
                                                                 value:
                                                                     sliderValue,
+                                                                secondaryTrackValue:
+                                                                    bufferedValue,
                                                                 onChangeStart:
                                                                     isInitialized
                                                                     ? (value) {
@@ -4172,6 +4396,97 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                 children: [
                                                   if (!widget
                                                       .isPreviewMode) ...[
+                                                    Selector<
+                                                      MediaPlaybackService,
+                                                      ({
+                                                        bool visible,
+                                                        bool switching,
+                                                        BilibiliStreamQuality?
+                                                        selected,
+                                                      })
+                                                    >(
+                                                      selector: (_, service) => (
+                                                        visible:
+                                                            service
+                                                                .isCurrentItemBilibiliStream &&
+                                                            service
+                                                                .streamQualities
+                                                                .isNotEmpty,
+                                                        switching: service
+                                                            .isSwitchingStreamQuality,
+                                                        selected: service
+                                                            .selectedStreamQuality,
+                                                      ),
+                                                      builder: (context, state, _) {
+                                                        if (!state.visible) {
+                                                          return const SizedBox.shrink();
+                                                        }
+                                                        return Tooltip(
+                                                          message: '清晰度',
+                                                          child: InkWell(
+                                                            borderRadius:
+                                                                BorderRadius.circular(
+                                                                  8,
+                                                                ),
+                                                            onTap:
+                                                                state.switching
+                                                                ? null
+                                                                : () => unawaited(
+                                                                    _showStreamQualityPicker(
+                                                                      playbackService,
+                                                                      context,
+                                                                    ),
+                                                                  ),
+                                                            child: SizedBox(
+                                                              height: controlMetrics
+                                                                  .bottomButtonExtent,
+                                                              child: Padding(
+                                                                padding: EdgeInsets.symmetric(
+                                                                  horizontal:
+                                                                      controlMetrics
+                                                                          .controlGap,
+                                                                ),
+                                                                child: Center(
+                                                                  child:
+                                                                      state
+                                                                          .switching
+                                                                      ? SizedBox(
+                                                                          width:
+                                                                              iconSize,
+                                                                          height:
+                                                                              iconSize,
+                                                                          child: const CircularProgressIndicator(
+                                                                            strokeWidth:
+                                                                                2,
+                                                                          ),
+                                                                        )
+                                                                      : ConstrainedBox(
+                                                                          constraints: const BoxConstraints(
+                                                                            maxWidth:
+                                                                                88,
+                                                                          ),
+                                                                          child: FittedBox(
+                                                                            fit:
+                                                                                BoxFit.scaleDown,
+                                                                            child: Text(
+                                                                              state.selected?.label ??
+                                                                                  '清晰度',
+                                                                              maxLines: 1,
+                                                                              style: TextStyle(
+                                                                                color: Colors.white,
+                                                                                fontSize: controlMetrics.toolFontSize,
+                                                                                fontWeight: FontWeight.bold,
+                                                                              ),
+                                                                            ),
+                                                                          ),
+                                                                        ),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        );
+                                                      },
+                                                    ),
                                                     Builder(
                                                       builder: (speedButtonContext) => Tooltip(
                                                         message: '倍速',

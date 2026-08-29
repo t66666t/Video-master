@@ -51,6 +51,11 @@ class ChapterSliderTrackShape extends SliderTrackShape
         begin: sliderTheme.disabledInactiveTrackColor,
         end: sliderTheme.inactiveTrackColor,
       ).evaluate(enableAnimation)!;
+    final secondaryPaint = Paint()
+      ..color = ColorTween(
+        begin: sliderTheme.disabledSecondaryActiveTrackColor,
+        end: sliderTheme.secondaryActiveTrackColor,
+      ).evaluate(enableAnimation)!;
 
     final boundaries = <double>[0];
     for (final chapter in chapters.skip(1)) {
@@ -66,6 +71,12 @@ class ChapterSliderTrackShape extends SliderTrackShape
             0.0,
             1.0,
           );
+    final secondaryFraction = secondaryOffset == null
+        ? thumbFraction
+        : (textDirection == TextDirection.ltr
+                  ? (secondaryOffset.dx - trackRect.left) / trackRect.width
+                  : (trackRect.right - secondaryOffset.dx) / trackRect.width)
+              .clamp(thumbFraction, 1.0);
     // The visual separator scales with the actual player width. A 0.24%
     // separator stays subtle on phones while remaining visible on wide windows.
     final gapFraction = 0.0024;
@@ -88,7 +99,19 @@ class ChapterSliderTrackShape extends SliderTrackShape
           textDirection,
         );
       }
-      final inactiveStart = math.max(start, thumbFraction);
+      final bufferedStart = math.max(start, thumbFraction);
+      final bufferedEnd = math.min(end, secondaryFraction);
+      if (bufferedEnd > bufferedStart) {
+        _paintFractionRange(
+          context.canvas,
+          trackRect,
+          bufferedStart,
+          bufferedEnd,
+          secondaryPaint,
+          textDirection,
+        );
+      }
+      final inactiveStart = math.max(start, secondaryFraction);
       if (end > inactiveStart) {
         _paintFractionRange(
           context.canvas,

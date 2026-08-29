@@ -1,5 +1,6 @@
 import 'media_source_ref.dart';
 import 'package:path/path.dart' as p;
+import 'bilibili_video_shot.dart';
 import 'managed_subtitle_asset.dart';
 import 'media_chapter.dart';
 
@@ -43,6 +44,7 @@ class VideoItem {
   bool isVideoMirroredV;
   String? sourceFingerprint;
   MediaSourceRef? sourceRef;
+  BilibiliVideoShot? bilibiliVideoShot;
   List<MediaChapter> chapters;
   bool hasProbedChapters;
 
@@ -84,6 +86,7 @@ class VideoItem {
     this.isVideoMirroredV = false,
     this.sourceFingerprint,
     this.sourceRef,
+    this.bilibiliVideoShot,
     this.chapters = const <MediaChapter>[],
     this.hasProbedChapters = false,
   });
@@ -134,6 +137,7 @@ class VideoItem {
       'isVideoMirroredV': isVideoMirroredV,
       'sourceFingerprint': sourceFingerprint,
       'sourceRef': sourceRef?.toJson(),
+      'bilibiliVideoShot': bilibiliVideoShot?.toJson(),
       'chapters': chapters.map((chapter) => chapter.toJson()).toList(),
       'hasProbedChapters': hasProbedChapters,
     };
@@ -222,6 +226,9 @@ class VideoItem {
       isVideoMirroredV: json['isVideoMirroredV'] as bool? ?? false,
       sourceFingerprint: json['sourceFingerprint'] as String?,
       sourceRef: MediaSourceRef.fromJsonOrNull(json['sourceRef']),
+      bilibiliVideoShot: BilibiliVideoShot.fromJsonOrNull(
+        json['bilibiliVideoShot'],
+      ),
       chapters: MediaChapter.normalize(
         (json['chapters'] as List<dynamic>? ?? const <dynamic>[])
             .whereType<Map>()

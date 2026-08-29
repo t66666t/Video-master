@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
+import 'package:video_player_app/models/bilibili_video_shot.dart';
 import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/models/subtitle_style.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
@@ -16,6 +17,183 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   testWidgets(
+    'disabled seek thumbnails keep time feedback without an image preview',
+    (tester) async {
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.binding.setSurfaceSize(const Size(1000, 600));
+      final controller = VideoPlayerController.networkUrl(
+        Uri.parse('https://example.invalid/video.mp4'),
+      );
+      controller.value = VideoPlayerValue(
+        duration: const Duration(seconds: 100),
+        position: const Duration(seconds: 10),
+        isInitialized: true,
+      );
+      final playbackService = MediaPlaybackService();
+
+      await tester.pumpWidget(
+        MultiProvider(
+          providers: [
+            ChangeNotifierProvider<SettingsService>.value(
+              value: SettingsService(),
+            ),
+            ChangeNotifierProvider<MediaPlaybackService>.value(
+              value: playbackService,
+            ),
+          ],
+          child: MaterialApp(
+            home: Scaffold(
+              body: VideoControlsOverlay(
+                controller: controller,
+                enableSeekThumbnailPreview: false,
+                isLocked: false,
+                isPreviewMode: true,
+                onTogglePlay: () {},
+                onBackPressed: () {},
+                onToggleLock: () {},
+                onSpeedUpdate: (_) async {},
+                showSubtitles: false,
+                onToggleSubtitles: () {},
+                onMoveSubtitles: () {},
+                isLongPressing: false,
+                longPressFeedbackText: '',
+                onLongPressStart: () => true,
+                onLongPressEnd: () {},
+                subtitleEntries: const [],
+                subtitleStyle: const SubtitleStyle(),
+                subtitleAlignment: Alignment.bottomCenter,
+                onEnterSubtitleDragMode: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final hoverRegion = find.byKey(
+        const ValueKey('video-controls-progress-hover-region'),
+      );
+      final progressRect = tester.getRect(hoverRegion);
+      final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+      await mouse.addPointer(location: progressRect.center);
+      await tester.pump(const Duration(milliseconds: 180));
+
+      expect(
+        find.byKey(const ValueKey('video-controls-seek-preview-time')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('seek-preview-loading')), findsNothing);
+
+      await mouse.down(progressRect.center);
+      await mouse.moveTo(
+        Offset(progressRect.right - 20, progressRect.center.dy),
+      );
+      await tester.pump(const Duration(milliseconds: 180));
+      expect(
+        find.byKey(const ValueKey('video-controls-seek-preview-time')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('seek-preview-loading')), findsNothing);
+
+      await mouse.cancel();
+      await mouse.removePointer();
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(seconds: 20));
+      await controller.dispose();
+    },
+  );
+
+  testWidgets('Bilibili sprite metadata drives hover and drag thumbnails', (
+    tester,
+  ) async {
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.binding.setSurfaceSize(const Size(1000, 600));
+    final controller = VideoPlayerController.networkUrl(
+      Uri.parse('https://example.invalid/video.mp4'),
+    );
+    controller.value = VideoPlayerValue(
+      duration: const Duration(seconds: 100),
+      position: const Duration(seconds: 10),
+      isInitialized: true,
+    );
+    final playbackService = MediaPlaybackService();
+    final videoShot = BilibiliVideoShot(
+      spritePaths: const ['assets/icon/fluent-player.png'],
+      timestampsSeconds: const [0, 40],
+      columns: 2,
+      rows: 1,
+      cellWidth: 480,
+      cellHeight: 270,
+    );
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<SettingsService>.value(
+            value: SettingsService(),
+          ),
+          ChangeNotifierProvider<MediaPlaybackService>.value(
+            value: playbackService,
+          ),
+        ],
+        child: MaterialApp(
+          home: Scaffold(
+            body: VideoControlsOverlay(
+              controller: controller,
+              bilibiliVideoShot: videoShot,
+              isLocked: false,
+              isPreviewMode: true,
+              onTogglePlay: () {},
+              onBackPressed: () {},
+              onToggleLock: () {},
+              onSpeedUpdate: (_) async {},
+              showSubtitles: false,
+              onToggleSubtitles: () {},
+              onMoveSubtitles: () {},
+              isLongPressing: false,
+              longPressFeedbackText: '',
+              onLongPressStart: () => true,
+              onLongPressEnd: () {},
+              subtitleEntries: const [],
+              subtitleStyle: const SubtitleStyle(),
+              subtitleAlignment: Alignment.bottomCenter,
+              onEnterSubtitleDragMode: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final hoverRegion = find.byKey(
+      const ValueKey('video-controls-progress-hover-region'),
+    );
+    final progressRect = tester.getRect(hoverRegion);
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: progressRect.center);
+    await tester.pump(const Duration(milliseconds: 180));
+
+    expect(
+      find.byKey(const ValueKey('bilibili-video-shot-0-0-1')),
+      findsOneWidget,
+    );
+
+    await mouse.down(progressRect.center);
+    await mouse.moveTo(Offset(progressRect.left + 20, progressRect.center.dy));
+    await tester.pump(const Duration(milliseconds: 180));
+    expect(
+      find.byKey(const ValueKey('bilibili-video-shot-0-0-0')),
+      findsOneWidget,
+    );
+
+    await mouse.cancel();
+    await mouse.removePointer();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 20));
+    await controller.dispose();
+  });
+
+  testWidgets(
     'mouse hover previews time and cancelled drag restores the playing chapter',
     (tester) async {
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -23,9 +201,12 @@ void main() {
       final controller = VideoPlayerController.networkUrl(
         Uri.parse('https://example.invalid/video.mp4'),
       );
-      controller.value = const VideoPlayerValue(
-        duration: Duration(seconds: 100),
-        position: Duration(seconds: 10),
+      controller.value = VideoPlayerValue(
+        duration: const Duration(seconds: 100),
+        position: const Duration(seconds: 10),
+        buffered: <DurationRange>[
+          DurationRange(Duration.zero, const Duration(seconds: 60)),
+        ],
         isInitialized: true,
       );
       final playbackService = MediaPlaybackService();
@@ -79,6 +260,16 @@ void main() {
         ),
       );
       await tester.pump();
+
+      final progressSlider = tester.widget<Slider>(
+        find.descendant(
+          of: find.byKey(
+            const ValueKey('video-controls-progress-hover-region'),
+          ),
+          matching: find.byType(Slider),
+        ),
+      );
+      expect(progressSlider.secondaryTrackValue, 60 * 1000);
 
       Finder chapterTitle(String text) => find.descendant(
         of: find.byKey(const ValueKey('video-controls-chapter-title')),

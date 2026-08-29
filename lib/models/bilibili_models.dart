@@ -8,9 +8,9 @@ class BilibiliVideoInfo {
   final String ownerMid;
   final int pubDate;
   final List<BilibiliPage> pages;
-  
+
   // Optional Collection/Season Info (Level 1)
-  final BilibiliCollectionInfo? collectionInfo; 
+  final BilibiliCollectionInfo? collectionInfo;
 
   BilibiliVideoInfo({
     required this.title,
@@ -27,80 +27,91 @@ class BilibiliVideoInfo {
 
   factory BilibiliVideoInfo.fromJson(Map<String, dynamic> json) {
     // Check if this is a local storage map (has 'pages' as list directly, not inside data)
-    if (json.containsKey('title') && json.containsKey('pages') && !json.containsKey('data')) {
+    if (json.containsKey('title') &&
+        json.containsKey('pages') &&
+        !json.containsKey('data')) {
       return BilibiliVideoInfo.fromMap(json);
     }
 
     final data = json['data'];
-    
+
     // Check for UGC Season (Collection)
     BilibiliCollectionInfo? collectionInfo;
     final ugcSeason = data['ugc_season'];
-    
-    if (ugcSeason != null && ugcSeason['sections'] != null) {
-       final sections = ugcSeason['sections'] as List;
-       final List<BilibiliVideoInfo> videos = [];
-       
-       for (var section in sections) {
-         final episodes = section['episodes'] as List?;
-         if (episodes != null) {
-           for (var ep in episodes) {
-             // Each episode in a season is conceptually a VIDEO (Level 2)
-             // It might have its own pages (Level 3), but usually season list gives just the main page.
-             // We construct a 'VideoInfo' for each item.
-             // Fix for multi-page parsing: Check if 'pages' exist in episode, otherwise use episode itself
-             List<BilibiliPage> videoPages = [];
-             if (ep['pages'] != null) {
-                videoPages = (ep['pages'] as List).map((p) => BilibiliPage(
-                   cid: p['cid'] ?? 0,
-                   page: p['page'] ?? 1,
-                   part: p['part'] ?? '',
-                   duration: p['duration'] ?? 0,
-                   bvid: ep['bvid'],
-                   aid: ep['aid']?.toString(),
-                )).toList();
-             } else {
-                // Fallback to single page
-                videoPages = [
-                   BilibiliPage(
-                     cid: ep['cid'] ?? 0,
-                     page: 1, 
-                     part: ep['title'] ?? '',
-                     duration: ep['duration'] ?? 0,
-                     bvid: ep['bvid'],
-                     aid: ep['aid']?.toString(),
-                   )
-                ];
-             }
 
-             videos.add(BilibiliVideoInfo(
-               title: ep['title'] ?? '',
-               desc: '',
-               pic: ep['arc']?['pic'] ?? data['pic'] ?? '', // Use arc pic or season pic
-               bvid: ep['bvid'] ?? '',
-               aid: ep['aid']?.toString() ?? '',
-               ownerName: data['owner']['name'] ?? '',
-               ownerMid: data['owner']['mid'].toString(),
-               pubDate: ep['arc']?['pubdate'] ?? 0,
-               pages: videoPages,
-             ));
-           }
-         }
-       }
-       
-       collectionInfo = BilibiliCollectionInfo(
-         title: ugcSeason['title'] ?? data['title'],
-         cover: ugcSeason['cover'] ?? data['pic'],
-         videos: videos,
-       );
+    if (ugcSeason != null && ugcSeason['sections'] != null) {
+      final sections = ugcSeason['sections'] as List;
+      final List<BilibiliVideoInfo> videos = [];
+
+      for (var section in sections) {
+        final episodes = section['episodes'] as List?;
+        if (episodes != null) {
+          for (var ep in episodes) {
+            // Each episode in a season is conceptually a VIDEO (Level 2)
+            // It might have its own pages (Level 3), but usually season list gives just the main page.
+            // We construct a 'VideoInfo' for each item.
+            // Fix for multi-page parsing: Check if 'pages' exist in episode, otherwise use episode itself
+            List<BilibiliPage> videoPages = [];
+            if (ep['pages'] != null) {
+              videoPages = (ep['pages'] as List)
+                  .map(
+                    (p) => BilibiliPage(
+                      cid: p['cid'] ?? 0,
+                      page: p['page'] ?? 1,
+                      part: p['part'] ?? '',
+                      duration: p['duration'] ?? 0,
+                      bvid: ep['bvid'],
+                      aid: ep['aid']?.toString(),
+                    ),
+                  )
+                  .toList();
+            } else {
+              // Fallback to single page
+              videoPages = [
+                BilibiliPage(
+                  cid: ep['cid'] ?? 0,
+                  page: 1,
+                  part: ep['title'] ?? '',
+                  duration: ep['duration'] ?? 0,
+                  bvid: ep['bvid'],
+                  aid: ep['aid']?.toString(),
+                ),
+              ];
+            }
+
+            videos.add(
+              BilibiliVideoInfo(
+                title: ep['title'] ?? '',
+                desc: '',
+                pic:
+                    ep['arc']?['pic'] ??
+                    data['pic'] ??
+                    '', // Use arc pic or season pic
+                bvid: ep['bvid'] ?? '',
+                aid: ep['aid']?.toString() ?? '',
+                ownerName: data['owner']['name'] ?? '',
+                ownerMid: data['owner']['mid'].toString(),
+                pubDate: ep['arc']?['pubdate'] ?? 0,
+                pages: videoPages,
+              ),
+            );
+          }
+        }
+      }
+
+      collectionInfo = BilibiliCollectionInfo(
+        title: ugcSeason['title'] ?? data['title'],
+        cover: ugcSeason['cover'] ?? data['pic'],
+        videos: videos,
+      );
     }
-    
+
     // Standard Pages (for Single Video)
     List<BilibiliPage> standardPages = [];
     if (data['pages'] != null) {
-       standardPages = (data['pages'] as List)
-              .map((e) => BilibiliPage.fromJson(e))
-              .toList();
+      standardPages = (data['pages'] as List)
+          .map((e) => BilibiliPage.fromJson(e))
+          .toList();
     }
 
     return BilibiliVideoInfo(
@@ -127,8 +138,14 @@ class BilibiliVideoInfo {
       ownerName: map['ownerName'] ?? '',
       ownerMid: map['ownerMid'] ?? '',
       pubDate: map['pubDate'] ?? 0,
-      pages: (map['pages'] as List?)?.map((e) => BilibiliPage.fromJson(e)).toList() ?? [],
-      collectionInfo: map['collectionInfo'] != null ? BilibiliCollectionInfo.fromMap(map['collectionInfo']) : null,
+      pages:
+          (map['pages'] as List?)
+              ?.map((e) => BilibiliPage.fromJson(e))
+              .toList() ??
+          [],
+      collectionInfo: map['collectionInfo'] != null
+          ? BilibiliCollectionInfo.fromMap(map['collectionInfo'])
+          : null,
     );
   }
 
@@ -163,7 +180,11 @@ class BilibiliCollectionInfo {
     return BilibiliCollectionInfo(
       title: map['title'] ?? '',
       cover: map['cover'] ?? '',
-      videos: (map['videos'] as List?)?.map((e) => BilibiliVideoInfo.fromMap(e)).toList() ?? [],
+      videos:
+          (map['videos'] as List?)
+              ?.map((e) => BilibiliVideoInfo.fromMap(e))
+              .toList() ??
+          [],
     );
   }
 
@@ -220,22 +241,32 @@ class BilibiliStreamInfo {
   final List<StreamItem> videoStreams;
   final List<StreamItem> audioStreams;
   final Map<int, String> qualityMap;
+  final int durationMs;
 
   BilibiliStreamInfo({
     required this.videoStreams,
     required this.audioStreams,
     required this.qualityMap,
+    this.durationMs = 0,
   });
 
   factory BilibiliStreamInfo.fromJson(Map<String, dynamic> json) {
     final data = json['data'];
     if (data == null) {
-      return BilibiliStreamInfo(videoStreams: [], audioStreams: [], qualityMap: {});
+      return BilibiliStreamInfo(
+        videoStreams: [],
+        audioStreams: [],
+        qualityMap: {},
+      );
     }
 
     final dash = data['dash'];
     if (dash == null) {
-      return BilibiliStreamInfo(videoStreams: [], audioStreams: [], qualityMap: {});
+      return BilibiliStreamInfo(
+        videoStreams: [],
+        audioStreams: [],
+        qualityMap: {},
+      );
     }
 
     // Default fallback map (based on BBDown constants)
@@ -256,8 +287,10 @@ class BilibiliStreamInfo {
     // Override with dynamic values from API if available
     final acceptQuality = data['accept_quality'] as List?;
     final acceptDesc = data['accept_description'] as List?;
-    
-    if (acceptQuality != null && acceptDesc != null && acceptQuality.length == acceptDesc.length) {
+
+    if (acceptQuality != null &&
+        acceptDesc != null &&
+        acceptQuality.length == acceptDesc.length) {
       for (int i = 0; i < acceptQuality.length; i++) {
         final q = acceptQuality[i];
         final d = acceptDesc[i];
@@ -267,14 +300,21 @@ class BilibiliStreamInfo {
       }
     }
 
-    final videos = (dash['video'] as List?)
+    final videos =
+        (dash['video'] as List?)
             ?.map((e) => StreamItem.fromJson(e, qMap[e['id'] as int]))
             .toList() ??
         [];
-    final audios = (dash['audio'] as List?)
-            ?.map((e) => StreamItem.fromJson(e))
-            .toList() ??
-        [];
+    final audios = <StreamItem>[
+      ...?((dash['audio'] as List?)?.whereType<Map>().map(
+        (e) => StreamItem.fromJson(Map<String, dynamic>.from(e)),
+      )),
+      ...?(((dash['dolby'] as Map?)?['audio'] as List?)?.whereType<Map>().map(
+        (e) => StreamItem.fromJson(Map<String, dynamic>.from(e)),
+      )),
+      if ((dash['flac'] as Map?)?['audio'] case final Map flacAudio)
+        StreamItem.fromJson(Map<String, dynamic>.from(flacAudio)),
+    ];
 
     // Keep display order aligned with resolution preference selection.
     videos.sort(StreamItem.compareVideoQuality);
@@ -284,6 +324,10 @@ class BilibiliStreamInfo {
       videoStreams: videos,
       audioStreams: audios,
       qualityMap: qMap,
+      durationMs:
+          ((data['timelength'] as num?)?.toDouble() ??
+                  ((dash['duration'] as num?)?.toDouble() ?? 0) * 1000)
+              .round(),
     );
   }
 }
@@ -297,6 +341,11 @@ class StreamItem {
   final int codecid;
   final String? mimeType;
   final String? qualityName;
+  final int width;
+  final int height;
+  final String frameRate;
+  final String initializationRange;
+  final String indexRange;
 
   StreamItem({
     required this.id,
@@ -307,6 +356,11 @@ class StreamItem {
     required this.codecid,
     this.mimeType,
     this.qualityName,
+    this.width = 0,
+    this.height = 0,
+    this.frameRate = '',
+    this.initializationRange = '',
+    this.indexRange = '',
   });
 
   Map<String, dynamic> toJson() {
@@ -319,24 +373,49 @@ class StreamItem {
       'codecid': codecid,
       'mime_type': mimeType,
       'qualityName': qualityName,
+      'width': width,
+      'height': height,
+      'frame_rate': frameRate,
+      'segment_base': {
+        'initialization': initializationRange,
+        'index_range': indexRange,
+      },
     };
   }
 
-  factory StreamItem.fromJson(Map<String, dynamic> json, [String? qualityName]) {
-    final backupUrls = (json['backup_url'] as List?)
-            ?.map((e) => e?.toString() ?? '')
+  factory StreamItem.fromJson(
+    Map<String, dynamic> json, [
+    String? qualityName,
+  ]) {
+    final backupUrls =
+        ((json['backup_url'] ?? json['backupUrl']) as List?)
+            ?.map((e) => _normalizeBilibiliMediaUrl(e?.toString() ?? ''))
             .where((e) => e.isNotEmpty)
             .toList() ??
         const <String>[];
+    final segmentBase = (json['segment_base'] ?? json['SegmentBase']);
+    final segment = segmentBase is Map
+        ? segmentBase
+        : const <String, dynamic>{};
     return StreamItem(
       id: json['id'] ?? 0,
-      baseUrl: json['base_url'] ?? '',
+      baseUrl: _normalizeBilibiliMediaUrl(
+        (json['base_url'] ?? json['baseUrl'] ?? '').toString(),
+      ),
       backupUrls: backupUrls,
       bandwidth: json['bandwidth'] ?? 0,
       codecs: json['codecs'] ?? '',
       codecid: json['codecid'] ?? 0,
-      mimeType: json['mime_type'],
+      mimeType: (json['mime_type'] ?? json['mimeType'])?.toString(),
       qualityName: qualityName ?? json['qualityName'],
+      width: (json['width'] as num?)?.toInt() ?? 0,
+      height: (json['height'] as num?)?.toInt() ?? 0,
+      frameRate: (json['frame_rate'] ?? json['frameRate'] ?? '').toString(),
+      initializationRange:
+          (segment['initialization'] ?? segment['Initialization'] ?? '')
+              .toString(),
+      indexRange: (segment['index_range'] ?? segment['indexRange'] ?? '')
+          .toString(),
     );
   }
 
@@ -411,4 +490,9 @@ class StreamItem {
 
   @override
   int get hashCode => id.hashCode ^ codecid.hashCode ^ codecs.hashCode;
+}
+
+String _normalizeBilibiliMediaUrl(String value) {
+  final trimmed = value.trim();
+  return trimmed.startsWith('//') ? 'https:$trimmed' : trimmed;
 }
