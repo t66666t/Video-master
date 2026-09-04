@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../platform/local_playback_backend_policy.dart';
+
 /// Creates a transparent playback copy for codecs which are not consistently
 /// decoded by every video_player backend. The original library file is never
 /// modified and the existing controller/UI remains in charge of playback.
@@ -15,6 +17,10 @@ class AudioPlaybackCompatibilityService {
   AudioPlaybackCompatibilityService._();
 
   static final Map<String, Future<File>> _inFlight = <String, Future<File>>{};
+  static final Map<String, String> _probedSourceSignatures = <String, String>{};
+  static final Map<String, String?> _probedAudioCodecs = <String, String?>{};
+  static final Map<String, Future<String?>> _codecProbes =
+      <String, Future<String?>>{};
   static const Set<String> _portableCodecs = <String>{'aac', 'mp3'};
 
   static Future<File> resolve(
@@ -24,10 +30,30 @@ class AudioPlaybackCompatibilityService {
     Directory? persistentDirectory,
   }) async {
     if (!isAudio || kIsWeb) return source;
-    // All native builds ship media_kit's FFmpeg/libmpv decoder. It can decode
-    // PCM WAV, FLAC, ALAC, Opus, WMA and the other supported library formats
-    // directly. Avoid the old eager AAC conversion: it delayed first play,
-    // consumed extra storage and made lossless sources lossy.
+    // Android local files normally stay on the platform backend. Probe audio
+    // before controller creation and route only codecs that backend cannot
+    // reliably decode to the already shipped media_kit/libmpv adapter. This
+    // keeps ordinary local media and Bilibili behavior unchanged, avoids a
+    // lossy/transcoding delay, and still exposes one VideoPlayerController to
+    // the existing queue, notification and player screens.
+    if (Platform.isAndroid) {
+      if (LocalPlaybackBackendPolicy.isWideCodecBackendPreferred(source.path)) {
+        return source;
+      }
+      final stat = await source.stat();
+      final signature = '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+      if (_probedSourceSignatures[source.path] == signature) return source;
+
+      final codec = await probeAudioCodec(source.path);
+      if (LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend(codec)) {
+        LocalPlaybackBackendPolicy.preferProbedWideCodecBackend(source.path);
+      } else if (codec != null) {
+        LocalPlaybackBackendPolicy.preferPlatformBackend(source.path);
+      }
+      _probedSourceSignatures[source.path] = signature;
+      return source;
+    }
+    // Other native targets already use media_kit for local files.
     if (supportsDirectNativePlayback) return source;
     if (existingPlaybackPath != null) {
       final existing = File(existingPlaybackPath);
@@ -35,7 +61,7 @@ class AudioPlaybackCompatibilityService {
         return existing;
       }
     }
-    final codec = await _audioCodec(source.path);
+    final codec = await probeAudioCodec(source.path);
     if (!needsCompatibilityCopy(codec)) return source;
     final future = _inFlight.putIfAbsent(
       source.path,
@@ -64,7 +90,26 @@ class AudioPlaybackCompatibilityService {
       Platform.isWindows ||
       Platform.isLinux;
 
-  static Future<String?> _audioCodec(String path) async {
+  /// Returns a cached codec immediately when this source has already been
+  /// inspected. A null value is intentionally ambiguous; callers which need a
+  /// definitive answer should use [probeAudioCodec].
+  static String? cachedAudioCodec(String path) => _probedAudioCodecs[path];
+
+  /// Probes and caches the first audio stream codec without changing or
+  /// materializing the source file.
+  static Future<String?> probeAudioCodec(String path) {
+    if (_probedAudioCodecs.containsKey(path)) {
+      return Future<String?>.value(_probedAudioCodecs[path]);
+    }
+    return _codecProbes.putIfAbsent(path, () async {
+      final codec = await _probeAudioCodec(path);
+      _probedAudioCodecs[path] = codec;
+      _codecProbes.remove(path);
+      return codec;
+    });
+  }
+
+  static Future<String?> _probeAudioCodec(String path) async {
     try {
       final session = await FFprobeKit.getMediaInformation(
         path,

@@ -8,6 +8,7 @@ enum VideoComposeStage {
   finalizing,
   completed,
   failed,
+  materializing,
 }
 
 enum VideoComposeResolution { source, p360, p480, p720, p1080, p1440, p2160 }
@@ -99,6 +100,29 @@ class VideoComposeRequest {
     this.subtitleRendererVersion = 1,
     required this.outputPath,
   }) : subtitleStylePortrait = subtitleStylePortrait ?? subtitleStyle;
+
+  VideoComposeRequest copyWith({String? videoPath}) => VideoComposeRequest(
+    videoId: videoId,
+    videoPath: videoPath ?? this.videoPath,
+    title: title,
+    primarySubtitlePath: primarySubtitlePath,
+    secondarySubtitlePath: secondarySubtitlePath,
+    renderSecondarySubtitle: renderSecondarySubtitle,
+    continuousSubtitle: continuousSubtitle,
+    embedSoftSubtitles: embedSoftSubtitles,
+    softSubtitleOnly: softSubtitleOnly,
+    softSubtitleUseSourceQuality: softSubtitleUseSourceQuality,
+    softSubtitleTracks: softSubtitleTracks,
+    resolution: resolution,
+    renderMode: renderMode,
+    subtitleStyle: subtitleStyle,
+    subtitleStylePortrait: subtitleStylePortrait,
+    subtitleAlignment: subtitleAlignment,
+    splitSubtitleByLine: splitSubtitleByLine,
+    subtitleItemGap: subtitleItemGap,
+    subtitleRendererVersion: subtitleRendererVersion,
+    outputPath: outputPath,
+  );
 
   SubtitleStyle styleForCanvas({required int width, required int height}) =>
       height > width ? subtitleStylePortrait : subtitleStyle;

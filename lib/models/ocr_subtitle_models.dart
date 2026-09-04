@@ -130,6 +130,7 @@ enum OcrSubtitleJobStatus {
   cancelled,
   interrupted,
   failed,
+  materializing,
 }
 
 class OcrSubtitleTrack {
@@ -213,9 +214,11 @@ class OcrSubtitleJob {
     OcrSubtitleJobStatus.extracting,
     OcrSubtitleJobStatus.recognizing,
     OcrSubtitleJobStatus.writing,
+    OcrSubtitleJobStatus.materializing,
   }.contains(status);
 
   OcrSubtitleJob copyWith({
+    String? videoPath,
     List<OcrSubtitleTrack>? tracks,
     OcrSubtitleJobStatus? status,
     double? progress,
@@ -225,7 +228,7 @@ class OcrSubtitleJob {
     String? error,
   }) => OcrSubtitleJob(
     videoId: videoId,
-    videoPath: videoPath,
+    videoPath: videoPath ?? this.videoPath,
     tracks: tracks ?? this.tracks,
     start: start,
     end: end,

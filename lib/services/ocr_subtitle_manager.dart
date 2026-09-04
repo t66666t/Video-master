@@ -17,6 +17,7 @@ import '../models/managed_subtitle_asset.dart';
 import '../models/ocr_subtitle_models.dart';
 import '../utils/ffmpeg_utils.dart';
 import 'library_service.dart';
+import 'media_materialization_service.dart';
 import 'ocr_model_manager.dart';
 import 'ocr_processing_worker.dart';
 import 'settings_service.dart';
@@ -33,6 +34,8 @@ class OcrSubtitleManager extends ChangeNotifier {
   bool _cancelled = false;
   FFmpegSession? _activeSession;
   Process? _activeProcess;
+  Completer<void>? _materializationCancellation;
+  MediaMaterializationProgress? _materializationProgress;
   List<String> _completedPaths = const <String>[];
   String _activeBackend = '自动选择中';
   Timer? _notifyTimer;
@@ -51,6 +54,8 @@ class OcrSubtitleManager extends ChangeNotifier {
   OcrSubtitleJob? get job => _job;
   bool get isRunning => _job?.isRunning ?? false;
   String get activeBackend => _activeBackend;
+  MediaMaterializationProgress? get materializationProgress =>
+      _materializationProgress;
 
   List<OcrSubtitleTrack> tracksForVideo(String videoId) => List.unmodifiable(
     _tracksByVideo[videoId] ??
@@ -266,117 +271,138 @@ class OcrSubtitleManager extends ChangeNotifier {
     bool mirrorVertical = false,
     int? maxWidth,
     bool fastPreview = false,
+    void Function(MediaMaterializationProgress progress)? onProgress,
+    Future<void>? cancelSignal,
   }) async {
     await initialize();
-    final root = await SettingsService().resolveLargeDataRootDir();
-    final dir = Directory(
-      p.join(root.path, 'ocr_temp', _safeId(videoId), 'preview'),
-    );
-    if (!await dir.exists()) await dir.create(recursive: true);
-    final output = p.join(
-      dir.path,
-      'preview_${DateTime.now().microsecondsSinceEpoch}.jpg',
-    );
-    final attempts = fastPreview
-        ? <Duration>[position]
-        : <Duration>[
-            position,
-            if (position > const Duration(milliseconds: 500))
-              position - const Duration(milliseconds: 500),
-            if (position != Duration.zero) Duration.zero,
-          ];
-    String lastError = '';
-    for (final at in attempts) {
-      if (Platform.isAndroid || Platform.isIOS) {
-        try {
-          final bytes = await VideoThumbnail.thumbnailData(
-            video: videoPath,
-            imageFormat: ImageFormat.JPEG,
-            maxWidth: maxWidth ?? 0,
-            timeMs: math.max(0, at.inMilliseconds),
-            quality: fastPreview ? 40 : 90,
-          );
-          if (bytes != null && bytes.isNotEmpty) {
-            List<int> outputBytes = bytes;
-            if (mirrorHorizontal || mirrorVertical) {
-              var image = im.decodeImage(bytes);
-              if (image == null) throw StateError('无法解码原生预览帧');
-              if (mirrorHorizontal) image = im.flipHorizontal(image);
-              if (mirrorVertical) image = im.flipVertical(image);
-              outputBytes = im.encodeJpg(image, quality: fastPreview ? 45 : 92);
+    MaterializedMediaLease? frameLease;
+    var effectiveVideoPath = videoPath;
+    final sourceItem = library.getVideo(videoId);
+    if (sourceItem?.path.startsWith('bilibili://stream/') == true) {
+      frameLease = await library.acquireMaterializedMedia(
+        videoId,
+        MediaMaterializationRequirement.videoFrames,
+        targetHeight: 1080,
+        onProgress: onProgress,
+        cancelSignal: cancelSignal,
+      );
+      effectiveVideoPath = frameLease.requiredVideoPath;
+    }
+    try {
+      final root = await SettingsService().resolveLargeDataRootDir();
+      final dir = Directory(
+        p.join(root.path, 'ocr_temp', _safeId(videoId), 'preview'),
+      );
+      if (!await dir.exists()) await dir.create(recursive: true);
+      final output = p.join(
+        dir.path,
+        'preview_${DateTime.now().microsecondsSinceEpoch}.jpg',
+      );
+      final attempts = fastPreview
+          ? <Duration>[position]
+          : <Duration>[
+              position,
+              if (position > const Duration(milliseconds: 500))
+                position - const Duration(milliseconds: 500),
+              if (position != Duration.zero) Duration.zero,
+            ];
+      String lastError = '';
+      for (final at in attempts) {
+        if (Platform.isAndroid || Platform.isIOS) {
+          try {
+            final bytes = await VideoThumbnail.thumbnailData(
+              video: effectiveVideoPath,
+              imageFormat: ImageFormat.JPEG,
+              maxWidth: maxWidth ?? 0,
+              timeMs: math.max(0, at.inMilliseconds),
+              quality: fastPreview ? 40 : 90,
+            );
+            if (bytes != null && bytes.isNotEmpty) {
+              List<int> outputBytes = bytes;
+              if (mirrorHorizontal || mirrorVertical) {
+                var image = im.decodeImage(bytes);
+                if (image == null) throw StateError('无法解码原生预览帧');
+                if (mirrorHorizontal) image = im.flipHorizontal(image);
+                if (mirrorVertical) image = im.flipVertical(image);
+                outputBytes = im.encodeJpg(
+                  image,
+                  quality: fastPreview ? 45 : 92,
+                );
+              }
+              await File(output).writeAsBytes(outputBytes, flush: true);
+              if (await _isUsableImage(output)) return output;
             }
-            await File(output).writeAsBytes(outputBytes, flush: true);
-            if (await _isUsableImage(output)) return output;
+          } catch (error) {
+            lastError = '原生视频帧提取失败：$error';
+            final failedOutput = File(output);
+            if (await failedOutput.exists()) await failedOutput.delete();
           }
-        } catch (error) {
-          lastError = '原生视频帧提取失败：$error';
-          final failedOutput = File(output);
-          if (await failedOutput.exists()) await failedOutput.delete();
         }
-      }
-      final args = <String>[
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        '-ss',
-        _seconds(at),
-        if (fastPreview) '-noaccurate_seek',
-        '-autorotate',
-        '-i',
-        videoPath,
-        '-map',
-        '0:v:0',
-        '-frames:v',
-        '1',
-        if (mirrorHorizontal || mirrorVertical || maxWidth != null) ...[
-          '-vf',
-          [
-            if (mirrorHorizontal) 'hflip',
-            if (mirrorVertical) 'vflip',
-            if (maxWidth != null)
-              'scale=trunc(min(iw\\,$maxWidth)/2)*2:-2:flags=fast_bilinear',
-          ].join(','),
-        ],
-        '-q:v',
-        fastPreview ? '6' : '2',
-        '-c:v',
-        'mjpeg',
-        '-f',
-        'image2',
-        output,
-      ];
-      if (Platform.isWindows) {
-        try {
-          final ffmpegPath = await FFmpegUtils.ffmpegPath;
-          final result = await Process.run(
-            ffmpegPath,
-            args,
-          ).timeout(const Duration(seconds: 30));
-          if (result.exitCode == 0 && await _isUsableImage(output)) {
+        final args = <String>[
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-y',
+          '-ss',
+          _seconds(at),
+          if (fastPreview) '-noaccurate_seek',
+          '-i',
+          effectiveVideoPath,
+          '-map',
+          '0:v:0',
+          '-frames:v',
+          '1',
+          if (mirrorHorizontal || mirrorVertical || maxWidth != null) ...[
+            '-vf',
+            [
+              if (mirrorHorizontal) 'hflip',
+              if (mirrorVertical) 'vflip',
+              if (maxWidth != null)
+                'scale=trunc(min(iw\\,$maxWidth)/2)*2:-2:flags=fast_bilinear',
+            ].join(','),
+          ],
+          '-q:v',
+          fastPreview ? '6' : '2',
+          '-c:v',
+          'mjpeg',
+          '-f',
+          'image2',
+          output,
+        ];
+        if (Platform.isWindows) {
+          try {
+            final ffmpegPath = await FFmpegUtils.ffmpegPath;
+            final result = await Process.run(
+              ffmpegPath,
+              args,
+            ).timeout(const Duration(seconds: 30));
+            if (result.exitCode == 0 && await _isUsableImage(output)) {
+              return output;
+            }
+            lastError = result.stderr?.toString().trim() ?? '';
+          } catch (error) {
+            lastError = error.toString();
+          }
+        } else {
+          final session = await FFmpegKit.executeWithArguments(args);
+          if (ReturnCode.isSuccess(await session.getReturnCode()) &&
+              await _isUsableImage(output)) {
             return output;
           }
-          lastError = result.stderr?.toString().trim() ?? '';
-        } catch (error) {
-          lastError = error.toString();
+          lastError = (await session.getAllLogsAsString() ?? '').trim();
         }
-      } else {
-        final session = await FFmpegKit.executeWithArguments(args);
-        if (ReturnCode.isSuccess(await session.getReturnCode()) &&
-            await _isUsableImage(output)) {
-          return output;
-        }
-        lastError = (await session.getAllLogsAsString() ?? '').trim();
+        final failedOutput = File(output);
+        if (await failedOutput.exists()) await failedOutput.delete();
       }
-      final failedOutput = File(output);
-      if (await failedOutput.exists()) await failedOutput.delete();
+      debugPrint('OCR preview frame extraction failed: $lastError');
+      final reason = _shortFfmpegError(lastError);
+      if (reason.isEmpty) {
+        throw StateError('无法提取当前视频画面');
+      }
+      throw StateError('无法提取当前视频画面：$reason');
+    } finally {
+      await frameLease?.release();
     }
-    debugPrint('OCR preview frame extraction failed: $lastError');
-    final reason = _shortFfmpegError(lastError);
-    if (reason.isEmpty) {
-      throw StateError('无法提取当前视频画面');
-    }
-    throw StateError('无法提取当前视频画面：$reason');
   }
 
   Future<void> deletePreview(String? path) async {
@@ -476,7 +502,48 @@ class OcrSubtitleManager extends ChangeNotifier {
     _update(_job!.copyWith(remaining: initialEstimate));
     OcrProcessingWorker? worker;
     Directory? tempRoot;
+    MaterializedMediaLease? materializedLease;
+    final sourceItem = library.getVideo(request.videoId);
+    final isOnline = sourceItem?.path.startsWith('bilibili://stream/') == true;
+    final preparationEnd = isOnline ? 0.20 : 0.08;
     try {
+      if (isOnline) {
+        _materializationCancellation = Completer<void>();
+        _materializationProgress = const MediaMaterializationProgress(
+          stage: MediaMaterializationStage.resolving,
+          progress: 0,
+          message: '正在准备 Bilibili 视频素材',
+        );
+        materializedLease = await library.acquireMaterializedMedia(
+          request.videoId,
+          MediaMaterializationRequirement.videoFrames,
+          targetHeight: 1080,
+          cancelSignal: _materializationCancellation!.future,
+          onProgress: (value) {
+            _materializationProgress = value;
+            _update(
+              _job!.copyWith(
+                status: OcrSubtitleJobStatus.materializing,
+                progress: value.progress * 0.12,
+                statusMessage:
+                    '${value.message}${_materializationDetails(value)}',
+              ),
+            );
+          },
+        );
+        request = request.copyWith(
+          videoPath: materializedLease.requiredVideoPath,
+        );
+        _materializationProgress = null;
+        // OCR 使用的 1080P 视频轨现已就位。后台补齐音频并封装出可直接
+        // 播放的本地文件：之后在播放页播放同画质时命中本地文件，无需整段
+        // 在线重播。用户离开 OCR 页也不影响该缓存补齐任务继续。
+        final materialization = library.mediaMaterializationService;
+        final sourceVideo = library.getVideo(request.videoId);
+        if (materialization != null && sourceVideo != null) {
+          unawaited(materialization.ensurePlaybackFileReady(sourceVideo));
+        }
+      }
       final languages = normalizedTracks
           .map((track) => track.language)
           .toSet()
@@ -501,7 +568,9 @@ class OcrSubtitleManager extends ChangeNotifier {
           onProgress: (progress, message) => _update(
             _job!.copyWith(
               status: OcrSubtitleJobStatus.downloading,
-              progress: 0.08 * ((languageIndex + progress) / languages.length),
+              progress:
+                  (isOnline ? 0.12 : 0.0) +
+                  0.08 * ((languageIndex + progress) / languages.length),
               statusMessage: message,
             ),
           ),
@@ -516,7 +585,10 @@ class OcrSubtitleManager extends ChangeNotifier {
 
       final spanMs = math.max(1, (request.end - request.start).inMilliseconds);
       final totalWorkMs = spanMs * normalizedTracks.length;
-      final progressTracker = OcrTaskProgressTracker(totalMs: totalWorkMs);
+      final progressTracker = OcrTaskProgressTracker(
+        totalMs: totalWorkMs,
+        processingStart: preparationEnd,
+      );
       const chunkDuration = Duration(seconds: 15);
       final results = <_OcrTrackResult>[];
       OcrSubtitleLanguage? workerLanguage;
@@ -746,6 +818,9 @@ class OcrSubtitleManager extends ChangeNotifier {
       } catch (_) {}
       _activeSession = null;
       _activeProcess = null;
+      _materializationCancellation = null;
+      _materializationProgress = null;
+      await materializedLease?.release();
       if (tempRoot != null && await tempRoot.exists()) {
         await tempRoot.delete(recursive: true);
       }
@@ -755,8 +830,37 @@ class OcrSubtitleManager extends ChangeNotifier {
   Future<void> cancel() async {
     if (!isRunning) return;
     _cancelled = true;
+    final materialization = _materializationCancellation;
+    if (materialization != null && !materialization.isCompleted) {
+      materialization.complete();
+    }
     await _activeSession?.cancel();
     _activeProcess?.kill();
+  }
+
+  String _formatTransferBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    final kb = bytes / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
+    return '${(kb / 1024).toStringAsFixed(1)} MB';
+  }
+
+  String _materializationDetails(MediaMaterializationProgress value) {
+    if (value.stage != MediaMaterializationStage.downloadingVideo &&
+        value.stage != MediaMaterializationStage.downloadingAudio) {
+      return '';
+    }
+    final total = value.totalBytes == null
+        ? _formatTransferBytes(value.receivedBytes)
+        : '${_formatTransferBytes(value.receivedBytes)} / '
+              '${_formatTransferBytes(value.totalBytes!)}';
+    final speed = value.bytesPerSecond > 0
+        ? ' · ${_formatTransferBytes(value.bytesPerSecond.round())}/s'
+        : '';
+    final eta = value.remaining == null
+        ? ''
+        : ' · 剩余约 ${value.remaining!.inSeconds}s';
+    return ' · $total$speed$eta';
   }
 
   Future<List<int>> _extractChunk(
@@ -783,7 +887,6 @@ class OcrSubtitleManager extends ChangeNotifier {
       _seconds(end - start),
       '-threads',
       Platform.isWindows || Platform.isMacOS ? '2' : '1',
-      '-autorotate',
       '-i',
       request.videoPath,
       '-an',
@@ -793,7 +896,7 @@ class OcrSubtitleManager extends ChangeNotifier {
       '1',
       '-vf',
       crop,
-      '-vsync',
+      '-fps_mode',
       'vfr',
       '-q:v',
       '6',
@@ -1141,17 +1244,20 @@ class _OcrJobCancelled implements Exception {
 /// instead of extrapolating from the first few frames of a chunk.
 @visibleForTesting
 class OcrTaskProgressTracker {
-  static const double processingStart = 0.08;
   static const double processingEnd = 0.97;
 
   final int totalMs;
-  int _lastPublishedPercent = 7;
+  final double processingStart;
+  late int _lastPublishedPercent;
   double? _mediaMsPerWallMs;
   int _cumulativeMediaMs = 0;
   int _cumulativeWallMs = 0;
   Duration? remaining;
 
-  OcrTaskProgressTracker({required this.totalMs}) : assert(totalMs > 0);
+  OcrTaskProgressTracker({required this.totalMs, this.processingStart = 0.08})
+    : assert(totalMs > 0) {
+    _lastPublishedPercent = (processingStart * 100).floor() - 1;
+  }
 
   double progressFor(int completedMs) {
     final fraction = completedMs.clamp(0, totalMs) / totalMs;

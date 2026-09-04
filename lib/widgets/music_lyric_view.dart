@@ -1,8 +1,33 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/subtitle_model.dart';
+import 'music_text_optical_alignment.dart';
+
+@visibleForTesting
+int musicLyricTapScrollDurationMs(int lineDistance) {
+  return (580 + lineDistance.abs() * 42).clamp(580, 820);
+}
+
+@visibleForTesting
+const Curve musicLyricTapScrollCurve = Cubic(0.32, 0.0, 0.18, 1.0);
+
+/// Sends explicit, repeatable lyric-location commands. Unlike a
+/// `ValueNotifier<Duration>`, equal positions are not deduplicated: every scrub
+/// release is a real request and a newer request may interrupt the old one.
+class MusicLyricPositionController extends ChangeNotifier {
+  Duration _position = Duration.zero;
+
+  Duration get position => _position;
+
+  void locate(Duration position) {
+    _position = position;
+    notifyListeners();
+  }
+}
 
 /// Apple Music 风格歌词列表视图（响应式 vh 单位）
 ///
@@ -35,12 +60,33 @@ class MusicLyricView extends StatefulWidget {
   /// 歌词视图通过监听此通知器来高亮当前行，无需父组件重建。
   final ValueListenable<Duration>? positionListenable;
 
+  /// Explicit positioning commands, primarily from progress-bar drag end.
+  final MusicLyricPositionController? positionController;
+
   /// 用户滚动方向变化回调。
   ///
   /// Apple Music 手机端交互：用户向下滚动歌词时隐藏底部播放控件，
   /// 向上滚动时重新显示。正值表示向上滚（内容向下移），负值表示向下滚（内容向下移）。
   /// null 表示恢复自动跟随模式（控件应重新显示）。
   final void Function(double? direction)? onScrollDirectionChanged;
+
+  /// Reports the actual manual scroll gesture lifetime. Unlike
+  /// [onScrollDirectionChanged], this ends as soon as scrolling stops rather
+  /// than when the delayed auto-follow mode resumes.
+  final ValueChanged<bool>? onManualScrollActivityChanged;
+
+  /// Called when a lyric row commits a direct tap. This is separate from
+  /// [onSeek] so a parent background-tap recognizer can suppress only the same
+  /// pointer interaction without treating the seek as a generic page tap.
+  final VoidCallback? onDirectLyricTap;
+
+  /// Keeps a directly tapped lyric logically selected across the small native
+  /// seek undershoot/overshoot produced by ALAC packet boundaries. Callers must
+  /// opt in only after confirming the source codec is ALAC.
+  final bool stabilizeAlacDirectSeek;
+
+  /// Whether the shared playback clock is currently advancing.
+  final bool isPlaying;
 
   /// 歌词字号缩放比例（1.0 = 默认中等偏大，0.6 = 小，1.4 = 大）
   final double lyricFontSizeScale;
@@ -49,15 +95,34 @@ class MusicLyricView extends StatefulWidget {
   /// 仅当没有独立副字幕轨道（secondarySubtitles 为空）时生效。
   final bool splitSubtitleByLine;
 
+  /// 当前行在歌词视口内的纵向锚点。横屏默认沿用原来的 30%，
+  /// 竖屏可传入更靠上的值以匹配 Apple Music 手机布局。
+  final double anchorFraction;
+
+  /// 歌词左右留白占屏幕宽度的比例。
+  final double horizontalPaddingFraction;
+
+  /// 是否在组件内部绘制固定的上下渐隐。竖屏由父层根据控制栏动画
+  /// 动态绘制遮罩，因此会关闭这里的固定遮罩。
+  final bool applyEdgeFade;
+
   const MusicLyricView({
     super.key,
     required this.subtitles,
     this.secondarySubtitles = const [],
     this.onSeek,
     this.positionListenable,
+    this.positionController,
     this.onScrollDirectionChanged,
+    this.onManualScrollActivityChanged,
+    this.onDirectLyricTap,
+    this.stabilizeAlacDirectSeek = false,
+    this.isPlaying = true,
     this.lyricFontSizeScale = 1.0,
     this.splitSubtitleByLine = false,
+    this.anchorFraction = 0.30,
+    this.horizontalPaddingFraction = 0.05,
+    this.applyEdgeFade = true,
   });
 
   @override
@@ -71,8 +136,10 @@ class MusicLyricView extends StatefulWidget {
 // ignore_for_file: library_private_classes
 class MusicLyricViewState extends State<MusicLyricView>
     with SingleTickerProviderStateMixin {
-  final ScrollController _scrollController = ScrollController();
-  final List<GlobalKey> _lineKeys = [];
+  final ItemScrollController _itemScrollController = ItemScrollController();
+  final ScrollController _windowsScrollController = ScrollController();
+  List<GlobalKey> _windowsLineKeys = <GlobalKey>[];
+  final Set<_LyricHitRegionState> _lyricHitRegions = <_LyricHitRegionState>{};
 
   /// 预计算的副字幕文本列表（与 widget.subtitles 一一对应）。
   /// 在 initState/didUpdateWidget 中预计算一次，构建时 O(1) 查表，
@@ -80,16 +147,25 @@ class MusicLyricViewState extends State<MusicLyricView>
   List<String> _secondaryTexts = const [];
 
   /// 当前行索引（基于播放进度计算）
-  int _activeIndex = 0;
+  /// -1 means playback is still before the first timed lyric.
+  int _activeIndex = -1;
 
   /// 当前播放位置（由 positionListenable 驱动，每帧更新）
   Duration _currentPosition = Duration.zero;
 
-  /// 用于控制滚动动画的 AnimationController
-  late AnimationController _scrollAnimationController;
+  /// Lyrics remain hidden until the target line has been laid out and located.
+  /// This prevents a new episode from flashing at line zero before jumping.
+  late AnimationController _contentAnimationController;
 
   /// 用户点击高亮的行索引（点击后到进度追上之前高亮显示）
   int _tappedIndex = -1;
+  int? _alacLatchedTapIndex;
+
+  static const int _alacSeekBoundaryToleranceMs = 450;
+
+  /// 手指按下时的短暂背景反馈，与 seek 完成前的文字高亮分离。
+  int _pressedIndex = -1;
+  Timer? _pressedFeedbackTimer;
 
   /// 是否已完成过「进入页面时的初始定位」。
   /// 用于保证即使当前索引与初始值相同（例如暂停在 0 秒、当前就是第 0 行），
@@ -105,26 +181,56 @@ class MusicLyricViewState extends State<MusicLyricView>
   /// 是否正在执行程序化滚动（用于区分用户滚动与自动滚动）
   bool _isProgrammaticScroll = false;
 
-  /// 上一次手动滚动位置，用于检测手动滚动方向（不含程序化滚动）
-  double? _lastManualScrollOffset;
-
   /// 记录最后一次手动滚动方向的符号（>0 向下滚隐藏控件，<0 向上滚显示控件）
   double? _lastManualScrollDirection;
 
   Timer? _resumeTimer;
+  Timer? _programmaticScrollResetTimer;
+  Timer? _tapGuardResetTimer;
+  Timer? _seekDispatchTimer;
   bool _disposed = false;
+  int _locateRevealRequestId = 0;
 
-  /// 当前正在进行的滚动动画，用于取消冲突的动画
-  Completer<void>? _currentScrollCompleter;
+  /// Only the newest scroll request may reset the shared interaction guards.
+  /// ItemScrollController cancels its previous transition when scrollTo is
+  /// called again; this id prevents the canceled Future from cleaning up the
+  /// replacement request.
+  int _scrollRequestId = 0;
+  bool _scrollAnimationInFlight = false;
+
+  /// Raw-pointer tap tracking remains owned by this stable parent State.  The
+  /// positioned-list package swaps out its secondary list when an animated
+  /// transition is interrupted, which can dispose a row between pointer-down
+  /// and pointer-up.  Keeping the gesture here makes that interruption tappable.
+  int? _pendingTapPointer;
+  int? _pendingTapIndex;
+  Offset? _pendingTapOrigin;
+  int? _lastCommittedPointer;
+  int? _deferredDirectTapPointer;
+  VoidCallback? _deferredDirectTapScroll;
+
+  /// Native players should not receive an unbounded burst of seeks. Visual
+  /// feedback and scrolling stay immediate while rapid seeks are latest-wins.
+  DateTime? _lastSeekDispatchedAt;
+  Duration? _pendingSeekPosition;
+  static const Duration _minimumSeekInterval = Duration(milliseconds: 120);
+
+  /// While a direct tap owns the scroll, the position notification produced by
+  /// that seek may update highlighting but must not start a competing scroll.
+  int? _directTapScrollTarget;
+  int _directTapRequestId = 0;
+  bool _windowsTapScrollCompleted = false;
+  bool _windowsTapSeekAcknowledged = false;
+  Timer? _windowsTapTransactionTimeout;
+
+  int? _explicitLocateActiveIndex;
+  int _explicitLocateRequestId = 0;
 
   /// 用于 NotificationListener 判断是否为用户拖拽滚动
   bool _isDragScrolling = false;
 
   /// 是否正在执行点击跳转（用于避免点击跳转时的滚动被误判为用户手动滚动）
   bool _isTappingLine = false;
-
-  /// 当前行锚点：视口高度的 30%（Apple Music 风格 — 当前行靠上，留 70% 空间给后续歌词）
-  static const double _anchorFraction = 0.30;
 
   /// 用户滚动后恢复自动跟随的延时
   static const Duration _autoResumeDelay = Duration(seconds: 3);
@@ -176,27 +282,22 @@ class MusicLyricViewState extends State<MusicLyricView>
   @override
   void initState() {
     super.initState();
-    _initLineKeys();
+    _resetWindowsLineKeys();
     _precomputeSecondaryTexts();
 
-    // 初始化滚动动画控制器
-    _scrollAnimationController = AnimationController(
+    _contentAnimationController = AnimationController(
       vsync: this,
-      duration: Duration(milliseconds: _normalScrollDuration),
+      duration: const Duration(milliseconds: 180),
     );
 
     // 监听 positionListenable 以更新歌词高亮
     widget.positionListenable?.addListener(_onPositionChanged);
+    widget.positionController?.addListener(_onExplicitLocateRequested);
     _currentPosition = widget.positionListenable?.value ?? Duration.zero;
+    _activeIndex = _findActiveIndex(_currentPosition);
 
     // 首帧布局完成后做一次无动画定位
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_disposed) {
-        _updateActiveIndex(animate: false);
-        // 即使从未播放（暂停在 0 秒），也强制把当前行滚动到锚点位置
-        _performInitialLocate();
-      }
-    });
+    _scheduleLocateAndReveal();
   }
 
   /// 当 positionListenable 变化时更新 _currentPosition 并刷新歌词高亮
@@ -212,13 +313,6 @@ class MusicLyricViewState extends State<MusicLyricView>
     // 直接调用 _updateActiveIndex，该方法内部会检查索引是否变化
     // 这种方式比 Timer(Duration.zero) 更及时，避免定位延迟
     _updateActiveIndex();
-  }
-
-  void _initLineKeys() {
-    _lineKeys.clear();
-    for (var i = 0; i < widget.subtitles.length; i++) {
-      _lineKeys.add(GlobalKey(debugLabel: 'lyric_line_$i'));
-    }
   }
 
   /// 预计算每行主字幕对应的副字幕文本（与 _findSecondaryText 逻辑完全一致，
@@ -238,27 +332,34 @@ class MusicLyricViewState extends State<MusicLyricView>
 
     // 检查 subtitles 是否真正变化（不仅比较引用，还比较内容）
     // 避免调节字号等操作时，因引用变化导致误重置用户滚动状态
-    if (oldWidget.subtitles != widget.subtitles) {
-      final contentChanged = _isSubtitlesContentChanged(
-        oldWidget.subtitles,
-        widget.subtitles,
-      );
+    if (oldWidget.subtitles != widget.subtitles ||
+        oldWidget.secondarySubtitles != widget.secondarySubtitles) {
+      final contentChanged =
+          _isSubtitlesContentChanged(oldWidget.subtitles, widget.subtitles) ||
+          _isSubtitlesContentChanged(
+            oldWidget.secondarySubtitles,
+            widget.secondarySubtitles,
+          );
 
       if (contentChanged) {
-        _initLineKeys();
+        _contentAnimationController.value = 0;
+        _resetWindowsLineKeys();
         _precomputeSecondaryTexts();
-        _activeIndex = 0;
+        _activeIndex = -1;
         _tappedIndex = -1;
+        _alacLatchedTapIndex = null;
+        _pressedIndex = -1;
         _isUserScrolling = false;
         _resumeTimer?.cancel();
+        _windowsTapTransactionTimeout?.cancel();
+        _windowsTapTransactionTimeout = null;
+        _windowsTapScrollCompleted = false;
+        _windowsTapSeekAcknowledged = false;
+        _directTapScrollTarget = null;
+        _directTapRequestId++;
         // 字幕数据集变化（含从空到非空、异步加载完成），需要重新做一次初始定位
         _initialLocateDone = false;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!_disposed) {
-            _updateActiveIndex(animate: false);
-            _performInitialLocate();
-          }
-        });
+        _scheduleLocateAndReveal();
       }
       // 如果内容没变，只是引用变化，则不重置用户滚动状态
     }
@@ -270,6 +371,23 @@ class MusicLyricViewState extends State<MusicLyricView>
       _currentPosition = widget.positionListenable?.value ?? Duration.zero;
       _updateActiveIndex(animate: false);
     }
+    if (oldWidget.positionController != widget.positionController) {
+      oldWidget.positionController?.removeListener(_onExplicitLocateRequested);
+      widget.positionController?.addListener(_onExplicitLocateRequested);
+    }
+    if (oldWidget.stabilizeAlacDirectSeek != widget.stabilizeAlacDirectSeek ||
+        oldWidget.isPlaying != widget.isPlaying) {
+      if (!widget.stabilizeAlacDirectSeek) _alacLatchedTapIndex = null;
+      _updateActiveIndex(animate: false);
+    }
+  }
+
+  void _resetWindowsLineKeys() {
+    _windowsLineKeys = List<GlobalKey>.generate(
+      widget.subtitles.length,
+      (index) => GlobalKey(debugLabel: 'windows-music-lyric-$index'),
+      growable: false,
+    );
   }
 
   /// 检查字幕列表内容是否真正变化
@@ -287,13 +405,34 @@ class MusicLyricViewState extends State<MusicLyricView>
     return false;
   }
 
+  void _scheduleLocateAndReveal() {
+    final requestId = ++_locateRevealRequestId;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (_disposed ||
+          !mounted ||
+          requestId != _locateRevealRequestId ||
+          widget.subtitles.isEmpty) {
+        return;
+      }
+
+      // Read the clock again after the subtitle list has committed. During an
+      // episode hand-off it may have changed between widget construction and
+      // the first laid-out frame.
+      _currentPosition = widget.positionListenable?.value ?? _currentPosition;
+      _updateActiveIndex(animate: false);
+      await _performInitialLocate();
+      if (_disposed || !mounted || requestId != _locateRevealRequestId) return;
+      _contentAnimationController.forward(from: 0);
+    });
+  }
+
   /// 二分查找当前进度对应的歌词行索引
   int _findActiveIndex(Duration position) {
     final subs = widget.subtitles;
-    if (subs.isEmpty) return 0;
+    if (subs.isEmpty || position < subs.first.startTime) return -1;
     int left = 0;
     int right = subs.length - 1;
-    int result = 0;
+    int result = -1;
     while (left <= right) {
       final mid = left + ((right - left) >> 1);
       if (position < subs[mid].startTime) {
@@ -306,10 +445,43 @@ class MusicLyricViewState extends State<MusicLyricView>
     return result;
   }
 
+  int _findDisplayActiveIndex(Duration position) {
+    final normalIndex = _findActiveIndex(position);
+    final latchedIndex = _alacLatchedTapIndex;
+    if (!widget.stabilizeAlacDirectSeek ||
+        latchedIndex == null ||
+        latchedIndex < 0 ||
+        latchedIndex >= widget.subtitles.length) {
+      return normalIndex;
+    }
+
+    final targetMs = widget.subtitles[latchedIndex].startTime.inMilliseconds;
+    final positionMs = position.inMilliseconds;
+    final deltaMs = positionMs - targetMs;
+    if (deltaMs.abs() > _alacSeekBoundaryToleranceMs) {
+      _alacLatchedTapIndex = null;
+      return normalIndex;
+    }
+
+    // While paused, the row the user chose remains authoritative throughout
+    // the same tolerance that the playback service accepts for native ALAC
+    // seek verification. Once playback advances across the requested boundary,
+    // the ordinary timeline owns highlighting again.
+    if (!widget.isPlaying || deltaMs < 0) return latchedIndex;
+    _alacLatchedTapIndex = null;
+    return normalIndex;
+  }
+
   void _updateActiveIndex({bool animate = true}) {
     if (!mounted || widget.subtitles.isEmpty) return;
 
-    final newIndex = _findActiveIndex(_currentPosition);
+    final newIndex = _findDisplayActiveIndex(_currentPosition);
+    final isWindowsTapTransaction =
+        Theme.of(context).platform == TargetPlatform.windows &&
+        _directTapScrollTarget != null;
+    if (isWindowsTapTransaction && newIndex == _directTapScrollTarget) {
+      _windowsTapSeekAcknowledged = true;
+    }
     if (newIndex != _activeIndex) {
       // 判断是否为大幅度跳转
       final jumpDistance = (newIndex - _activeIndex).abs();
@@ -325,8 +497,18 @@ class MusicLyricViewState extends State<MusicLyricView>
         // 记录跳转类型，供 AnimatedOpacity 使用
         _isLargeJump = isLargeJump;
       });
-      if (!_isUserScrolling) {
-        _scrollToIndex(newIndex, animate: animate, isLargeJump: isLargeJump);
+      final directTapOwnsScroll = isWindowsTapTransaction
+          ? true
+          : _directTapScrollTarget == newIndex;
+      final explicitLocateOwnsScroll = _explicitLocateActiveIndex == newIndex;
+      if (!_isUserScrolling &&
+          !directTapOwnsScroll &&
+          !explicitLocateOwnsScroll) {
+        _scrollToIndex(
+          _scrollTargetForActiveIndex(newIndex),
+          animate: animate,
+          isLargeJump: isLargeJump,
+        );
       }
 
       // 动画完成后重置 _isLargeJump 标志
@@ -360,6 +542,9 @@ class MusicLyricViewState extends State<MusicLyricView>
         setState(() {});
       }
     }
+    if (isWindowsTapTransaction) {
+      _completeWindowsTapTransactionIfReady(_directTapRequestId);
+    }
   }
 
   /// 是否为大幅度跳转（用于控制动画速度）
@@ -372,99 +557,419 @@ class MusicLyricViewState extends State<MusicLyricView>
     int index, {
     bool animate = true,
     bool isLargeJump = false,
+    bool isDirectTap = false,
+    int? directTapDistance,
   }) async {
-    if (!mounted || index < 0 || index >= _lineKeys.length) return;
-    final key = _lineKeys[index];
-    final ctx = key.currentContext;
-    if (ctx == null) {
-      // 行尚未构建，下一帧重试
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!_disposed && mounted) {
-          _scrollToIndex(index, animate: animate, isLargeJump: isLargeJump);
+    if (!mounted || index < 0 || index >= widget.subtitles.length) return;
+    final requestId = ++_scrollRequestId;
+    final isWindows = Theme.of(context).platform == TargetPlatform.windows;
+    final windowsTargetContext = isWindows && index < _windowsLineKeys.length
+        ? _windowsLineKeys[index].currentContext
+        : null;
+    final controllerIsReady = isWindows
+        ? _windowsScrollController.hasClients && windowsTargetContext != null
+        : _itemScrollController.isAttached;
+    if (!controllerIsReady) {
+      final attachedCompleter = Completer<void>();
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!_disposed && mounted && requestId == _scrollRequestId) {
+          await _scrollToIndex(
+            index,
+            animate: animate,
+            isLargeJump: isLargeJump,
+            isDirectTap: isDirectTap,
+            directTapDistance: directTapDistance,
+          );
         }
+        if (!attachedCompleter.isCompleted) attachedCompleter.complete();
       });
-      return;
+      return attachedCompleter.future;
     }
 
-    // 取消正在进行的滚动动画
-    _currentScrollCompleter?.complete();
-    final completer = Completer<void>();
-    _currentScrollCompleter = completer;
-
     _isProgrammaticScroll = true;
+    _scrollAnimationInFlight = true;
+    final tapDistance = directTapDistance ?? (index - _activeIndex).abs();
+    final tapDurationMs = musicLyricTapScrollDurationMs(tapDistance);
+    final duration = !animate
+        ? Duration.zero
+        : isDirectTap
+        ? Duration(milliseconds: tapDurationMs)
+        : isLargeJump
+        ? const Duration(milliseconds: _jumpScrollDuration)
+        : const Duration(milliseconds: _normalScrollDuration);
+    final curve = isDirectTap
+        ? musicLyricTapScrollCurve
+        : isLargeJump
+        ? Curves.easeInOutCubic
+        : const Cubic(0.25, 0.8, 0.25, 1);
     try {
-      // 根据是否是大幅度跳转选择动画参数
-      final duration = animate
-          ? (isLargeJump
-                ? Duration(milliseconds: _jumpScrollDuration)
-                : Duration(milliseconds: _normalScrollDuration))
-          : Duration.zero;
-      final curve = isLargeJump
-          ? Curves.easeInOutCubic
-          : const Cubic(0.25, 0.8, 0.25, 1);
-
-      await Scrollable.ensureVisible(
-        ctx,
-        alignment: _anchorFraction,
-        alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
-        duration: duration,
-        curve: curve,
-      );
-
-      if (!completer.isCompleted) {
-        completer.complete();
+      if (isWindows) {
+        // Windows deliberately uses one ordinary viewport. The same render
+        // object supplies both the animated destination and the settled
+        // layout, so completing an animation cannot swap in a second list
+        // with a slightly different measured offset.
+        await _scrollWindowsLineToAnchor(
+          targetContext: windowsTargetContext!,
+          duration: duration,
+          curve: curve,
+        );
+      } else if (animate) {
+        await _itemScrollController.scrollTo(
+          index: index,
+          alignment: widget.anchorFraction,
+          duration: duration,
+          curve: curve,
+        );
+      } else {
+        _itemScrollController.jumpTo(
+          index: index,
+          alignment: widget.anchorFraction,
+        );
       }
-    } catch (e) {
-      if (!completer.isCompleted) {
-        completer.complete();
-      }
+    } catch (_) {
+      // A replacement scroll intentionally cancels the previous transition.
     } finally {
-      // 延迟重置标志位，确保滚动动画完全结束，避免 NotificationListener 误判
-      // 延迟时间略长于滚动动画，确保所有可能的 ScrollNotification 都已处理完毕
-      final resetDelay = animate
-          ? (isLargeJump
-                ? _jumpScrollDuration + 100
-                : _normalScrollDuration + 100)
-          : 50;
-      Future.delayed(Duration(milliseconds: resetDelay), () {
-        if (mounted && !_disposed) {
-          _isProgrammaticScroll = false;
-        }
-      });
-      if (_currentScrollCompleter == completer) {
-        _currentScrollCompleter = null;
+      if (requestId == _scrollRequestId && !_disposed && mounted) {
+        _scrollAnimationInFlight = false;
+        // 延迟重置标志位，确保滚动动画完全结束，避免 NotificationListener 误判
+        // 延迟时间略长于滚动动画，确保所有可能的 ScrollNotification 都已处理完毕
+        final resetDelay = animate ? 120 : 50;
+        _programmaticScrollResetTimer?.cancel();
+        _programmaticScrollResetTimer = Timer(
+          Duration(milliseconds: resetDelay),
+          () {
+            if (mounted && !_disposed) {
+              _isProgrammaticScroll = false;
+            }
+          },
+        );
       }
     }
   }
 
+  Future<void> _scrollWindowsLineToAnchor({
+    required BuildContext targetContext,
+    required Duration duration,
+    required Curve curve,
+  }) async {
+    final targetObject = targetContext.findRenderObject();
+    final scrollable = Scrollable.maybeOf(targetContext);
+    final scrollableObject = scrollable?.context.findRenderObject();
+    if (targetObject is! RenderBox ||
+        scrollableObject is! RenderBox ||
+        scrollable == null ||
+        !scrollable.position.hasPixels) {
+      return;
+    }
+
+    // Scrollable.ensureVisible aligns the whole row rectangle; because every
+    // lyric includes a stanza gap, that places its top above the requested
+    // anchor. Align the row's leading edge instead, matching the mobile list.
+    final rowTop = scrollableObject
+        .globalToLocal(targetObject.localToGlobal(Offset.zero))
+        .dy;
+    final position = scrollable.position;
+    final destination =
+        (position.pixels +
+                rowTop -
+                position.viewportDimension * widget.anchorFraction)
+            .clamp(position.minScrollExtent, position.maxScrollExtent);
+    if ((destination - position.pixels).abs() <= 0.01) return;
+    if (duration == Duration.zero) {
+      position.jumpTo(destination);
+      return;
+    }
+    await position.animateTo(destination, duration: duration, curve: curve);
+  }
+
   /// 点击某行：立即 seek + 立即滚动到该行
-  void _handleTapLine(int index) {
+  void _handleTapLine(int index, {int? deferScrollUntilPointerUp}) {
     if (index < 0 || index >= widget.subtitles.length) return;
     final sub = widget.subtitles[index];
+    final tapDistance = (index - _activeIndex).abs();
+    final isWindowsDirectTap =
+        Theme.of(context).platform == TargetPlatform.windows;
+    widget.onDirectLyricTap?.call();
     setState(() {
       _tappedIndex = index;
+      _alacLatchedTapIndex = widget.stabilizeAlacDirectSeek ? index : null;
       _isUserScrolling = false;
       _isTappingLine = true; // ✅ 标记正在执行点击跳转
     });
     _resumeTimer?.cancel();
+    _tapGuardResetTimer?.cancel();
+    _directTapScrollTarget = index;
+    final tapRequestId = ++_directTapRequestId;
+    if (isWindowsDirectTap) {
+      _windowsTapScrollCompleted = false;
+      _windowsTapSeekAcknowledged =
+          widget.positionListenable == null || _activeIndex == index;
+      _windowsTapTransactionTimeout?.cancel();
+      _windowsTapTransactionTimeout = Timer(const Duration(seconds: 3), () {
+        if (_disposed || !mounted || tapRequestId != _directTapRequestId) {
+          return;
+        }
+        _finishWindowsTapTransaction(tapRequestId);
+      });
+    }
     // ✅ 点击歌词时不再通知父组件显示控件，避免干扰原有的显隐状态
     // widget.onScrollDirectionChanged?.call(-1);
-    widget.onSeek?.call(sub.startTime);
-    _scrollToIndex(index, animate: true).then((_) {
-      // 滚动完成后延迟重置标志位，确保所有滚动通知都已处理
-      Future.delayed(const Duration(milliseconds: 100), () {
-        if (mounted && !_disposed) {
-          _isTappingLine = false;
+    _dispatchSeek(sub.startTime);
+
+    void startScroll() {
+      if (_disposed || !mounted || tapRequestId != _directTapRequestId) return;
+
+      final scrollFuture = _scrollToIndex(
+        index,
+        animate: true,
+        isDirectTap: true,
+        directTapDistance: tapDistance,
+      );
+      scrollFuture.then((_) {
+        if (_disposed || !mounted || tapRequestId != _directTapRequestId) {
+          return;
         }
+        if (isWindowsDirectTap) {
+          _windowsTapScrollCompleted = true;
+          _completeWindowsTapTransactionIfReady(tapRequestId);
+        } else {
+          _directTapScrollTarget = null;
+          _scheduleTapGuardRelease(tapRequestId);
+        }
+        // 滚动完成后延迟重置标志位，确保所有滚动通知都已处理
       });
+    }
+
+    if (deferScrollUntilPointerUp != null) {
+      // ScrollablePositionedList and Flutter's Scrollable both keep processing
+      // this pointer after pointer-down. Starting the replacement now lets the
+      // same gesture cancel the brand-new animation. Keep the seek immediate,
+      // but start positioning only after this pointer has ended.
+      _deferredDirectTapPointer = deferScrollUntilPointerUp;
+      _deferredDirectTapScroll = startScroll;
+    } else {
+      startScroll();
+    }
+  }
+
+  void _completeWindowsTapTransactionIfReady(int requestId) {
+    if (requestId != _directTapRequestId ||
+        !_windowsTapScrollCompleted ||
+        !_windowsTapSeekAcknowledged) {
+      return;
+    }
+    _finishWindowsTapTransaction(requestId);
+  }
+
+  void _finishWindowsTapTransaction(int requestId) {
+    if (requestId != _directTapRequestId) return;
+    _windowsTapTransactionTimeout?.cancel();
+    _windowsTapTransactionTimeout = null;
+    _windowsTapScrollCompleted = false;
+    _windowsTapSeekAcknowledged = false;
+    _directTapScrollTarget = null;
+    _scheduleTapGuardRelease(requestId);
+  }
+
+  void _scheduleTapGuardRelease(int requestId) {
+    _tapGuardResetTimer?.cancel();
+    _tapGuardResetTimer = Timer(const Duration(milliseconds: 100), () {
+      if (mounted && !_disposed && requestId == _directTapRequestId) {
+        _isTappingLine = false;
+      }
     });
+  }
+
+  void _dispatchSeek(Duration position) {
+    final callback = widget.onSeek;
+    if (callback == null) return;
+
+    final now = DateTime.now();
+    final last = _lastSeekDispatchedAt;
+    if (last == null || now.difference(last) >= _minimumSeekInterval) {
+      _seekDispatchTimer?.cancel();
+      _pendingSeekPosition = null;
+      _lastSeekDispatchedAt = now;
+      callback(position);
+      return;
+    }
+
+    _pendingSeekPosition = position;
+    _seekDispatchTimer?.cancel();
+    final remaining = _minimumSeekInterval - now.difference(last);
+    _seekDispatchTimer = Timer(remaining, () {
+      if (_disposed || !mounted) return;
+      final target = _pendingSeekPosition;
+      _pendingSeekPosition = null;
+      if (target == null) return;
+      _lastSeekDispatchedAt = DateTime.now();
+      widget.onSeek?.call(target);
+    });
+  }
+
+  void _onExplicitLocateRequested() {
+    if (_disposed || !mounted || widget.subtitles.isEmpty) return;
+    final controller = widget.positionController;
+    if (controller == null) return;
+    _alacLatchedTapIndex = null;
+
+    final activeIndex = _findActiveIndex(controller.position);
+    final targetIndex = _scrollTargetForActiveIndex(activeIndex);
+    final requestId = ++_explicitLocateRequestId;
+    _explicitLocateActiveIndex = activeIndex;
+    _resumeTimer?.cancel();
+    _isUserScrolling = false;
+
+    final distance = (targetIndex - _activeIndex).abs();
+    _scrollToIndex(
+      targetIndex,
+      animate: true,
+      isLargeJump: distance > _largeJumpThreshold,
+    ).whenComplete(() {
+      if (_disposed || !mounted || requestId != _explicitLocateRequestId) {
+        return;
+      }
+      _explicitLocateActiveIndex = null;
+    });
+  }
+
+  void _beginLinePointer(PointerDownEvent event, int index) {
+    if (_lastCommittedPointer == event.pointer) return;
+    if (_pendingTapPointer != null) return;
+    _pendingTapPointer = event.pointer;
+    _pendingTapIndex = index;
+    _pendingTapOrigin = event.position;
+    _handleTapDown(index);
+
+    // During a positioned-list transition the package removes the hit-tested
+    // row on this very pointer-down. Commit now so the tap cannot disappear
+    // with that row; ordinary stationary lists still wait for pointer-up, which
+    // preserves normal drag-to-scroll behavior.
+    if (_scrollAnimationInFlight) {
+      _lastCommittedPointer = event.pointer;
+      _pendingTapPointer = null;
+      _pendingTapIndex = null;
+      _pendingTapOrigin = null;
+      _releasePressedLine(index);
+      _handleTapLine(index, deferScrollUntilPointerUp: event.pointer);
+    }
+  }
+
+  void _handleAnimatedPointerDown(PointerDownEvent event) {
+    if (!_scrollAnimationInFlight || _lastCommittedPointer == event.pointer) {
+      return;
+    }
+    final index = _hitTestLyricIndex(event.position);
+    if (index == null) return;
+
+    _lastCommittedPointer = event.pointer;
+    _cancelPendingLinePointer();
+    _handleTapDown(index);
+    _releasePressedLine(index);
+    _handleTapLine(index, deferScrollUntilPointerUp: event.pointer);
+  }
+
+  int? _hitTestLyricIndex(Offset globalPosition) {
+    final candidates = <int>[];
+    for (final region in _lyricHitRegions.toList(growable: false)) {
+      final box = region.renderBox;
+      if (box == null || !box.attached || !box.hasSize) continue;
+      final local = box.globalToLocal(globalPosition);
+      final rect = Offset.zero & box.size;
+      if (rect.contains(local)) {
+        candidates.add(region.index);
+      }
+    }
+    if (candidates.isEmpty) return null;
+
+    // Long-distance positioned-list transitions temporarily render two lists.
+    // Prefer the row belonging to the list nearest the latest visual target.
+    final reference =
+        _directTapScrollTarget ??
+        (_tappedIndex >= 0 ? _tappedIndex : _activeIndex);
+    candidates.sort(
+      (a, b) => (a - reference).abs().compareTo((b - reference).abs()),
+    );
+    return candidates.first;
+  }
+
+  void _handleRootPointerMove(PointerMoveEvent event) {
+    if (event.pointer != _pendingTapPointer) return;
+    final origin = _pendingTapOrigin;
+    if (origin != null && (event.position - origin).distance > kTouchSlop) {
+      _cancelPendingLinePointer();
+    }
+  }
+
+  void _handleRootPointerUp(PointerUpEvent event) {
+    _startDeferredDirectTapScroll(event.pointer);
+    if (event.pointer != _pendingTapPointer) return;
+    final index = _pendingTapIndex;
+    _pendingTapPointer = null;
+    _pendingTapIndex = null;
+    _pendingTapOrigin = null;
+    if (index == null) return;
+    _releasePressedLine(index);
+    _handleTapLine(index);
+  }
+
+  void _handleRootPointerCancel(PointerCancelEvent event) {
+    _startDeferredDirectTapScroll(event.pointer);
+    if (event.pointer == _pendingTapPointer) _cancelPendingLinePointer();
+  }
+
+  void _startDeferredDirectTapScroll(int pointer) {
+    if (_deferredDirectTapPointer != pointer) return;
+    final startScroll = _deferredDirectTapScroll;
+    _deferredDirectTapPointer = null;
+    _deferredDirectTapScroll = null;
+    if (startScroll == null) return;
+
+    // Our stable parent listener receives pointer-up before descendants. Wait
+    // until the frame boundary so every inner recognizer has fully released
+    // the pointer before beginning the replacement animation.
+    WidgetsBinding.instance.addPostFrameCallback((_) => startScroll());
+  }
+
+  void _cancelPendingLinePointer() {
+    final index = _pendingTapIndex;
+    _pendingTapPointer = null;
+    _pendingTapIndex = null;
+    _pendingTapOrigin = null;
+    if (index != null) _releasePressedLine(index);
+  }
+
+  void _handleTapDown(int index) {
+    _pressedFeedbackTimer?.cancel();
+    if (!mounted || _pressedIndex == index) return;
+    setState(() => _pressedIndex = index);
+  }
+
+  void _releasePressedLine(int index) {
+    _pressedFeedbackTimer?.cancel();
+    _pressedFeedbackTimer = Timer(const Duration(milliseconds: 90), () {
+      if (!mounted || _disposed || _pressedIndex != index) return;
+      setState(() => _pressedIndex = -1);
+    });
+  }
+
+  Widget _wrapTapInteraction(int index, Widget child) {
+    return Semantics(
+      button: true,
+      onTap: () => _handleTapLine(index),
+      child: Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: (event) => _beginLinePointer(event, index),
+        child: child,
+      ),
+    );
   }
 
   /// Apple Music 歌词透明度算法（包含点击和悬停效果）
   ///
   /// - 当前行 (offset=0)：完全不透明
-  /// - 已播放 (offset<0)：快速淡出，但最低保持在 0.35
-  /// - 后续行 (offset>0)：逐渐降低透明度，最低保持在 0.35
+  /// - 已播放 (offset<0)：比后续歌词更快融入背景
+  /// - 后续行 (offset>0)：保留阅读线索，但远处不与当前行争夺注意力
   /// - 鼠标悬停：该行透明度稍微增加（变亮）
   double _opacityForOffset(int offset, bool isTapped, bool isHovered) {
     // 点击状态：完全不透明
@@ -477,23 +982,23 @@ class MusicLyricViewState extends State<MusicLyricView>
     double opacity;
 
     if (offset < 0) {
-      // 已播放歌词：快速淡出，但最低保持在 0.35
+      // 已播放歌词更快淡出，尤其是 Header 后方的旧歌词。
       final distance = -offset; // 距离当前行的行数
       if (distance == 1) {
-        opacity = 0.50; // 上一行：较淡
+        opacity = 0.30;
       } else if (distance == 2) {
-        opacity = 0.42; // 上两行：更淡
+        opacity = 0.18;
       } else {
-        opacity = 0.35; // 上三行及以后：最低透明度
+        opacity = 0.10;
       }
     } else {
-      // 后续歌词：逐渐淡出，最低 0.35
+      // 后续歌词稍亮于已播放歌词，仍可提前浏览。
       if (offset == 1) {
-        opacity = 0.55; // 下一行：稍淡
+        opacity = 0.34;
       } else if (offset == 2) {
-        opacity = 0.42; // 下两行：更淡
+        opacity = 0.23;
       } else {
-        opacity = 0.35; // 下三行及以后：最低透明度
+        opacity = 0.14;
       }
     }
 
@@ -510,9 +1015,15 @@ class MusicLyricViewState extends State<MusicLyricView>
   void dispose() {
     _disposed = true;
     _resumeTimer?.cancel();
+    _programmaticScrollResetTimer?.cancel();
+    _tapGuardResetTimer?.cancel();
+    _windowsTapTransactionTimeout?.cancel();
+    _seekDispatchTimer?.cancel();
+    _pressedFeedbackTimer?.cancel();
     widget.positionListenable?.removeListener(_onPositionChanged);
-    _scrollController.dispose();
-    _scrollAnimationController.dispose();
+    widget.positionController?.removeListener(_onExplicitLocateRequested);
+    _windowsScrollController.dispose();
+    _contentAnimationController.dispose();
     super.dispose();
   }
 
@@ -524,7 +1035,16 @@ class MusicLyricViewState extends State<MusicLyricView>
   void scrollToCurrentIndex({bool animate = true}) {
     if (!mounted || widget.subtitles.isEmpty) return;
     final currentIndex = _findActiveIndex(_currentPosition);
-    _scrollToIndex(currentIndex, animate: animate, isLargeJump: true);
+    _scrollToIndex(
+      _scrollTargetForActiveIndex(currentIndex),
+      animate: animate,
+      isLargeJump: true,
+    );
+  }
+
+  int _scrollTargetForActiveIndex(int activeIndex) {
+    if (activeIndex >= 0) return activeIndex;
+    return widget.subtitles.isEmpty ? -1 : 0;
   }
 
   /// 进入页面（或字幕首次就绪）时，把歌词滚动到当前播放位置对应的行。
@@ -534,12 +1054,16 @@ class MusicLyricViewState extends State<MusicLyricView>
   /// 滚动到锚点（视口约 30%）位置，而不是停留在自然滚动位置（顶部）。
   /// 同时保证在「视频从未播放」的场景下也能完成一次自动定位。
   /// 仅在尚未完成过初始定位时执行一次，避免干扰用户后续的手动滚动。
-  void _performInitialLocate() {
+  Future<void> _performInitialLocate() async {
     if (!mounted || widget.subtitles.isEmpty) return;
     if (_initialLocateDone) return;
     _initialLocateDone = true;
     final index = _findActiveIndex(_currentPosition);
-    _scrollToIndex(index, animate: false, isLargeJump: true);
+    await _scrollToIndex(
+      _scrollTargetForActiveIndex(index),
+      animate: false,
+      isLargeJump: true,
+    );
   }
 
   @override
@@ -561,8 +1085,28 @@ class MusicLyricViewState extends State<MusicLyricView>
       builder: (context, constraints) {
         final viewportHeight = constraints.maxHeight;
         // 顶/底内边距：让首/末行也能滚动到锚点位置
-        final topPadding = viewportHeight * _anchorFraction;
-        final bottomPadding = viewportHeight * (1.0 - _anchorFraction);
+        final topPadding = viewportHeight * widget.anchorFraction;
+        final bottomPadding = viewportHeight * (1.0 - widget.anchorFraction);
+
+        final scrollContent = _buildScrollContent(
+          screenWidth: screenWidth,
+          engFontSize: engFontSize,
+          zhFontSize: zhFontSize,
+          stanzaGap: stanzaGap,
+          engZhGap: engZhGap,
+          topPadding: topPadding,
+          bottomPadding: bottomPadding,
+        );
+
+        final revealedContent = FadeTransition(
+          opacity: CurvedAnimation(
+            parent: _contentAnimationController,
+            curve: Curves.easeOutCubic,
+          ),
+          child: scrollContent,
+        );
+
+        if (!widget.applyEdgeFade) return revealedContent;
 
         return ShaderMask(
           shaderCallback: (Rect bounds) {
@@ -579,15 +1123,7 @@ class MusicLyricViewState extends State<MusicLyricView>
             ).createShader(bounds);
           },
           blendMode: BlendMode.dstIn,
-          child: _buildScrollContent(
-            screenWidth: screenWidth, // ✅ 传入 screenWidth
-            engFontSize: engFontSize,
-            zhFontSize: zhFontSize,
-            stanzaGap: stanzaGap,
-            engZhGap: engZhGap,
-            topPadding: topPadding,
-            bottomPadding: bottomPadding,
-          ),
+          child: revealedContent,
         );
       },
     );
@@ -613,50 +1149,48 @@ class MusicLyricViewState extends State<MusicLyricView>
         _isDragScrolling = true;
         _isUserScrolling = true;
         _resumeTimer?.cancel();
+        widget.onManualScrollActivityChanged?.call(true);
       }
     }
 
     if (notification is ScrollUpdateNotification) {
+      final scrollDelta = notification.scrollDelta ?? 0.0;
       // 仅处理用户手动滚动（拖拽或鼠标滚轮）
-      if (_isUserScrolling) {
-        final currentOffset = _scrollController.offset;
-        if (_lastManualScrollOffset != null &&
-            (_lastManualScrollOffset! - currentOffset).abs() > 1.0) {
-          final delta = _lastManualScrollOffset! - currentOffset;
-          // ✅ 修正方向逻辑（对标 Apple Music）：
-          // delta > 0: 内容向下移动（用户向上滑/往前翻字幕）→ 显示控件（direction = 1.0）
-          // delta < 0: 内容向上移动（用户向下滑/往后翻字幕）→ 隐藏控件（direction = -1.0）
-          final direction = delta > 0 ? 1.0 : -1.0;
-          // 仅当方向变化时才通知，避免重复回调
-          if (_lastManualScrollDirection == null ||
-              (direction > 0 && _lastManualScrollDirection! < 0) ||
-              (direction < 0 && _lastManualScrollDirection! > 0)) {
-            _lastManualScrollDirection = direction;
-            widget.onScrollDirectionChanged?.call(direction);
-          }
-        }
-        _lastManualScrollOffset = currentOffset;
-      }
-
-      // 鼠标滚轮检测：无 dragDetails 但 offset 发生了变化（鼠标滚轮不会设置 dragDetails）
-      if (!_isDragScrolling && !_isProgrammaticScroll) {
-        final currentOffset = _scrollController.offset;
-        if (_lastManualScrollOffset != null &&
-            (_lastManualScrollOffset! - currentOffset).abs() > 1.0) {
-          _isUserScrolling = true;
-          _resumeTimer?.cancel();
-          final delta = _lastManualScrollOffset! - currentOffset;
-          // ✅ 修正方向逻辑
-          final direction = delta > 0 ? 1.0 : -1.0;
+      if (_isUserScrolling && scrollDelta.abs() > 1.0) {
+        final delta = -scrollDelta;
+        // ✅ 修正方向逻辑（对标 Apple Music）：
+        // delta > 0: 内容向下移动（用户向上滑/往前翻字幕）→ 显示控件（direction = 1.0）
+        // delta < 0: 内容向上移动（用户向下滑/往后翻字幕）→ 隐藏控件（direction = -1.0）
+        final direction = delta > 0 ? 1.0 : -1.0;
+        // 仅当方向变化时才通知，避免重复回调
+        if (_lastManualScrollDirection == null ||
+            (direction > 0 && _lastManualScrollDirection! < 0) ||
+            (direction < 0 && _lastManualScrollDirection! > 0)) {
           _lastManualScrollDirection = direction;
           widget.onScrollDirectionChanged?.call(direction);
         }
-        _lastManualScrollOffset = currentOffset;
+      }
+
+      // 鼠标滚轮检测：无 dragDetails 但 offset 发生了变化（鼠标滚轮不会设置 dragDetails）
+      if (!_isDragScrolling &&
+          !_isProgrammaticScroll &&
+          scrollDelta.abs() > 1.0) {
+        if (!_isUserScrolling) {
+          widget.onManualScrollActivityChanged?.call(true);
+        }
+        _isUserScrolling = true;
+        _resumeTimer?.cancel();
+        final delta = -scrollDelta;
+        // ✅ 修正方向逻辑
+        final direction = delta > 0 ? 1.0 : -1.0;
+        _lastManualScrollDirection = direction;
+        widget.onScrollDirectionChanged?.call(direction);
       }
     }
 
     if (notification is ScrollEndNotification) {
       if (_isUserScrolling && !_isProgrammaticScroll) {
+        widget.onManualScrollActivityChanged?.call(false);
         _scheduleResumeAutoFollow();
       }
       _isDragScrolling = false;
@@ -671,12 +1205,11 @@ class MusicLyricViewState extends State<MusicLyricView>
     _resumeTimer = Timer(_autoResumeDelay, () {
       if (_disposed || !mounted) return;
       _isUserScrolling = false;
-      _lastManualScrollOffset = null;
       _lastManualScrollDirection = null;
       _isDragScrolling = false;
       // 通知父组件恢复自动跟随（显示控件）
       widget.onScrollDirectionChanged?.call(null);
-      _scrollToIndex(_activeIndex, animate: true);
+      _scrollToIndex(_scrollTargetForActiveIndex(_activeIndex), animate: true);
     });
   }
 
@@ -693,39 +1226,77 @@ class MusicLyricViewState extends State<MusicLyricView>
     if (subs.isEmpty) {
       return const SizedBox.shrink();
     }
-
-    final scrollView = SingleChildScrollView(
-      controller: _scrollController,
-      padding: EdgeInsets.only(
-        top: topPadding,
-        bottom: bottomPadding,
-        left: screenWidth * 0.05, // ✅ 对标 Apple Music：屏幕宽度的5%
-        right: screenWidth * 0.05,
-      ),
-      // 桌面端鼠标滚轮 + 触摸拖拽均原生支持
-      physics: const BouncingScrollPhysics(
-        parent: RangeMaintainingScrollPhysics(),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          for (int i = 0; i < subs.length; i++)
-            _buildLyricGroup(
-              index: i,
-              sub: subs[i],
-              engFontSize: engFontSize,
-              zhFontSize: zhFontSize,
-              stanzaGap: stanzaGap,
-              engZhGap: engZhGap,
-            ),
-        ],
-      ),
+    if (_windowsLineKeys.length != subs.length) {
+      _resetWindowsLineKeys();
+    }
+    final padding = EdgeInsets.only(
+      top: topPadding,
+      bottom: bottomPadding,
+      left: screenWidth * widget.horizontalPaddingFraction,
+      right: screenWidth * widget.horizontalPaddingFraction,
     );
+    const physics = BouncingScrollPhysics(
+      parent: RangeMaintainingScrollPhysics(),
+    );
+    final isWindows = Theme.of(context).platform == TargetPlatform.windows;
+
+    final Widget scrollView;
+    if (isWindows) {
+      // Windows 始终保留同一棵滚动树。动画终点和静止布局使用同一个
+      // RenderViewport，避免可变高度歌词在临时列表切换时重新测量并闪动。
+      scrollView = SingleChildScrollView(
+        key: const ValueKey<String>('music-lyric-windows-single-scroll'),
+        controller: _windowsScrollController,
+        padding: padding,
+        physics: physics,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: List<Widget>.generate(
+            subs.length,
+            (i) => KeyedSubtree(
+              key: _windowsLineKeys[i],
+              child: _buildLyricGroup(
+                index: i,
+                sub: subs[i],
+                engFontSize: engFontSize,
+                zhFontSize: zhFontSize,
+                stanzaGap: stanzaGap,
+                engZhGap: engZhGap,
+              ),
+            ),
+            growable: false,
+          ),
+        ),
+      );
+    } else {
+      scrollView = ScrollablePositionedList.builder(
+        key: const ValueKey<String>('music-lyric-positioned-list'),
+        itemScrollController: _itemScrollController,
+        padding: padding,
+        physics: physics,
+        itemCount: subs.length,
+        itemBuilder: (context, i) => _buildLyricGroup(
+          index: i,
+          sub: subs[i],
+          engFontSize: engFontSize,
+          zhFontSize: zhFontSize,
+          stanzaGap: stanzaGap,
+          engZhGap: engZhGap,
+        ),
+      );
+    }
 
     // 用 NotificationListener 包裹，精准区分用户手动滚动与程序化滚动
-    return NotificationListener<ScrollNotification>(
-      onNotification: _handleScrollNotification,
-      child: scrollView,
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: _handleAnimatedPointerDown,
+      onPointerMove: _handleRootPointerMove,
+      onPointerUp: _handleRootPointerUp,
+      onPointerCancel: _handleRootPointerCancel,
+      child: NotificationListener<ScrollNotification>(
+        onNotification: _handleScrollNotification,
+        child: scrollView,
+      ),
     );
   }
 
@@ -779,10 +1350,11 @@ class MusicLyricViewState extends State<MusicLyricView>
   }) {
     final isActive = index == _activeIndex;
     final isTapped = index == _tappedIndex;
+    final isPressed = index == _pressedIndex;
     final isHovered = index == _hoveredIndex;
     final offset = index - _activeIndex;
     // Apple Music 透明度：基于与当前行的距离 + 悬停效果
-    final opacity = _opacityForOffset(offset, isTapped, isHovered);
+    final opacity = _opacityForOffset(offset, isTapped || isPressed, isHovered);
     final highlight = isActive || isTapped;
 
     // 主字幕文本（原文）
@@ -801,6 +1373,8 @@ class MusicLyricViewState extends State<MusicLyricView>
       mainText = lines[0];
       translatedText = lines.sublist(1).join('\n');
     }
+    final mainIsChinese = _isChineseText(mainText);
+    final translationIsChinese = _isChineseText(translatedText);
 
     // 优化：对静态行使用 Opacity，对动态行使用 AnimatedOpacity
     // 静态行：距离当前行 > 2，透明度不变，不需要动画
@@ -808,62 +1382,114 @@ class MusicLyricViewState extends State<MusicLyricView>
 
     // 构建歌词内容（复用）
     Widget lyricContent = Container(
-      key: _lineKeys[index],
       width: double.infinity,
       padding: EdgeInsets.only(bottom: stanzaGap),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
+      child: Stack(
+        clipBehavior: Clip.none,
         children: [
-          // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
-          // 统一字号，只通过透明度区分（Apple Music 风格）
-          // 注意：整体透明度由 AnimatedOpacity 控制，这里只设置颜色
-          Text(
-            mainText,
-            textAlign: TextAlign.left,
-            softWrap: true,
-            maxLines: null,
-            style: TextStyle(
-              // 自动检测：含中文用思源黑体，否则用 Inter
-              fontFamily: _isChineseText(mainText)
-                  ? _fontFamilyZh
-                  : _fontFamilyEng,
-              fontSize: engFontSize, // 统一字号，不变
-              // 中文用 SemiBold (w600)，英文用 ExtraBold (w800)
-              fontWeight: _isChineseText(mainText)
-                  ? FontWeight.w600
-                  : FontWeight.w800,
-              color: Colors.white, // 颜色固定为白色，透明度由 AnimatedOpacity 控制
-              height: 1.3,
-              letterSpacing: -0.5, // 收紧字间距更有现代感
-            ),
-          ),
-
-          // === 翻译（中文）— 辅助补充 ===
-          // 副字幕比主字幕稍淡，通过颜色 alpha 实现
-          if (translatedText.isNotEmpty)
-            Padding(
-              padding: EdgeInsets.only(top: engZhGap),
-              child: Text(
-                translatedText,
-                textAlign: TextAlign.left,
-                softWrap: true,
-                maxLines: null,
-                style: TextStyle(
-                  fontFamily: _fontFamilyZh,
-                  fontSize: zhFontSize,
-                  // 与主字幕字重完全一致（中文 w600，英文 w800）
-                  fontWeight: _isChineseText(translatedText)
-                      ? FontWeight.w600
-                      : FontWeight.w800,
-                  // 副字幕比主字幕稍淡（当前行 0.7，非当前行 0.5）
-                  color: Colors.white.withValues(
-                    alpha: highlight ? 0.70 : 0.50,
+          Positioned(
+            left: -12,
+            right: -12,
+            top: -8,
+            bottom: -8,
+            child: IgnorePointer(
+              child: AnimatedScale(
+                scale: isPressed ? 1.0 : 0.985,
+                duration: Duration(milliseconds: isPressed ? 105 : 720),
+                curve: isPressed ? Curves.easeOutCubic : Curves.easeOutBack,
+                child: AnimatedOpacity(
+                  key: ValueKey<String>('music-lyric-press-$index'),
+                  opacity: isPressed ? 1.0 : 0.0,
+                  duration: Duration(milliseconds: isPressed ? 90 : 780),
+                  curve: isPressed
+                      ? Curves.easeOutCubic
+                      : const Cubic(0.16, 1.0, 0.30, 1.0),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                        colors: [
+                          Colors.white.withValues(alpha: 0.26),
+                          Colors.white.withValues(alpha: 0.14),
+                        ],
+                      ),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.10),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.14),
+                          blurRadius: 18,
+                          offset: const Offset(0, 7),
+                        ),
+                      ],
+                    ),
                   ),
-                  height: 1.5,
                 ),
               ),
             ),
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
+              MusicTextOpticalAlignment(
+                applyCjkRaise: mainIsChinese,
+                fontSize: engFontSize,
+                child: Text(
+                  mainText,
+                  textAlign: TextAlign.left,
+                  softWrap: true,
+                  maxLines: null,
+                  style: TextStyle(
+                    fontFamily: mainIsChinese ? _fontFamilyZh : _fontFamilyEng,
+                    fontSize: engFontSize,
+                    fontWeight: mainIsChinese
+                        ? FontWeight.w600
+                        : FontWeight.w800,
+                    color: Colors.white,
+                    height: 1.3,
+                    letterSpacing: -0.5,
+                    leadingDistribution: mainIsChinese
+                        ? TextLeadingDistribution.even
+                        : null,
+                  ),
+                ),
+              ),
+
+              if (translatedText.isNotEmpty)
+                Padding(
+                  padding: EdgeInsets.only(top: engZhGap),
+                  child: MusicTextOpticalAlignment(
+                    applyCjkRaise: translationIsChinese,
+                    fontSize: zhFontSize,
+                    child: Text(
+                      translatedText,
+                      textAlign: TextAlign.left,
+                      softWrap: true,
+                      maxLines: null,
+                      style: TextStyle(
+                        fontFamily: _fontFamilyZh,
+                        fontSize: zhFontSize,
+                        fontWeight: translationIsChinese
+                            ? FontWeight.w600
+                            : FontWeight.w800,
+                        color: Colors.white.withValues(
+                          alpha: highlight ? 0.70 : 0.50,
+                        ),
+                        height: 1.5,
+                        leadingDistribution: translationIsChinese
+                            ? TextLeadingDistribution.even
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ],
       ),
     );
@@ -876,6 +1502,7 @@ class MusicLyricViewState extends State<MusicLyricView>
     } else {
       // 动态行：透明度可能变化，使用动画
       opacityWrapper = AnimatedOpacity(
+        key: ValueKey<String>('music-lyric-row-opacity-$index'),
         opacity: opacity,
         // Apple Music 风格：根据跳转类型使用不同的动画时长
         duration: Duration(
@@ -899,17 +1526,23 @@ class MusicLyricViewState extends State<MusicLyricView>
       repaintWrapper = RepaintBoundary(child: opacityWrapper);
     }
 
+    final feedbackWrapper = AnimatedScale(
+      key: ValueKey<String>('music-lyric-row-scale-$index'),
+      scale: isPressed ? 0.982 : 1.0,
+      duration: Duration(milliseconds: isPressed ? 105 : 680),
+      curve: isPressed ? Curves.easeOutCubic : Curves.easeOutBack,
+      alignment: Alignment.centerLeft,
+      child: repaintWrapper,
+    );
+
     // 优化：只对动态行监听鼠标事件（移动端不启用 MouseRegion）
+    Widget interactiveRow;
     if (isStaticLine) {
       // 静态行：不需要鼠标事件监听
-      return GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: () => _handleTapLine(index),
-        child: repaintWrapper,
-      );
+      interactiveRow = _wrapTapInteraction(index, feedbackWrapper);
     } else {
       // 动态行：需要鼠标事件监听（只在桌面端启用）
-      return MouseRegion(
+      interactiveRow = MouseRegion(
         onEnter: (_) {
           // 鼠标进入：更新悬停索引
           if (mounted) {
@@ -928,12 +1561,66 @@ class MusicLyricViewState extends State<MusicLyricView>
             }
           });
         },
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => _handleTapLine(index),
-          child: repaintWrapper,
-        ),
+        child: _wrapTapInteraction(index, feedbackWrapper),
       );
     }
+
+    return _LyricHitRegion(
+      index: index,
+      onAttach: _lyricHitRegions.add,
+      onDetach: _lyricHitRegions.remove,
+      child: interactiveRow,
+    );
   }
+}
+
+class _LyricHitRegion extends StatefulWidget {
+  final int index;
+  final ValueChanged<_LyricHitRegionState> onAttach;
+  final ValueChanged<_LyricHitRegionState> onDetach;
+  final Widget child;
+
+  const _LyricHitRegion({
+    required this.index,
+    required this.onAttach,
+    required this.onDetach,
+    required this.child,
+  });
+
+  @override
+  State<_LyricHitRegion> createState() => _LyricHitRegionState();
+}
+
+class _LyricHitRegionState extends State<_LyricHitRegion> {
+  int get index => widget.index;
+
+  RenderBox? get renderBox {
+    final renderObject = context.findRenderObject();
+    return renderObject is RenderBox ? renderObject : null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.onAttach(this);
+  }
+
+  @override
+  void didUpdateWidget(covariant _LyricHitRegion oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.onAttach != widget.onAttach ||
+        oldWidget.onDetach != widget.onDetach) {
+      oldWidget.onDetach(this);
+      widget.onAttach(this);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.onDetach(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

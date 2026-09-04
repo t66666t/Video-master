@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/audio_playback_compatibility_service.dart';
 import 'package:video_player_app/models/video_item.dart';
+import 'package:video_player_app/platform/local_playback_backend_policy.dart';
 
 void main() {
   test('native builds use the wide-codec backend without transcoding', () {
@@ -65,6 +66,29 @@ void main() {
     expect(
       AudioPlaybackCompatibilityService.needsCompatibilityCopy('flac'),
       isTrue,
+    );
+  });
+
+  test('wide-codec routing distinguishes ALAC from AAC in M4A', () {
+    expect(
+      LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend('alac'),
+      isTrue,
+    );
+    expect(
+      LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend('flac'),
+      isFalse,
+    );
+    expect(
+      LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend('aac'),
+      isFalse,
+    );
+    expect(
+      LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend('mp3'),
+      isFalse,
+    );
+    expect(
+      LocalPlaybackBackendPolicy.codecNeedsWideCodecBackend('pcm_s24le'),
+      isFalse,
     );
   });
 

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 import 'cached_thumbnail_widget.dart';
+import 'music_text_optical_alignment.dart';
 
 /// Apple Music 风格专辑封面卡片组件（响应式 vh 单位）
 ///
@@ -218,46 +219,73 @@ class _MusicAlbumCoverState extends State<MusicAlbumCover>
     final screenHeight = MediaQuery.of(context).size.height;
     // 歌曲名到艺术家间距：~0.8vh
     final lineGap = (screenHeight * 0.008).clamp(4.0, 10.0);
+    final titleHeight = titleSize * 1.3 * 2;
+    final artistHeight = artistSize * 1.4;
+    final artistText = [
+      widget.artist,
+      widget.album,
+    ].where((s) => s.isNotEmpty).join(' \u2014 ');
+    final displayTitle = widget.title.isNotEmpty ? widget.title : '未知曲目';
     return SizedBox(
       width: widget.infoWidth ?? size,
+      height: titleHeight + lineGap + artistHeight,
       child: Column(
         children: [
-          Text(
-            widget.title.isNotEmpty ? widget.title : '未知曲目',
-            style: TextStyle(
-              fontFamily: _isChineseText(widget.title)
-                  ? 'Noto Sans SC'
-                  : 'Inter',
-              fontSize: titleSize,
-              fontWeight: FontWeight.w600,
-              color: Colors.white,
-              letterSpacing: 0.05,
-            ),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-          ),
-          if (widget.artist.isNotEmpty || widget.album.isNotEmpty) ...[
-            SizedBox(height: lineGap),
-            Text(
-              [
-                widget.artist,
-                widget.album,
-              ].where((s) => s.isNotEmpty).join(' \u2014 '),
-              style: TextStyle(
-                fontFamily: _isChineseText('${widget.artist}${widget.album}')
-                    ? 'Noto Sans SC'
-                    : 'Inter',
-                fontSize: artistSize,
-                fontWeight: FontWeight.w400,
-                color: Colors.white.withValues(alpha: 0.7),
-                letterSpacing: 0.03,
+          SizedBox(
+            height: titleHeight,
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: MusicTextOpticalAlignment(
+                applyCjkRaise: musicTextContainsCjk(displayTitle),
+                fontSize: titleSize,
+                child: Text(
+                  displayTitle,
+                  style: TextStyle(
+                    fontFamily: _isChineseText(displayTitle)
+                        ? 'Noto Sans SC'
+                        : 'Inter',
+                    fontSize: titleSize,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                    height: 1.3,
+                    letterSpacing: 0.05,
+                  ),
+                  strutStyle: StrutStyle(
+                    fontSize: titleSize,
+                    height: 1.3,
+                    forceStrutHeight: true,
+                  ),
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
             ),
-          ],
+          ),
+          SizedBox(height: lineGap),
+          SizedBox(
+            height: artistHeight,
+            child: MusicTextOpticalAlignment(
+              applyCjkRaise: musicTextContainsCjk(artistText),
+              fontSize: artistSize,
+              child: Text(
+                artistText,
+                style: TextStyle(
+                  fontFamily: _isChineseText(artistText)
+                      ? 'Noto Sans SC'
+                      : 'Inter',
+                  fontSize: artistSize,
+                  fontWeight: FontWeight.w400,
+                  color: Colors.white.withValues(alpha: 0.7),
+                  height: 1.4,
+                  letterSpacing: 0.03,
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
         ],
       ),
     );

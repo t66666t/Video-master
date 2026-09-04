@@ -12,7 +12,6 @@ import '../models/subtitle_output_path_strategy.dart';
 import '../models/danmaku_style.dart';
 import '../models/video_compose_models.dart';
 import '../utils/device_form_factor.dart';
-import '../utils/subtitle_file_matcher.dart';
 
 enum PlaybackSpeedLockAction { locked, switched, unlocked }
 
@@ -215,13 +214,6 @@ class SettingsService extends ChangeNotifier {
 
   // New: Auto Cache Subtitles
   bool autoCacheSubtitles = true;
-
-  // Desktop same-folder subtitle discovery. The default accepts exact names
-  // and conventional metadata suffixes such as `.zh-CN` or ` [English]`, but
-  // avoids broad matches such as `Movie2.srt` for `Movie.mkv`.
-  SubtitlePrefixMatchMode desktopSubtitlePrefixMatchMode =
-      SubtitlePrefixMatchMode.exactOrDelimited;
-  bool desktopSubtitleScanCaseSensitive = false;
 
   // New: Auto Scroll Subtitles
   bool autoScrollSubtitles = true;
@@ -698,19 +690,6 @@ class SettingsService extends ChangeNotifier {
         key: 'autoCacheSubtitles',
         defaultValue: true,
         apply: (service, value) => service.autoCacheSubtitles = value,
-      ),
-      _stringSetting(
-        key: 'desktopSubtitlePrefixMatchMode',
-        defaultValue: SubtitlePrefixMatchMode.exactOrDelimited.name,
-        normalize: (value) => SubtitlePrefixMatchMode.fromStorage(value).name,
-        apply: (service, value) => service.desktopSubtitlePrefixMatchMode =
-            SubtitlePrefixMatchMode.fromStorage(value),
-      ),
-      _boolSetting(
-        key: 'desktopSubtitleScanCaseSensitive',
-        defaultValue: false,
-        apply: (service, value) =>
-            service.desktopSubtitleScanCaseSensitive = value,
       ),
       _boolSetting(
         key: 'autoScrollSubtitles',
@@ -2115,23 +2094,6 @@ class SettingsService extends ChangeNotifier {
 
   Future<void> saveAutoCacheSubtitles(bool value) async {
     await _updateRegisteredSetting<bool>('autoCacheSubtitles', value);
-  }
-
-  Future<void> saveDesktopSubtitleScanSettings({
-    required SubtitlePrefixMatchMode prefixMatchMode,
-    required bool caseSensitive,
-  }) async {
-    await _updateRegisteredSetting<String>(
-      'desktopSubtitlePrefixMatchMode',
-      prefixMatchMode.name,
-      notify: false,
-    );
-    await _updateRegisteredSetting<bool>(
-      'desktopSubtitleScanCaseSensitive',
-      caseSensitive,
-      notify: false,
-    );
-    notifyListeners();
   }
 
   Future<void> saveSplitSubtitleByLine(bool value) async {

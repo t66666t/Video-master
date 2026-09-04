@@ -29,6 +29,7 @@ void main() {
       bool compactTopRightButtons = false,
       bool showResetScreenButton = false,
       bool hasChapters = false,
+      EdgeInsets viewPadding = EdgeInsets.zero,
     }) async {
       await tester.binding.setSurfaceSize(size);
       await tester.pumpWidget(
@@ -41,42 +42,49 @@ void main() {
               value: playbackService,
             ),
           ],
-          child: MaterialApp(
-            home: Scaffold(
-              body: VideoControlsOverlay(
-                controller: controller,
-                isLocked: isLocked,
-                isPreviewMode: false,
-                onTogglePlay: () {},
-                onBackPressed: () {},
-                onToggleLock: () {},
-                onOpenSettings: () {},
-                onOpenSubtitleManager: () {},
-                compactTopRightButtons: compactTopRightButtons,
-                showDanmakuControls: true,
-                danmakuEnabled: true,
-                onToggleDanmaku: () {},
-                onOpenDanmakuSettings: () {},
-                onSpeedUpdate: (_) async {},
-                showSubtitles: false,
-                onToggleSubtitles: () {},
-                onMoveSubtitles: () {},
-                isLongPressing: false,
-                longPressFeedbackText: '',
-                onLongPressStart: () => true,
-                onLongPressEnd: () {},
-                subtitleEntries: const [],
-                subtitleStyle: const SubtitleStyle(),
-                subtitleAlignment: Alignment.bottomCenter,
-                onEnterSubtitleDragMode: () {},
-                showResetScreenButton: showResetScreenButton,
-                onResetScreenTransform: showResetScreenButton ? () {} : null,
-                chapters: hasChapters
-                    ? const <MediaChapter>[
-                        MediaChapter(title: '第一章', startMs: 0, endMs: 10000),
-                      ]
-                    : const <MediaChapter>[],
-                onOpenChapters: hasChapters ? () {} : null,
+          child: MediaQuery(
+            data: MediaQueryData(
+              size: size,
+              padding: viewPadding,
+              viewPadding: viewPadding,
+            ),
+            child: MaterialApp(
+              home: Scaffold(
+                body: VideoControlsOverlay(
+                  controller: controller,
+                  isLocked: isLocked,
+                  isPreviewMode: false,
+                  onTogglePlay: () {},
+                  onBackPressed: () {},
+                  onToggleLock: () {},
+                  onOpenSettings: () {},
+                  onOpenSubtitleManager: () {},
+                  compactTopRightButtons: compactTopRightButtons,
+                  showDanmakuControls: true,
+                  danmakuEnabled: true,
+                  onToggleDanmaku: () {},
+                  onOpenDanmakuSettings: () {},
+                  onSpeedUpdate: (_) async {},
+                  showSubtitles: false,
+                  onToggleSubtitles: () {},
+                  onMoveSubtitles: () {},
+                  isLongPressing: false,
+                  longPressFeedbackText: '',
+                  onLongPressStart: () => true,
+                  onLongPressEnd: () {},
+                  subtitleEntries: const [],
+                  subtitleStyle: const SubtitleStyle(),
+                  subtitleAlignment: Alignment.bottomCenter,
+                  onEnterSubtitleDragMode: () {},
+                  showResetScreenButton: showResetScreenButton,
+                  onResetScreenTransform: showResetScreenButton ? () {} : null,
+                  chapters: hasChapters
+                      ? const <MediaChapter>[
+                          MediaChapter(title: '第一章', startMs: 0, endMs: 10000),
+                        ]
+                      : const <MediaChapter>[],
+                  onOpenChapters: hasChapters ? () {} : null,
+                ),
               ),
             ),
           ),
@@ -166,6 +174,23 @@ void main() {
 
     expect(phoneButtonSize, greaterThanOrEqualTo(40));
     expect(phoneButtonSize, lessThan(tabletButtonSize));
+    const landscapeNotchInset = 47.0;
+    await pumpAt(
+      const Size(800, 360),
+      viewPadding: const EdgeInsets.only(left: landscapeNotchInset),
+    );
+    expect(
+      tester
+          .getRect(find.byKey(const ValueKey('player-side-danmaku-toggle')))
+          .left,
+      landscapeNotchInset,
+    );
+    expect(
+      tester
+          .getRect(find.byKey(const ValueKey('video-controls-bottom-row')))
+          .left,
+      landscapeNotchInset,
+    );
     await pumpAt(const Size(800, 360), compactTopRightButtons: true);
     await pumpAt(const Size(800, 360));
     final danmakuToggleBeforeReset = tester.getRect(

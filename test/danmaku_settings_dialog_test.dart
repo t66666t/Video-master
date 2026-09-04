@@ -34,6 +34,7 @@ void main() {
     await tester.tap(find.text('设置'));
     await tester.pumpAndSettle();
     expect(find.text('弹幕高级设置'), findsNothing);
+    expect(find.text('适中 · 1.0×'), findsOneWidget);
 
     await tester.tap(find.text('高级设置'));
     await tester.pumpAndSettle();

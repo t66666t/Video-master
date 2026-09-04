@@ -840,22 +840,25 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }) async {
     final library = Provider.of<LibraryService>(context, listen: false);
 
-    AppToast.showLoading("开始导入...");
+    final importToast = AppToast.showLoading("开始导入...");
+    try {
+      final count = await service.importToLibrary(
+        library,
+        episode: episode,
+        targetFolderId: widget.targetFolderId,
+      );
 
-    final count = await service.importToLibrary(
-      library,
-      episode: episode,
-      targetFolderId: widget.targetFolderId,
-    );
+      if (!mounted) return;
 
-    if (!mounted) return;
+      await importToast.dismiss();
 
-    AppToast.dismiss();
-
-    if (count > 0) {
-      AppToast.show("已导入 $count 个视频", type: AppToastType.success);
-    } else {
-      AppToast.show("导入失败或无已完成任务", type: AppToastType.error);
+      if (count > 0) {
+        AppToast.show("已导入 $count 个视频", type: AppToastType.success);
+      } else {
+        AppToast.show("导入失败或无已完成任务", type: AppToastType.error);
+      }
+    } finally {
+      await importToast.dismiss(immediate: true);
     }
   }
 
@@ -2116,30 +2119,33 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                   .toDouble();
 
               // 横向间距：使用更宽的动态范围，在小屏幕上非常紧凑，在大屏幕上也不会过分拉开
-              final double inputToActionsGap = (screenWidth * 0.015)
-                  .clamp(4.0, 16.0)
-                  .toDouble();
-              final double actionGap = (screenWidth * 0.005)
-                  .clamp(0.0, 8.0)
-                  .toDouble();
-              final double actionsToParseGap = (screenWidth * 0.012)
-                  .clamp(4.0, 12.0)
-                  .toDouble();
+              final double inputToActionsGap = isCompactAppBar
+                  ? 2
+                  : (screenWidth * 0.015).clamp(4.0, 16.0).toDouble();
+              final double actionGap = isCompactAppBar
+                  ? 0
+                  : (screenWidth * 0.005).clamp(0.0, 8.0).toDouble();
+              final double actionsToParseGap = isCompactAppBar
+                  ? 2
+                  : (screenWidth * 0.012).clamp(4.0, 12.0).toDouble();
 
               // 按钮尺寸与内边距：基于屏幕宽度做微调
-              final double iconButtonPadding = (screenWidth * 0.008)
-                  .clamp(2.0, 8.0)
-                  .toDouble();
-              final double actionIconSize = (screenWidth * 0.035)
-                  .clamp(14.0, 20.0)
-                  .toDouble();
-              final double actionButtonExtent = (screenWidth * 0.06)
-                  .clamp(24.0, 36.0)
-                  .toDouble();
-              final double parseButtonHeight = actionButtonExtent;
-              final double parseButtonHorizontalPadding = (screenWidth * 0.025)
-                  .clamp(12.0, 24.0)
-                  .toDouble();
+              final double iconButtonPadding = isCompactAppBar
+                  ? 0
+                  : (screenWidth * 0.008).clamp(2.0, 8.0).toDouble();
+              final double actionIconSize = isCompactAppBar
+                  ? 14
+                  : (screenWidth * 0.035).clamp(14.0, 20.0).toDouble();
+              final double actionButtonExtent = isCompactAppBar
+                  ? 22
+                  : (screenWidth * 0.06).clamp(24.0, 36.0).toDouble();
+              final double parseButtonHeight = isCompactAppBar
+                  ? 28
+                  : actionButtonExtent;
+              final double parseButtonHorizontalPadding = isCompactAppBar
+                  ? 8
+                  : (screenWidth * 0.025).clamp(12.0, 24.0).toDouble();
+              final double parseButtonMinWidth = isCompactAppBar ? 48 : 64;
               final double inputContentPadding = (screenWidth * 0.015)
                   .clamp(8.0, 16.0)
                   .toDouble();
@@ -2157,7 +2163,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       setState(() => _streamingMode = !_streamingMode);
                     },
                     child: Text(
-                      _streamingMode ? 'Bilibili 在线导入' : 'BBDown 下载',
+                      _streamingMode ? 'Bilibili 在线导入' : 'BiliBili视频下载',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
@@ -2221,35 +2227,30 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                         vertical: topVerticalPadding,
                       ),
                       color: const Color(0xFF1E1E1E),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _inputController,
-                              maxLines: inputMaxLines,
-                              minLines: inputMinLines,
-                              expands: false,
-                              keyboardType: TextInputType.multiline,
-                              textInputAction: TextInputAction.newline,
-                              decoration: InputDecoration(
-                                labelText:
-                                    "输入 BV号 或 视频链接（链接包含视频标题前缀也可输入） (支持多行)",
-                                border: const OutlineInputBorder(),
-                                contentPadding: EdgeInsets.all(
-                                  inputContentPadding,
-                                ),
-                                hintText: "每行一个链接，自动忽略前缀...",
-                                isDense: true,
+                      child: Builder(
+                        builder: (context) {
+                          final inputField = TextField(
+                            controller: _inputController,
+                            maxLines: inputMaxLines,
+                            minLines: inputMinLines,
+                            expands: false,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            decoration: InputDecoration(
+                              labelText: "输入 BV号 或 视频链接（链接包含视频标题前缀也可输入） (支持多行)",
+                              border: const OutlineInputBorder(),
+                              contentPadding: EdgeInsets.all(
+                                inputContentPadding,
                               ),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 13,
-                              ),
+                              hintText: "每行一个链接，自动忽略前缀...",
+                              isDense: true,
                             ),
-                          ),
-                          SizedBox(width: inputToActionsGap),
-                          Row(
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
+                          );
+                          final actions = Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               IconButton(
@@ -2343,7 +2344,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                             parseButtonHorizontalPadding,
                                         vertical: 0,
                                       ),
-                                      minimumSize: Size(64, parseButtonHeight),
+                                      minimumSize: Size(
+                                        parseButtonMinWidth,
+                                        parseButtonHeight,
+                                      ),
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
                                     ),
                                     child: isParsing
                                         ? const SizedBox(
@@ -2359,8 +2365,17 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                 },
                               ),
                             ],
-                          ),
-                        ],
+                          );
+
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(child: inputField),
+                              SizedBox(width: inputToActionsGap),
+                              actions,
+                            ],
+                          );
+                        },
                       ),
                     ),
                     Selector<BilibiliDownloadService, String?>(
@@ -2677,6 +2692,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   ) {
     bool hasInfo = _streamingMode || ep.availableVideoQualities.isNotEmpty;
     final episodeStatusText = _episodeStatusText(ep);
+    final isStreamingImporting =
+        _streamingMode && service.isStreamingImporting(ep);
+    final streamingImportProgressText = isStreamingImporting
+        ? ep.downloadSpeed
+        : null;
     final media = MediaQuery.of(context);
     final isCompact =
         media.orientation == Orientation.portrait && media.size.width < 600;
@@ -2867,17 +2887,26 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       // Action Button
                       if (_streamingMode)
                         IconButton(
-                          icon: Icon(
-                            Icons.file_upload_outlined,
-                            size: compactIconSize,
-                            color: Colors.white70,
-                          ),
+                          icon: isStreamingImporting
+                              ? SizedBox(
+                                  width: compactIconSize - 3,
+                                  height: compactIconSize - 3,
+                                  child: const CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : Icon(
+                                  Icons.file_upload_outlined,
+                                  size: compactIconSize,
+                                  color: Colors.white70,
+                                ),
                           tooltip: '导出在线播放条目',
                           padding: iconPadding,
                           constraints: iconConstraints,
                           visualDensity: iconDensity,
-                          onPressed: () =>
-                              _exportStreaming(service, episode: ep),
+                          onPressed: isStreamingImporting
+                              ? null
+                              : () => _exportStreaming(service, episode: ep),
                         )
                       else if (ep.status == DownloadStatus.downloading)
                         IconButton(
@@ -2964,7 +2993,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                 ],
                               ),
                             ),
-                          if (_streamingMode ||
+                          if ((_streamingMode && !isStreamingImporting) ||
                               ep.status == DownloadStatus.completed)
                             const PopupMenuItem(
                               value: 'export',
@@ -3111,6 +3140,18 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
               ),
             ),
 
+          if (streamingImportProgressText != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                streamingImportProgressText,
+                style: const TextStyle(
+                  color: Colors.lightBlueAccent,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+
           // Status Text for Completed/Exported
           if (ep.status == DownloadStatus.completed && ep.downloadSpeed != null)
             Padding(
@@ -3163,6 +3204,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     bool hasInfo = _streamingMode || ep.availableVideoQualities.isNotEmpty;
     bool isCompleted = ep.status == DownloadStatus.completed;
     final episodeStatusText = _episodeStatusText(ep);
+    final isStreamingImporting =
+        _streamingMode && service.isStreamingImporting(ep);
+    final streamingImportProgressText = isStreamingImporting
+        ? ep.downloadSpeed
+        : null;
     final media = MediaQuery.of(context);
     final isCompact =
         media.orientation == Orientation.portrait && media.size.width < 600;
@@ -3305,17 +3351,29 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                               ep.status == DownloadStatus.completed) ...[
                             if (_streamingMode)
                               IconButton(
-                                icon: Icon(
-                                  Icons.file_upload_outlined,
-                                  size: compactIconSize,
-                                  color: Colors.white70,
-                                ),
+                                icon: isStreamingImporting
+                                    ? SizedBox(
+                                        width: compactIconSize - 3,
+                                        height: compactIconSize - 3,
+                                        child: const CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                        ),
+                                      )
+                                    : Icon(
+                                        Icons.file_upload_outlined,
+                                        size: compactIconSize,
+                                        color: Colors.white70,
+                                      ),
                                 tooltip: '导出在线播放条目',
                                 padding: iconPadding,
                                 constraints: iconConstraints,
                                 visualDensity: iconDensity,
-                                onPressed: () =>
-                                    _exportStreaming(service, episode: ep),
+                                onPressed: isStreamingImporting
+                                    ? null
+                                    : () => _exportStreaming(
+                                        service,
+                                        episode: ep,
+                                      ),
                               )
                             else if (ep.status == DownloadStatus.downloading)
                               IconButton(
@@ -3417,7 +3475,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                       ),
                                     ),
 
-                                  if (_streamingMode ||
+                                  if ((_streamingMode &&
+                                          !isStreamingImporting) ||
                                       ep.status == DownloadStatus.completed)
                                     const PopupMenuItem(
                                       value: 'export',
@@ -3772,6 +3831,21 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       ],
                     ),
                   ],
+                ),
+              ),
+
+            if (streamingImportProgressText != null)
+              Padding(
+                padding: const EdgeInsets.only(left: 48, top: 4),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    streamingImportProgressText,
+                    style: const TextStyle(
+                      color: Colors.lightBlueAccent,
+                      fontSize: 10,
+                    ),
+                  ),
                 ),
               ),
 

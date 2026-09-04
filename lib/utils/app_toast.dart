@@ -29,9 +29,19 @@ class AppToastHandle {
       fromSwipe: fromSwipe,
     );
   }
+
+  void updateProgress({String? message, double? progress, AppToastType? type}) {
+    AppToast._updateProgressIfCurrent(
+      _presentationId,
+      message: message,
+      progress: progress,
+      type: type,
+    );
+  }
 }
 
 class AppToast {
+  static const Duration _maximumVisibleDuration = Duration(seconds: 8);
   static final GlobalKey<NavigatorState> navigatorKey =
       GlobalKey<NavigatorState>();
   static final NavigatorObserver observer = _ToastNavigatorObserver();
@@ -39,6 +49,7 @@ class AppToast {
       RouteObserver<PageRoute<dynamic>>();
 
   static OverlayEntry? _entry;
+  static final Set<OverlayEntry> _retiringEntries = <OverlayEntry>{};
   static Timer? _dismissTimer;
   static _ToastOverlayController? _controller;
   static ValueNotifier<_ToastViewData>? _contentNotifier;
@@ -58,7 +69,9 @@ class AppToast {
         showSpinner: false,
         action: action,
       ),
-      autoDismissAfter: duration,
+      autoDismissAfter: duration > _maximumVisibleDuration
+          ? _maximumVisibleDuration
+          : duration,
     );
   }
 
@@ -96,6 +109,32 @@ class AppToast {
     double? progress,
     AppToastType? type,
   }) {
+    final presentationId = _currentPresentationId;
+    if (presentationId == null) {
+      if (message != null) {
+        showProgress(
+          message,
+          progress: progress,
+          type: type ?? AppToastType.info,
+        );
+      }
+      return;
+    }
+    _updateProgressIfCurrent(
+      presentationId,
+      message: message,
+      progress: progress,
+      type: type,
+    );
+  }
+
+  static void _updateProgressIfCurrent(
+    int presentationId, {
+    String? message,
+    double? progress,
+    AppToastType? type,
+  }) {
+    if (_currentPresentationId != presentationId) return;
     final notifier = _contentNotifier;
     final current = notifier?.value;
     if (notifier == null || current == null) {
@@ -110,11 +149,8 @@ class AppToast {
     }
 
     _dismissTimer?.cancel();
-    final presentationId = _currentPresentationId;
     _dismissTimer = Timer(const Duration(seconds: 8), () {
-      if (presentationId != null) {
-        _dismissIfCurrent(presentationId);
-      }
+      _dismissIfCurrent(presentationId);
     });
     notifier.value = current.copyWith(
       message: message,
@@ -131,6 +167,13 @@ class AppToast {
   }) async {
     _dismissTimer?.cancel();
     _dismissTimer = null;
+
+    if (immediate) {
+      for (final retiringEntry in _retiringEntries.toList()) {
+        if (retiringEntry.mounted) retiringEntry.remove();
+      }
+      _retiringEntries.clear();
+    }
 
     final controller = _controller;
     final entry = _entry;
@@ -153,11 +196,16 @@ class AppToast {
       return;
     }
 
-    await controller.hide(animateSwipeAway: fromSwipe);
-    if (entry.mounted) {
-      entry.remove();
+    _retiringEntries.add(entry);
+    try {
+      await controller.hide(animateSwipeAway: fromSwipe);
+    } finally {
+      _retiringEntries.remove(entry);
+      if (entry.mounted) {
+        entry.remove();
+      }
+      contentNotifier?.dispose();
     }
-    contentNotifier?.dispose();
   }
 
   static Future<void> _dismissIfCurrent(
@@ -273,26 +321,36 @@ class AppToast {
 class _ToastNavigatorObserver extends NavigatorObserver {
   String? currentRouteName;
 
+  void _dismissForRouteChange() {
+    // A toast belongs to the route/flow that created it. Route transitions
+    // must not carry an old overlay into the next flow.
+    unawaited(AppToast.dismiss(immediate: true));
+  }
+
   @override
   void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForRouteChange();
     currentRouteName = route.settings.name;
     super.didPush(route, previousRoute);
   }
 
   @override
   void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForRouteChange();
     currentRouteName = previousRoute?.settings.name;
     super.didPop(route, previousRoute);
   }
 
   @override
   void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
+    _dismissForRouteChange();
     currentRouteName = newRoute?.settings.name;
     super.didReplace(newRoute: newRoute, oldRoute: oldRoute);
   }
 
   @override
   void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForRouteChange();
     currentRouteName = previousRoute?.settings.name;
     super.didRemove(route, previousRoute);
   }
@@ -353,7 +411,7 @@ class _ToastAnimatedContainer extends StatefulWidget {
 }
 
 class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late final AnimationController _controller;
   late final Animation<double> _opacity;
   late final Animation<double> _scale;
@@ -361,13 +419,20 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
   final GlobalKey _toastKey = GlobalKey();
   double _dragOffsetY = 0;
   double _toastHeight = 0;
+  double _toastTop = 0;
   bool _isDragging = false;
   bool _isHiding = false;
   bool _hasUpwardDrag = false;
+  int? _trackedPointer;
+  double? _pointerStartY;
+  bool _pointerDismissTriggered = false;
+
+  static const double _quickSwipeDistance = 10;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 200),
@@ -387,30 +452,47 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
     widget.onControllerReady(_ToastOverlayController(_hide));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _updateToastHeight();
+      _updateToastMetrics();
       _controller.forward();
     });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _controller.dispose();
     super.dispose();
   }
 
-  void _updateToastHeight() {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.hidden) {
+      unawaited(AppToast.dismiss(immediate: true));
+    }
+  }
+
+  void _updateToastMetrics() {
     final context = _toastKey.currentContext;
     if (context == null) return;
     final nextHeight = context.size?.height;
-    if (nextHeight == null || nextHeight <= 0 || nextHeight == _toastHeight) {
-      return;
+    if (nextHeight != null && nextHeight > 0) {
+      _toastHeight = nextHeight;
     }
-    _toastHeight = nextHeight;
+    final renderObject = context.findRenderObject();
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      _toastTop = renderObject.localToGlobal(Offset.zero).dy;
+    }
   }
 
   double _dismissTargetOffset() {
     final effectiveHeight = _toastHeight > 0 ? _toastHeight : 72.0;
-    return -(effectiveHeight + 24);
+    // Include the SafeArea inset and host padding. Moving only by the toast's
+    // own height leaves a visible strip at the top on tablets with a larger
+    // status-bar inset.
+    return -(_toastTop + effectiveHeight + 24);
   }
 
   Future<void> _hide({bool animateSwipeAway = false}) async {
@@ -423,9 +505,45 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
     if (animateSwipeAway) {
       setState(() {
         _isDragging = false;
+        _dragOffsetY = _dismissTargetOffset();
       });
     }
-    await _controller.reverse();
+    try {
+      await _controller.reverse().orCancel;
+    } on TickerCanceled {
+      // The immediate-removal fallback can dispose this widget while its
+      // swipe animation is running. The owning dismiss() still performs its
+      // idempotent Overlay cleanup in finally.
+    }
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if (_isHiding || _trackedPointer != null) return;
+    _updateToastMetrics();
+    _trackedPointer = event.pointer;
+    _pointerStartY = event.position.dy;
+    _pointerDismissTriggered = false;
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (_isHiding ||
+        _trackedPointer != event.pointer ||
+        _pointerDismissTriggered) {
+      return;
+    }
+    final startY = _pointerStartY;
+    if (startY == null || startY - event.position.dy < _quickSwipeDistance) {
+      return;
+    }
+    _pointerDismissTriggered = true;
+    unawaited(AppToast.dismiss(fromSwipe: true));
+  }
+
+  void _clearTrackedPointer(PointerEvent event) {
+    if (_trackedPointer != event.pointer) return;
+    _trackedPointer = null;
+    _pointerStartY = null;
+    _pointerDismissTriggered = false;
   }
 
   void _handleVerticalDragUpdate(DragUpdateDetails details) {
@@ -463,7 +581,12 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
   }
 
   void _handleVerticalDragCancel() {
-    if (_isHiding || (!_isDragging && _dragOffsetY == 0)) return;
+    if (_isHiding) return;
+    if (_hasUpwardDrag) {
+      unawaited(AppToast.dismiss(fromSwipe: true));
+      return;
+    }
+    if (!_isDragging && _dragOffsetY == 0) return;
     _hasUpwardDrag = false;
     setState(() {
       _isDragging = false;
@@ -473,39 +596,46 @@ class _ToastAnimatedContainerState extends State<_ToastAnimatedContainer>
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return Listener(
       behavior: HitTestBehavior.translucent,
-      onVerticalDragUpdate: _handleVerticalDragUpdate,
-      onVerticalDragEnd: _handleVerticalDragEnd,
-      onVerticalDragCancel: _handleVerticalDragCancel,
-      child: TweenAnimationBuilder<double>(
-        tween: Tween<double>(end: _dragOffsetY),
-        duration: _isDragging
-            ? Duration.zero
-            : const Duration(milliseconds: 120),
-        curve: Curves.easeOutCubic,
-        builder: (context, dragOffsetY, child) {
-          final dragProgress = (-dragOffsetY / 120).clamp(0.0, 1.0);
-          final animatedOpacity = 1 - (dragProgress * 0.32);
-          final animatedScale = 1 - (dragProgress * 0.02);
+      onPointerDown: _handlePointerDown,
+      onPointerMove: _handlePointerMove,
+      onPointerUp: _clearTrackedPointer,
+      onPointerCancel: _clearTrackedPointer,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onVerticalDragUpdate: _handleVerticalDragUpdate,
+        onVerticalDragEnd: _handleVerticalDragEnd,
+        onVerticalDragCancel: _handleVerticalDragCancel,
+        child: TweenAnimationBuilder<double>(
+          tween: Tween<double>(end: _dragOffsetY),
+          duration: _isDragging
+              ? Duration.zero
+              : const Duration(milliseconds: 120),
+          curve: Curves.easeOutCubic,
+          builder: (context, dragOffsetY, child) {
+            final dragProgress = (-dragOffsetY / 120).clamp(0.0, 1.0);
+            final animatedOpacity = 1 - (dragProgress * 0.32);
+            final animatedScale = 1 - (dragProgress * 0.02);
 
-          return Transform.translate(
-            offset: Offset(0, dragOffsetY),
-            child: Transform.scale(
-              scale: animatedScale,
-              alignment: Alignment.topCenter,
-              child: Opacity(opacity: animatedOpacity, child: child),
-            ),
-          );
-        },
-        child: FadeTransition(
-          opacity: _opacity,
-          child: SlideTransition(
-            position: _slide,
-            child: ScaleTransition(
-              scale: _scale,
-              alignment: Alignment.topCenter,
-              child: KeyedSubtree(key: _toastKey, child: widget.child),
+            return Transform.translate(
+              offset: Offset(0, dragOffsetY),
+              child: Transform.scale(
+                scale: animatedScale,
+                alignment: Alignment.topCenter,
+                child: Opacity(opacity: animatedOpacity, child: child),
+              ),
+            );
+          },
+          child: FadeTransition(
+            opacity: _opacity,
+            child: SlideTransition(
+              position: _slide,
+              child: ScaleTransition(
+                scale: _scale,
+                alignment: Alignment.topCenter,
+                child: KeyedSubtree(key: _toastKey, child: widget.child),
+              ),
             ),
           ),
         ),

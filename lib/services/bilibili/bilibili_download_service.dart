@@ -23,6 +23,7 @@ import 'package:video_player_app/services/bilibili/download_manager.dart';
 import 'package:video_player_app/services/bilibili/download_integrity.dart';
 import 'package:video_player_app/services/bilibili/post_process_task_queue.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/services/media_materialization_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/task_subtitle_storage_service.dart';
 import 'package:video_player_app/services/temporary_storage_cleanup_models.dart';
@@ -52,6 +53,7 @@ class BilibiliDownloadService extends ChangeNotifier {
   static const Duration _baseTaskPersistDebounce = Duration(milliseconds: 900);
   final BilibiliApiService apiService;
   late final BilibiliStreamingService streamingService;
+  late final MediaMaterializationService materializationService;
   final Uuid _uuid = const Uuid();
   late BilibiliDownloadManager _downloadManager;
   Future<void>? _initFuture;
@@ -67,6 +69,8 @@ class BilibiliDownloadService extends ChangeNotifier {
   final Map<BilibiliDownloadEpisode, String> _episodeOwnerTaskIds =
       Map<BilibiliDownloadEpisode, String>.identity();
   final Set<BilibiliDownloadEpisode> _pendingProgressEpisodes =
+      Set<BilibiliDownloadEpisode>.identity();
+  final Set<BilibiliDownloadEpisode> _streamingImportingEpisodes =
       Set<BilibiliDownloadEpisode>.identity();
   final Map<String, Map<String, dynamic>> _taskJsonSnapshots =
       <String, Map<String, dynamic>>{};
@@ -111,6 +115,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     : apiService = apiService ?? BilibiliApiService() {
     _downloadManager = BilibiliDownloadManager(this.apiService);
     streamingService = BilibiliStreamingService(this.apiService);
+    materializationService = MediaMaterializationService(this.apiService);
   }
 
   /// Downloads, converts and replaces a library item's danmaku sidecar.
@@ -367,6 +372,22 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   int episodeRevision(BilibiliDownloadEpisode episode) =>
       Object.hash(_coarseRenderRevision, _episodeRevisions[episode] ?? 0);
+
+  bool isStreamingImporting(BilibiliDownloadEpisode episode) =>
+      _streamingImportingEpisodes.contains(episode);
+
+  void _setStreamingImportProgress(
+    BilibiliDownloadEpisode episode,
+    String message,
+  ) {
+    if (!_streamingImportingEpisodes.contains(episode)) return;
+    episode
+      ..status = DownloadStatus.fetchingInfo
+      ..error = null
+      ..downloadSpeed = message
+      ..downloadSize = null;
+    notifyListeners();
+  }
 
   String episodeKey(BilibiliDownloadEpisode episode) =>
       '${episode.bvid}_${episode.page.cid}_${episode.page.page}';
@@ -879,7 +900,10 @@ class BilibiliDownloadService extends ChangeNotifier {
     } else {
       await _flushPendingTaskPersistence();
     }
-    await streamingService.shutdown();
+    await Future.wait<void>([
+      streamingService.shutdown(),
+      materializationService.shutdown(),
+    ]);
   }
 
   // --- Parsing ---
@@ -3350,11 +3374,42 @@ class BilibiliDownloadService extends ChangeNotifier {
               .toList();
     if (candidates.isEmpty) return 0;
 
-    final dataRoot = await SettingsService().resolveLargeDataRootDir();
-    final thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
-    if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
-    final danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
-    if (!await danmakuDir.exists()) await danmakuDir.create(recursive: true);
+    final importCandidates = candidates
+        .where(_streamingImportingEpisodes.add)
+        .toList(growable: false);
+    if (importCandidates.isEmpty) return 0;
+    for (final ep in importCandidates) {
+      ep
+        ..status = DownloadStatus.fetchingInfo
+        ..progress = 0
+        ..error = null
+        ..downloadSpeed = importCandidates.length > 1
+            ? '等待导出在线播放条目...'
+            : '正在准备视频信息...'
+        ..downloadSize = null;
+    }
+    notifyListeners();
+
+    late final Directory dataRoot;
+    late final Directory thumbDir;
+    late final Directory danmakuDir;
+    try {
+      dataRoot = await SettingsService().resolveLargeDataRootDir();
+      thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
+      if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+      danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
+      if (!await danmakuDir.exists()) await danmakuDir.create(recursive: true);
+    } catch (error) {
+      for (final ep in importCandidates) {
+        ep
+          ..status = DownloadStatus.failed
+          ..error = error.toString()
+          ..downloadSpeed = null;
+        _streamingImportingEpisodes.remove(ep);
+      }
+      notifyListeners();
+      return 0;
+    }
     final ensuredCollectionIds = <String>{};
     // A streaming import is an explicit "create cards" operation. Keep the
     // collections created during this one call together, but never look up a
@@ -3376,27 +3431,24 @@ class BilibiliDownloadService extends ChangeNotifier {
 
     var count = 0;
 
-    for (final ep in candidates) {
-      final task =
-          parsedTask ??
-          tasks.cast<BilibiliDownloadTask?>().firstWhere(
-            (item) =>
-                item != null &&
-                item.isStreamingImport &&
-                item.videos.any((video) => video.episodes.contains(ep)),
-            orElse: () => null,
-          );
-      if (task == null) continue;
-      final video = task.videos.firstWhere(
-        (item) => item.episodes.contains(ep),
-      );
-      ep
-        ..status = DownloadStatus.fetchingInfo
-        ..error = null
-        ..downloadSpeed = '正在解析字幕与章节...';
-      notifyListeners();
-
+    for (final ep in importCandidates) {
       try {
+        final task =
+            parsedTask ??
+            tasks.cast<BilibiliDownloadTask?>().firstWhere(
+              (item) =>
+                  item != null &&
+                  item.isStreamingImport &&
+                  item.videos.any((video) => video.episodes.contains(ep)),
+              orElse: () => null,
+            );
+        if (task == null) {
+          throw StateError('找不到在线播放条目对应的导入任务');
+        }
+        final video = task.videos.firstWhere(
+          (item) => item.episodes.contains(ep),
+        );
+        _setStreamingImportProgress(ep, '正在准备视频信息...');
         final metadata = await apiService.fetchPlayerMetadata(
           ep.bvid,
           ep.page.cid,
@@ -3408,6 +3460,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           ..availableSubtitles = metadata.subtitles
           ..chapters = metadata.chapters;
         ep.selectedSubtitle ??= _selectBestSubtitle(metadata.subtitles);
+        _setStreamingImportProgress(ep, '正在导出附加内容...');
 
         String? rootCollectionId;
         if (task.collectionInfo != null) {
@@ -3576,6 +3629,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           chapters: metadata.chapters,
           hasProbedChapters: true,
         );
+        _setStreamingImportProgress(ep, '正在写入媒体库...');
         await library.addSingleVideo(item, reuseExistingItem: false);
         ep
           ..status = DownloadStatus.completed
@@ -3595,6 +3649,14 @@ class BilibiliDownloadService extends ChangeNotifier {
           ..status = DownloadStatus.failed
           ..error = error.toString()
           ..downloadSpeed = null;
+      } finally {
+        _streamingImportingEpisodes.remove(ep);
+        if (ep.status == DownloadStatus.fetchingInfo) {
+          ep
+            ..status = DownloadStatus.failed
+            ..error ??= '导出在线播放条目未完成'
+            ..downloadSpeed = null;
+        }
         notifyListeners();
       }
     }

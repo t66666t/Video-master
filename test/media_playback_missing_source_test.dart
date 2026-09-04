@@ -67,8 +67,12 @@ void main() {
       expect(service.state, PlaybackState.paused);
       expect(service.isSourceMissing, isTrue);
       expect(service.controller, isNull);
-      expect(playlist.hasPrevious, isTrue);
-      expect(playlist.hasNext, isTrue);
+      expect(playlist.playlist, isEmpty);
+      expect(playlist.currentIndex, -1);
+      expect(playlist.hasPrevious, isFalse);
+      expect(playlist.hasNext, isFalse);
+      expect(service.hasPlayablePrevious, isFalse);
+      expect(service.hasPlayableNext, isFalse);
 
       for (var i = 0; i < 100 && service.subtitlePaths.isEmpty; i++) {
         await Future<void>.delayed(const Duration(milliseconds: 1));
@@ -77,14 +81,13 @@ void main() {
       expect(service.subtitles.single.text, 'Still available');
 
       await service.playNext(autoPlay: false);
-      expect(service.currentItem?.id, next.id);
+      expect(service.currentItem?.id, missing.id);
       expect(service.isSourceMissing, isTrue);
-      expect(playlist.hasPrevious, isTrue);
 
       await service.playPrevious(autoPlay: false);
       expect(service.currentItem?.id, missing.id);
       expect(service.isSourceMissing, isTrue);
-      expect(playlist.hasNext, isTrue);
+      expect(playlist.hasNext, isFalse);
     },
   );
 }

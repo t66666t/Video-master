@@ -62,6 +62,8 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
   int _loadToken = 0;
   late final _DanmakuAtlasManager _atlasManager;
   late final _DanmakuPerformanceGovernor _performanceGovernor;
+  final DanmakuAssetAdmissionGate _assetAdmissionGate =
+      DanmakuAssetAdmissionGate();
   _DanmakuAtlasStyle? _preparedStyle;
   int? _requestedPrefetchBucket;
   int? _completedPrefetchBucket;
@@ -101,6 +103,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
 
   Future<void> _load() async {
     final token = ++_loadToken;
+    _assetAdmissionGate.reset();
     try {
       final bytes = await File(widget.path).readAsBytes();
       final document = await compute(
@@ -183,24 +186,42 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
 
         final generation = _atlasManager.generation;
         final positionUs = widget.position.value.inMicroseconds;
-        final allIndices = resolveDanmakuPrefetchIndices(
+        // Even under pressure, keep a small bounded future runway. Disabling
+        // look-ahead entirely guarantees that a sprite can only be created
+        // after its media timestamp, which makes it pop into the middle of its
+        // trajectory. Upcoming work is deliberately ordered before old active
+        // items so the entry edge remains the protected deadline.
+        final indices = resolveDanmakuPrefetchIndices(
           document.items,
           positionUs: positionUs,
           speed: widget.speed,
           viewportWidth: _viewportWidth,
           referenceWidth: document.referenceWidth,
+          maximumActiveItems: _performanceGovernor.constrainPrefetch
+              ? math.min(_performanceGovernor.admissionCap, 200)
+              : 640,
+          maximumUpcomingItems: _performanceGovernor.constrainPrefetch
+              ? 128
+              : 800,
+          // Keep the horizon in media time at ten seconds. At an 8x temporary
+          // playback rate that is only 1.25 seconds of wall-clock preparation;
+          // reducing it further would recreate the late-entry race.
+          lookAheadUs: 10000000,
+          atlasSegmentUs: _performanceGovernor.constrainPrefetch
+              ? 1000000
+              : 5000000,
         );
-        final indices = _performanceGovernor.pauseLookAhead
-            ? <int>[
-                for (final index in allIndices)
-                  if (document.items[index].startTime.inMicroseconds <=
-                      positionUs)
-                    index,
-              ]
-            : allIndices;
 
         _atlasManager.beginPrefetchCycle();
-        const batchSize = 64;
+        _atlasManager.pinPreparedItems(<int>[
+          for (final index in indices)
+            if (document.items[index].startTime.inMicroseconds <= positionUs)
+              index,
+        ]);
+        // Text layout and Picture.toImage both share frame-critical resources.
+        // Smaller pages reduce the size of each individual raster/upload spike
+        // while the video and the danmaku animation are already running.
+        const batchSize = 32;
         for (var offset = 0; offset < indices.length; offset += batchSize) {
           if (!mounted || generation != _atlasManager.generation) break;
           final end = math.min(offset + batchSize, indices.length);
@@ -217,14 +238,14 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
             );
             return elapsedUs >= 0 && elapsedUs < durationUs;
           });
-          await _atlasManager.prepare(
+          final preparedNewAssets = await _atlasManager.prepare(
             items,
             generation: generation,
             pinPages: pinsCurrentFrame,
           );
           // Atlas construction is kept outside paint() and yields after every
           // batch, so a dense burst cannot monopolize the UI isolate.
-          if (end < indices.length && mounted) {
+          if (preparedNewAssets && end < indices.length && mounted) {
             await WidgetsBinding.instance.endOfFrame;
           }
         }
@@ -298,6 +319,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
                 activeSet: activeSet,
                 atlasManager: _atlasManager,
                 performanceGovernor: _performanceGovernor,
+                assetAdmissionGate: _assetAdmissionGate,
               ),
               // The overlay changes on every VSync. Marking it as complex
               // invites a raster-cache attempt which cannot be reused.
@@ -322,12 +344,14 @@ class _DanmakuPainter extends CustomPainter {
   final DanmakuActiveSet activeSet;
   final _DanmakuAtlasManager atlasManager;
   final _DanmakuPerformanceGovernor performanceGovernor;
+  final DanmakuAssetAdmissionGate assetAdmissionGate;
   late final Paint _atlasPaint = Paint()
-    ..isAntiAlias = false
-    // Atlas pixels are generated at the display DPR and drawn back 1:1.
-    // Filtering a fractional destination on Windows blends neighbouring alpha
-    // pixels and can look like a faint duplicate edge while text is moving.
-    ..filterQuality = FilterQuality.none;
+    ..isAntiAlias = true
+    // Scrolling comments deliberately retain a fractional X coordinate. Linear
+    // sampling lets those sub-pixel steps remain continuous instead of turning
+    // them into a repeated-frame/one-pixel-jump pattern on high-refresh-rate
+    // Windows displays.
+    ..filterQuality = FilterQuality.low;
 
   _DanmakuPainter({
     required this.document,
@@ -339,6 +363,7 @@ class _DanmakuPainter extends CustomPainter {
     required this.activeSet,
     required this.atlasManager,
     required this.performanceGovernor,
+    required this.assetAdmissionGate,
   }) : super(
          repaint: Listenable.merge(<Listenable>[
            position,
@@ -351,6 +376,7 @@ class _DanmakuPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (size.isEmpty) return;
     final positionUs = position.value.inMicroseconds;
+    assetAdmissionGate.beginFrame(positionUs);
     // All movement is derived from shared media time. At 2x, position itself
     // advances twice as fast in wall time, so danmaku accelerates with the
     // video without maintaining a second, drift-prone animation clock.
@@ -406,8 +432,17 @@ class _DanmakuPainter extends CustomPainter {
       final fallback = atlasManager.lookupFallback(item.index);
       final layoutWidth = sprite?.width ?? fallback?.width;
       final layoutHeight = sprite?.height ?? fallback?.height;
-      if (layoutWidth == null ||
-          layoutHeight == null ||
+      if (layoutWidth == null || layoutHeight == null) {
+        assetAdmissionGate.shouldPaint(
+          itemIndex: item.index,
+          assetReady: false,
+        );
+        continue;
+      }
+      if (!assetAdmissionGate.shouldPaint(
+            itemIndex: item.index,
+            assetReady: true,
+          ) ||
           y < contentRect.top ||
           y + layoutHeight > contentRect.bottom) {
         continue;
@@ -420,7 +455,12 @@ class _DanmakuPainter extends CustomPainter {
         DanmakuType.bottom => contentRect.center.dx - layoutWidth / 2,
       };
       if (sprite != null) {
-        atlasManager.addSprite(sprite, x, y);
+        atlasManager.addSprite(
+          sprite,
+          x,
+          y,
+          continuousHorizontal: item.type == DanmakuType.scroll,
+        );
       } else {
         fallback!.paintTextAt(canvas, x, y);
       }
@@ -453,6 +493,38 @@ class _DanmakuPainter extends CustomPainter {
         oldDelegate.opacity != opacity ||
         oldDelegate.speed != speed ||
         oldDelegate.requestedFontSize != requestedFontSize;
+  }
+}
+
+/// Prevents an asset which missed its entry deadline from appearing halfway
+/// across the screen once its asynchronous atlas upload eventually finishes.
+///
+/// A seek clears the suppression set because it establishes a new presentation
+/// epoch. Normal playback-rate changes remain continuous and therefore never
+/// clear it.
+@visibleForTesting
+class DanmakuAssetAdmissionGate {
+  int? _lastPositionUs;
+  final Set<int> _suppressedItems = <int>{};
+
+  void beginFrame(int positionUs) {
+    final previous = _lastPositionUs;
+    if (previous != null && positionUs < previous) {
+      _suppressedItems.clear();
+    }
+    _lastPositionUs = positionUs;
+  }
+
+  bool shouldPaint({required int itemIndex, required bool assetReady}) {
+    if (_suppressedItems.contains(itemIndex)) return false;
+    if (assetReady) return true;
+    _suppressedItems.add(itemIndex);
+    return false;
+  }
+
+  void reset() {
+    _lastPositionUs = null;
+    _suppressedItems.clear();
   }
 }
 
@@ -543,11 +615,11 @@ List<int> resolveDanmakuPrefetchIndices(
   required double speed,
   double viewportWidth = 1920,
   double referenceWidth = 1920,
+  int maximumActiveItems = 640,
+  int maximumUpcomingItems = 800,
+  int lookAheadUs = 10000000,
+  int atlasSegmentUs = 5000000,
 }) {
-  const maximumActiveItems = 640;
-  const maximumUpcomingItems = 800;
-  const lookAheadUs = 10000000;
-  const atlasSegmentUs = 5000000;
   final result = <int>[];
   final active = resolveDanmakuActiveRange(
     items,
@@ -556,27 +628,32 @@ List<int> resolveDanmakuPrefetchIndices(
     viewportWidth: viewportWidth,
     referenceWidth: referenceWidth,
   );
-  for (
-    var i = active.endExclusive - 1;
-    i >= active.start && result.length < maximumActiveItems;
-    i--
-  ) {
-    result.add(i);
-  }
-
-  final requestedFutureUs = positionUs + lookAheadUs;
+  final safeMaximumUpcomingItems = math.max(0, maximumUpcomingItems);
+  final safeLookAheadUs = math.max(0, lookAheadUs);
+  final safeAtlasSegmentUs = math.max(1, atlasSegmentUs);
+  final requestedFutureUs = positionUs + safeLookAheadUs;
   final alignedFutureUs =
-      ((requestedFutureUs + atlasSegmentUs - 1) ~/ atlasSegmentUs) *
-      atlasSegmentUs;
+      ((requestedFutureUs + safeAtlasSegmentUs - 1) ~/ safeAtlasSegmentUs) *
+      safeAtlasSegmentUs;
   final upcomingEnd = _firstStartAfter(items, alignedFutureUs);
   var upcomingCount = 0;
   for (
     var i = active.endExclusive;
-    i < upcomingEnd && upcomingCount < maximumUpcomingItems;
+    i < upcomingEnd && upcomingCount < safeMaximumUpcomingItems;
     i++
   ) {
     result.add(i);
     upcomingCount++;
+  }
+  final safeMaximumActiveItems = math.max(0, maximumActiveItems);
+  var activeCount = 0;
+  for (
+    var i = active.endExclusive - 1;
+    i >= active.start && activeCount < safeMaximumActiveItems;
+    i--
+  ) {
+    result.add(i);
+    activeCount++;
   }
   return result;
 }
@@ -969,18 +1046,24 @@ class _DanmakuAtlasManager extends ChangeNotifier {
     _building?.unpinAll();
   }
 
-  Future<void> prepare(
+  void pinPreparedItems(Iterable<int> itemIndices) {
+    _active?.pinItems(itemIndices);
+    _building?.pinItems(itemIndices);
+  }
+
+  Future<bool> prepare(
     List<DanmakuItem> items, {
     required int generation,
     required bool pinPages,
   }) async {
-    if (_disposed || generation != _generation || items.isEmpty) return;
+    if (_disposed || generation != _generation || items.isEmpty) return false;
     if (_fallbackEnabled) {
-      if (_prepareFallback(items)) notifyListeners();
-      return;
+      final changed = _prepareFallback(items);
+      if (changed) notifyListeners();
+      return changed;
     }
     final target = _building ?? _active;
-    if (target == null) return;
+    if (target == null) return false;
     bool changed;
     try {
       changed = await target.prepareBatch(items, pinPages: pinPages);
@@ -989,9 +1072,9 @@ class _DanmakuAtlasManager extends ChangeNotifier {
         _activateFallback(target.style, items);
         notifyListeners();
       }
-      return;
+      return true;
     }
-    if (_disposed || generation != _generation) return;
+    if (_disposed || generation != _generation) return false;
     if (identical(_building, target) && target.hasSprites) {
       final previous = _active;
       _active = target;
@@ -1001,6 +1084,7 @@ class _DanmakuAtlasManager extends ChangeNotifier {
     } else if (identical(_active, target) && changed) {
       notifyListeners();
     }
+    return changed;
   }
 
   _DanmakuSprite? lookup(int itemIndex) => _active?.lookup(itemIndex);
@@ -1011,8 +1095,18 @@ class _DanmakuAtlasManager extends ChangeNotifier {
 
   void beginFrame() => _active?.beginFrame();
 
-  void addSprite(_DanmakuSprite sprite, double x, double y) {
-    _active?.addSprite(sprite, x, y);
+  void addSprite(
+    _DanmakuSprite sprite,
+    double x,
+    double y, {
+    required bool continuousHorizontal,
+  }) {
+    _active?.addSprite(
+      sprite,
+      x,
+      y,
+      continuousHorizontal: continuousHorizontal,
+    );
   }
 
   void paintFrame(Canvas canvas, Paint paint, double opacity) {
@@ -1117,6 +1211,15 @@ class _DanmakuAtlasCache {
   void unpinAll() {
     for (final page in _pages) {
       page.pinned = false;
+    }
+  }
+
+  void pinItems(Iterable<int> itemIndices) {
+    for (final itemIndex in itemIndices) {
+      final sprite = _itemSprites[itemIndex];
+      if (sprite == null) continue;
+      sprite.page.pinned = true;
+      sprite.page.lastTouch = ++_touchSequence;
     }
   }
 
@@ -1257,13 +1360,18 @@ class _DanmakuAtlasCache {
     _framePages.clear();
   }
 
-  void addSprite(_DanmakuSprite sprite, double x, double y) {
+  void addSprite(
+    _DanmakuSprite sprite,
+    double x,
+    double y, {
+    required bool continuousHorizontal,
+  }) {
     final page = sprite.page;
     if (!page.inFrame) {
       page.inFrame = true;
       _framePages.add(page);
     }
-    page.addSprite(sprite, x, y);
+    page.addSprite(sprite, x, y, continuousHorizontal: continuousHorizontal);
   }
 
   void paintFrame(Canvas canvas, Paint paint, double opacity) {
@@ -1495,22 +1603,25 @@ class _DanmakuAtlasPage {
     inFrame = false;
   }
 
-  void addSprite(_DanmakuSprite sprite, double x, double y) {
+  void addSprite(
+    _DanmakuSprite sprite,
+    double x,
+    double y, {
+    required bool continuousHorizontal,
+  }) {
     _ensureCapacity(_spriteCount + 1);
     final offset = _spriteCount * 4;
     final scale = 1 / devicePixelRatio;
-    final destinationX = _snapDanmakuLogicalPixel(
+    final destination = resolveDanmakuAtlasDestination(
       x - sprite.imagePadding,
-      devicePixelRatio,
-    );
-    final destinationY = _snapDanmakuLogicalPixel(
       y - sprite.imagePadding,
       devicePixelRatio,
+      continuousHorizontal: continuousHorizontal,
     );
     _transforms[offset] = scale;
     _transforms[offset + 1] = 0;
-    _transforms[offset + 2] = destinationX;
-    _transforms[offset + 3] = destinationY;
+    _transforms[offset + 2] = destination.dx;
+    _transforms[offset + 3] = destination.dy;
     _rects[offset] = sprite.sourceLeft;
     _rects[offset + 1] = sprite.sourceTop;
     _rects[offset + 2] = sprite.sourceLeft + sprite.sourceWidth;
@@ -1559,8 +1670,16 @@ class _DanmakuAtlasPage {
 }
 
 @visibleForTesting
-double snapDanmakuLogicalPixel(double value, double devicePixelRatio) {
-  return _snapDanmakuLogicalPixel(value, devicePixelRatio);
+Offset resolveDanmakuAtlasDestination(
+  double x,
+  double y,
+  double devicePixelRatio, {
+  bool continuousHorizontal = true,
+}) {
+  return Offset(
+    continuousHorizontal ? x : _snapDanmakuLogicalPixel(x, devicePixelRatio),
+    _snapDanmakuLogicalPixel(y, devicePixelRatio),
+  );
 }
 
 double _snapDanmakuLogicalPixel(double value, double devicePixelRatio) {
@@ -1581,7 +1700,7 @@ class _DanmakuPerformanceGovernor extends ChangeNotifier {
   int _consecutiveSevereFrames = 0;
   double? _refreshRate;
 
-  bool get pauseLookAhead => _level >= 1;
+  bool get constrainPrefetch => _level >= 1;
   int get admissionCap => _admissionCap;
 
   void updateRefreshRate(double refreshRate) {

@@ -73,6 +73,25 @@ void main() {
     expect(settings.bilibiliDanmakuSpeed, kDanmakuSpeedMin);
   });
 
+  test('弹幕速度使用宽范围对数滑块并可无损往返', () {
+    expect(kDanmakuSpeedMin, 0.05);
+    expect(kDanmakuSpeedMax, 16);
+    expect(danmakuSpeedToSlider(kDanmakuSpeedMin), 0);
+    expect(danmakuSpeedToSlider(kDanmakuSpeedMax), 1);
+
+    for (final speed in <double>[0.05, 0.1, 0.2, 0.5, 1, 2, 4, 8, 16]) {
+      expect(
+        danmakuSpeedFromSlider(danmakuSpeedToSlider(speed)),
+        closeTo(speed, 0.000001),
+      );
+    }
+
+    // 常用的慢速不再被挤在线性滑块最左侧的一小段。
+    expect(danmakuSpeedToSlider(0.1), greaterThan(0.1));
+    expect(danmakuSpeedToSlider(0.5), greaterThan(0.35));
+    expect(danmakuSpeedToSlider(1), inInclusiveRange(0.5, 0.55));
+  });
+
   test('普通与高级弹幕设置全局持久化并可恢复历史默认外观', () async {
     SharedPreferences.setMockInitialValues({});
     final settings = SettingsService();

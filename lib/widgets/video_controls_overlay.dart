@@ -21,6 +21,7 @@ import '../services/video_preview_service.dart';
 import '../utils/desktop_player_shortcuts.dart';
 import '../models/media_chapter.dart';
 import '../models/bilibili_video_shot.dart';
+import '../utils/app_toast.dart';
 import 'chapter_slider_track_shape.dart';
 import 'player_control_metrics.dart';
 import 'progress_interaction_geometry.dart';
@@ -29,7 +30,7 @@ import 'playback_speed_dialog.dart';
 const Color _danmakuControlAccent = Color(0xFFFF6699);
 
 class VideoControlsOverlay extends StatefulWidget {
-  final VideoPlayerController controller;
+  final VideoPlayerController? controller;
   final bool isLocked;
   final VoidCallback onTogglePlay;
   final VoidCallback onBackPressed;
@@ -97,6 +98,7 @@ class VideoControlsOverlay extends StatefulWidget {
   final ValueNotifier<bool>? playbackControlsVisibility;
   final bool enableSeekThumbnailPreview;
   final BilibiliVideoShot? bilibiliVideoShot;
+  final bool showBufferedProgress;
 
   const VideoControlsOverlay({
     super.key,
@@ -163,6 +165,7 @@ class VideoControlsOverlay extends StatefulWidget {
     this.playbackControlsVisibility,
     this.enableSeekThumbnailPreview = true,
     this.bilibiliVideoShot,
+    this.showBufferedProgress = false,
   });
 
   @override
@@ -170,6 +173,15 @@ class VideoControlsOverlay extends StatefulWidget {
 }
 
 class VideoControlsOverlayState extends State<VideoControlsOverlay> {
+  final ValueNotifier<VideoPlayerValue> _unavailableControllerValue =
+      ValueNotifier<VideoPlayerValue>(VideoPlayerValue.uninitialized());
+
+  VideoPlayerValue get _controllerValue =>
+      widget.controller?.value ?? _unavailableControllerValue.value;
+  Listenable get _controllerListenable =>
+      widget.controller ?? _unavailableControllerValue;
+  String get _controllerDataSource => widget.controller?.dataSource ?? '';
+
   bool _isDraggingProgress = false;
   double _dragProgressValue = 0.0;
   int? _desktopProgressPointer;
@@ -296,7 +308,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isStreamQualityDialogOpen = false;
 
   String? _resolvePreviewFilePath() {
-    final path = widget.controller.dataSource;
+    final path = _controllerDataSource;
     String filePath = path;
     if (path.startsWith('file://')) {
       try {
@@ -322,7 +334,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       await showPlaybackSpeedDialog(
         context: context,
         anchorContext: anchorContext,
-        initialSpeed: widget.controller.value.playbackSpeed,
+        initialSpeed: _controllerValue.playbackSpeed,
         settings: settings,
         onSpeedSelected: widget.onSpeedUpdate,
       );
@@ -392,7 +404,17 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (selectedId != null &&
           selectedId != playbackService.selectedStreamQuality?.id &&
           !playbackService.isSwitchingStreamQuality) {
-        await playbackService.switchBilibiliStreamQuality(selectedId);
+        final switched = await playbackService.switchBilibiliStreamQuality(
+          selectedId,
+        );
+        if (!switched && mounted) {
+          final retainedLabel =
+              playbackService.selectedStreamQuality?.label ?? '当前清晰度';
+          AppToast.show(
+            '清晰度切换失败，已继续播放 $retainedLabel',
+            type: AppToastType.error,
+          );
+        }
       }
     } finally {
       _isStreamQualityDialogOpen = false;
@@ -962,6 +984,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _videoShotFrame = null;
       _isProgressDragCanceling = false;
       _progressDragWasCancelled = false;
+      // Locked mobile controls still need to disappear after inactivity. Keep
+      // the unlock affordance visible briefly, then let the normal timer fade
+      // it out; a tap on the player surface will reveal it again.
+      if (_autoHideLockedControls) {
+        _startAutoHideTimer();
+      }
     }
     if (oldWidget.enableSeekThumbnailPreview &&
         !widget.enableSeekThumbnailPreview) {
@@ -975,7 +1003,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (oldWidget.subtitles != widget.subtitles) {
       _rebuildSubtitleIndex();
     }
-    if (oldWidget.controller.dataSource != widget.controller.dataSource ||
+    if ((oldWidget.controller?.dataSource ?? '') != _controllerDataSource ||
         oldWidget.bilibiliVideoShot != widget.bilibiliVideoShot) {
       VideoPreviewService().markInteractionEnded();
       _cancelSeekPreviewRefine();
@@ -1008,16 +1036,22 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _doubleTapFeedbackHideTimer?.cancel();
     _doubleTapFeedbackDismissTimer?.cancel();
     _autoHideTimer?.cancel();
+    _unavailableControllerValue.dispose();
     super.dispose();
   }
 
   // Start or reset the auto-hide timer
+  bool get _autoHideLockedControls =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
   void _startAutoHideTimer() {
     _autoHideTimer?.cancel();
     _autoHideTimer = Timer(_autoHideDelay, () {
       if (mounted &&
           _showControls &&
-          !widget.isLocked &&
+          (!widget.isLocked || _autoHideLockedControls) &&
           !_isDraggingProgress &&
           !_isProgressHovered) {
         setState(() {
@@ -1142,7 +1176,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         widget.onBackPressed();
         return;
       case DesktopPlayerShortcutAction.playPause:
-        if (!widget.controller.value.isInitialized &&
+        if (!_controllerValue.isInitialized &&
             !widget.allowPlayWhenUninitialized) {
           return;
         }
@@ -1150,20 +1184,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         widget.onTogglePlay();
         return;
       case DesktopPlayerShortcutAction.seekBackward:
-        if (!widget.controller.value.isInitialized) return;
+        if (!_controllerValue.isInitialized) return;
         _startAutoHideTimer();
         final Duration target =
-            widget.controller.value.position -
+            _controllerValue.position -
             Duration(seconds: widget.doubleTapSeekSeconds);
         _seekTo(target < Duration.zero ? Duration.zero : target);
         return;
       case DesktopPlayerShortcutAction.seekForward:
-        if (!widget.controller.value.isInitialized) return;
+        if (!_controllerValue.isInitialized) return;
         _startAutoHideTimer();
         final Duration target =
-            widget.controller.value.position +
+            _controllerValue.position +
             Duration(seconds: widget.doubleTapSeekSeconds);
-        final Duration duration = widget.controller.value.duration;
+        final Duration duration = _controllerValue.duration;
         _seekTo(target > duration ? duration : target);
         return;
       case DesktopPlayerShortcutAction.openSettings:
@@ -1400,7 +1434,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       } else {
         _currentBrightness = 1.0;
       }
-      _currentVolume = widget.controller.value.volume;
+      _currentVolume = _controllerValue.volume;
     } catch (e) {
       debugPrint("Error initializing controls: $e");
     }
@@ -1532,15 +1566,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       handler(position);
       return;
     }
-    widget.controller.seekTo(position);
+    widget.controller?.seekTo(position);
   }
 
   // Helper for keyboard seek
   void _seekRelative(int seconds) {
-    if (!widget.controller.value.isInitialized) return;
-    final newPos =
-        widget.controller.value.position + Duration(seconds: seconds);
-    final total = widget.controller.value.duration;
+    if (!_controllerValue.isInitialized) return;
+    final newPos = _controllerValue.position + Duration(seconds: seconds);
+    final total = _controllerValue.duration;
     final clamped = newPos < Duration.zero
         ? Duration.zero
         : (newPos > total ? total : newPos);
@@ -1565,7 +1598,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _onHorizontalDragStart(DragStartDetails details, double width) {
     if (_shouldBlockPrimaryGestures) return;
-    if (!widget.controller.value.isInitialized || widget.isLocked) return;
+    if (!_controllerValue.isInitialized || widget.isLocked) return;
     // 互斥：如果正在长按加速（或显示双击反馈），则不响应滑动
     if (_isLongPressActive) return;
     // 恢复键盘焦点，确保手势操作后快捷键仍然可用
@@ -1586,7 +1619,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     setState(() {
       _showControlsBeforeGestureSeek = _showControls;
       _isGestureSeeking = true;
-      _gestureTargetTime = widget.controller.value.position;
+      _gestureTargetTime = _controllerValue.position;
       _isGestureCanceling = false;
     });
 
@@ -1608,7 +1641,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     final int secondsToAdd = (offsetX / 10).round();
 
     final Duration newTime =
-        widget.controller.value.position + Duration(seconds: secondsToAdd);
+        _controllerValue.position + Duration(seconds: secondsToAdd);
 
     final RenderBox box = context.findRenderObject() as RenderBox;
     final localOffset = box.globalToLocal(details.globalPosition);
@@ -1616,15 +1649,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     final bool isInCancelArea = localOffset.dy < box.size.height * 0.25;
 
     setState(() {
-      final totalDuration = widget.controller.value.duration;
+      final totalDuration = _controllerValue.duration;
       final clamped = newTime < Duration.zero
           ? Duration.zero
           : (newTime > totalDuration ? totalDuration : newTime);
       _gestureTargetTime = clamped;
 
       final diff =
-          _gestureTargetTime.inSeconds -
-          widget.controller.value.position.inSeconds;
+          _gestureTargetTime.inSeconds - _controllerValue.position.inSeconds;
       _gestureDiffText = diff > 0 ? "+${diff}s" : "${diff}s";
 
       _isGestureCanceling = isInCancelArea;
@@ -1679,8 +1711,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
     // Side Double Tap: Seek
     final int seconds = widget.doubleTapSeekSeconds;
-    final currentPos = widget.controller.value.position;
-    final duration = widget.controller.value.duration;
+    final currentPos = _controllerValue.position;
+    final duration = _controllerValue.duration;
 
     Duration target = Duration.zero;
 
@@ -2081,7 +2113,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
           _currentVolume = _startDragValue;
         });
       } else if (isWindows) {
-        _startDragValue = widget.controller.value.volume;
+        _startDragValue = _controllerValue.volume;
         setState(() {
           _isAdjustingVolume = true;
           _currentVolume = _startDragValue;
@@ -2345,6 +2377,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         );
         final settings = Provider.of<SettingsService>(context);
         final bool isLeftHandedMode = settings.isLeftHandedMode;
+        final EdgeInsets viewPadding =
+            MediaQuery.maybeOf(context)?.viewPadding ?? EdgeInsets.zero;
+        final double controlSafeLeft = math.max(
+          bottomBarPadding,
+          viewPadding.left,
+        );
+        final double controlSafeRight = math.max(
+          bottomBarPadding,
+          viewPadding.right,
+        );
+        final double sideControlHorizontalInset = math.max(
+          controlMetrics.sideControlHorizontalInset,
+          isLeftHandedMode ? viewPadding.right : viewPadding.left,
+        );
         final Alignment timeAlignment = isLeftHandedMode
             ? Alignment.centerRight
             : Alignment.centerLeft;
@@ -2354,7 +2400,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final bool isWindows = !kIsWeb && Platform.isWindows;
         final bool showLockButton =
             !widget.isPreviewMode &&
-            (kIsWeb || !(Platform.isWindows || Platform.isMacOS));
+            (kIsWeb ||
+                (defaultTargetPlatform != TargetPlatform.windows &&
+                    defaultTargetPlatform != TargetPlatform.macOS));
         final bool showInteractiveDanmakuControls =
             widget.showDanmakuControls && !widget.isLocked;
         final bool hasResetScreenControl =
@@ -2405,6 +2453,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final List<Widget> topLeading = [
           if (isDesktop)
             IconButton(
+              key: const ValueKey('video-controls-close'),
               icon: const Icon(Icons.close, color: Colors.white),
               tooltip: _tooltipWithShortcut(
                 "退出播放",
@@ -2833,7 +2882,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                   ),
                                   const SizedBox(height: 8),
                                   Text(
-                                    "${_formatDuration(_gestureTargetTime)} / ${_formatDuration(widget.controller.value.duration)}",
+                                    "${_formatDuration(_gestureTargetTime)} / ${_formatDuration(_controllerValue.duration)}",
                                     style: const TextStyle(
                                       color: Colors.white,
                                       fontSize: 16,
@@ -2934,12 +2983,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                   _showControls &&
                   !hideControlsForGestureSeek)
                 Positioned(
-                  left: isLeftHandedMode
-                      ? null
-                      : controlMetrics.sideControlHorizontalInset,
-                  right: isLeftHandedMode
-                      ? controlMetrics.sideControlHorizontalInset
-                      : null,
+                  left: isLeftHandedMode ? null : sideControlHorizontalInset,
+                  right: isLeftHandedMode ? sideControlHorizontalInset : null,
                   top: resetScreenControlTop,
                   child: _PlayerSideControlButton(
                     key: const ValueKey('player-side-reset-screen'),
@@ -2956,75 +3001,87 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                     ),
                   ),
                 ),
-              if (visibleSideControlCount > 0 &&
-                  (widget.isLocked ||
-                      (_showControls && !hideControlsForGestureSeek)))
+              if (visibleSideControlCount > 0)
                 Positioned(
-                  left: isLeftHandedMode
-                      ? null
-                      : controlMetrics.sideControlHorizontalInset,
-                  right: isLeftHandedMode
-                      ? controlMetrics.sideControlHorizontalInset
-                      : null,
+                  left: isLeftHandedMode ? null : sideControlHorizontalInset,
+                  right: isLeftHandedMode ? sideControlHorizontalInset : null,
                   top: sideControlGroupTop,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (showLockButton)
-                        _PlayerSideControlButton(
-                          key: const ValueKey('player-side-lock'),
-                          extent: sideControlButtonExtent,
-                          tooltip: widget.isLocked ? '解锁播放器' : '锁定播放器',
-                          highlighted: widget.isLocked,
-                          onPressed: () {
-                            _startAutoHideTimer();
-                            widget.onToggleLock();
-                          },
-                          child: Icon(
-                            widget.isLocked
-                                ? Icons.lock_rounded
-                                : Icons.lock_open_rounded,
-                            color: widget.isLocked
-                                ? _danmakuControlAccent
-                                : Colors.white70,
-                            size: sideControlIconSize,
-                          ),
-                        ),
-                      if (showLockButton && showInteractiveDanmakuControls)
-                        SizedBox(height: controlMetrics.sideControlGap),
-                      if (showInteractiveDanmakuControls)
-                        _PlayerSideControlButton(
-                          key: const ValueKey('player-side-danmaku-toggle'),
-                          extent: sideControlButtonExtent,
-                          tooltip: widget.danmakuEnabled ? '关闭弹幕' : '打开弹幕',
-                          highlighted: widget.danmakuEnabled,
-                          onPressed: () {
-                            _startAutoHideTimer();
-                            widget.onToggleDanmaku?.call();
-                          },
-                          child: _DanmakuToggleGlyph(
-                            enabled: widget.danmakuEnabled,
-                            size: sideControlIconSize,
-                          ),
-                        ),
-                      if (showInteractiveDanmakuControls)
-                        SizedBox(height: controlMetrics.sideControlGap),
-                      if (showInteractiveDanmakuControls)
-                        _PlayerSideControlButton(
-                          key: const ValueKey('player-side-danmaku-settings'),
-                          extent: sideControlButtonExtent,
-                          tooltip: '弹幕设置',
-                          onPressed: () {
-                            _startAutoHideTimer();
-                            widget.onOpenDanmakuSettings?.call();
-                          },
-                          child: Icon(
-                            Icons.tune_rounded,
-                            color: Colors.white70,
-                            size: sideControlIconSize,
-                          ),
-                        ),
-                    ],
+                  child: AnimatedOpacity(
+                    opacity: (widget.isLocked && _autoHideLockedControls)
+                        ? (_showControls ? 1.0 : 0.0)
+                        : (widget.isLocked ||
+                              (_showControls && !hideControlsForGestureSeek))
+                        ? 1.0
+                        : 0.0,
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeInOut,
+                    child: IgnorePointer(
+                      ignoring: (widget.isLocked && _autoHideLockedControls)
+                          ? !_showControls
+                          : !(widget.isLocked ||
+                                (_showControls && !hideControlsForGestureSeek)),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (showLockButton)
+                            _PlayerSideControlButton(
+                              key: const ValueKey('player-side-lock'),
+                              extent: sideControlButtonExtent,
+                              tooltip: widget.isLocked ? '解锁播放器' : '锁定播放器',
+                              highlighted: widget.isLocked,
+                              onPressed: () {
+                                _startAutoHideTimer();
+                                widget.onToggleLock();
+                              },
+                              child: Icon(
+                                widget.isLocked
+                                    ? Icons.lock_rounded
+                                    : Icons.lock_open_rounded,
+                                color: widget.isLocked
+                                    ? _danmakuControlAccent
+                                    : Colors.white70,
+                                size: sideControlIconSize,
+                              ),
+                            ),
+                          if (showLockButton && showInteractiveDanmakuControls)
+                            SizedBox(height: controlMetrics.sideControlGap),
+                          if (showInteractiveDanmakuControls)
+                            _PlayerSideControlButton(
+                              key: const ValueKey('player-side-danmaku-toggle'),
+                              extent: sideControlButtonExtent,
+                              tooltip: widget.danmakuEnabled ? '关闭弹幕' : '打开弹幕',
+                              highlighted: widget.danmakuEnabled,
+                              onPressed: () {
+                                _startAutoHideTimer();
+                                widget.onToggleDanmaku?.call();
+                              },
+                              child: _DanmakuToggleGlyph(
+                                enabled: widget.danmakuEnabled,
+                                size: sideControlIconSize,
+                              ),
+                            ),
+                          if (showInteractiveDanmakuControls)
+                            SizedBox(height: controlMetrics.sideControlGap),
+                          if (showInteractiveDanmakuControls)
+                            _PlayerSideControlButton(
+                              key: const ValueKey(
+                                'player-side-danmaku-settings',
+                              ),
+                              extent: sideControlButtonExtent,
+                              tooltip: '弹幕设置',
+                              onPressed: () {
+                                _startAutoHideTimer();
+                                widget.onOpenDanmakuSettings?.call();
+                              },
+                              child: Icon(
+                                Icons.tune_rounded,
+                                color: Colors.white70,
+                                size: sideControlIconSize,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
 
@@ -3058,9 +3115,17 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                               _startAutoHideTimer();
                             },
                             child: Container(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: isSmallScreen ? 8 : 16,
-                                vertical: topBarPadding,
+                              padding: EdgeInsets.fromLTRB(
+                                math.max(
+                                  isSmallScreen ? 8 : 16,
+                                  viewPadding.left,
+                                ),
+                                topBarPadding,
+                                math.max(
+                                  isSmallScreen ? 8 : 16,
+                                  viewPadding.right,
+                                ),
+                                topBarPadding,
                               ),
                               decoration: const BoxDecoration(
                                 gradient: LinearGradient(
@@ -3126,9 +3191,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                   'video-controls-bottom-panel',
                                 ),
                                 padding: EdgeInsets.fromLTRB(
-                                  bottomBarPadding,
+                                  controlSafeLeft,
                                   0,
-                                  bottomBarPadding,
+                                  controlSafeRight,
                                   controlMetrics.bottomPadding,
                                 ),
                                 decoration: const BoxDecoration(
@@ -3145,17 +3210,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
                                     AnimatedBuilder(
-                                      animation: widget.controller,
+                                      animation: _controllerListenable,
                                       builder: (context, child) {
                                         final position =
-                                            widget.controller.value.position;
+                                            _controllerValue.position;
                                         final duration =
-                                            widget.controller.value.duration;
+                                            _controllerValue.duration;
                                         final isInitialized =
-                                            widget
-                                                .controller
-                                                .value
-                                                .isInitialized &&
+                                            _controllerValue.isInitialized &&
                                             duration.inMilliseconds > 0;
 
                                         final currentPosition =
@@ -3174,10 +3236,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                   .toDouble()
                                                   .clamp(0.0, sliderMax)
                                             : 0.0;
-                                        final bufferedValue = isInitialized
+                                        final bufferedValue =
+                                            isInitialized &&
+                                                widget.showBufferedProgress
                                             ? math.max(
                                                 sliderValue,
-                                                widget.controller.value.buffered
+                                                _controllerValue.buffered
                                                     .fold<double>(0, (
                                                       furthest,
                                                       range,
@@ -3240,7 +3304,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                           .chapterButtonBottom,
                                                       child: AnimatedBuilder(
                                                         animation:
-                                                            widget.controller,
+                                                            _controllerListenable,
                                                         builder: (context, _) {
                                                           final chapter =
                                                               MediaChapter.atPosition(
@@ -3960,7 +4024,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                     // 时间文本 — 小范围 AnimatedBuilder，仅重建 Text
                                                     AnimatedBuilder(
                                                       animation:
-                                                          widget.controller,
+                                                          _controllerListenable,
                                                       builder: (context, _) {
                                                         final pos =
                                                             _isDraggingProgress
@@ -3969,14 +4033,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                     _dragProgressValue
                                                                         .toInt(),
                                                               )
-                                                            : widget
-                                                                  .controller
-                                                                  .value
+                                                            : _controllerValue
                                                                   .position;
-                                                        final dur = widget
-                                                            .controller
-                                                            .value
-                                                            .duration;
+                                                        final dur =
+                                                            _controllerValue
+                                                                .duration;
                                                         return Text(
                                                           key: const ValueKey(
                                                             'video-controls-time-display',
@@ -4103,17 +4164,13 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       ),
                                                       child: InkWell(
                                                         onTap: () {
-                                                          if (!widget
-                                                              .controller
-                                                              .value
+                                                          if (!_controllerValue
                                                               .isInitialized) {
                                                             return;
                                                           }
                                                           _startAutoHideTimer();
                                                           final newPos =
-                                                              widget
-                                                                  .controller
-                                                                  .value
+                                                              _controllerValue
                                                                   .position -
                                                               Duration(
                                                                 seconds: widget
@@ -4143,9 +4200,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                               Icon(
                                                                 Icons.replay,
                                                                 color:
-                                                                    widget
-                                                                        .controller
-                                                                        .value
+                                                                    _controllerValue
                                                                         .isInitialized
                                                                     ? Colors
                                                                           .white
@@ -4159,9 +4214,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 "${widget.doubleTapSeekSeconds}",
                                                                 style: TextStyle(
                                                                   color:
-                                                                      widget
-                                                                          .controller
-                                                                          .value
+                                                                      _controllerValue
                                                                           .isInitialized
                                                                       ? Colors
                                                                             .white
@@ -4191,16 +4244,13 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                     // 播放/暂停按钮 — 小范围 AnimatedBuilder，仅重建 IconButton
                                                     AnimatedBuilder(
                                                       animation:
-                                                          widget.controller,
+                                                          _controllerListenable,
                                                       builder: (context, _) {
-                                                        final isPlaying = widget
-                                                            .controller
-                                                            .value
-                                                            .isPlaying;
+                                                        final isPlaying =
+                                                            _controllerValue
+                                                                .isPlaying;
                                                         final isInitialized =
-                                                            widget
-                                                                .controller
-                                                                .value
+                                                            _controllerValue
                                                                 .isInitialized;
                                                         final canTogglePlay =
                                                             isInitialized ||
@@ -4256,26 +4306,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       ),
                                                       child: InkWell(
                                                         onTap: () {
-                                                          if (!widget
-                                                              .controller
-                                                              .value
+                                                          if (!_controllerValue
                                                               .isInitialized) {
                                                             return;
                                                           }
                                                           _startAutoHideTimer();
                                                           final newPos =
-                                                              widget
-                                                                  .controller
-                                                                  .value
+                                                              _controllerValue
                                                                   .position +
                                                               Duration(
                                                                 seconds: widget
                                                                     .doubleTapSeekSeconds,
                                                               );
                                                           final duration =
-                                                              widget
-                                                                  .controller
-                                                                  .value
+                                                              _controllerValue
                                                                   .duration;
                                                           _seekTo(
                                                             newPos > duration
@@ -4308,9 +4352,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 child: Icon(
                                                                   Icons.replay,
                                                                   color:
-                                                                      widget
-                                                                          .controller
-                                                                          .value
+                                                                      _controllerValue
                                                                           .isInitialized
                                                                       ? Colors
                                                                             .white
@@ -4325,9 +4367,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 "${widget.doubleTapSeekSeconds}",
                                                                 style: TextStyle(
                                                                   color:
-                                                                      widget
-                                                                          .controller
-                                                                          .value
+                                                                      _controllerValue
                                                                           .isInitialized
                                                                       ? Colors
                                                                             .white
@@ -4498,20 +4538,23 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 BorderRadius.circular(
                                                                   8,
                                                                 ),
-                                                            onTap: () => unawaited(
-                                                              _showPlaybackSpeedPicker(
-                                                                settings,
-                                                                speedButtonContext,
-                                                              ),
-                                                            ),
+                                                            onTap:
+                                                                _controllerValue
+                                                                    .isInitialized
+                                                                ? () => unawaited(
+                                                                    _showPlaybackSpeedPicker(
+                                                                      settings,
+                                                                      speedButtonContext,
+                                                                    ),
+                                                                  )
+                                                                : null,
                                                             child: AnimatedBuilder(
-                                                              animation: widget
-                                                                  .controller,
+                                                              animation:
+                                                                  _controllerListenable,
                                                               builder: (context, _) {
-                                                                final speed = widget
-                                                                    .controller
-                                                                    .value
-                                                                    .playbackSpeed;
+                                                                final speed =
+                                                                    _controllerValue
+                                                                        .playbackSpeed;
                                                                 return SizedBox(
                                                                   height: controlMetrics
                                                                       .bottomButtonExtent,
@@ -4545,22 +4588,6 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                             ),
                                                                           ),
                                                                         ),
-                                                                        if (settings.isLockedPlaybackSpeed(
-                                                                          speed,
-                                                                        )) ...[
-                                                                          SizedBox(
-                                                                            width:
-                                                                                controlMetrics.controlGap /
-                                                                                2,
-                                                                          ),
-                                                                          Icon(
-                                                                            Icons.lock,
-                                                                            size:
-                                                                                controlMetrics.toolFontSize,
-                                                                            color:
-                                                                                Colors.blueAccent,
-                                                                          ),
-                                                                        ],
                                                                       ],
                                                                     ),
                                                                   ),

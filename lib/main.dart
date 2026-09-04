@@ -15,6 +15,7 @@ import 'screens/home_screen.dart';
 import 'services/library_service.dart';
 import 'services/settings_service.dart';
 import 'services/transcription_manager.dart';
+import 'services/media_materialization_service.dart';
 import 'services/batch_import_service.dart';
 import 'services/embedded_subtitle_service.dart';
 import 'services/bilibili/bilibili_download_service.dart';
@@ -48,8 +49,11 @@ void main() async {
   final embeddedSubtitleService = EmbeddedSubtitleService();
   final bilibiliService = BilibiliDownloadService();
   library.attachBilibiliStreamingService(bilibiliService.streamingService);
+  library.attachMediaMaterializationService(
+    bilibiliService.materializationService,
+  );
   final ytDlpService = YtDlpDownloadService();
-  final videoComposeManager = VideoComposeManager();
+  final videoComposeManager = VideoComposeManager(library: library);
   final ocrSubtitleManager = OcrSubtitleManager(library: library);
 
   // Initialize media playback services
@@ -60,6 +64,8 @@ void main() async {
   progressTracker.initialize(libraryService: library);
 
   final mediaPlaybackService = MediaPlaybackService();
+  bilibiliService.materializationService.onRequestPlaybackRelease =
+      mediaPlaybackService.releaseMaterializedPlaybackForClear;
   final deferredServicesReady = Completer<void>();
 
   // 恢复上次的播放状态 - 等待 library 初始化完成后执行
@@ -119,6 +125,9 @@ void main() async {
             ChangeNotifierProvider.value(value: bilibiliService),
             ChangeNotifierProvider<BilibiliStreamingService>.value(
               value: bilibiliService.streamingService,
+            ),
+            ChangeNotifierProvider<MediaMaterializationService>.value(
+              value: bilibiliService.materializationService,
             ),
             ChangeNotifierProvider.value(value: ytDlpService),
             ChangeNotifierProvider.value(value: videoComposeManager),
@@ -497,6 +506,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   bool _sessionThumbnailCacheCleared = false;
   StreamSubscription<bool>? _notificationClickedSubscription;
   bool _pendingNotificationPlaybackNavigation = false;
+  int? _pendingNotificationSessionGeneration;
+  bool _notificationNavigationInFlight = false;
 
   bool _isForegroundState(AppLifecycleState? state) {
     return state == null ||
@@ -528,6 +539,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           ensureNotificationVisible: true,
         ),
       );
+      if (_pendingNotificationPlaybackNavigation) {
+        unawaited(_openPlaybackFromNotificationIfReady());
+      }
     }
     if (state == AppLifecycleState.detached) {
       unawaited(widget.bilibiliService.shutdown());
@@ -553,6 +567,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       return;
     }
     _pendingNotificationPlaybackNavigation = true;
+    _pendingNotificationSessionGeneration =
+        MediaPlaybackService().sessionGeneration;
     unawaited(_openPlaybackFromNotificationIfReady());
   }
 
@@ -564,19 +580,34 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   }
 
   Future<void> _openPlaybackFromNotificationIfReady() async {
-    if (!_pendingNotificationPlaybackNavigation) {
+    if (!_pendingNotificationPlaybackNavigation ||
+        _notificationNavigationInFlight ||
+        !_isForegroundState(WidgetsBinding.instance.lifecycleState)) {
       return;
     }
 
-    final currentItem = MediaPlaybackService().currentItem;
+    final playbackService = MediaPlaybackService();
+    final currentItem = playbackService.currentItem;
     if (currentItem == null) {
       return;
     }
 
+    final expectedGeneration = _pendingNotificationSessionGeneration;
     _pendingNotificationPlaybackNavigation = false;
-    await PlaybackNavigationService.instance.openPortraitFromNotification(
-      currentItem,
-    );
+    _pendingNotificationSessionGeneration = null;
+    _notificationNavigationInFlight = true;
+    try {
+      await PlaybackNavigationService.instance
+          .openCurrentPlaybackSessionFromNotification(
+            playbackService,
+            expectedGeneration: expectedGeneration,
+          );
+    } finally {
+      _notificationNavigationInFlight = false;
+      if (_pendingNotificationPlaybackNavigation) {
+        unawaited(_openPlaybackFromNotificationIfReady());
+      }
+    }
   }
 
   Future<void> _cleanupSessionThumbnailCaches() async {

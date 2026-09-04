@@ -1,131 +1,190 @@
 import 'package:flutter/foundation.dart';
+
 import '../models/video_item.dart';
 import 'library_service.dart';
+import 'playback_queue_policy.dart';
 
-/// 播放列表管理器
+/// Owns the one canonical, source-validated playback queue.
+///
+/// Library visibility and direct-open eligibility deliberately remain outside
+/// this class. A missing local item can be opened, but its id will be detached
+/// from [snapshot] and previous/next navigation will be unavailable.
 class PlaylistManager extends ChangeNotifier {
-  // 依赖服务
-  LibraryService? _libraryService;
+  PlaylistManager({PlaybackQueuePolicy? queuePolicy})
+    : _queuePolicy = queuePolicy ?? PlaybackQueuePolicy(),
+      _snapshot = PlaybackQueueSnapshot(
+        revision: 0,
+        entries: const <VideoItem>[],
+        currentItemId: null,
+        folderId: null,
+      );
 
-  // 当前播放列表
-  List<VideoItem> _playlist = [];
-  int _currentIndex = -1;
+  final PlaybackQueuePolicy _queuePolicy;
+  LibraryService? _libraryService;
+  PlaybackQueueSnapshot _snapshot;
+  List<VideoItem> _sourceItems = const <VideoItem>[];
   String? _currentFolderId;
+  String? _anchoredItemId;
   bool _isFolderPlaylist = false;
 
-  // Getters
-  List<VideoItem> get playlist => List.unmodifiable(_playlist);
-  int get currentIndex => _currentIndex;
-  VideoItem? get currentItem => 
-      _currentIndex >= 0 && _currentIndex < _playlist.length 
-          ? _playlist[_currentIndex] 
-          : null;
+  PlaybackQueueSnapshot get snapshot => _snapshot;
+  List<VideoItem> get playlist => _snapshot.entries;
+  int get currentIndex => _snapshot.currentIndex;
+  int get revision => _snapshot.revision;
+  VideoItem? get currentItem => _snapshot.currentItem;
+  String? get anchoredItemId => _anchoredItemId;
+  bool get isCurrentItemDetached =>
+      _anchoredItemId != null && _snapshot.currentIndex < 0;
+  bool isQueueEligible(VideoItem item) => _queuePolicy.isEligible(item);
 
-  /// 初始化服务依赖
   void initialize({required LibraryService libraryService}) {
     _libraryService = libraryService;
   }
 
-  /// 设置播放列表
-  void setPlaylist(List<VideoItem> items, {int startIndex = 0}) {
-    _playlist = List.from(items);
-    _currentIndex = items.isEmpty ? -1 : startIndex.clamp(0, items.length - 1);
+  /// Replaces the queue with a validated projection.
+  ///
+  /// [startIndex] addresses the unfiltered input so a missing selected item
+  /// becomes detached instead of silently selecting a different playable item.
+  void setPlaylist(
+    List<VideoItem> items, {
+    int startIndex = 0,
+    String? currentItemId,
+  }) {
+    _sourceItems = List<VideoItem>.from(items);
+    final requestedId =
+        currentItemId ??
+        (items.isNotEmpty && startIndex >= 0 && startIndex < items.length
+            ? items[startIndex].id
+            : null);
     _isFolderPlaylist = false;
-    notifyListeners();
+    _currentFolderId = null;
+    _replaceSnapshot(_sourceItems, currentItemId: requestedId, folderId: null);
   }
 
   bool matchesFolderPlaylist(String? folderId, String currentItemId) {
-    if (!_isFolderPlaylist || _currentFolderId != folderId) {
-      return false;
-    }
-    final current = currentItem;
-    if (current == null || current.id != currentItemId) {
-      return false;
-    }
-    return true;
+    return _isFolderPlaylist &&
+        _currentFolderId == folderId &&
+        _anchoredItemId == currentItemId &&
+        _snapshot.indexOf(currentItemId) >= 0;
   }
 
-  /// 从文件夹加载播放列表
   void loadFolderPlaylist(String? folderId, String currentItemId) {
-    if (_libraryService == null) {
+    final library = _libraryService;
+    if (library == null) {
       debugPrint('PlaylistManager: LibraryService not initialized');
       return;
     }
-    if (matchesFolderPlaylist(folderId, currentItemId)) {
-      return;
-    }
-    
-    // 获取同文件夹的所有媒体（不包括回收站中的）
-    final folderItems = _libraryService!.getVideosInFolder(folderId);
-    
-    // 找到当前项的索引
-    final currentIdx = folderItems.indexWhere((item) => item.id == currentItemId);
-    
-    setPlaylist(folderItems, startIndex: currentIdx >= 0 ? currentIdx : 0);
+    if (matchesFolderPlaylist(folderId, currentItemId)) return;
+
     _isFolderPlaylist = true;
     _currentFolderId = folderId;
+    _sourceItems = library.getVideosInFolder(folderId);
+    _replaceSnapshot(
+      _sourceItems,
+      currentItemId: currentItemId,
+      folderId: folderId,
+    );
   }
 
-  /// 重新加载播放列表（用于同步文件夹内容变化）
+  /// Revalidates source existence and publishes a new queue revision.
   void reloadPlaylist() {
-    if (!_isFolderPlaylist || _libraryService == null) return;
+    final library = _libraryService;
+    if (!_isFolderPlaylist || library == null) return;
+    _sourceItems = library.getVideosInFolder(_currentFolderId);
+    _replaceSnapshot(
+      _sourceItems,
+      currentItemId: _anchoredItemId,
+      folderId: _currentFolderId,
+    );
+  }
 
-    final currentItemId = currentItem?.id;
-    final folderItems = _libraryService!.getVideosInFolder(_currentFolderId);
-    
-    _playlist = List.from(folderItems);
-    
-    if (currentItemId != null) {
-      final newIndex = _playlist.indexWhere((item) => item.id == currentItemId);
-      if (newIndex >= 0) {
-        _currentIndex = newIndex;
-      } else {
-        // 如果当前项不在新列表中（可能被移走），保持索引在有效范围内
-        if (_currentIndex >= _playlist.length) {
-          _currentIndex = _playlist.isEmpty ? -1 : _playlist.length - 1;
-        }
-      }
-    } else {
-      _currentIndex = _playlist.isEmpty ? -1 : 0;
+  /// Revalidates an explicitly supplied queue without changing its scope.
+  void revalidatePlaylist() {
+    if (_isFolderPlaylist) {
+      reloadPlaylist();
+      return;
     }
-    
-    notifyListeners();
+    _replaceSnapshot(
+      _sourceItems,
+      currentItemId: _anchoredItemId,
+      folderId: null,
+    );
   }
 
-  /// 获取下一个媒体
-  VideoItem? getNext() {
-    if (!hasNext) return null;
-    return _playlist[_currentIndex + 1];
+  /// Cheap source revalidation used immediately before publishing an OS queue.
+  /// It notifies only when membership or the anchored index actually changes,
+  /// avoiding a media-session listener loop.
+  void refreshQueueEligibility() {
+    if (_isFolderPlaylist && _libraryService != null) {
+      _sourceItems = _libraryService!.getVideosInFolder(_currentFolderId);
+    }
+    final filtered = _queuePolicy.filter(_sourceItems);
+    final oldIds = _snapshot.entries.map((item) => item.id).toList();
+    final newIds = filtered.map((item) => item.id).toList();
+    if (listEquals(oldIds, newIds) &&
+        _snapshot.currentItemId == _anchoredItemId) {
+      return;
+    }
+    _replaceSnapshot(
+      filtered,
+      currentItemId: _anchoredItemId,
+      folderId: _currentFolderId,
+      revalidate: false,
+    );
   }
 
-  /// 获取第一个媒体
-  VideoItem? getFirst() {
-    if (_playlist.isEmpty) return null;
-    return _playlist.first;
-  }
+  VideoItem? getNext() => hasNext ? playlist[currentIndex + 1] : null;
+  VideoItem? getFirst() => playlist.isEmpty ? null : playlist.first;
+  VideoItem? getPrevious() => hasPrevious ? playlist[currentIndex - 1] : null;
+  bool get hasNext => _snapshot.hasNext;
+  bool get hasPrevious => _snapshot.hasPrevious;
 
-  /// 获取上一个媒体
-  VideoItem? getPrevious() {
-    if (!hasPrevious) return null;
-    return _playlist[_currentIndex - 1];
-  }
-
-  /// 是否有下一个媒体
-  bool get hasNext => _currentIndex >= 0 && _currentIndex < _playlist.length - 1;
-
-  /// 是否有上一个媒体
-  bool get hasPrevious => _currentIndex > 0;
-
-  /// 设置当前索引
   void setCurrentIndex(int index) {
-    if (index >= 0 && index < _playlist.length) {
-      _currentIndex = index;
-      notifyListeners();
-    }
+    if (index < 0 || index >= playlist.length) return;
+    _replaceSnapshot(
+      _sourceItems,
+      currentItemId: playlist[index].id,
+      folderId: _currentFolderId,
+    );
   }
 
-  /// 获取媒体项的索引
-  int indexOfItem(String itemId) {
-    return _playlist.indexWhere((item) => item.id == itemId);
+  /// Keeps a direct-open item associated with its folder while explicitly
+  /// detaching it when it does not satisfy queue eligibility.
+  void anchorCurrentItem(VideoItem item) {
+    final index = indexOfItem(item.id);
+    if (index >= 0) {
+      setCurrentIndex(index);
+      return;
+    }
+    if (_libraryService != null) {
+      loadFolderPlaylist(item.parentId, item.id);
+      return;
+    }
+    _replaceSnapshot(
+      _sourceItems,
+      currentItemId: item.id,
+      folderId: _currentFolderId,
+    );
+  }
+
+  int indexOfItem(String itemId) => _snapshot.indexOf(itemId);
+
+  void _replaceSnapshot(
+    Iterable<VideoItem> items, {
+    required String? currentItemId,
+    required String? folderId,
+    bool revalidate = true,
+  }) {
+    final entries = revalidate
+        ? _queuePolicy.filter(items)
+        : List<VideoItem>.unmodifiable(items);
+    _anchoredItemId = currentItemId;
+    _snapshot = PlaybackQueueSnapshot(
+      revision: _snapshot.revision + 1,
+      entries: entries,
+      currentItemId: currentItemId,
+      folderId: folderId,
+    );
+    notifyListeners();
   }
 }

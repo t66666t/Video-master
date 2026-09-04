@@ -100,14 +100,14 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     YtDlpDownloadService service, {
     YtDlpTaskRecord? task,
   }) async {
-    AppToast.showLoading('开始导出...');
+    final exportToast = AppToast.showLoading('开始导出...');
     try {
       final count = await service.importToLibrary(
         task: task,
         targetFolderId: widget.targetFolderId,
       );
       if (!mounted) {
-        AppToast.dismiss(immediate: true);
+        await exportToast.dismiss(immediate: true);
         return;
       }
       // show() 会自动替换当前的 loading toast，无需额外 dismiss
@@ -118,10 +118,12 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       }
     } catch (e) {
       if (!mounted) {
-        AppToast.dismiss(immediate: true);
+        await exportToast.dismiss(immediate: true);
         return;
       }
       AppToast.show('导出失败: $e', type: AppToastType.error);
+    } finally {
+      await exportToast.dismiss(immediate: true);
     }
   }
 
@@ -318,14 +320,17 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                     onPressed: canUpdate
                         ? () async {
                             Navigator.of(dialogContext).pop();
-                            AppToast.showProgress('正在检查最新稳定版...', progress: 0);
+                            final updateToast = AppToast.showProgress(
+                              '正在检查最新稳定版...',
+                              progress: 0,
+                            );
                             void syncUpdateToast() {
                               final progress = service.ytDlpUpdateProgress;
                               final stage = service.ytDlpUpdateStage;
                               final progressText = progress == null
                                   ? ''
                                   : ' ${(progress * 100).clamp(0, 100).toStringAsFixed(progress >= 0.995 ? 0 : 1)}%';
-                              AppToast.updateProgress(
+                              updateToast.updateProgress(
                                 message: '$stage$progressText',
                                 progress: progress,
                               );
@@ -338,7 +343,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                               if (!mounted) {
                                 return;
                               }
-                              await AppToast.dismiss();
+                              await updateToast.dismiss();
                               final message =
                                   result.status ==
                                       YtDlpBinaryUpdateStatus.alreadyUpToDate
@@ -356,13 +361,14 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                               if (!mounted) {
                                 return;
                               }
-                              await AppToast.dismiss();
+                              await updateToast.dismiss();
                               AppToast.show(
                                 '更新 yt-dlp 失败: $error',
                                 type: AppToastType.error,
                               );
                             } finally {
                               service.removeListener(syncUpdateToast);
+                              await updateToast.dismiss();
                             }
                           }
                         : null,

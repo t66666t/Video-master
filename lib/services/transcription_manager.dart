@@ -13,8 +13,10 @@ import 'package:video_player_app/models/batch_subtitle_task_view.dart';
 import 'package:video_player_app/models/subtitle_output_path_strategy.dart';
 import 'package:video_player_app/models/transcription_status.dart';
 import 'package:video_player_app/models/managed_subtitle_asset.dart';
+import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/services/bcut_asr_service.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/services/media_materialization_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/temporary_storage_cleanup_models.dart';
 import 'package:video_player_app/services/task_subtitle_storage_service.dart';
@@ -539,7 +541,8 @@ class TranscriptionManager extends ChangeNotifier {
   ) async {
     _currentVideoPath = job.videoPath;
     _currentVideoId = job.videoId;
-    _libraryService = job.libraryService;
+    _libraryService =
+        job.libraryService ?? (job.videoId == null ? null : LibraryService());
     _autoCache = job.autoCache;
     _currentJobIsExternal = job.isExternal;
     _currentJobOutputPathStrategy = job.outputPathStrategy;
@@ -551,11 +554,64 @@ class TranscriptionManager extends ChangeNotifier {
     notifyListeners();
 
     _PreparedAudioResult? preparedAudio;
+    MaterializedMediaLease? materializedLease;
     try {
       cancellation.throwIfCancelled();
+      var transcriptionMediaPath = job.videoPath;
+      final libraryItem = job.videoId == null
+          ? null
+          : _libraryService?.getVideo(job.videoId!);
+      final isBilibiliStream =
+          !job.isExternal &&
+          libraryItem != null &&
+          (libraryItem.sourceRef?.kind == MediaSourceKind.bilibiliStream ||
+              libraryItem.path.startsWith('bilibili://stream/'));
+      if (isBilibiliStream) {
+        _updateStatus(
+          TranscriptionStatus.downloading,
+          '正在准备下载 Bilibili 音频...',
+          0.0,
+        );
+        try {
+          materializedLease = await _libraryService!.acquireMaterializedMedia(
+            job.videoId!,
+            MediaMaterializationRequirement.audioOnly,
+            cancelSignal: cancellation.whenCancelled,
+            onProgress: (download) {
+              if (cancellation.isCancelled) return;
+              final fraction = download.progress.clamp(0.0, 1.0);
+              final percent = ' ${(fraction * 100).toStringAsFixed(0)}%';
+              final total = download.totalBytes == null
+                  ? ''
+                  : ' / ${_formatTransferBytes(download.totalBytes!)}';
+              final speed = download.bytesPerSecond > 0
+                  ? ' · ${_formatTransferBytes(download.bytesPerSecond.round())}/s'
+                  : '';
+              final eta = download.remaining == null
+                  ? ''
+                  : ' · 剩余约 ${download.remaining!.inSeconds}s';
+              _updateStatus(
+                TranscriptionStatus.downloading,
+                '正在下载音频$percent · ${_formatTransferBytes(download.receivedBytes)}$total$speed$eta',
+                fraction * 0.1,
+              );
+            },
+          );
+          transcriptionMediaPath = materializedLease.requiredAudioPath;
+        } catch (_) {
+          cancellation.throwIfCancelled();
+          rethrow;
+        }
+        cancellation.throwIfCancelled();
+        _updateStatus(
+          TranscriptionStatus.downloading,
+          'Bilibili 音频下载完成，正在检查格式...',
+          0.1,
+        );
+      }
       _updateStatus(TranscriptionStatus.extracting, "正在准备识别音频...", 0.0);
       preparedAudio = await _prepareAudioForTranscription(
-        job.videoPath,
+        transcriptionMediaPath,
         cancellation,
       );
       cancellation.throwIfCancelled();
@@ -654,6 +710,7 @@ class TranscriptionManager extends ChangeNotifier {
           }
         }
       }
+      await materializedLease?.release();
     }
   }
 
@@ -664,12 +721,26 @@ class TranscriptionManager extends ChangeNotifier {
   ) {
     _status = status;
     _statusMessage = message;
-    _progress = progress;
+    final normalized = progress.clamp(0.0, 1.0);
+    _progress = status == TranscriptionStatus.error
+        ? normalized
+        : normalized < _progress
+        ? _progress
+        : normalized;
     final key = _currentMediaKey;
     if (key != null) {
       _statusMessagesByMediaKey[key] = message;
     }
     notifyListeners();
+  }
+
+  String _formatTransferBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    final kib = bytes / 1024;
+    if (kib < 1024) return '${kib.toStringAsFixed(1)} KB';
+    final mib = kib / 1024;
+    if (mib < 1024) return '${mib.toStringAsFixed(1)} MB';
+    return '${(mib / 1024).toStringAsFixed(2)} GB';
   }
 
   Future<_MediaProbeInfo> _probeMedia(

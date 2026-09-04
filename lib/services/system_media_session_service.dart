@@ -15,6 +15,97 @@ import 'playlist_manager.dart';
 import 'settings_service.dart';
 import 'subtitle_timeline_resolver.dart';
 
+@visibleForTesting
+Future<Uri?> resolveExistingMediaArtworkUri(VideoItem item) async {
+  final thumbnailPath = item.thumbnailPath?.trim();
+  if (thumbnailPath == null || thumbnailPath.isEmpty) {
+    return null;
+  }
+  final file = File(thumbnailPath);
+  return await file.exists() ? file.uri : null;
+}
+
+@visibleForTesting
+class SystemMediaControlLayout {
+  const SystemMediaControlLayout({
+    required this.controls,
+    required this.androidCompactActionIndices,
+  });
+
+  final List<audio_service.MediaControl> controls;
+  final List<int> androidCompactActionIndices;
+}
+
+/// Builds a stable system-control layout for an active media item.
+///
+/// Previous/next stay registered at queue boundaries. Android therefore keeps
+/// the same compact slots instead of shifting the play button when an item is
+/// first or last, while iOS receives real previousTrack/nextTrack commands.
+/// A boundary command is harmless because MediaPlaybackService already
+/// clamps previous/next navigation to the playable queue.
+@visibleForTesting
+SystemMediaControlLayout buildSystemMediaControlLayout({
+  required bool enabled,
+  required bool hasMedia,
+  required bool playing,
+  required bool canStepWithinMedia,
+  required bool isIOS,
+}) {
+  if (!enabled || !hasMedia) {
+    return const SystemMediaControlLayout(
+      controls: <audio_service.MediaControl>[],
+      androidCompactActionIndices: <int>[],
+    );
+  }
+
+  final centerControl = playing
+      ? audio_service.MediaControl.pause
+      : audio_service.MediaControl.play;
+  if (isIOS) {
+    return SystemMediaControlLayout(
+      controls: <audio_service.MediaControl>[
+        audio_service.MediaControl.skipToPrevious,
+        centerControl,
+        audio_service.MediaControl.skipToNext,
+      ],
+      androidCompactActionIndices: const <int>[0, 1, 2],
+    );
+  }
+
+  final controls = <audio_service.MediaControl>[
+    audio_service.MediaControl.skipToPrevious,
+    if (canStepWithinMedia) audio_service.MediaControl.rewind,
+    centerControl,
+    if (canStepWithinMedia) audio_service.MediaControl.fastForward,
+    audio_service.MediaControl.skipToNext,
+  ];
+  return SystemMediaControlLayout(
+    controls: controls,
+    androidCompactActionIndices: <int>[
+      0,
+      controls.length ~/ 2,
+      controls.length - 1,
+    ],
+  );
+}
+
+@visibleForTesting
+Duration calculateSubtitleBoundaryDelay({
+  required Duration position,
+  required Duration boundary,
+  required double playbackSpeed,
+  required Duration padding,
+  required Duration minimumDelay,
+}) {
+  final mediaDeltaUs = boundary.inMicroseconds - position.inMicroseconds;
+  final speed = playbackSpeed.isFinite && playbackSpeed > 0
+      ? playbackSpeed
+      : 1.0;
+  final wallDeltaUs = mediaDeltaUs <= 0 ? 0 : (mediaDeltaUs / speed).round();
+  final delay = Duration(microseconds: wallDeltaUs) + padding;
+  return delay < minimumDelay ? minimumDelay : delay;
+}
+
 class SystemMediaSessionService {
   SystemMediaSessionService._internal();
 
@@ -24,10 +115,10 @@ class SystemMediaSessionService {
   static const Duration _progressSyncThrottle = Duration(milliseconds: 800);
   static const Duration _seekJumpThreshold = Duration(milliseconds: 1500);
   static const Duration _subtitleBoundarySyncPadding = Duration(
-    milliseconds: 45,
+    milliseconds: 12,
   );
   static const Duration _minimumSubtitleBoundaryDelay = Duration(
-    milliseconds: 60,
+    milliseconds: 20,
   );
 
   _SystemMediaAudioHandler? _handler;
@@ -38,6 +129,7 @@ class SystemMediaSessionService {
   StreamSubscription<void>? _becomingNoisySubscription;
   Timer? _scheduledSyncTimer;
   Timer? _scheduledSubtitleBoundaryTimer;
+  bool _isPublishingQueue = false;
   bool _initialized = false;
 
   _PlaybackSnapshot? _lastSnapshot;
@@ -47,6 +139,7 @@ class SystemMediaSessionService {
   bool? _lastAllowConcurrentPlayback;
   bool? _lastHeadsetControlEnabled;
   int _publishRevision = 0;
+  int _notificationVisibilityPrimeRevision = 0;
   String? _lastVisibleNotificationItemId;
   String? _artworkCacheKey;
   Uri? _artworkCacheValue;
@@ -301,6 +394,7 @@ class SystemMediaSessionService {
     }
     if (previous.itemId != snapshot.itemId ||
         previous.state != snapshot.state ||
+        previous.desiredPlaying != snapshot.desiredPlaying ||
         previous.queueIndex != snapshot.queueIndex ||
         previous.title != snapshot.title ||
         previous.subtitle != snapshot.subtitle ||
@@ -346,10 +440,10 @@ class SystemMediaSessionService {
 
     audio_service.MediaItem? mediaItem;
     if (force || _shouldRefreshMediaItem(previous, resolvedSnapshot)) {
-      mediaItem = await _buildCurrentMediaItem();
+      mediaItem = await _buildCurrentMediaItem(resolvedSnapshot);
     } else if (_lastPublishedMediaItem == null &&
         resolvedSnapshot.itemId != null) {
-      mediaItem = await _buildCurrentMediaItem();
+      mediaItem = await _buildCurrentMediaItem(resolvedSnapshot);
     }
     if (publishRevision != _publishRevision) {
       _logMediaSessionEvent(
@@ -362,6 +456,10 @@ class SystemMediaSessionService {
       );
       return;
     }
+    // Only a publication that survived asynchronous metadata/artwork work may
+    // supersede an in-flight paused-session notification prime. Incrementing
+    // earlier would let a failed/stale publication strand the forced state.
+    _notificationVisibilityPrimeRevision++;
     _playbackService?.setMediaNotificationVisible(
       isSupportedPlatform &&
           resolvedSnapshot.itemId != null &&
@@ -383,18 +481,33 @@ class SystemMediaSessionService {
   }
 
   void _publishQueue() {
-    if (!_initialized || _handler == null) {
+    if (!_initialized || _handler == null || _isPublishingQueue) {
       return;
     }
-    final mediaItems = _buildQueueMediaItems();
-    _handler!.queue.add(mediaItems);
-    _logMediaSessionEvent(
-      'queue published',
-      data: <String, Object?>{
-        'queueLength': mediaItems.length,
-        'currentIndex': _playlistManager?.currentIndex,
-      },
-    );
+    _isPublishingQueue = true;
+    try {
+      _playlistManager?.refreshQueueEligibility();
+      final mediaItems = _buildQueueMediaItems();
+      _handler!.queue.add(mediaItems);
+      _logMediaSessionEvent(
+        'queue published',
+        data: <String, Object?>{
+          'queueLength': mediaItems.length,
+          'currentIndex': _playlistManager?.currentIndex,
+          'queueRevision': _playlistManager?.revision,
+        },
+      );
+    } finally {
+      _isPublishingQueue = false;
+    }
+  }
+
+  @visibleForTesting
+  List<String> buildQueueItemIdsForTesting({PlaylistManager? playlistManager}) {
+    if (playlistManager != null) {
+      return playlistManager.playlist.map((item) => item.id).toList();
+    }
+    return _buildQueueMediaItems().map((item) => item.id).toList();
   }
 
   Future<void> refreshNow({bool ensureNotificationVisible = false}) async {
@@ -428,6 +541,7 @@ class SystemMediaSessionService {
         _lastVisibleNotificationItemId == snapshot.itemId) {
       return;
     }
+    final int primeRevision = ++_notificationVisibilityPrimeRevision;
     _logMediaSessionEvent(
       'priming paused notification visibility',
       data: <String, Object?>{
@@ -435,12 +549,24 @@ class SystemMediaSessionService {
         'state': snapshot.state.name,
       },
     );
+    // audio_service creates Android's foreground media notification only on a
+    // non-playing -> playing transition. Prime a restored paused session once,
+    // then immediately publish its truthful paused state. This is the same
+    // lifecycle used by the stable pre-streaming implementation.
     _handler!.playbackState.add(
       _buildPlaybackState(snapshot, forcePlaying: true),
     );
     await Future<void>.delayed(const Duration(milliseconds: 80));
-    _handler!.playbackState.add(_buildPlaybackState(snapshot));
-    _lastVisibleNotificationItemId = snapshot.itemId;
+    if (primeRevision != _notificationVisibilityPrimeRevision) {
+      return;
+    }
+    final currentSnapshot = _buildSnapshot();
+    if (currentSnapshot.itemId != snapshot.itemId ||
+        currentSnapshot.state == PlaybackState.idle) {
+      return;
+    }
+    _handler!.playbackState.add(_buildPlaybackState(currentSnapshot));
+    _lastVisibleNotificationItemId = currentSnapshot.itemId;
   }
 
   bool _shouldRefreshMediaItem(
@@ -464,8 +590,6 @@ class SystemMediaSessionService {
     final playlistManager = _playlistManager;
     final currentItem = playbackService?.currentItem;
     final currentIndex = playlistManager?.currentIndex;
-    final playlistLength = playlistManager?.playlist.length ?? 0;
-    final canCircularNavigateQueue = playlistLength > 1;
     final resolvedPosition =
         positionOverride ??
         _resolveLivePosition(playbackService) ??
@@ -492,8 +616,9 @@ class SystemMediaSessionService {
           ? currentIndex
           : null,
       isPlaying: playbackService?.isPlaying ?? false,
-      hasPrevious: canCircularNavigateQueue,
-      hasNext: canCircularNavigateQueue,
+      desiredPlaying: playbackService?.desiredPlaying ?? false,
+      hasPrevious: playbackService?.hasPlayablePrevious ?? false,
+      hasNext: playbackService?.hasPlayableNext ?? false,
       speed: _resolvePlaybackSpeed(playbackService?.controller),
     );
   }
@@ -501,11 +626,17 @@ class SystemMediaSessionService {
   List<audio_service.MediaItem> _buildQueueMediaItems() {
     final playbackService = _playbackService;
     final playlist = _playlistManager?.playlist ?? const <VideoItem>[];
+    final queueRevision = _playlistManager?.revision ?? 0;
     final currentSubtitleText = _resolveCurrentSubtitleText(
       playbackService: playbackService,
     );
     return playlist
-        .map((item) {
+        .toList(growable: false)
+        .asMap()
+        .entries
+        .map((entry) {
+          final queueIndex = entry.key;
+          final item = entry.value;
           final secondaryText = _resolveSecondaryText(
             playbackService: playbackService,
             item: item,
@@ -525,26 +656,28 @@ class SystemMediaSessionService {
             displayTitle: item.title,
             displaySubtitle: secondaryText,
             displayDescription: secondaryText,
+            extras: <String, Object?>{
+              'queueRevision': queueRevision,
+              'queueIndex': queueIndex,
+            },
           );
         })
         .toList(growable: false);
   }
 
-  Future<audio_service.MediaItem?> _buildCurrentMediaItem() async {
+  Future<audio_service.MediaItem?> _buildCurrentMediaItem(
+    _PlaybackSnapshot snapshot,
+  ) async {
     final playbackService = _playbackService;
     final item = playbackService?.currentItem;
     if (item == null) {
       return null;
     }
 
-    final currentSubtitleText = _resolveCurrentSubtitleText(
-      playbackService: playbackService,
-    );
-    final secondaryText = _resolveSecondaryText(
-      playbackService: playbackService,
-      item: item,
-      currentSubtitleText: currentSubtitleText,
-    );
+    final currentSubtitleText = snapshot.subtitle;
+    final secondaryText = currentSubtitleText?.isNotEmpty == true
+        ? currentSubtitleText!
+        : (item.type == MediaType.audio ? '音频' : '视频');
 
     return audio_service.MediaItem(
       id: item.id,
@@ -572,43 +705,26 @@ class SystemMediaSessionService {
     bool forcePlaying = false,
   }) {
     final bool remoteControlsEnabled = headsetControlsEnabled;
-    final bool effectivePlaying = forcePlaying || snapshot.isPlaying;
-    final List<audio_service.MediaControl> controls = remoteControlsEnabled
-        ? <audio_service.MediaControl>[
-            if (snapshot.hasPrevious) audio_service.MediaControl.skipToPrevious,
-            if (_canStepWithinMedia(snapshot))
-              audio_service.MediaControl.rewind,
-            effectivePlaying
-                ? audio_service.MediaControl.pause
-                : audio_service.MediaControl.play,
-            if (_canStepWithinMedia(snapshot))
-              audio_service.MediaControl.fastForward,
-            if (snapshot.hasNext) audio_service.MediaControl.skipToNext,
-          ]
-        : const <audio_service.MediaControl>[];
-
-    final List<int> compactActionIndices = <int>[];
-    final previousIndex = snapshot.hasPrevious ? 0 : null;
-    final centerIndex = _canStepWithinMedia(snapshot)
-        ? (snapshot.hasPrevious ? 2 : 1)
-        : (snapshot.hasPrevious ? 1 : 0);
-    final nextIndex = snapshot.hasNext ? controls.length - 1 : null;
-    if (previousIndex != null) {
-      compactActionIndices.add(previousIndex);
-    }
-    if (centerIndex >= 0 && centerIndex < controls.length) {
-      compactActionIndices.add(centerIndex);
-    }
-    if (nextIndex != null && !compactActionIndices.contains(nextIndex)) {
-      compactActionIndices.add(nextIndex);
-    }
+    // The session intent is the single source of truth for the notification
+    // play/pause button. Transient signals — state==loading during a switch, a
+    // late controller sample, a seek transition — must never flip it. The
+    // button changes only when the actual play/pause intent changes, which
+    // keeps it stable across background episode switches.
+    final bool effectivePlaying = forcePlaying || snapshot.desiredPlaying;
+    final layout = buildSystemMediaControlLayout(
+      enabled: remoteControlsEnabled,
+      hasMedia: snapshot.itemId != null,
+      playing: effectivePlaying,
+      canStepWithinMedia: _canStepWithinMedia(snapshot),
+      isIOS: !kIsWeb && Platform.isIOS,
+    );
 
     return audio_service.PlaybackState(
-      controls: controls,
+      controls: layout.controls,
       systemActions: remoteControlsEnabled && snapshot.duration > Duration.zero
           ? const <audio_service.MediaAction>{audio_service.MediaAction.seek}
           : const <audio_service.MediaAction>{},
-      androidCompactActionIndices: compactActionIndices,
+      androidCompactActionIndices: layout.androidCompactActionIndices,
       processingState: _mapProcessingState(snapshot.state),
       playing: effectivePlaying,
       updatePosition: snapshot.position,
@@ -754,12 +870,13 @@ class SystemMediaSessionService {
       return;
     }
 
-    Duration wait = nextBoundary - livePosition + _subtitleBoundarySyncPadding;
-    if (wait.isNegative) {
-      wait = Duration.zero;
-    } else if (wait < _minimumSubtitleBoundaryDelay) {
-      wait = _minimumSubtitleBoundaryDelay;
-    }
+    final wait = calculateSubtitleBoundaryDelay(
+      position: livePosition,
+      boundary: nextBoundary,
+      playbackSpeed: snapshot.speed,
+      padding: _subtitleBoundarySyncPadding,
+      minimumDelay: _minimumSubtitleBoundaryDelay,
+    );
 
     _scheduledSubtitleBoundaryTimer = Timer(wait, () {
       _scheduledSubtitleBoundaryTimer = null;
@@ -767,15 +884,42 @@ class SystemMediaSessionService {
         return;
       }
       final liveSnapshot = _buildSnapshot();
+      if (liveSnapshot.itemId != snapshot.itemId || !liveSnapshot.isPlaying) {
+        _scheduleSubtitleBoundaryPublish(liveSnapshot);
+        return;
+      }
+      final controller = _playbackService?.controller;
+      final bool clockAdvancing;
+      try {
+        clockAdvancing =
+            controller != null &&
+            controller.value.isInitialized &&
+            controller.value.isPlaying &&
+            !controller.value.isBuffering;
+      } catch (_) {
+        _scheduleSubtitleBoundaryPublish(liveSnapshot);
+        return;
+      }
+      if (!clockAdvancing) {
+        _scheduleSubtitleBoundaryPublish(liveSnapshot);
+        return;
+      }
+      // Background controller samples arrive every ~900 ms. At the exact
+      // subtitle timer callback that shared sample may still point just before
+      // the boundary, so publish against the boundary we deliberately reached
+      // rather than waiting for the next coarse sample.
+      final boundarySnapshot = liveSnapshot.position < nextBoundary
+          ? _buildSnapshot(positionOverride: nextBoundary)
+          : liveSnapshot;
       _logMediaSessionEvent(
         'subtitle boundary publish triggered',
         data: <String, Object?>{
-          'itemId': liveSnapshot.itemId,
-          'positionMs': liveSnapshot.position.inMilliseconds,
-          'subtitle': liveSnapshot.subtitle,
+          'itemId': boundarySnapshot.itemId,
+          'positionMs': boundarySnapshot.position.inMilliseconds,
+          'subtitle': boundarySnapshot.subtitle,
         },
       );
-      unawaited(_publishSnapshot(snapshot: liveSnapshot));
+      unawaited(_publishSnapshot(snapshot: boundarySnapshot));
     });
   }
 
@@ -785,16 +929,11 @@ class SystemMediaSessionService {
       return _artworkCacheValue;
     }
 
-    Uri? resolvedUri;
-    if (item.type == MediaType.video) {
-      final thumbnailPath = item.thumbnailPath;
-      if (thumbnailPath != null && thumbnailPath.isNotEmpty) {
-        final file = File(thumbnailPath);
-        if (await file.exists()) {
-          resolvedUri = file.uri;
-        }
-      }
-    }
+    // Audio thumbnails contain the album artwork extracted by LibraryService.
+    // They are just as suitable for system media metadata as video thumbnails,
+    // so only fall back to the generated music-note image when no thumbnail is
+    // available for either media type.
+    Uri? resolvedUri = await resolveExistingMediaArtworkUri(item);
 
     if (resolvedUri == null) {
       final placeholderPath = await _ensureAudioPlaceholderArtworkPath();
@@ -883,6 +1022,22 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     with audio_service.QueueHandler, audio_service.SeekHandler {
   MediaPlaybackService? _playbackService;
   PlaylistManager? _playlistManager;
+  Future<void> _remoteCommandBarrier = Future<void>.value();
+  bool _episodeSkipInFlight = false;
+
+  Future<void> _runSerialized(Future<void> Function() command) {
+    final operation = _remoteCommandBarrier.then((_) => command());
+    _remoteCommandBarrier = operation.catchError((
+      Object error,
+      StackTrace stack,
+    ) {
+      SystemMediaSessionService.instance._logMediaSessionEvent(
+        'remote command failed',
+        data: <String, Object?>{'error': error.toString()},
+      );
+    });
+    return operation;
+  }
 
   bool _shouldHandleRemoteCommand(String command) {
     final enabled = SystemMediaSessionService.instance.headsetControlsEnabled;
@@ -910,6 +1065,10 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote play command received',
       data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
+    // Do not queue transport intent behind a slow episode switch. The playback
+    // service records this intent immediately and reconciles the new controller
+    // before committing it, so the notification remains responsive while the
+    // target source is loading.
     await _playbackService?.resume();
   }
 
@@ -929,7 +1088,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     SystemMediaSessionService.instance._logMediaSessionEvent(
       'remote stop command received',
     );
-    await _playbackService?.stop();
+    await _runSerialized(() async => _playbackService?.stop());
   }
 
   @override
@@ -942,19 +1101,25 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
         'itemId': _playbackService?.currentItem?.id,
       },
     );
-    await _playbackService?.seekTo(position, source: 'system_media');
+    await _runSerialized(
+      () async => _playbackService?.seekTo(position, source: 'system_media'),
+    );
   }
 
   @override
   Future<void> rewind() async {
     if (!_shouldHandleRemoteCommand('rewind')) return;
-    await _handleConfiguredStepDirection(isBackward: true);
+    await _runSerialized(
+      () => _handleConfiguredStepDirection(isBackward: true),
+    );
   }
 
   @override
   Future<void> fastForward() async {
     if (!_shouldHandleRemoteCommand('fastForward')) return;
-    await _handleConfiguredStepDirection(isBackward: false);
+    await _runSerialized(
+      () => _handleConfiguredStepDirection(isBackward: false),
+    );
   }
 
   @override
@@ -964,7 +1129,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote next command received',
       data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
-    await _handleQueueSkip(isNext: true);
+    await _handleSingleEpisodeSkip(isNext: true);
   }
 
   @override
@@ -974,7 +1139,7 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote previous command received',
       data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );
-    await _handleQueueSkip(isNext: false);
+    await _handleSingleEpisodeSkip(isNext: false);
   }
 
   @override
@@ -993,9 +1158,8 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote queue item command received',
       data: <String, Object?>{'index': index, 'itemId': playlist[index].id},
     );
-    await playbackService.playPlaylistItem(
-      playlist[index],
-      autoPlay: SettingsService().autoPlayNextVideo,
+    await _runSerialized(
+      () => playbackService.playPlaylistItem(playlist[index]),
     );
   }
 
@@ -1015,9 +1179,8 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
       'remote media item command received',
       data: <String, Object?>{'index': index, 'itemId': mediaItem.id},
     );
-    await playbackService.playPlaylistItem(
-      playlistManager.playlist[index],
-      autoPlay: SettingsService().autoPlayNextVideo,
+    await _runSerialized(
+      () => playbackService.playPlaylistItem(playlistManager.playlist[index]),
     );
   }
 
@@ -1051,14 +1214,32 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
     );
   }
 
+  Future<void> _handleSingleEpisodeSkip({required bool isNext}) async {
+    // Do not queue repeated MediaSession callbacks behind a slow Android
+    // decoder switch. Some devices resend the hardware/notification action;
+    // replaying those callbacks after the first load completes looks like an
+    // endless previous/next loop. The old stable handler acknowledged only
+    // the command currently being handled.
+    if (_episodeSkipInFlight) {
+      SystemMediaSessionService.instance._logMediaSessionEvent(
+        'remote episode command ignored while switch is active',
+        data: <String, Object?>{'direction': isNext ? 'next' : 'previous'},
+      );
+      return;
+    }
+    _episodeSkipInFlight = true;
+    try {
+      await _runSerialized(() => _handleQueueSkip(isNext: isNext));
+    } finally {
+      _episodeSkipInFlight = false;
+    }
+  }
+
   Future<void> _handleQueueSkip({required bool isNext}) async {
     final playbackService = _playbackService;
     if (playbackService == null) {
       return;
     }
-    // Use the same entry point as the playback pages. It reads the persisted
-    // manual episode-switch auto-play setting and retains play()'s request
-    // generation guards for overlapping notification commands.
     if (isNext) {
       await playbackService.playNext();
     } else {
@@ -1078,6 +1259,7 @@ class _PlaybackSnapshot {
     required this.bufferedPosition,
     required this.queueIndex,
     required this.isPlaying,
+    this.desiredPlaying = false,
     required this.hasPrevious,
     required this.hasNext,
     required this.speed,
@@ -1092,6 +1274,11 @@ class _PlaybackSnapshot {
   final Duration bufferedPosition;
   final int? queueIndex;
   final bool isPlaying;
+
+  /// The session's play intent. While a notification-triggered episode switch
+  /// is still loading, the notification must keep showing the pause button
+  /// (standard buffering semantics) instead of flickering to play/paused.
+  final bool desiredPlaying;
   final bool hasPrevious;
   final bool hasNext;
   final double speed;
@@ -1108,6 +1295,7 @@ class _PlaybackSnapshot {
         other.bufferedPosition == bufferedPosition &&
         other.queueIndex == queueIndex &&
         other.isPlaying == isPlaying &&
+        other.desiredPlaying == desiredPlaying &&
         other.hasPrevious == hasPrevious &&
         other.hasNext == hasNext &&
         (other.speed - speed).abs() < 0.001;
@@ -1124,6 +1312,7 @@ class _PlaybackSnapshot {
     bufferedPosition,
     queueIndex,
     isPlaying,
+    desiredPlaying,
     hasPrevious,
     hasNext,
     speed.toStringAsFixed(3),

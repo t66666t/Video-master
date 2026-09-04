@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/material.dart';
 
 /// Apple Music 风格播放控制栏（严格对齐 Apple Music 全屏播放页面截图）
@@ -61,6 +62,8 @@ class MusicPlaybackControls extends StatefulWidget {
 }
 
 class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
+  bool _isScrubbing = false;
+
   String _formatDuration(Duration d) {
     final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
@@ -101,7 +104,7 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
       mainAxisSize: MainAxisSize.min,
       children: [
         _buildProgressBar(baseDimension, isMobile),
-        SizedBox(height: screenHeight * 0.02), // 进度条到控制按钮间距 ~2vh
+        SizedBox(height: (screenHeight * 0.05).clamp(34.0, 54.0)),
         _buildControlButtons(baseDimension, screenHeight, isMobile),
       ],
     );
@@ -121,8 +124,8 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
     final trackH = isMobile
         ? (baseDim * 0.005).clamp(3.0, 6.0)
         : (baseDim * 0.006).clamp(4.0, 8.0);
-    // 滑块拇指半径：轨道高度的 1.5~2 倍
-    final thumbR = (trackH * 1.8).clamp(5.0, 14.0);
+    // 静止状态不显示拇指；拖动时才淡入接近 Apple Music 的小圆点。
+    final thumbR = (trackH * 1.6).clamp(4.0, 9.0);
     final timeColor = Colors.white.withValues(alpha: 0.7);
 
     // 如果没有提供 positionListenable，直接使用 currentPosition 和 progress
@@ -175,71 +178,87 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
     double thumbR,
     Color timeColor,
   ) {
-    final remaining = totalDuration - currentPosition;
+    final rawRemaining = totalDuration - currentPosition;
+    final remaining = rawRemaining.isNegative ? Duration.zero : rawRemaining;
     // 使用父组件传入的 progress，确保滑块位置与显示时间一致
     final effectiveProgress = totalDuration.inMilliseconds > 0
         ? progress.clamp(0.0, 1.0)
         : 0.0;
 
-    return Row(
+    final effectiveTrackHeight = _isScrubbing ? trackH * 1.45 : trackH;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        // 当前时间标签
         SizedBox(
-          width: 48,
-          child: Text(
-            _formatDuration(currentPosition),
-            maxLines: 1,
-            softWrap: false,
-            style: TextStyle(
-              fontFamily: 'Inter',
-              fontSize: timeFontSize,
-              fontWeight: FontWeight.w500,
-              color: timeColor,
-              fontFeatures: const [FontFeature.tabularFigures()],
-            ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        // 进度滑块
-        Expanded(
+          height: 24,
           child: SliderTheme(
             data: SliderThemeData(
-              trackHeight: trackH,
-              thumbShape: RoundSliderThumbShape(enabledThumbRadius: thumbR),
-              overlayShape: RoundSliderOverlayShape(
-                overlayRadius: thumbR * 2.2,
-              ),
-              activeTrackColor: Colors.white,
-              inactiveTrackColor: Colors.white.withValues(alpha: 0.2),
-              thumbColor: Colors.white,
-              overlayColor: Colors.white.withValues(alpha: 0.1),
-              trackShape: CustomSliderTrackShape(),
+              trackHeight: effectiveTrackHeight,
+              thumbShape: _isScrubbing
+                  ? RoundSliderThumbShape(enabledThumbRadius: thumbR)
+                  : SliderComponentShape.noThumb,
+              overlayShape: _isScrubbing
+                  ? RoundSliderOverlayShape(overlayRadius: thumbR * 2.4)
+                  : SliderComponentShape.noOverlay,
+              activeTrackColor: Colors.white.withValues(alpha: 0.62),
+              inactiveTrackColor: Colors.white.withValues(alpha: 0.24),
+              thumbColor: Colors.white.withValues(alpha: 0.92),
+              overlayColor: Colors.white.withValues(alpha: 0.10),
+              trackShape: AppleMusicSliderTrackShape(),
             ),
             child: Slider(
+              key: const ValueKey('music-progress-slider'),
               value: effectiveProgress,
+              padding: EdgeInsets.zero,
               onChanged: widget.onProgressChanged,
-              onChangeStart: widget.onProgressChangeStart,
-              onChangeEnd: widget.onProgressChangeEnd,
+              onChangeStart: widget.onProgressChangeStart == null
+                  ? null
+                  : (value) {
+                      setState(() => _isScrubbing = true);
+                      widget.onProgressChangeStart?.call(value);
+                    },
+              onChangeEnd: widget.onProgressChangeEnd == null
+                  ? null
+                  : (value) {
+                      setState(() => _isScrubbing = false);
+                      widget.onProgressChangeEnd?.call(value);
+                    },
             ),
           ),
         ),
-        const SizedBox(width: 8),
-        // 剩余时间标签（倒计时格式 -mm:ss）
-        SizedBox(
-          width: 56,
-          child: Text(
-            '-${_formatDuration(remaining)}',
-            textAlign: TextAlign.end,
-            maxLines: 1,
-            softWrap: false,
-            style: TextStyle(
-              fontFamily: 'Inter',
-              fontSize: timeFontSize,
-              fontWeight: FontWeight.w500,
-              color: timeColor,
-              fontFeatures: const [FontFeature.tabularFigures()],
+        const SizedBox(height: 1),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              _formatDuration(currentPosition),
+              key: const ValueKey('music-current-time'),
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontSize: timeFontSize,
+                fontWeight: FontWeight.w500,
+                color: timeColor,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
             ),
-          ),
+            Text(
+              '-${_formatDuration(remaining)}',
+              key: const ValueKey('music-remaining-time'),
+              textAlign: TextAlign.end,
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(
+                fontFamily: 'Inter',
+                fontSize: timeFontSize,
+                fontWeight: FontWeight.w500,
+                color: timeColor,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
         ),
       ],
     );
@@ -255,15 +274,14 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
     // 主控图标（上一曲/播放/下一曲）：
     // 手机 ~5.5% clamp(16,24)；桌面 ~6.5% clamp(20,34)
     final mainIconSize = isMobile
-        ? (baseDim * 0.055).clamp(16.0, 24.0)
+        ? (baseDim * 0.055).clamp(30.0, 42.0)
         : (baseDim * 0.065).clamp(20.0, 34.0);
     // 次要图标（音量/字号）：
     // 手机 ~3.5% clamp(12,18)；桌面 ~4.2% clamp(14,24)
     final secondaryIconSize = isMobile
         ? (baseDim * 0.035).clamp(12.0, 18.0)
         : (baseDim * 0.042).clamp(14.0, 24.0);
-    // 播放按钮直径：主图标 * ~1.9
-    final playButtonSize = mainIconSize * 1.9;
+    final playIconSize = mainIconSize * 1.22;
     // 统一按钮颜色
     final secondaryColor = Colors.white.withValues(alpha: 0.7);
     // 统一按钮触控区域
@@ -273,21 +291,69 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         // ===== 左侧组：音量按钮（Expanded 占等宽空间，靠左对齐）=====
+        SizedBox(
+          width: buttonMinSize,
+          child: IconButton(
+            icon: Icon(
+              _getVolumeIcon(),
+              size: secondaryIconSize,
+              color: secondaryColor,
+            ),
+            onPressed: widget.onToggleMute,
+            tooltip: widget.isMuted ? '取消静音' : '静音',
+            iconSize: secondaryIconSize,
+            padding: const EdgeInsets.all(8),
+            constraints: BoxConstraints(
+              minWidth: buttonMinSize,
+              minHeight: buttonMinSize,
+            ),
+          ),
+        ),
+
+        // ===== 中央组：在剩余宽度内均匀分布，窄屏也不会挤压两侧按钮 =====
         Expanded(
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              // 音量按钮（直接切换静音/取消静音，不显示悬浮面板）
               IconButton(
-                icon: Icon(
-                  _getVolumeIcon(),
-                  size: secondaryIconSize,
-                  color: secondaryColor,
+                icon: const Icon(
+                  CupertinoIcons.backward_fill,
+                  color: Colors.white,
                 ),
-                onPressed: widget.onToggleMute,
-                tooltip: widget.isMuted ? '取消静音' : '静音',
-                iconSize: secondaryIconSize,
-                padding: const EdgeInsets.all(8),
+                onPressed: widget.onPrevious,
+                tooltip: '上一曲',
+                iconSize: mainIconSize,
+                padding: const EdgeInsets.all(4),
+                constraints: BoxConstraints(
+                  minWidth: buttonMinSize,
+                  minHeight: buttonMinSize,
+                ),
+              ),
+              IconButton(
+                onPressed: widget.onPlayPause,
+                icon: Icon(
+                  widget.isPlaying
+                      ? CupertinoIcons.pause_fill
+                      : CupertinoIcons.play_fill,
+                  color: Colors.white,
+                ),
+                iconSize: playIconSize,
+                padding: const EdgeInsets.all(4),
+                constraints: BoxConstraints(
+                  minWidth: buttonMinSize * 1.25,
+                  minHeight: buttonMinSize * 1.25,
+                ),
+                tooltip: widget.isPlaying ? '暂停' : '播放',
+              ),
+              IconButton(
+                icon: const Icon(
+                  CupertinoIcons.forward_fill,
+                  color: Colors.white,
+                ),
+                onPressed: widget.onNext,
+                tooltip: '下一曲',
+                iconSize: mainIconSize,
+                padding: const EdgeInsets.all(4),
                 constraints: BoxConstraints(
                   minWidth: buttonMinSize,
                   minHeight: buttonMinSize,
@@ -297,88 +363,23 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
           ),
         ),
 
-        // ===== 中央组：上一曲 / 播放暂停 / 下一曲（不 Expanded，自适应宽度，绝对居中）=====
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // 上一曲
-            IconButton(
-              icon: Icon(Icons.skip_previous_rounded, color: Colors.white),
-              onPressed: widget.onPrevious,
-              tooltip: '上一曲',
-              iconSize: mainIconSize,
-              padding: const EdgeInsets.all(8),
-              constraints: BoxConstraints(
-                minWidth: buttonMinSize,
-                minHeight: buttonMinSize,
-              ),
+        SizedBox(
+          width: buttonMinSize,
+          child: IconButton(
+            key: widget.fontSizeButtonKey,
+            icon: Icon(
+              Icons.format_size,
+              size: secondaryIconSize,
+              color: secondaryColor,
             ),
-            SizedBox(width: mainIconSize * (isMobile ? 0.2 : 0.3)),
-            // 播放/暂停（大圆形白色按钮）
-            GestureDetector(
-              onTap: widget.onPlayPause,
-              child: Container(
-                width: playButtonSize,
-                height: playButtonSize,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.white,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.25),
-                      blurRadius: playButtonSize * 0.22,
-                      offset: Offset(0, playButtonSize * 0.06),
-                    ),
-                  ],
-                ),
-                child: Icon(
-                  widget.isPlaying
-                      ? Icons.pause_rounded
-                      : Icons.play_arrow_rounded,
-                  size: mainIconSize * 1.05,
-                  color: const Color(0xFF1C1C1E),
-                ),
-              ),
+            onPressed: widget.onFontSizeAdjust,
+            tooltip: '调节字号',
+            iconSize: secondaryIconSize,
+            padding: const EdgeInsets.all(8),
+            constraints: BoxConstraints(
+              minWidth: buttonMinSize,
+              minHeight: buttonMinSize,
             ),
-            SizedBox(width: mainIconSize * (isMobile ? 0.2 : 0.3)),
-            // 下一曲
-            IconButton(
-              icon: Icon(Icons.skip_next_rounded, color: Colors.white),
-              onPressed: widget.onNext,
-              tooltip: '下一曲',
-              iconSize: mainIconSize,
-              padding: const EdgeInsets.all(8),
-              constraints: BoxConstraints(
-                minWidth: buttonMinSize,
-                minHeight: buttonMinSize,
-              ),
-            ),
-          ],
-        ),
-
-        // ===== 右侧组：字号调节按钮（Expanded 占等宽空间，靠右对齐）=====
-        Expanded(
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              // 字号调节按钮（统一使用 IconButton 风格）
-              IconButton(
-                key: widget.fontSizeButtonKey, // 用于定位字号调节滑块
-                icon: Icon(
-                  Icons.format_size,
-                  size: secondaryIconSize,
-                  color: secondaryColor,
-                ),
-                onPressed: widget.onFontSizeAdjust,
-                tooltip: '调节字号',
-                iconSize: secondaryIconSize,
-                padding: const EdgeInsets.all(8),
-                constraints: BoxConstraints(
-                  minWidth: buttonMinSize,
-                  minHeight: buttonMinSize,
-                ),
-              ),
-            ],
           ),
         ),
       ],
@@ -387,7 +388,7 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
 }
 
 /// 自定义圆角轨道形状
-class CustomSliderTrackShape extends RoundedRectSliderTrackShape {
+class AppleMusicSliderTrackShape extends RoundedRectSliderTrackShape {
   @override
   Rect getPreferredRect({
     required RenderBox parentBox,
@@ -397,13 +398,10 @@ class CustomSliderTrackShape extends RoundedRectSliderTrackShape {
     bool isDiscrete = false,
   }) {
     final trackHeight = sliderTheme.trackHeight ?? 4;
-    final thumbSize =
-        sliderTheme.thumbShape?.getPreferredSize(isEnabled, isDiscrete) ??
-        const Size(20, 20);
-    final thumbRadius = thumbSize.width / 2;
-    final trackLeft = offset.dx + thumbRadius;
+    // 轨道无论是否正在拖动都保持同一宽度，避免拇指出现时两端跳动。
+    final trackLeft = offset.dx;
     final trackTop = offset.dy + (parentBox.size.height - trackHeight) / 2;
-    final trackWidth = parentBox.size.width - 2 * thumbRadius;
+    final trackWidth = parentBox.size.width;
     return Rect.fromLTWH(trackLeft, trackTop, trackWidth, trackHeight);
   }
 }

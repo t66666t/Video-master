@@ -28,6 +28,7 @@ import '../widgets/media_library_locate_button.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../services/thumbnail_preload_manager.dart';
 import '../widgets/mini_playback_card.dart';
+import '../widgets/playback_card_layout.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'recycle_bin_screen.dart';
 import '../widgets/video_action_buttons.dart';
@@ -66,6 +67,7 @@ class _CollectionScreenState extends State<CollectionScreen>
     with SingleTickerProviderStateMixin {
   bool _isSelectionMode = false;
   bool _showExportSettingsButton = false;
+  double _stablePlaybackBottomInset = 0.0;
   final Set<String> _selectedIds = {};
   final FocusNode _shortcutFocusNode = FocusNode(
     debugLabel: 'CollectionShortcutFocus',
@@ -674,18 +676,13 @@ class _CollectionScreenState extends State<CollectionScreen>
 
     if (!isVisible) return 0.0;
 
-    // 根据屏幕宽度计算卡片高度（与 PlaybackCardLayout 保持一致）
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isPhone = screenWidth < 600;
-    final isTablet = screenWidth >= 600 && screenWidth < 1200;
-
-    if (isPhone) return 117.0 + _getPlaybackCardVerticalOffset();
-    if (isTablet) return 127.0 + _getPlaybackCardVerticalOffset();
-    return 107.0 + _getPlaybackCardVerticalOffset();
-  }
-
-  double _getPlaybackCardVerticalOffset() {
-    return 6.0;
+    final stableBottomInset =
+        PlaybackCardOverlayLayout.resolveStableBottomInset(
+          MediaQuery.of(context),
+          _stablePlaybackBottomInset,
+        );
+    return PlaybackCardOverlayLayout.cardBottom(stableBottomInset) +
+        PlaybackCardLayout.calculate(context).height;
   }
 
   Route<void> _buildVideoPlayerRoute(
@@ -699,32 +696,30 @@ class _CollectionScreenState extends State<CollectionScreen>
     );
   }
 
-  void _scheduleFolderPlaylistWarmup(VideoItem item) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final playlistManager = Provider.of<PlaylistManager>(
-        context,
-        listen: false,
+  void _preparePlaybackQueue(VideoItem item) {
+    if (!mounted) return;
+    final playlistManager = Provider.of<PlaylistManager>(
+      context,
+      listen: false,
+    );
+    if (_isSearchResults) {
+      final library = Provider.of<LibraryService>(context, listen: false);
+      final searchItems = _visibleContents(
+        library,
+      ).whereType<VideoItem>().toList(growable: false);
+      final startIndex = searchItems.indexWhere(
+        (candidate) => candidate.id == item.id,
       );
-      if (_isSearchResults) {
-        final library = Provider.of<LibraryService>(context, listen: false);
-        final searchItems = _visibleContents(
-          library,
-        ).whereType<VideoItem>().toList(growable: false);
-        final startIndex = searchItems.indexWhere(
-          (candidate) => candidate.id == item.id,
-        );
-        playlistManager.setPlaylist(
-          searchItems,
-          startIndex: startIndex < 0 ? 0 : startIndex,
-        );
-        return;
-      }
-      if (playlistManager.matchesFolderPlaylist(widget.collectionId, item.id)) {
-        return;
-      }
-      playlistManager.loadFolderPlaylist(widget.collectionId, item.id);
-    });
+      playlistManager.setPlaylist(
+        searchItems,
+        startIndex: startIndex < 0 ? 0 : startIndex,
+      );
+      return;
+    }
+    if (playlistManager.matchesFolderPlaylist(widget.collectionId, item.id)) {
+      return;
+    }
+    playlistManager.loadFolderPlaylist(widget.collectionId, item.id);
   }
 
   void _openPlaybackScreen(
@@ -732,9 +727,9 @@ class _CollectionScreenState extends State<CollectionScreen>
     VideoPlayerController? existingController,
     bool useRootNavigator = false,
   }) {
+    _preparePlaybackQueue(item);
     final navigator = Navigator.of(context, rootNavigator: useRootNavigator);
     navigator.push(_buildVideoPlayerRoute(item, existingController));
-    _scheduleFolderPlaylistWarmup(item);
   }
 
   @override
@@ -1145,6 +1140,14 @@ class _CollectionScreenState extends State<CollectionScreen>
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsService>(context);
     final useCompactTopBar = useCompactMediaLibraryTopBar(context);
+    _stablePlaybackBottomInset =
+        PlaybackCardOverlayLayout.resolveStableBottomInset(
+          MediaQuery.of(context),
+          _stablePlaybackBottomInset,
+        );
+    final playbackCardBottom = PlaybackCardOverlayLayout.cardBottom(
+      _stablePlaybackBottomInset,
+    );
 
     return Consumer<LibraryService>(
       builder: (context, library, child) {
@@ -1180,6 +1183,7 @@ class _CollectionScreenState extends State<CollectionScreen>
             },
             child: Scaffold(
               backgroundColor: const Color(0xFF121212),
+              extendBody: true,
               // Only the search prompt follows the Android keyboard. The
               // folder/search-result grid stays at its original dimensions
               // underneath the IME to avoid a full card-grid relayout.
@@ -1870,7 +1874,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                                           PlaybackState.paused);
                               if (!isVisible) return const SizedBox.shrink();
                               return Container(
-                                height: _getPlaybackCardVerticalOffset(),
+                                height: playbackCardBottom,
                                 color: const Color(0xFF2C2C2C),
                               );
                             },
@@ -1879,7 +1883,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                         Positioned(
                           left: 0,
                           right: 0,
-                          bottom: _getPlaybackCardVerticalOffset(),
+                          bottom: playbackCardBottom,
                           child: Consumer<MediaPlaybackService>(
                             builder: (context, playbackService, child) {
                               final isVisible =
@@ -1962,14 +1966,42 @@ class _CollectionScreenState extends State<CollectionScreen>
                   ),
                 ),
               ),
+              floatingActionButtonLocation:
+                  const PlaybackActionButtonsLocation(),
               floatingActionButton: !_isSelectionMode && !_isSearchResults
-                  ? Padding(
-                      padding: EdgeInsets.only(
-                        bottom: _getPlaybackCardBottomPadding(),
-                      ),
-                      child: VideoActionButtons(
-                        collectionId: widget.collectionId,
-                      ),
+                  ? Consumer<MediaPlaybackService>(
+                      builder: (context, playbackService, child) {
+                        final isCardVisible =
+                            playbackService.currentItem != null &&
+                            (playbackService.state == PlaybackState.playing ||
+                                playbackService.state == PlaybackState.paused);
+                        final cardHeight = PlaybackCardLayout.calculate(
+                          context,
+                        ).height;
+                        final actionBottom =
+                            PlaybackCardOverlayLayout.actionButtonsBottom(
+                              stableBottomInset: _stablePlaybackBottomInset,
+                              cardHeight: cardHeight,
+                              isCardVisible: isCardVisible,
+                            );
+                        final topBoundary =
+                            MediaQuery.of(context).viewPadding.top +
+                            (useCompactTopBar ? 50.0 : kToolbarHeight) +
+                            8.0;
+                        final maxExpandedHeight =
+                            MediaQuery.sizeOf(context).height -
+                            topBoundary -
+                            actionBottom;
+                        return AnimatedPadding(
+                          duration: const Duration(milliseconds: 300),
+                          curve: Curves.easeInOut,
+                          padding: EdgeInsets.only(bottom: actionBottom),
+                          child: VideoActionButtons(
+                            collectionId: widget.collectionId,
+                            maxExpandedHeight: maxExpandedHeight,
+                          ),
+                        );
+                      },
                     )
                   : null,
               bottomNavigationBar: _isSelectionMode && _selectedIds.isNotEmpty
@@ -3050,10 +3082,7 @@ class _CollectionScreenState extends State<CollectionScreen>
             final currentController = playbackService.currentItem?.id == item.id
                 ? playbackService.controller
                 : null;
-            _openPlaybackScreen(
-              item,
-              existingController: currentController,
-            );
+            _openPlaybackScreen(item, existingController: currentController);
           }
         }
 

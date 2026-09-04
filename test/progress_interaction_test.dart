@@ -242,6 +242,7 @@ void main() {
                 onMoveSubtitles: () {},
                 isLongPressing: false,
                 longPressFeedbackText: '',
+                showBufferedProgress: true,
                 onLongPressStart: () => true,
                 onLongPressEnd: () {},
                 subtitleEntries: const [],

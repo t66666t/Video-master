@@ -3,7 +3,6 @@ import 'package:provider/provider.dart';
 import '../models/video_item.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
-import '../services/settings_service.dart';
 import 'cached_thumbnail_widget.dart';
 
 class EpisodePickerPanel extends StatefulWidget {
@@ -190,7 +189,6 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final settings = Provider.of<SettingsService>(context, listen: false);
     final playbackService = Provider.of<MediaPlaybackService>(context);
     final playlistManager = Provider.of<PlaylistManager>(context);
     final playlist = playlistManager.playlist;
@@ -313,9 +311,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                         ),
                         onPressed: playlistManager.hasPrevious
                             ? () {
-                                playbackService.playPrevious(
-                                  autoPlay: settings.autoPlayNextVideo,
-                                );
+                                playbackService.playPrevious();
                               }
                             : null,
                       ),
@@ -359,9 +355,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                         ),
                         onPressed: playlistManager.hasNext
                             ? () {
-                                playbackService.playNext(
-                                  autoPlay: settings.autoPlayNextVideo,
-                                );
+                                playbackService.playNext();
                               }
                             : null,
                       ),
@@ -403,10 +397,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                                 if (targetIndex >= 0) {
                                   playlistManager.setCurrentIndex(targetIndex);
                                 }
-                                playbackService.play(
-                                  item,
-                                  autoPlay: settings.autoPlayNextVideo,
-                                );
+                                playbackService.playPlaylistItem(item);
                               }
                               // 保持弹窗开启
                             },

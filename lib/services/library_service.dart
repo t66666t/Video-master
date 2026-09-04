@@ -20,12 +20,14 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_binar
 import '../models/media_source_ref.dart';
 import '../models/video_collection.dart';
 import '../utils/media_library_search_query.dart';
+import '../utils/imported_media_title.dart';
 import '../models/video_item.dart';
 import '../models/managed_subtitle_asset.dart';
 import 'thumbnail_cache_service.dart';
 import 'audio_playback_compatibility_service.dart';
 import 'settings_service.dart';
 import 'temporary_storage_cleanup_models.dart';
+import 'media_materialization_service.dart';
 import '../utils/media_duration_probe.dart';
 import '../utils/media_chapter_probe.dart';
 import '../utils/serial_task_queue.dart';
@@ -173,6 +175,7 @@ class LibraryService extends ChangeNotifier {
   LibraryService._internal();
 
   BilibiliStreamingService? _bilibiliStreamingService;
+  MediaMaterializationService? _mediaMaterializationService;
 
   /// Connects library ownership operations to the live Bilibili gateway.
   ///
@@ -198,6 +201,86 @@ class LibraryService extends ChangeNotifier {
     _invalidateVideoSizeCache(item.id);
     await _saveLibrary();
     notifyListeners();
+  }
+
+  void attachMediaMaterializationService(MediaMaterializationService? service) {
+    if (identical(_mediaMaterializationService, service)) return;
+    _mediaMaterializationService
+      ?..onCacheChanged = null
+      ..onPlaybackMaterialized = null
+      ..onDeferredClearCompleted = null;
+    _mediaMaterializationService = service;
+    if (service != null) {
+      service.onCacheChanged = notifyOnlineCacheChanged;
+      service.onPlaybackMaterialized = notifyOnlineCacheChanged;
+      service.onDeferredClearCompleted = _clearRemainingOnlineCache;
+      unawaited(service.cleanupPendingDeletions());
+    }
+  }
+
+  MediaMaterializationService? get mediaMaterializationService =>
+      _mediaMaterializationService;
+
+  /// All library cards backed by a Bilibili online stream.
+  List<VideoItem> get bilibiliStreamItems =>
+      _videos.values.where(_isBilibiliStreamItem).toList(growable: false);
+
+  Future<String> downloadBilibiliAudioForTranscription(
+    String videoId, {
+    void Function(BilibiliAudioDownloadProgress progress)? onProgress,
+    Future<void>? cancelSignal,
+  }) async {
+    final item = _videos[videoId];
+    if (item == null) throw StateError('媒体库中找不到该视频卡片');
+    if (!_isBilibiliStreamItem(item)) {
+      throw StateError('该视频不是 Bilibili 在线播放卡片');
+    }
+    final service = _bilibiliStreamingService;
+    if (service == null) throw StateError('Bilibili 在线服务尚未初始化');
+    return service.downloadAudioForTranscription(
+      item,
+      onProgress: onProgress,
+      cancelSignal: cancelSignal,
+    );
+  }
+
+  Future<MediaMaterializationEstimate> estimateOnlineMediaMaterialization(
+    String videoId,
+    MediaMaterializationRequirement requirement, {
+    int? targetHeight,
+  }) {
+    final item = _videos[videoId];
+    if (item == null) throw StateError('媒体库中找不到该视频卡片');
+    final service = _mediaMaterializationService;
+    if (service == null) throw StateError('本地素材服务尚未初始化');
+    return service.estimate(item, requirement, targetHeight: targetHeight);
+  }
+
+  Future<MaterializedMediaLease> acquireMaterializedMedia(
+    String videoId,
+    MediaMaterializationRequirement requirement, {
+    int? targetHeight,
+    void Function(MediaMaterializationProgress progress)? onProgress,
+    Future<void>? cancelSignal,
+  }) {
+    final item = _videos[videoId];
+    if (item == null) throw StateError('媒体库中找不到该视频卡片');
+    final service = _mediaMaterializationService;
+    if (service == null) throw StateError('本地素材服务尚未初始化');
+    return service.acquire(
+      item,
+      requirement,
+      targetHeight: targetHeight,
+      onProgress: onProgress,
+      cancelSignal: cancelSignal,
+    );
+  }
+
+  Future<MaterializedMediaLease?> acquireExistingMaterializedPlayback(
+    VideoItem item,
+  ) {
+    return _mediaMaterializationService?.acquireExistingPlayback(item) ??
+        Future<MaterializedMediaLease?>.value(null);
   }
 
   static const Set<String> supportedVideoExtensions = {
@@ -370,19 +453,6 @@ class LibraryService extends ChangeNotifier {
     return MediaType.video;
   }
 
-  String _normalizeImportedName(String value) {
-    var name = p.basename(value).trim();
-    name = name.replaceFirst(RegExp(r'^incoming_media_\d+_'), '');
-    name = name.replaceFirst(RegExp(r'^shared_media_\d+_'), '');
-    name = name.replaceFirst(
-      RegExp(
-        r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}_',
-      ),
-      '',
-    );
-    return name.isEmpty ? p.basename(value) : name;
-  }
-
   static bool isSupportedMediaPath(String path) {
     return supportedMediaExtensions.contains(p.extension(path).toLowerCase());
   }
@@ -475,8 +545,9 @@ class LibraryService extends ChangeNotifier {
     bool requireInternalMatchForFingerprint = false,
   }) async {
     final normalizedPath = p.normalize(path);
-    final normalizedName = _normalizeImportedName(
-      originalTitle ?? path,
+    final normalizedName = resolveImportedMediaTitle(
+      sourcePath: path,
+      originalTitle: originalTitle,
     ).toLowerCase();
     int? candidateSize;
     try {
@@ -501,7 +572,10 @@ class LibraryService extends ChangeNotifier {
         continue;
       }
 
-      final existingName = _normalizeImportedName(existing.title).toLowerCase();
+      final existingName = resolveImportedMediaTitle(
+        sourcePath: existing.path,
+        originalTitle: existing.title,
+      ).toLowerCase();
       if (existingName != normalizedName) {
         continue;
       }
@@ -2036,13 +2110,11 @@ class LibraryService extends ChangeNotifier {
 
     final shouldManageSidecarSubtitles =
         moveImportedFilesToLibrary || copyImportedFilesToLibrary;
+    // 结构化导入：同一智能匹配算法。时长因子在此阶段不可用（视频尚未
+    // 进入库内完成时长探测），故仅以文件名证据决定是否绑定。
     final discoveredSubtitles = shouldManageSidecarSubtitles
         ? await const SubtitleDiscoveryService().scanVideoDirectory(
             videoPath: filePath,
-            rules: SubtitleScanRules(
-              prefixMatchMode: SettingsService().desktopSubtitlePrefixMatchMode,
-              caseSensitive: SettingsService().desktopSubtitleScanCaseSensitive,
-            ),
           )
         : const <DiscoveredSubtitleFile>[];
 
@@ -2062,7 +2134,7 @@ class LibraryService extends ChangeNotifier {
       );
     }
 
-    final originalTitle = _normalizeImportedName(p.basename(filePath));
+    final originalTitle = resolveImportedMediaTitle(sourcePath: filePath);
     final sourceFingerprint = await _computeSourceFingerprint(effectivePath);
     final durationMs = probeDuration
         ? await _probeMediaDurationMs(effectivePath)
@@ -2112,12 +2184,15 @@ class LibraryService extends ChangeNotifier {
     VideoItem item,
     List<DiscoveredSubtitleFile> subtitles,
   ) async {
-    if (subtitles.isEmpty) return;
+    // 只收录"命名证据充分、可自动匹配"（A 类）的字幕；评分不足的字幕
+    // 不强行绑定到本视频（B 站轨道等被引擎判为 rejected 的也不收录）。
+    final eligible = subtitles.where((entry) => entry.analysis.isAuto).toList();
+    if (eligible.isEmpty) return;
 
     final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
     final localSubtitles = <String, String>{};
     final managedAssets = <ManagedSubtitleAsset>[];
-    for (final subtitle in subtitles) {
+    for (final subtitle in eligible) {
       final copiedPath = await storage.copyIntoTask(
         item.id,
         subtitle.path,
@@ -2146,6 +2221,7 @@ class LibraryService extends ChangeNotifier {
 
     item.localSubtitles = localSubtitles;
     item.managedSubtitleAssets = managedAssets;
+    // 服务端已把最优候选排在最前；导入绑定默认字幕取排序第一的合格候选。
     item.subtitlePath = managedAssets.first.path;
     item.isSubtitleCached = true;
   }
@@ -2823,10 +2899,11 @@ class LibraryService extends ChangeNotifier {
         var path = filePaths[i];
         final id = const Uuid().v4();
         // 使用原始标题（如果提供了），否则使用路径的文件名
-        final originalTitle = _normalizeImportedName(
-          (originalTitles != null && i < originalTitles.length)
+        final originalTitle = resolveImportedMediaTitle(
+          sourcePath: path,
+          originalTitle: originalTitles != null && i < originalTitles.length
               ? originalTitles[i]
-              : p.basename(path),
+              : null,
         );
         final sourceFingerprint = await _computeSourceFingerprint(path);
 
@@ -3170,12 +3247,11 @@ class LibraryService extends ChangeNotifier {
     // owned by the card id and must be removed with the card itself.
     if (_isBilibiliStreamItem(vid)) {
       try {
-        final streaming = _bilibiliStreamingService;
-        if (streaming != null) {
-          await streaming.clearCacheForItem(vid.id);
-        } else {
-          await BilibiliStreamingService.clearCacheForItemOnDisk(vid.id);
-        }
+        final materialization = _mediaMaterializationService;
+        final cleared = materialization == null
+            ? true
+            : await materialization.clearCard(vid.id);
+        if (cleared) await _clearRemainingOnlineCache(vid.id);
       } catch (e) {
         developer.log('Error deleting Bilibili stream cache', error: e);
       }
@@ -3324,6 +3400,45 @@ class LibraryService extends ChangeNotifier {
       } catch (e) {
         debugPrint("Error deleting internal video: $e");
       }
+    }
+  }
+
+  Future<void> _clearRemainingOnlineCache(String itemId) async {
+    final streaming = _bilibiliStreamingService;
+    if (streaming != null) {
+      await streaming.clearCacheForItem(itemId);
+    } else {
+      await BilibiliStreamingService.clearCacheForItemOnDisk(itemId);
+    }
+    final report = streaming != null
+        ? await streaming.inspectItemCache(itemId)
+        : await BilibiliStreamingService.inspectCacheForItem(itemId);
+    if (report.fileCount > 0) {
+      await _mediaMaterializationService?.markCardForDeletion(itemId);
+    }
+    notifyOnlineCacheChanged(itemId);
+  }
+
+  /// 按卡片统一清除在线视频缓存：素材缓存（合成/OCR/转写下载的轨道与可
+  /// 播放文件）+ 播放网关缓存。正在使用的素材会转为延迟删除。
+  Future<void> clearOnlineCacheForItem(String videoId) async {
+    final item = _videos[videoId];
+    if (item == null || !_isBilibiliStreamItem(item)) return;
+    await _mediaMaterializationService?.clearCard(videoId);
+    await _clearRemainingOnlineCache(videoId);
+    _invalidateVideoSizeCache(videoId);
+  }
+
+  /// 按卡片分类统计在线视频缓存（素材文件 vs 播放网关缓存）。
+  Future<BilibiliItemCacheBreakdown?> inspectOnlineCacheBreakdown(
+    String videoId,
+  ) async {
+    final item = _videos[videoId];
+    if (item == null || !_isBilibiliStreamItem(item)) return null;
+    try {
+      return await BilibiliStreamingService.inspectItemCacheBreakdown(videoId);
+    } catch (_) {
+      return null;
     }
   }
 
@@ -4921,7 +5036,10 @@ class LibraryService extends ChangeNotifier {
       ),
     );
     // #endregion
-    item.title = _normalizeImportedName(item.title);
+    item.title = resolveImportedMediaTitle(
+      sourcePath: item.path,
+      originalTitle: item.title,
+    );
     item.sourceFingerprint ??= await _computeSourceFingerprint(item.path);
     final isBilibiliStream = _isBilibiliStreamItem(item);
 

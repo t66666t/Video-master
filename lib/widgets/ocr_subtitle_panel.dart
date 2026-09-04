@@ -6,10 +6,14 @@ import 'package:provider/provider.dart';
 
 import '../models/ocr_subtitle_models.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
+import '../services/library_service.dart';
+import '../services/media_materialization_service.dart';
 import '../services/ocr_subtitle_manager.dart';
 import '../utils/app_toast.dart';
 import 'ocr_region_editor.dart';
 import 'ocr_region_preview.dart';
+import 'media_materialization_progress_card.dart';
 
 class OcrSubtitlePanel extends StatefulWidget {
   final VideoItem videoItem;
@@ -45,6 +49,10 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
   String? _previewPath;
   String? _deliveredPath;
   bool _tracksEditedInThisPanel = false;
+  bool _preparingOnlineFrame = false;
+  MediaMaterializationProgress? _preparationProgress;
+  String? _preparationError;
+  Completer<void>? _preparationCancellation;
 
   OcrSubtitleManager get _manager => context.read<OcrSubtitleManager>();
 
@@ -70,6 +78,10 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
   void didUpdateWidget(covariant OcrSubtitlePanel oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.videoItem.id != widget.videoItem.id) {
+      final cancellation = _preparationCancellation;
+      if (cancellation != null && !cancellation.isCompleted) {
+        cancellation.complete();
+      }
       _startMs = 0;
       _endMs = widget.duration.inMilliseconds.toDouble();
       _deliveredPath = null;
@@ -77,6 +89,10 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
         _manager.tracksForVideo(widget.videoItem.id),
       );
       _tracksEditedInThisPanel = false;
+      _preparingOnlineFrame = false;
+      _preparationProgress = null;
+      _preparationError = null;
+      _preparationCancellation = null;
       final previousPath = _previewPath;
       _previewPath = null;
       unawaited(_manager.deletePreview(previousPath));
@@ -85,6 +101,10 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
 
   @override
   void dispose() {
+    // 面板关闭不再取消素材下载：下载已登记在全局任务注册表中，
+    // 会继续在后台完成并沉淀为可复用缓存；重新进入面板或打开合成页时，
+    // 通过任务快照恢复进度显示。切换视频（didUpdateWidget）仍会取消，
+    // 因为继续下载的是旧卡片的素材。
     _manager.removeListener(_onManagerChanged);
     unawaited(_manager.deletePreview(_previewPath));
     super.dispose();
@@ -140,6 +160,22 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
   }
 
   Future<void> _selectRegion() async {
+    if (!await _confirmOnlineVideoDownload()) return;
+    final online =
+        widget.videoItem.sourceRef?.kind == MediaSourceKind.bilibiliStream;
+    final cancellation = Completer<void>();
+    if (online && mounted) {
+      setState(() {
+        _preparingOnlineFrame = true;
+        _preparationError = null;
+        _preparationProgress = const MediaMaterializationProgress(
+          stage: MediaMaterializationStage.resolving,
+          progress: 0,
+          message: '正在准备 Bilibili 视频素材',
+        );
+        _preparationCancellation = cancellation;
+      });
+    }
     final wasPlaying = await widget.pauseForRegionSelection();
     String? capturedPath;
     try {
@@ -150,6 +186,13 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
         position: initialPosition,
         mirrorHorizontal: widget.videoItem.isVideoMirroredH,
         mirrorVertical: widget.videoItem.isVideoMirroredV,
+        cancelSignal: online ? cancellation.future : null,
+        onProgress: online
+            ? (value) {
+                if (!mounted) return;
+                setState(() => _preparationProgress = value);
+              }
+            : null,
       );
       capturedPath = path;
       if (!mounted) return;
@@ -192,8 +235,18 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
         unawaited(_manager.deletePreview(previousPath));
       }
     } catch (error) {
+      if (mounted && online) {
+        setState(() => _preparationError = error.toString());
+      }
       if (mounted) AppToast.show('无法打开字幕区域：$error', type: AppToastType.error);
     } finally {
+      if (mounted && online) {
+        setState(() {
+          _preparingOnlineFrame = false;
+          _preparationCancellation = null;
+          if (_preparationError == null) _preparationProgress = null;
+        });
+      }
       await _manager.deletePreview(capturedPath);
       await widget.restorePlayback(wasPlaying);
     }
@@ -239,6 +292,7 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
       AppToast.show('已有 OCR 字幕任务正在运行', type: AppToastType.info);
       return;
     }
+    if (!await _confirmOnlineVideoDownload()) return;
     final start = _customRange
         ? Duration(milliseconds: _startMs.round())
         : Duration.zero;
@@ -261,6 +315,82 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
     await _manager.start(request);
   }
 
+  Future<bool> _confirmOnlineVideoDownload() async {
+    if (widget.videoItem.sourceRef?.kind != MediaSourceKind.bilibiliStream) {
+      return true;
+    }
+    try {
+      final estimate = await context
+          .read<LibraryService>()
+          .estimateOnlineMediaMaterialization(
+            widget.videoItem.id,
+            MediaMaterializationRequirement.videoFrames,
+            targetHeight: 1080,
+          );
+      if (!estimate.requiresVideoDownload || !mounted) return true;
+      final size = estimate.estimatedBytes == null
+          ? '大小暂时无法确定'
+          : '预计 ${LibraryService.formatSize(estimate.estimatedBytes!)}';
+      return await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) => AlertDialog(
+              title: const Text('需要下载 OCR 视频素材'),
+              content: Text(
+                'OCR 需要先下载 ${estimate.qualityLabel} 视频轨（$size）。\n\n'
+                '该素材会归属于当前卡片，后续 OCR 和视频合成可复用。',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('下载并继续'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+    } catch (error) {
+      if (mounted) {
+        AppToast.show('无法获取在线视频素材信息：$error', type: AppToastType.error);
+      }
+      return false;
+    }
+  }
+
+  /// 全局素材任务的进度卡片：任何页面（合成、OCR、播放页后台补齐）发起的
+  /// 下载在退出页面后仍在继续，重进面板时据此恢复进度显示。
+  Widget _buildActiveTaskCard() {
+    final materialization = context.read<MediaMaterializationService>();
+    return ListenableBuilder(
+      listenable: materialization,
+      builder: (context, _) {
+        final job = _manager.job;
+        final jobDownloadingMaterial =
+            job?.videoId == widget.videoItem.id &&
+            job?.status == OcrSubtitleJobStatus.materializing;
+        if (jobDownloadingMaterial) {
+          // OCR 任务自身的素材下载已通过任务进度展示，避免重复卡片。
+          return const SizedBox.shrink();
+        }
+        final task = materialization.activeTaskFor(widget.videoItem.id);
+        if (task == null || task.stage == MediaMaterializationStage.completed) {
+          return const SizedBox.shrink();
+        }
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: MediaMaterializationProgressCard(
+            progress: task.toProgress(),
+            onCancel: () =>
+                unawaited(materialization.cancelActiveTask(task.itemId)),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final managerJob = _manager.job;
@@ -268,6 +398,9 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
     final running = managerJob?.isRunning ?? false;
     final job = ownsJob || running ? managerJob : null;
     final runningOtherVideo = running && !ownsJob;
+    final displayedProgress = job?.status == OcrSubtitleJobStatus.materializing
+        ? (_manager.materializationProgress?.progress ?? job?.progress ?? 0)
+        : (job?.progress ?? 0);
     return Container(
       color: const Color(0xFF17191D),
       child: SafeArea(
@@ -298,6 +431,22 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
               ],
             ),
             const SizedBox(height: 12),
+            if (_preparationProgress != null) ...[
+              MediaMaterializationProgressCard(
+                progress: _preparationProgress!,
+                error: _preparationError,
+                onCancel: _preparingOnlineFrame
+                    ? () {
+                        final cancellation = _preparationCancellation;
+                        if (cancellation != null && !cancellation.isCompleted) {
+                          cancellation.complete();
+                        }
+                      }
+                    : null,
+              ),
+              const SizedBox(height: 12),
+            ] else
+              _buildActiveTaskCard(),
             _card(
               title: '字幕区域',
               child: Column(
@@ -526,13 +675,13 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
                   ],
                   const SizedBox(height: 10),
                   LinearProgressIndicator(
-                    value: job == null ? 0 : job.progress.clamp(0, 1),
+                    value: displayedProgress.clamp(0, 1),
                     minHeight: 6,
                   ),
                   const SizedBox(height: 7),
                   Text(
                     running
-                        ? '${((job?.progress ?? 0) * 100).round()}%  ·  '
+                        ? '${(displayedProgress * 100).round()}%  ·  '
                               '剩余约 ${_formatDuration(job?.remaining)}  ·  '
                               '${_manager.activeBackend}'
                         : '${((job?.progress ?? 0) * 100).round()}%',

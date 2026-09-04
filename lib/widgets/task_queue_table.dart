@@ -852,6 +852,7 @@ class _CompactTableStatus extends StatelessWidget {
     }
 
     final statusText = switch (status) {
+      TranscriptionStatus.downloading => '下载',
       TranscriptionStatus.extracting => '提取',
       TranscriptionStatus.uploading => '上传',
       TranscriptionStatus.transcribing => '转录',
@@ -1141,6 +1142,7 @@ class _ProgressIndicator extends StatelessWidget {
 
     // Processing states: extracting / uploading / transcribing
     final statusText = switch (status) {
+      TranscriptionStatus.downloading => '下载中',
       TranscriptionStatus.extracting => '提取中',
       TranscriptionStatus.uploading => '上传中',
       TranscriptionStatus.transcribing => '转录中',

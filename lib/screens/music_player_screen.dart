@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' show ImageFilter;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/subtitle_model.dart';
 import '../services/media_playback_service.dart';
+import '../services/audio_playback_compatibility_service.dart';
+import '../services/music_artwork_backdrop_cache.dart';
 import '../services/settings_service.dart';
 import '../utils/desktop_player_shortcuts.dart';
 import '../models/video_item.dart';
@@ -13,6 +16,63 @@ import '../widgets/cached_thumbnail_widget.dart';
 import '../widgets/music_album_cover.dart';
 import '../widgets/music_lyric_view.dart';
 import '../widgets/music_playback_controls.dart';
+import '../widgets/music_text_optical_alignment.dart';
+
+/// Prepares the already-blurred artwork while the source playback page is
+/// still visible. This moves image decoding and blur work out of the route's
+/// first frame, where it would otherwise interrupt the page transition.
+Future<void> prepareMusicPlayerArtwork(
+  BuildContext context,
+  String? coverPath,
+) async {
+  final bytes = await MusicArtworkBackdropCache.instance.warm(coverPath);
+  if (bytes == null || !context.mounted) return;
+  await precacheImage(MemoryImage(bytes), context);
+}
+
+Route<T> buildMusicPlayerRoute<T>({required WidgetBuilder builder}) {
+  return PageRouteBuilder<T>(
+    settings: const RouteSettings(name: 'music-player'),
+    fullscreenDialog: true,
+    opaque: true,
+    transitionDuration: const Duration(milliseconds: 280),
+    reverseTransitionDuration: const Duration(milliseconds: 220),
+    pageBuilder: (context, animation, secondaryAnimation) => builder(context),
+    transitionsBuilder: (context, animation, secondaryAnimation, child) {
+      final curved = CurvedAnimation(
+        parent: animation,
+        curve: Curves.easeOutCubic,
+        reverseCurve: Curves.easeInCubic,
+      );
+      return FadeTransition(
+        opacity: curved,
+        child: SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0, 0.018),
+            end: Offset.zero,
+          ).animate(curved),
+          child: child,
+        ),
+      );
+    },
+  );
+}
+
+@visibleForTesting
+SystemUiMode musicPlayerSystemUiModeForSize(Size viewportSize) {
+  return viewportSize.width > viewportSize.height
+      ? SystemUiMode.immersiveSticky
+      : SystemUiMode.edgeToEdge;
+}
+
+@visibleForTesting
+double musicControlsLyricMaskProgress(double controllerValue) {
+  return const Interval(
+    0.0,
+    0.18,
+    curve: Curves.easeOutCubic,
+  ).transform(controllerValue.clamp(0.0, 1.0));
+}
 
 /// Apple Music 风格全屏音乐播放页面（响应式布局）
 ///
@@ -41,6 +101,7 @@ class MusicPlayerScreen extends StatefulWidget {
   final VoidCallback? onPlayPause;
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
+  final bool restoreSystemUiOnExit;
 
   const MusicPlayerScreen({
     super.key,
@@ -53,6 +114,7 @@ class MusicPlayerScreen extends StatefulWidget {
     this.onPlayPause,
     this.onPrevious,
     this.onNext,
+    this.restoreSystemUiOnExit = true,
   });
 
   @override
@@ -67,6 +129,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   double? _seekTargetProgress;
   final FocusNode _focusNode = FocusNode();
   late final MediaPlaybackService _positionMediaService;
+  bool? _lastSystemUiLandscape;
 
   /// 显示位置通知器 — 驱动进度条每帧平滑更新
   /// 正常播放时跟随 service.positionNotifier，拖动时切到拖动位置
@@ -74,10 +137,14 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     Duration.zero,
   );
 
-  /// 集切换过渡动画时长（优雅的淡入淡出效果）
-  static const Duration _episodeTransitionDuration = Duration(
-    milliseconds: 400,
+  /// The lyric clock follows playback normally, but receives the scrub target
+  /// explicitly on drag end so a seek into the prelude can still reposition
+  /// the list while keeping the active lyric index at -1.
+  final ValueNotifier<Duration> _lyricPosition = ValueNotifier<Duration>(
+    Duration.zero,
   );
+  final MusicLyricPositionController _lyricPositionController =
+      MusicLyricPositionController();
 
   /// 竖屏模式下底部播放控件的可见性（Apple Music 手机端交互）
   ///
@@ -89,7 +156,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   bool _verticalControlsVisible = true;
 
   /// 隐藏/显示控件的动画时长
-  static const Duration _controlsAnimDuration = Duration(milliseconds: 300);
+  static const Duration _controlsAnimDuration = Duration(milliseconds: 380);
 
   /// 底部控件显隐动画控制器（实现从下往上出现、从上往下消失）
   late AnimationController _controlsAnimationController;
@@ -101,6 +168,11 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   /// 播放一段时间后自动隐藏控件的定时器（Apple Music 核心逻辑）
   /// 控件显示后，若用户在 _autoHideDelay 时间内没有交互，则自动隐藏
   Timer? _autoHideControlsTimer;
+
+  bool _suppressNextBackgroundTap = false;
+  bool _isLyricScrollActive = false;
+  int _audioCodecProbeGeneration = 0;
+  String? _audioCodecProbePath;
 
   /// 控件显示后，用户无操作自动隐藏的延时（Apple Music 风格：5秒）
   static const Duration _autoHideDelay = Duration(seconds: 5);
@@ -133,11 +205,13 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     // 初始化底部控件显隐动画控制器
     _controlsAnimationController = AnimationController(
       duration: _controlsAnimDuration,
+      reverseDuration: const Duration(milliseconds: 300),
       vsync: this,
     );
     _controlsSlideAnimation =
         Tween<Offset>(
-          begin: const Offset(0, 1), // 隐藏位置（向下偏移一个控件高度）
+          // Apple Music 的控制区更接近淡出和轻微下沉，而不是整块滑出屏幕。
+          begin: const Offset(0, 0.08),
           end: Offset.zero, // 显示位置
         ).animate(
           CurvedAnimation(
@@ -155,16 +229,17 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     );
     _positionMediaService.positionNotifier.addListener(_onPositionNotified);
     _displayPosition.value = _positionMediaService.position;
+    _lyricPosition.value = _positionMediaService.position;
 
     // 请求焦点以接收键盘事件
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _restoreKeyboardFocus();
     });
 
-    // 在移动端启用全屏模式，隐藏状态栏和导航栏
-    if (Platform.isAndroid || Platform.isIOS) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    }
+    // 手机竖屏显示状态栏和手势/导航栏；横屏保持沉浸式播放。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _syncMobileSystemUiForOrientation(force: true);
+    });
 
     // 启动自动隐藏控件定时器（Apple Music 逻辑：几秒无操作后控件自动隐藏）
     _startAutoHideTimer();
@@ -203,6 +278,9 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     if (_displayPosition.value != service.positionNotifier.value) {
       _displayPosition.value = service.positionNotifier.value;
     }
+    if (_lyricPosition.value != service.positionNotifier.value) {
+      _lyricPosition.value = service.positionNotifier.value;
+    }
   }
 
   @override
@@ -215,10 +293,13 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     _focusNode.dispose();
     _positionMediaService.positionNotifier.removeListener(_onPositionNotified);
     _displayPosition.dispose();
+    _lyricPosition.dispose();
+    _lyricPositionController.dispose();
 
-    // 恢复系统UI显示（仅移动端）
-    if (Platform.isAndroid || Platform.isIOS) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    // Music 页是播放页的子页时，退出后底下仍然是播放页，
+    // 不能先恢复系统栏，否则路由切换期间会发生一次视口抖动。
+    if (widget.restoreSystemUiOnExit) {
+      _restoreSystemUIMode();
     }
 
     super.dispose();
@@ -228,6 +309,55 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _scheduleKeyboardFocusRestore();
+      if (ModalRoute.of(context)?.isCurrent == true) {
+        _syncMobileSystemUiForOrientation(force: true);
+      }
+    }
+  }
+
+  @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+        _syncMobileSystemUiForOrientation();
+      }
+    });
+  }
+
+  bool get _isMobilePlatform =>
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.android ||
+          defaultTargetPlatform == TargetPlatform.iOS);
+
+  void _syncMobileSystemUiForOrientation({bool force = false}) {
+    if (!_isMobilePlatform) return;
+    final viewportSize = MediaQuery.sizeOf(context);
+    final mode = musicPlayerSystemUiModeForSize(viewportSize);
+    final isLandscape = mode == SystemUiMode.immersiveSticky;
+    if (!force && _lastSystemUiLandscape == isLandscape) return;
+    _lastSystemUiLandscape = isLandscape;
+
+    if (isLandscape) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(mode));
+      return;
+    }
+
+    _restoreSystemUIMode();
+  }
+
+  void _restoreSystemUIMode() {
+    if (_isMobilePlatform) {
+      unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+      SystemChrome.setSystemUIOverlayStyle(
+        const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+          systemNavigationBarColor: Colors.transparent,
+          systemNavigationBarDividerColor: Colors.transparent,
+          systemNavigationBarIconBrightness: Brightness.light,
+        ),
+      );
     }
   }
 
@@ -402,12 +532,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   void _handleLyricScrollDirection(double? direction) {
     if (direction == null) {
       // 恢复自动跟随模式 → 不影响控件显示/隐藏状态
-      // 如果控件是显示的，重置自动隐藏定时器
-      // 如果控件是隐藏的，保持隐藏状态
       _hideControlsTimer?.cancel();
-      if (_verticalControlsVisible) {
-        _startAutoHideTimer();
-      }
       return;
     }
 
@@ -429,6 +554,15 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
       // 用户向上滑歌词（往前翻/回到当前行）→ 立即显示控件 + 取消待执行的隐藏 + 重置自动隐藏定时器
       _hideControlsTimer?.cancel();
       _setControlsVisible(true);
+      if (!_isLyricScrollActive) _startAutoHideTimer();
+    }
+  }
+
+  void _handleLyricScrollActivity(bool active) {
+    _isLyricScrollActive = active;
+    if (active) {
+      _cancelAutoHideTimer();
+    } else if (_verticalControlsVisible) {
       _startAutoHideTimer();
     }
   }
@@ -459,12 +593,60 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     _startAutoHideTimer();
   }
 
+  void _handlePortraitBackgroundTap() {
+    if (_suppressNextBackgroundTap) {
+      _suppressNextBackgroundTap = false;
+      return;
+    }
+    _onUserInteraction();
+  }
+
+  void _handleDirectLyricTap() {
+    _suppressNextBackgroundTap = true;
+    // A semantics action has no enclosing pointer tap. Bound suppression to
+    // the current event/frame so it cannot consume a later background tap.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _suppressNextBackgroundTap = false;
+    });
+  }
+
+  bool _isConfirmedAlacItem(VideoItem? item) {
+    if (item == null || item.type != MediaType.audio) return false;
+    final declaredCodec = item.codec?.trim().toLowerCase();
+    if (declaredCodec == 'alac') return true;
+    final cachedCodec = AudioPlaybackCompatibilityService.cachedAudioCodec(
+      item.path,
+    );
+    if (cachedCodec != null) return cachedCodec.toLowerCase() == 'alac';
+
+    final extension = item.path.toLowerCase();
+    if (extension.endsWith('.alac')) return true;
+    if (!extension.endsWith('.m4a') && !extension.endsWith('.m4b')) {
+      return false;
+    }
+    _scheduleAudioCodecProbe(item);
+    return false;
+  }
+
+  void _scheduleAudioCodecProbe(VideoItem item) {
+    if (_audioCodecProbePath == item.path) return;
+    _audioCodecProbePath = item.path;
+    final generation = ++_audioCodecProbeGeneration;
+    unawaited(
+      AudioPlaybackCompatibilityService.probeAudioCodec(item.path).then((_) {
+        if (!mounted || generation != _audioCodecProbeGeneration) return;
+        if (_mediaService.currentItem?.path != item.path) return;
+        setState(() {});
+      }),
+    );
+  }
+
   void _handleSeekTo(Duration position) {
     final onSeek = widget.onSeek;
     if (onSeek != null) {
       onSeek(position);
     } else {
-      _mediaService.seekTo(position);
+      unawaited(_mediaService.seekTo(position, source: 'music-player'));
     }
   }
 
@@ -484,6 +666,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   void _handleProgressChangeStart(double value) {
     // 用户开始拖拽进度条 → 显示控件并重置自动隐藏定时器
     _onUserInteraction();
+    _cancelAutoHideTimer();
     setState(() {
       _isDragging = true;
       _dragProgress = value;
@@ -505,6 +688,8 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     );
     // 立即更新显示位置到目标位置，避免闪烁
     _displayPosition.value = seekPos;
+    _lyricPositionController.locate(seekPos);
+    _lyricPosition.value = seekPos;
     _handleSeekTo(seekPos);
   }
 
@@ -545,17 +730,13 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
         );
 
         // 使用实时数据（来自快照，builder 仅在低频字段变化时执行，故数据新鲜）
-        final effectiveCover = snapshot.cover;
+        final effectiveCover = snapshot.cover ?? widget.coverImagePath;
         final effectiveTitle = snapshot.title;
         // VideoItem 没有 artist 字段，使用 widget.artist（如果有传入）或留空
         final effectiveArtist = widget.artist;
         final effectiveTotalDuration = snapshot.duration;
         final effectiveSubtitles = snapshot.subtitles;
         final effectiveSecondarySubtitles = snapshot.secondarySubtitles;
-
-        // 使用当前播放项 ID 作为 Key，当集切换时 AnimatedSwitcher 自动触发淡入淡出动画
-        // 注意：不包含 isPlaying 状态，避免播放/暂停、进度条跳转时误触发切换动画
-        final contentKey = ValueKey<String>(snapshot.itemId);
 
         return Scaffold(
           backgroundColor: Colors.black,
@@ -566,69 +747,42 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
             child: Stack(
               children: [
                 // Block 1: 背景层（封面高斯模糊 + 半透明黑色遮罩）
-                _buildBackgroundLayer(effectiveCover),
+                _buildBackgroundLayer(snapshot.itemId, effectiveCover),
 
-                // 主内容区（带集切换淡入淡出过渡动画）
-                AnimatedSwitcher(
-                  duration: _episodeTransitionDuration,
-                  transitionBuilder: (child, animation) {
-                    // 创建优雅的淡入淡出 + 轻微缩放动画
-                    final curvedAnimation = CurvedAnimation(
-                      parent: animation,
-                      curve: Curves.easeInOutCubic,
-                    );
-
-                    return FadeTransition(
-                      opacity: curvedAnimation,
-                      child: ScaleTransition(
-                        scale: Tween<double>(
-                          begin: 0.95,
-                          end: 1.0,
-                        ).animate(curvedAnimation),
-                        child: child,
+                // 页面骨架在切集时保持原位。仅封面背景与歌词内容自行过渡，
+                // 避免标题、进度条和控制按钮随整页缩放或闪动。
+                SafeArea(
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final isNarrow = constraints.maxWidth < 768;
+                          if (isNarrow) {
+                            return _buildVerticalLayout(
+                              mediaService,
+                              snapshot.itemId,
+                              effectiveTitle,
+                              effectiveArtist,
+                              effectiveSubtitles,
+                              effectiveSecondarySubtitles,
+                              splitSubtitleByLine,
+                            );
+                          }
+                          return _buildHorizontalLayout(
+                            mediaService,
+                            snapshot.itemId,
+                            effectiveTotalDuration,
+                            effectiveTitle,
+                            effectiveArtist,
+                            effectiveSubtitles,
+                            effectiveSecondarySubtitles,
+                            splitSubtitleByLine,
+                          );
+                        },
                       ),
-                    );
-                  },
-                  child: KeyedSubtree(
-                    key: contentKey,
-                    child: SafeArea(
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          // 中间内容：占满整个 SafeArea 高度。
-                          // 窗口控制按钮已移至 Stack 顶层作为浮层，不再占用布局高度，
-                          // 避免挤压字幕/内容区域导致视觉重心偏下。
-                          LayoutBuilder(
-                            builder: (context, constraints) {
-                              // 响应式断点：768px 以下改为上下布局
-                              final isNarrow = constraints.maxWidth < 768;
-                              if (isNarrow) {
-                                return _buildVerticalLayout(
-                                  mediaService,
-                                  effectiveTitle,
-                                  effectiveArtist,
-                                  effectiveSubtitles,
-                                  effectiveSecondarySubtitles,
-                                  splitSubtitleByLine,
-                                );
-                              } else {
-                                return _buildHorizontalLayout(
-                                  mediaService,
-                                  effectiveTotalDuration,
-                                  effectiveTitle,
-                                  effectiveArtist,
-                                  effectiveSubtitles,
-                                  effectiveSecondarySubtitles,
-                                  splitSubtitleByLine,
-                                );
-                              }
-                            },
-                          ),
-                          // Block 2: 右上角窗口控制按钮（浮层，仅宽屏显示）
-                          _buildWindowControls(),
-                        ],
-                      ),
-                    ),
+                      _buildWindowControls(),
+                    ],
                   ),
                 ),
 
@@ -652,6 +806,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
   /// 调节歌词字号并持久化（竖屏 / 横屏分别记忆，互不干扰）
   void _onFontSizeChanged(double value) {
+    _onUserInteraction();
     final settings = Provider.of<SettingsService>(context, listen: false);
     if (_isPortraitLayout) {
       _lyricFontSizeScalePortrait = value;
@@ -683,6 +838,11 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
           divisions: 8,
           onChanged: (value) =>
               _onFontSizeChanged(double.parse(value.toStringAsFixed(2))),
+          onChangeStart: (_) {
+            _onUserInteraction();
+            _cancelAutoHideTimer();
+          },
+          onChangeEnd: (_) => _startAutoHideTimer(),
           activeColor: Colors.white,
           inactiveColor: Colors.white.withValues(alpha: 0.25),
           thumbColor: Colors.white,
@@ -730,64 +890,66 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   }
 
   /// 构建背景层（优化性能：使用缓存的模糊效果）
-  Widget _buildBackgroundLayer(String? coverPath) {
+  Widget _buildBackgroundLayer(String itemId, String? coverPath) {
     return Positioned.fill(
       child: ClipRect(
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // 放大的封面图作为背景底纹
-            if (coverPath != null && coverPath.isNotEmpty)
-              Image.network(
-                coverPath,
-                width: double.infinity,
-                height: double.infinity,
-                fit: BoxFit.cover,
-                // 移除 scale 参数，它会影响图片质量
-                errorBuilder: (context, error, stackTrace) => Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        const Color(0xFF3A3A3C),
-                        const Color(0xFF1C1C1E),
-                      ],
-                    ),
-                  ),
-                ),
-                loadingBuilder: (context, child, loadingProgress) {
-                  if (loadingProgress == null) return child;
-                  return Container(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                        colors: [
-                          const Color(0xFF3A3A3C),
-                          const Color(0xFF1C1C1E),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-              )
-            else
-              Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [const Color(0xFF3A3A3C), const Color(0xFF1C1C1E)],
-                  ),
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF343338), Color(0xFF111113)],
                 ),
               ),
+            ),
 
-            // 优化：降低模糊强度以提高性能（从50降到30）
-            // 使用 ImageFilter.blur 的优化版本
-            BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-              child: Container(color: Colors.black.withValues(alpha: 0.35)),
+            // 本地封面在后台 isolate 中预先缩小并强模糊。进入页面后这里只
+            // 拉伸一张缓存位图，不再对全屏纹理执行实时高斯模糊。
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 520),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              child: coverPath != null && coverPath.isNotEmpty
+                  ? RepaintBoundary(
+                      key: ValueKey<String>('music-backdrop-$coverPath'),
+                      child: _MusicBackdropArtwork(
+                        itemId: itemId,
+                        coverPath: coverPath,
+                      ),
+                    )
+                  : const SizedBox.expand(
+                      key: ValueKey<String>('music-backdrop-fallback'),
+                    ),
+            ),
+
+            // 保留封面色相，同时稳定白色歌词的对比度和上下层次。
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Color(0x5C000000),
+                    Color(0x2E000000),
+                    Color(0x52000000),
+                    Color(0x8A000000),
+                  ],
+                  stops: [0.0, 0.30, 0.68, 1.0],
+                ),
+              ),
+            ),
+            const DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: RadialGradient(
+                  center: Alignment(0.45, -0.35),
+                  radius: 1.25,
+                  colors: [Color(0x00FFFFFF), Color(0x59000000)],
+                  stops: [0.36, 1.0],
+                ),
+              ),
             ),
           ],
         ),
@@ -867,6 +1029,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   /// 消除黑边/空旷感，并让视觉重心回到屏幕中心。
   Widget _buildHorizontalLayout(
     MediaPlaybackService mediaService,
+    String itemId,
     Duration effectiveTotalDuration,
     String effectiveTitle,
     String effectiveArtist,
@@ -1002,19 +1165,53 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                   left: screenWidth * 0.03,
                   right: screenWidth * 0.02,
                 ),
-                child: MusicLyricView(
-                  subtitles: effectiveSubtitles,
-                  secondarySubtitles: effectiveSecondarySubtitles,
-                  onSeek: _handleSeekTo,
-                  positionListenable: mediaService.positionNotifier,
-                  lyricFontSizeScale: _lyricFontSizeScaleLandscape,
-                  splitSubtitleByLine: splitSubtitleByLine,
+                child: _buildEpisodeLyricTransition(
+                  itemId: itemId,
+                  child: MusicLyricView(
+                    key: ValueKey<String>('music-lyric-view-$itemId'),
+                    subtitles: effectiveSubtitles,
+                    secondarySubtitles: effectiveSecondarySubtitles,
+                    onSeek: _handleSeekTo,
+                    positionListenable: _lyricPosition,
+                    positionController: _lyricPositionController,
+                    stabilizeAlacDirectSeek: _isConfirmedAlacItem(
+                      mediaService.currentItem,
+                    ),
+                    isPlaying: mediaService.isPlaying,
+                    lyricFontSizeScale: _lyricFontSizeScaleLandscape,
+                    splitSubtitleByLine: splitSubtitleByLine,
+                  ),
                 ),
               ),
             ),
           ],
         );
       },
+    );
+  }
+
+  /// Only the transcript surface participates in an episode transition.
+  /// Keeping the layout builder outside this switcher guarantees that the
+  /// cover, metadata, progress bar, and playback buttons never move.
+  Widget _buildEpisodeLyricTransition({
+    required String itemId,
+    required Widget child,
+  }) {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      reverseDuration: const Duration(milliseconds: 160),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      layoutBuilder: (currentChild, previousChildren) => Stack(
+        fit: StackFit.expand,
+        children: <Widget>[...previousChildren, ?currentChild],
+      ),
+      transitionBuilder: (transitionChild, animation) =>
+          FadeTransition(opacity: animation, child: transitionChild),
+      child: KeyedSubtree(
+        key: ValueKey<String>('music-lyric-episode-$itemId'),
+        child: child,
+      ),
     );
   }
 
@@ -1028,6 +1225,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   /// 字体统一使用 Noto Sans SC（中文）/ Inter（英文），符合设计文档要求
   Widget _buildVerticalLayout(
     MediaPlaybackService mediaService,
+    String itemId,
     String effectiveTitle,
     String effectiveArtist,
     List<SubtitleItem> effectiveSubtitles,
@@ -1040,14 +1238,13 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     final effectiveCover = mediaService.currentItem?.thumbnailPath;
     final effectiveTotalDuration = mediaService.duration;
 
-    // 竖屏 Header 高度：约 10vh~12vh
-    final headerHeight = (screenHeight * 0.11).clamp(70.0, 110.0);
-    // 缩略图尺寸：约 14vw 或 6vh
-    final thumbSize = (screenWidth * 0.14).clamp(36.0, 56.0);
-
+    // 标题字号继续使用旧版封面尺寸作为基准，避免本次视觉改造改变字体大小。
+    final titleSizeReference = (screenWidth * 0.14).clamp(36.0, 56.0);
+    // Apple Music 的 Header 封面更大，但独立于标题字号计算。
+    final thumbSize = (screenWidth * 0.16).clamp(48.0, 68.0);
     // 竖屏标题字号：相对封面较小，整体在封面高度内垂直居中（仅针对标题，不含歌手名）
     const double titleLineHeight = 1.2;
-    final double titleFontSize = thumbSize * 0.30;
+    final double titleFontSize = titleSizeReference * 0.30;
 
     // 封面解码分辨率需乘设备像素比，否则在 Retina/高分屏上会被放大而模糊
     final int coverCacheSize =
@@ -1055,162 +1252,255 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
     // 外层 GestureDetector：点击屏幕任何地方都显示控件并重置自动隐藏定时器
     // （Apple Music 风格：控件隐藏后，点击屏幕任意位置可唤出）
+    final lyricView = _buildEpisodeLyricTransition(
+      itemId: itemId,
+      child: MusicLyricView(
+        key: ValueKey<String>('music-lyric-view-$itemId'),
+        subtitles: effectiveSubtitles,
+        secondarySubtitles: effectiveSecondarySubtitles,
+        onSeek: _handleSeekTo,
+        positionListenable: _lyricPosition,
+        positionController: _lyricPositionController,
+        onScrollDirectionChanged: _handleLyricScrollDirection,
+        onManualScrollActivityChanged: _handleLyricScrollActivity,
+        onDirectLyricTap: _handleDirectLyricTap,
+        stabilizeAlacDirectSeek: _isConfirmedAlacItem(mediaService.currentItem),
+        isPlaying: mediaService.isPlaying,
+        lyricFontSizeScale: _lyricFontSizeScalePortrait,
+        splitSubtitleByLine: splitSubtitleByLine,
+        anchorFraction: 0.215,
+        horizontalPaddingFraction: 0.082,
+        applyEdgeFade: false,
+      ),
+    );
+
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onTap: _onUserInteraction,
+      onTap: _handlePortraitBackgroundTap,
       child: Stack(
+        fit: StackFit.expand,
         children: [
-          // 主内容：Header + 全高歌词（歌词延伸至屏幕底端，不再为底部控件预留空间）
-          Column(
-            children: [
-              // ========== Header 区域：缩略图 + 歌曲信息 + 关闭按钮 ==========
-              SizedBox(
-                height: headerHeight,
-                child: Padding(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: screenWidth * 0.05,
-                    vertical: screenHeight * 0.015,
+          // 只裁切歌词层：背景、封面、标题与播放控件完全不参与遮罩。
+          // 顶部在标题栏下方才羽化显现；底部在进度条上方开始羽化消失，
+          // 到达进度条时已经完全透明，并随控件显隐动画恢复。
+          AnimatedBuilder(
+            key: const ValueKey('music-portrait-lyric-mask'),
+            animation: _controlsAnimationController,
+            child: RepaintBoundary(child: lyricView),
+            builder: (context, child) {
+              final controlsMaskProgress = musicControlsLyricMaskProgress(
+                _controlsAnimationController.value,
+              );
+              return ShaderMask(
+                key: const ValueKey('music-portrait-lyric-visibility-mask'),
+                blendMode: BlendMode.dstIn,
+                shaderCallback: (bounds) {
+                  final height = bounds.height;
+                  final topHiddenEnd = screenHeight * 0.014 + thumbSize + 6.0;
+                  final topFeatherEnd =
+                      topHiddenEnd + (screenHeight * 0.085).clamp(58.0, 82.0);
+
+                  final timeFontSize = (screenHeight * 0.032).clamp(10.0, 13.0);
+                  final progressBlockHeight = 25.0 + timeFontSize * 1.35;
+                  final controlsGap = (screenHeight * 0.05).clamp(34.0, 54.0);
+                  const controlRowHeight = 55.0;
+                  final controlsBottomPadding = (screenHeight * 0.035).clamp(
+                    20.0,
+                    34.0,
+                  );
+                  final bottomHiddenStart =
+                      height -
+                      controlsBottomPadding -
+                      progressBlockHeight -
+                      controlsGap -
+                      controlRowHeight;
+                  final bottomFeatherStart =
+                      bottomHiddenStart -
+                      (screenHeight * 0.10).clamp(70.0, 96.0);
+                  final bottomAlpha = ((1.0 - controlsMaskProgress) * 255)
+                      .round();
+
+                  double stop(double value) => (value / height).clamp(0.0, 1.0);
+
+                  return LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      const Color(0x00FFFFFF),
+                      const Color(0x00FFFFFF),
+                      const Color(0xFFFFFFFF),
+                      const Color(0xFFFFFFFF),
+                      Color.fromARGB(bottomAlpha, 255, 255, 255),
+                      Color.fromARGB(bottomAlpha, 255, 255, 255),
+                    ],
+                    stops: [
+                      0.0,
+                      stop(topHiddenEnd),
+                      stop(topFeatherEnd),
+                      stop(bottomFeatherStart),
+                      stop(bottomHiddenStart),
+                      1.0,
+                    ],
+                  ).createShader(bounds);
+                },
+                child: child,
+              );
+            },
+          ),
+
+          // 顶部元数据保持原有背景；经过其后的歌词由上面的 alpha mask 隐藏。
+          Positioned(
+            left: screenWidth * 0.082,
+            right: screenWidth * 0.082,
+            top: screenHeight * 0.014,
+            child: SizedBox(
+              key: const ValueKey('music-portrait-header'),
+              height: thumbSize,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // 专辑缩略图（使用 CachedThumbnailWidget 支持缓存，仅显示封面不渲染标题）
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: SizedBox(
+                      width: thumbSize,
+                      height: thumbSize,
+                      child: effectiveCover != null && effectiveCover.isNotEmpty
+                          ? CachedThumbnailWidget(
+                              videoId: mediaService.currentItem?.id ?? '',
+                              thumbnailPath: effectiveCover,
+                              fit: BoxFit.cover,
+                              cacheWidth: coverCacheSize,
+                              cacheHeight: coverCacheSize,
+                              placeholder: Container(
+                                color: Colors.white.withValues(alpha: 0.15),
+                              ),
+                              errorWidget: Container(
+                                color: Colors.white.withValues(alpha: 0.15),
+                                child: Icon(
+                                  Icons.music_note,
+                                  size: thumbSize * 0.3,
+                                  color: Colors.white.withValues(alpha: 0.3),
+                                ),
+                              ),
+                            )
+                          : Container(
+                              color: Colors.white.withValues(alpha: 0.15),
+                              child: Icon(
+                                Icons.music_note,
+                                size: thumbSize * 0.3,
+                                color: Colors.white.withValues(alpha: 0.3),
+                              ),
+                            ),
+                    ),
                   ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      // 专辑缩略图（使用 CachedThumbnailWidget 支持缓存，仅显示封面不渲染标题）
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(12),
-                        child: SizedBox(
-                          width: thumbSize,
-                          height: thumbSize,
-                          child:
-                              effectiveCover != null &&
-                                  effectiveCover.isNotEmpty
-                              ? CachedThumbnailWidget(
-                                  videoId: mediaService.currentItem?.id ?? '',
-                                  thumbnailPath: effectiveCover,
-                                  fit: BoxFit.cover,
-                                  cacheWidth: coverCacheSize,
-                                  cacheHeight: coverCacheSize,
-                                  placeholder: Container(
-                                    color: Colors.white.withValues(alpha: 0.15),
-                                  ),
-                                  errorWidget: Container(
-                                    color: Colors.white.withValues(alpha: 0.15),
-                                    child: Icon(
-                                      Icons.music_note,
-                                      size: thumbSize * 0.3,
-                                      color: Colors.white.withValues(
-                                        alpha: 0.3,
-                                      ),
-                                    ),
-                                  ),
-                                )
-                              : Container(
-                                  color: Colors.white.withValues(alpha: 0.15),
-                                  child: Icon(
-                                    Icons.music_note,
-                                    size: thumbSize * 0.3,
-                                    color: Colors.white.withValues(alpha: 0.3),
+                  SizedBox(width: screenWidth * 0.03),
+
+                  // 歌曲标题：最多两行，整体在封面高度内垂直居中
+                  // （仅针对标题，不含歌手名；字号相对封面较小）
+                  Expanded(
+                    child: SizedBox(
+                      height: thumbSize,
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            MusicTextOpticalAlignment(
+                              applyCjkRaise: musicTextContainsCjk(
+                                effectiveTitle,
+                              ),
+                              fontSize: titleFontSize,
+                              child: Text(
+                                effectiveTitle,
+                                style: TextStyle(
+                                  fontFamily: 'Noto Sans SC',
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: titleFontSize,
+                                  color: Colors.white,
+                                  height: titleLineHeight,
+                                ),
+                                strutStyle: StrutStyle(
+                                  fontFamily: 'Noto Sans SC',
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: titleFontSize,
+                                  height: titleLineHeight,
+                                  leading: 0,
+                                  forceStrutHeight: true,
+                                ),
+                                maxLines: effectiveArtist.isEmpty ? 2 : 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (effectiveArtist.isNotEmpty)
+                              MusicTextOpticalAlignment(
+                                applyCjkRaise: musicTextContainsCjk(
+                                  effectiveArtist,
+                                ),
+                                fontSize: titleFontSize,
+                                child: Text(
+                                  effectiveArtist,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontFamily: 'Noto Sans SC',
+                                    fontWeight: FontWeight.w500,
+                                    fontSize: titleFontSize,
+                                    height: titleLineHeight,
+                                    color: Colors.white.withValues(alpha: 0.58),
                                   ),
                                 ),
-                        ),
-                      ),
-                      SizedBox(width: screenWidth * 0.03),
-
-                      // 歌曲标题：最多两行，整体在封面高度内垂直居中
-                      // （仅针对标题，不含歌手名；字号相对封面较小）
-                      Expanded(
-                        child: SizedBox(
-                          height: thumbSize,
-                          // 垂直居中、水平靠左对齐（原来用 Center 会导致水平也居中）
-                          child: Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              effectiveTitle,
-                              style: TextStyle(
-                                fontFamily: 'Noto Sans SC',
-                                fontWeight: FontWeight.w600,
-                                fontSize: titleFontSize,
-                                color: Colors.white,
-                                height: titleLineHeight,
                               ),
-                              strutStyle: StrutStyle(
-                                fontFamily: 'Noto Sans SC',
-                                fontWeight: FontWeight.w600,
-                                fontSize: titleFontSize,
-                                height: titleLineHeight,
-                                leading: 0,
-                                forceStrutHeight: true,
-                              ),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
+                          ],
                         ),
                       ),
+                    ),
+                  ),
 
-                      // 标题右端与关闭按钮之间的紧凑间距：让标题尽量延伸到叉叉按钮左侧
-                      SizedBox(width: (screenWidth * 0.006).clamp(2.0, 5.0)),
+                  // 标题右端与关闭按钮之间的紧凑间距：让标题尽量延伸到叉叉按钮左侧
+                  SizedBox(width: (screenWidth * 0.006).clamp(2.0, 5.0)),
 
-                      // 右上角关闭按钮：无圆形背景，尺寸随屏幕宽度等比缩放。
-                      // 收紧最小点击区域与内边距，避免按钮的透明留白把标题“挤短”。
-                      IconButton(
-                        icon: Icon(
-                          Icons.close,
-                          size: (screenWidth * 0.045).clamp(18.0, 26.0),
-                          color: Colors.white.withValues(alpha: 0.6),
-                        ),
-                        onPressed: _handleExit,
-                        iconSize: (screenWidth * 0.045).clamp(18.0, 26.0),
-                        padding: EdgeInsets.all(
-                          (screenWidth * 0.006).clamp(2.0, 4.0),
-                        ),
-                        constraints: BoxConstraints(
-                          minWidth: (screenWidth * 0.05).clamp(30.0, 36.0),
-                          minHeight: (screenWidth * 0.05).clamp(30.0, 36.0),
-                        ),
-                        tooltip: '关闭',
+                  // 可见圆形缩小，但 IconButton 仍保留系统的舒适触控热区。
+                  IconButton(
+                    icon: DecoratedBox(
+                      key: const ValueKey('music-portrait-close-background'),
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white.withValues(alpha: 0.16),
                       ),
-                    ],
+                      child: SizedBox.square(
+                        dimension: (screenWidth * 0.088).clamp(32.0, 38.0),
+                        child: Icon(
+                          Icons.close_rounded,
+                          size: (screenWidth * 0.043).clamp(17.0, 20.0),
+                          color: Colors.white.withValues(alpha: 0.88),
+                        ),
+                      ),
+                    ),
+                    onPressed: _handleExit,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 44,
+                      minHeight: 44,
+                    ),
+                    tooltip: '关闭',
                   ),
-                ),
+                ],
               ),
-
-              // ========== 中间区域：全高同步歌词 ==========
-              // 与横屏共用同一个 MusicLyricView 组件和双语歌词逻辑
-              // 包含：主字幕（原文，大字号/粗字重）+ 副字幕（翻译，小字号/常规字重）
-              // 通过 onScrollDirectionChanged 回调通知父组件用户滚动方向
-              // GestureDetector 包裹：点击歌词区域时显示控件并重置自动隐藏定时器
-              Expanded(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.translucent,
-                  onTap: _onUserInteraction,
-                  child: MusicLyricView(
-                    subtitles: effectiveSubtitles,
-                    secondarySubtitles: effectiveSecondarySubtitles,
-                    onSeek: _handleSeekTo,
-                    positionListenable: mediaService.positionNotifier,
-                    onScrollDirectionChanged: _handleLyricScrollDirection,
-                    lyricFontSizeScale: _lyricFontSizeScalePortrait,
-                    splitSubtitleByLine: splitSubtitleByLine,
-                  ),
-                ),
-              ),
-            ],
+            ),
           ),
-          // 底部控件浮层：带羽化模糊，跟随显隐动画从下往上出现 / 消失
+          // 底部控件浮层只承载控件，不再修改背景。
           _buildVerticalControlsOverlay(mediaService, effectiveTotalDuration),
         ],
       ),
     );
   }
 
-  /// 竖屏底部控件浮层（强模糊 + 暗化遮罩）
+  /// 竖屏底部控件浮层。
   ///
-  /// 歌词区已延伸至屏幕底端，本浮层覆盖在歌词之上：
-  /// - 使用 BackdropFilter 对背后歌词做高强度高斯模糊（sigma 30），使字幕完全无法辨认
-  /// - 叠加较高不透明度的暗色背景，进一步确保控件区域下方的字幕不可见
-  /// - 使用 ShaderMask（dstIn + 竖向线性渐变）让遮罩从顶部渐入、到底部达到满强度，
-  ///   羽化过渡区更短，避免控件区域上方出现突兀的硬边界
-  /// - 整体由 _controlsSlideAnimation 驱动，跟随显隐动画从下往上出现 / 消失
+  /// 歌词区已延伸至屏幕底端，本浮层只负责控件自身的淡入与轻微位移。
+  /// 歌词的上下遮挡由歌词层自己的 alpha mask 完成，背景始终保持原样。
   Widget _buildVerticalControlsOverlay(
     MediaPlaybackService mediaService,
     Duration effectiveTotalDuration,
@@ -1218,37 +1508,33 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     final screenHeight = MediaQuery.of(context).size.height;
     final screenWidth = MediaQuery.of(context).size.width;
 
-    // 顶部羽化留白：较短的羽化过渡，约 6vh
-    final featherPadding = (screenHeight * 0.06).clamp(40.0, 72.0);
+    // 只覆盖进度条与按钮所需的播放区；底部对齐不变，因此不会移动控件。
+    final overlayHeight = (screenHeight * 0.29).clamp(220.0, 330.0);
+    final controlsBottomPadding = (screenHeight * 0.035).clamp(20.0, 34.0);
 
     return Positioned(
+      key: const ValueKey('music-portrait-controls-overlay'),
       left: 0,
       right: 0,
       bottom: 0,
-      child: SlideTransition(
-        position: _controlsSlideAnimation,
-        child: IgnorePointer(
-          ignoring: !_verticalControlsVisible,
-          child: ShaderMask(
-            // 羽化遮罩：顶部完全透明（歌词可见）→ 底部不透明（强模糊 + 暗化，字幕不可见）
-            shaderCallback: (rect) => LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: const [Colors.transparent, Colors.white],
-              stops: const [0.0, 0.25],
-            ).createShader(rect),
-            blendMode: BlendMode.dstIn,
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 30, sigmaY: 30),
-              child: Container(
-                padding: EdgeInsets.only(
-                  left: screenWidth * 0.06,
-                  right: screenWidth * 0.06,
-                  top: featherPadding,
-                  bottom: screenHeight * 0.02,
-                ),
-                // 高不透明度暗色背景：进一步确保控件下方的字幕完全不可见
-                color: Colors.black.withValues(alpha: 0.85),
+      height: overlayHeight,
+      child: IgnorePointer(
+        ignoring: !_verticalControlsVisible,
+        child: FadeTransition(
+          opacity: CurvedAnimation(
+            parent: _controlsAnimationController,
+            curve: const Interval(0.18, 1.0, curve: Curves.easeOutCubic),
+          ),
+          child: SlideTransition(
+            position: _controlsSlideAnimation,
+            child: Padding(
+              padding: EdgeInsets.only(
+                left: screenWidth * 0.082,
+                right: screenWidth * 0.082,
+                bottom: controlsBottomPadding,
+              ),
+              child: Align(
+                alignment: Alignment.bottomCenter,
                 child: RepaintBoundary(
                   child: MusicPlaybackControls(
                     positionListenable: _displayPosition,
@@ -1299,6 +1585,124 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                 ),
               ),
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MusicBackdropArtwork extends StatefulWidget {
+  final String itemId;
+  final String coverPath;
+
+  const _MusicBackdropArtwork({required this.itemId, required this.coverPath});
+
+  @override
+  State<_MusicBackdropArtwork> createState() => _MusicBackdropArtworkState();
+}
+
+class _MusicBackdropArtworkState extends State<_MusicBackdropArtwork> {
+  Uint8List? _blurredBytes;
+  int _requestId = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(covariant _MusicBackdropArtwork oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.coverPath != widget.coverPath) _load();
+  }
+
+  void _load() {
+    final requestId = ++_requestId;
+    final cached = MusicArtworkBackdropCache.instance.peek(widget.coverPath);
+    if (cached != null) {
+      _blurredBytes = cached;
+      return;
+    }
+    _blurredBytes = null;
+    MusicArtworkBackdropCache.instance.warm(widget.coverPath).then((bytes) {
+      if (!mounted || requestId != _requestId || bytes == null) return;
+      setState(() => _blurredBytes = bytes);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = _blurredBytes;
+    return SizedBox.expand(
+      child: Transform.scale(
+        scale: 1.28,
+        child: ColorFiltered(
+          colorFilter: const ColorFilter.matrix(<double>[
+            1.14,
+            -0.05,
+            -0.05,
+            0,
+            0,
+            -0.05,
+            1.12,
+            -0.05,
+            0,
+            0,
+            -0.05,
+            -0.05,
+            1.14,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+          ]),
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 360),
+            layoutBuilder: (currentChild, previousChildren) {
+              return Stack(
+                fit: StackFit.expand,
+                children: <Widget>[...previousChildren, ?currentChild],
+              );
+            },
+            child: bytes != null
+                ? Image.memory(
+                    bytes,
+                    key: ValueKey<String>(
+                      'music-backdrop-memory-${widget.coverPath}',
+                    ),
+                    width: double.infinity,
+                    height: double.infinity,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                    filterQuality: FilterQuality.low,
+                  )
+                : ImageFiltered(
+                    key: ValueKey<String>(
+                      'music-backdrop-fallback-${widget.coverPath}',
+                    ),
+                    imageFilter: ImageFilter.blur(
+                      sigmaX: 24,
+                      sigmaY: 24,
+                      tileMode: TileMode.decal,
+                    ),
+                    child: SizedBox.expand(
+                      child: CachedThumbnailWidget(
+                        videoId: widget.itemId,
+                        thumbnailPath: widget.coverPath,
+                        fit: BoxFit.cover,
+                        cacheWidth: 144,
+                        cacheHeight: 144,
+                        fadeInDuration: const Duration(milliseconds: 180),
+                        placeholder: const SizedBox.expand(),
+                        errorWidget: const SizedBox.expand(),
+                      ),
+                    ),
+                  ),
           ),
         ),
       ),

@@ -109,6 +109,16 @@ void main() {
     expect(filter.indexOf('crop='), lessThan(filter.indexOf('scale=')));
   });
 
+  test('OCR extraction uses current cross-platform FFmpeg options', () {
+    final source = File(
+      'lib/services/ocr_subtitle_manager.dart',
+    ).readAsStringSync();
+
+    expect(source, contains("'-fps_mode',\n      'vfr',"));
+    expect(source, isNot(contains("'-vsync',")));
+    expect(source, isNot(contains("'-autorotate',")));
+  });
+
   test('OCR progress is monotonic and ETA uses completed chunk speed', () {
     final tracker = OcrTaskProgressTracker(totalMs: 60000);
     expect(tracker.progressFor(0), 0.08);

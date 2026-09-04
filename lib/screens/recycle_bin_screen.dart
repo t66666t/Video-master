@@ -8,12 +8,16 @@ import '../services/library_service.dart';
 import '../services/playback_navigation_service.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
 import '../utils/app_toast.dart';
 import '../widgets/responsive_icon_button.dart';
 
 Future<void> _openRecycleBinVideo(BuildContext context, VideoItem item) async {
+  final isOnline =
+      item.sourceRef?.kind == MediaSourceKind.bilibiliStream ||
+      item.path.startsWith('bilibili://stream/');
   final file = File(item.path);
-  if (!await file.exists()) {
+  if (!isOnline && !await file.exists()) {
     if (!context.mounted) return;
     AppToast.show("媒体文件不存在，可能已被移动或删除", type: AppToastType.error);
     return;

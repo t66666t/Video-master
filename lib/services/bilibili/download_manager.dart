@@ -17,6 +17,7 @@ import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/download_integrity.dart';
 import 'package:video_player_app/services/bilibili/media_connection_pool.dart';
+import 'package:video_player_app/services/bilibili/media_probe_result.dart';
 import 'package:video_player_app/services/bilibili/post_process_task_queue.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 import 'package:video_player_app/utils/ffmpeg_utils.dart';
@@ -1751,66 +1752,101 @@ class BilibiliDownloadManager {
       throw DownloadIntegrityException('$label 过小：$length bytes');
     }
 
-    final MediaInformation? information = Platform.isWindows
+    final BilibiliMediaProbeResult? probe = Platform.isWindows
         ? await _probeMediaOnWindows(file)
-        : await _probeMediaWithKit(file);
-    if (information == null) {
-      throw DownloadIntegrityException('$label 无法被 ffprobe 解析');
+        : _fromMediaInformation(await _probeMediaWithKit(file));
+    if (probe == null) {
+      throw DownloadIntegrityException('$label 无法解析媒体信息');
     }
 
-    final durationSeconds = double.tryParse(information.getDuration() ?? '');
-    if (durationSeconds == null || durationSeconds <= 0) {
-      throw DownloadIntegrityException('$label 缺少有效时长');
-    }
-    final streams = information.getStreams();
-    final videoStreams = streams.where((stream) => stream.getType() == 'video');
-    final audioStreams = streams.where((stream) => stream.getType() == 'audio');
-    if (requireVideo && videoStreams.isEmpty) {
+    if (requireVideo && !probe.hasVideo) {
       throw DownloadIntegrityException('$label 缺少视频流');
     }
-    if (requireAudio && audioStreams.isEmpty) {
+    if (requireAudio && !probe.hasAudio) {
       throw DownloadIntegrityException('$label 缺少音频流');
     }
-    final videoCodec = videoStreams.isEmpty
-        ? null
-        : videoStreams.first.getCodec();
     return _MediaProbeResult(
-      duration: Duration(milliseconds: (durationSeconds * 1000).round()),
-      videoCodec: videoCodec,
+      duration: probe.duration,
+      videoCodec: probe.videoCodec,
     );
   }
 
-  Future<MediaInformation?> _probeMediaOnWindows(File file) async {
-    final ffprobePath = await FFmpegUtils.ffprobePath;
-    final process = await Process.start(ffprobePath, [
-      '-v',
-      'error',
-      '-print_format',
-      'json',
-      '-show_format',
-      '-show_streams',
+  BilibiliMediaProbeResult? _fromMediaInformation(
+    MediaInformation? information,
+  ) {
+    if (information == null) return null;
+    final durationSeconds = double.tryParse(information.getDuration() ?? '');
+    if (durationSeconds == null || durationSeconds <= 0) return null;
+    final streams = information.getStreams();
+    final videoStreams = streams.where((stream) => stream.getType() == 'video');
+    return BilibiliMediaProbeResult(
+      duration: Duration(milliseconds: (durationSeconds * 1000).round()),
+      hasVideo: videoStreams.isNotEmpty,
+      hasAudio: streams.any((stream) => stream.getType() == 'audio'),
+      videoCodec: videoStreams.isEmpty ? null : videoStreams.first.getCodec(),
+    );
+  }
+
+  Future<BilibiliMediaProbeResult?> _probeMediaOnWindows(File file) async {
+    try {
+      final ffprobePath = await FFmpegUtils.ffprobePath;
+      final result = await _runProbeProcess(ffprobePath, [
+        '-v',
+        'error',
+        '-print_format',
+        'json',
+        '-show_format',
+        '-show_streams',
+        file.path,
+      ]);
+      if (result.exitCode == 0) {
+        final parsed = BilibiliMediaProbeResult.fromFfprobeJson(result.stdout);
+        if (parsed != null) return parsed;
+      }
+      developer.log(
+        'Windows ffprobe was unavailable or returned invalid output; '
+        'falling back to ffmpeg media-header probing',
+        error: result.stderr,
+      );
+    } catch (error, stack) {
+      developer.log(
+        'Windows ffprobe could not be started; falling back to ffmpeg',
+        error: error,
+        stackTrace: stack,
+      );
+    }
+
+    final ffmpegPath = await FFmpegUtils.ffmpegPath;
+    final fallback = await _runProbeProcess(ffmpegPath, [
+      '-hide_banner',
+      '-i',
       file.path,
     ]);
-    final stdoutFuture = process.stdout.fold<List<int>>(
-      <int>[],
-      (bytes, chunk) => bytes..addAll(chunk),
-    );
-    final stderrFuture = process.stderr.transform(utf8.decoder).join();
+    return BilibiliMediaProbeResult.fromFfmpegHeader(fallback.stderr);
+  }
+
+  Future<({int exitCode, String stdout, String stderr})> _runProbeProcess(
+    String executable,
+    List<String> arguments,
+  ) async {
+    final process = await Process.start(executable, arguments);
+    final stdoutFuture = process.stdout
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
+    final stderrFuture = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
     try {
       final exitCode = await process.exitCode.timeout(_probeTimeout);
-      final output = utf8.decode(await stdoutFuture);
-      final error = await stderrFuture;
-      if (exitCode != 0) {
-        developer.log('ffprobe failed', error: error);
-        return null;
-      }
-      final decoded = jsonDecode(output);
-      return decoded is Map
-          ? MediaInformation(Map<dynamic, dynamic>.from(decoded))
-          : null;
+      return (
+        exitCode: exitCode,
+        stdout: await stdoutFuture,
+        stderr: await stderrFuture,
+      );
     } on TimeoutException {
       process.kill();
-      throw const PostProcessTimeoutException('ffprobe', _probeTimeout);
+      await _settleProcessOutput(stdoutFuture.then((_) {}), stderrFuture);
+      throw const PostProcessTimeoutException('媒体文件校验', _probeTimeout);
     }
   }
 

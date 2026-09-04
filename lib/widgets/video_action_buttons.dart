@@ -24,6 +24,7 @@ import '../utils/app_toast.dart';
 
 class VideoActionButtons extends StatefulWidget {
   final String? collectionId;
+  final double? maxExpandedHeight;
   final bool
   isHorizontal; // For empty state usage if needed, though mostly for FAB
 
@@ -48,6 +49,7 @@ class VideoActionButtons extends StatefulWidget {
   const VideoActionButtons({
     super.key,
     this.collectionId,
+    this.maxExpandedHeight,
     this.isHorizontal = false,
   });
 
@@ -295,12 +297,10 @@ class VideoActionButtons extends StatefulWidget {
       if (ModalRoute.of(context)?.isCurrent != true) return;
 
       if (!context.mounted) {
-        await AppToast.dismiss(immediate: true);
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
         return;
       }
       if (ModalRoute.of(context)?.isCurrent != true) {
-        await AppToast.dismiss(immediate: true);
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
         return;
       }
@@ -315,7 +315,6 @@ class VideoActionButtons extends StatefulWidget {
         return;
       }
       final summary = await _prepareArchiveSelectionSummary(selection, library);
-      await AppToast.dismiss();
       if (!context.mounted || ModalRoute.of(context)?.isCurrent != true) {
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
         return;
@@ -350,7 +349,6 @@ class VideoActionButtons extends StatefulWidget {
             sortOptions: sortOptions,
           )
           .whenComplete(toastBridge.dispose);
-      await AppToast.dismiss();
       if (!context.mounted) return;
       if (ModalRoute.of(context)?.isCurrent != true) return;
       _showTopBanner(
@@ -359,7 +357,6 @@ class VideoActionButtons extends StatefulWidget {
         autoHideDuration: const Duration(milliseconds: 1200),
       );
     } catch (e) {
-      await AppToast.dismiss(immediate: true);
       await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
       if (context.mounted) {
         _showTopBanner(
@@ -481,26 +478,33 @@ class VideoActionButtons extends StatefulWidget {
     final sourceName = selection.displayName;
     final sizeLabel = selection.sizeLabel;
 
-    AppToast.showProgress(
+    final progressToast = AppToast.showProgress(
       sizeLabel == null
           ? '正在准备压缩包：$sourceName'
           : '正在准备压缩包：$sourceName\n文件大小：$sizeLabel',
       progress: 0.12,
     );
-    await Future<void>.delayed(const Duration(milliseconds: 60));
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
 
-    AppToast.updateProgress(
-      message: selection.hasResolvedPath
-          ? '正在校验压缩包并生成导入确认信息...'
-          : '已获取压缩包引用，正在生成导入确认信息...',
-      progress: 0.48,
-    );
-    await Future<void>.delayed(const Duration(milliseconds: 60));
+      progressToast.updateProgress(
+        message: selection.hasResolvedPath
+            ? '正在校验压缩包并生成导入确认信息...'
+            : '已获取压缩包引用，正在生成导入确认信息...',
+        progress: 0.48,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 60));
 
-    final summary = selection.toSelectionSummary(library);
-    AppToast.updateProgress(message: '压缩包信息已就绪，正在打开确认窗口...', progress: 0.95);
-    await Future<void>.delayed(const Duration(milliseconds: 90));
-    return summary;
+      final summary = selection.toSelectionSummary(library);
+      progressToast.updateProgress(
+        message: '压缩包信息已就绪，正在打开确认窗口...',
+        progress: 0.95,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 90));
+      return summary;
+    } finally {
+      await progressToast.dismiss();
+    }
   }
 
   static Future<String> _ensureArchivePathForImport(
@@ -513,19 +517,23 @@ class VideoActionButtons extends StatefulWidget {
       throw StateError('无法获取压缩包文件路径');
     }
 
-    AppToast.updateProgress(
-      message: '正在准备压缩包文件，确认导入后才开始必要的文件落盘...',
+    final preparationToast = AppToast.showProgress(
+      '正在准备压缩包文件，确认导入后才开始必要的文件落盘...',
       progress: 0.02,
     );
-    final result = await _fileManagerChannel.invokeMethod<Object?>(
-      "materializeArchiveForImport",
-      {"uri": selection.uri, "displayName": selection.displayName},
-    );
-    if (result is! String || result.isEmpty) {
-      throw StateError('无法准备压缩包文件');
+    try {
+      final result = await _fileManagerChannel.invokeMethod<Object?>(
+        "materializeArchiveForImport",
+        {"uri": selection.uri, "displayName": selection.displayName},
+      );
+      if (result is! String || result.isEmpty) {
+        throw StateError('无法准备压缩包文件');
+      }
+      selection.resolvedPath = result;
+      return result;
+    } finally {
+      await preparationToast.dismiss();
     }
-    selection.resolvedPath = result;
-    return result;
   }
 
   static Future<_StructuredImportDialogAction?> _showStructuredImportDialog(
@@ -1001,8 +1009,12 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     return Consumer<SettingsService>(
       builder: (context, settings, _) {
         final isCollapsed = settings.isActionButtonsCollapsed;
+        final mediaQuery = MediaQuery.of(context);
+        final isTablet = mediaQuery.size.shortestSide >= 600.0;
+        final maxExpandedHeight = (widget.maxExpandedHeight ?? double.infinity)
+            .clamp(96.0, double.infinity);
 
-        return Column(
+        final buttons = Column(
           mainAxisAlignment: MainAxisAlignment.end,
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.end,
@@ -1192,6 +1204,21 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
               ),
             ),
           ],
+        );
+
+        // Tablet FABs use a deliberately tighter 48dp column. If landscape or
+        // split-screen height is even shorter, scale the complete group down
+        // proportionally so its top never crosses the app-bar boundary.
+        return ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: isTablet ? 48.0 : 56.0,
+            maxHeight: maxExpandedHeight,
+          ),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.bottomRight,
+            child: buttons,
+          ),
         );
       },
     );
@@ -1554,7 +1581,6 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         collectionId,
       );
     } catch (e) {
-      await AppToast.dismiss(immediate: true);
       await VideoActionButtons._cleanupTemporaryArchiveSelection(archivePath);
       if (context.mounted) {
         VideoActionButtons._showTopBanner(
@@ -1671,6 +1697,7 @@ enum _StructuredImportDialogAction { cancel, preview, confirm }
 
 class _ArchiveImportToastBridge {
   final LibraryService library;
+  AppToastHandle? _toast;
   bool _disposed = false;
   String _lastMessage = '';
   double? _lastProgress;
@@ -1678,14 +1705,14 @@ class _ArchiveImportToastBridge {
   _ArchiveImportToastBridge(this.library);
 
   void start({required String initialMessage}) {
-    AppToast.showProgress(initialMessage, progress: 0.01);
+    _toast = AppToast.showProgress(initialMessage, progress: 0.01);
     library.isImporting.addListener(_sync);
     library.importProgress.addListener(_sync);
     library.importStatus.addListener(_sync);
     _sync();
   }
 
-  void dispose() {
+  Future<void> dispose() async {
     if (_disposed) {
       return;
     }
@@ -1693,6 +1720,8 @@ class _ArchiveImportToastBridge {
     library.isImporting.removeListener(_sync);
     library.importProgress.removeListener(_sync);
     library.importStatus.removeListener(_sync);
+    await _toast?.dismiss();
+    _toast = null;
   }
 
   void _sync() {
@@ -1718,7 +1747,7 @@ class _ArchiveImportToastBridge {
 
     _lastMessage = effectiveMessage;
     _lastProgress = effectiveProgress;
-    AppToast.updateProgress(
+    _toast?.updateProgress(
       message: effectiveMessage,
       progress: effectiveProgress,
     );

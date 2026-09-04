@@ -9,10 +9,14 @@ import 'package:permission_handler/permission_handler.dart';
 import '../models/subtitle_style.dart';
 import '../models/video_compose_models.dart';
 import '../models/video_item.dart';
+import '../models/media_source_ref.dart';
+import '../services/library_service.dart';
+import '../services/media_materialization_service.dart';
 import '../services/settings_service.dart';
 import '../services/video_compose_manager.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
+import 'media_materialization_progress_card.dart';
 import 'package:intl/intl.dart';
 import '../screens/simple_video_player_screen.dart';
 
@@ -647,8 +651,8 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
       VideoComposePreviewConfig(
         primarySubtitlePath: _primaryPath,
         secondarySubtitlePath: _secondaryPath,
-        renderSecondarySubtitle: _secondaryPath != null &&
-            _secondaryPath!.isNotEmpty,
+        renderSecondarySubtitle:
+            _secondaryPath != null && _secondaryPath!.isNotEmpty,
         continuousSubtitle: _continuousSubtitle,
         splitSubtitleByLine: Provider.of<SettingsService>(
           context,
@@ -660,10 +664,23 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
   }
 
   Future<void> _loadSourceResolution() async {
-    final manager = Provider.of<VideoComposeManager>(context, listen: false);
-    final source = await manager.getSourceResolutionLabel(
-      widget.videoItem.path,
-    );
+    String? source;
+    if (widget.videoItem.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+      try {
+        final estimate = await context
+            .read<LibraryService>()
+            .estimateOnlineMediaMaterialization(
+              widget.videoItem.id,
+              MediaMaterializationRequirement.videoFrames,
+            );
+        if (estimate.width != null && estimate.height != null) {
+          source = '${estimate.width}×${estimate.height}';
+        }
+      } catch (_) {}
+    } else {
+      final manager = Provider.of<VideoComposeManager>(context, listen: false);
+      source = await manager.getSourceResolutionLabel(widget.videoItem.path);
+    }
     if (!mounted) return;
     setState(() {
       _sourceResolutionLabel = source;
@@ -831,6 +848,7 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
         return;
       }
     }
+    if (!await _confirmOnlineMaterializationIfNeeded()) return;
     final SubtitleStyle landscapeStyle =
         widget.videoItem.type == MediaType.audio
         ? settings.audioSubtitleStyleLandscape
@@ -858,6 +876,51 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
       splitSubtitleByLine: settings.splitSubtitleByLine,
       customOutputPath: effectiveOutputPath,
     );
+  }
+
+  Future<bool> _confirmOnlineMaterializationIfNeeded() async {
+    if (widget.videoItem.sourceRef?.kind != MediaSourceKind.bilibiliStream) {
+      return true;
+    }
+    final library = context.read<LibraryService>();
+    try {
+      final height = _heightFromResolution(_resolution);
+      final estimate = await library.estimateOnlineMediaMaterialization(
+        widget.videoItem.id,
+        MediaMaterializationRequirement.completeMedia,
+        targetHeight: height <= 0 ? null : height,
+      );
+      if (!estimate.requiresVideoDownload || !mounted) return true;
+      final size = estimate.estimatedBytes == null
+          ? '大小暂时无法确定'
+          : '预计 ${LibraryService.formatSize(estimate.estimatedBytes!)}';
+      return await showDialog<bool>(
+            context: context,
+            builder: (dialogContext) => AlertDialog(
+              title: const Text('需要准备本地视频素材'),
+              content: Text(
+                '视频合成需要先下载 ${estimate.qualityLabel} 音视频素材（$size）。\n\n'
+                '素材会归属于当前卡片，后续合成和 OCR 可复用，并计入回收站可释放空间。',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('下载并继续'),
+                ),
+              ],
+            ),
+          ) ??
+          false;
+    } catch (error) {
+      if (mounted) {
+        AppToast.show('无法获取在线视频素材信息：$error', type: AppToastType.error);
+      }
+      return false;
+    }
   }
 
   Future<bool> _ensureAndroidExternalStoragePermission({
@@ -1906,6 +1969,9 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
           child: Consumer2<VideoComposeManager, SettingsService>(
             builder: (context, manager, settings, child) {
               final latest = manager.latestTaskForVideo(widget.videoItem.id);
+              final materializationProgress = latest == null
+                  ? null
+                  : manager.materializationProgressForTask(latest.taskId);
               final bool isRunningCurrent =
                   manager.runningTask?.request.videoId == widget.videoItem.id;
               return SingleChildScrollView(
@@ -2605,13 +2671,22 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
                     ),
                     SizedBox(height: spacing),
                     if (latest != null) ...[
-                      _buildComposeProgressCard(
-                        task: latest,
-                        isRunningCurrent: isRunningCurrent,
-                        spacing: spacing,
-                        textSize: textSize,
-                        smallSize: smallSize,
-                      ),
+                      if (materializationProgress != null)
+                        MediaMaterializationProgressCard(
+                          progress: materializationProgress,
+                          padding: EdgeInsets.symmetric(
+                            horizontal: (spacing * 1.6).clamp(10.0, 14.0),
+                            vertical: (spacing * 1.15).clamp(8.0, 12.0),
+                          ),
+                        )
+                      else
+                        _buildComposeProgressCard(
+                          task: latest,
+                          isRunningCurrent: isRunningCurrent,
+                          spacing: spacing,
+                          textSize: textSize,
+                          smallSize: smallSize,
+                        ),
                       SizedBox(height: spacing),
                     ],
                     ElevatedButton.icon(

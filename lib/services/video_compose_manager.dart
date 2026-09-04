@@ -15,6 +15,8 @@ import 'video_compose/video_compose_probe_service.dart';
 import 'video_compose/video_compose_precise_renderer.dart';
 import 'video_compose/video_compose_subtitle_service.dart';
 import 'video_compose/video_compose_task_store.dart';
+import 'library_service.dart';
+import 'media_materialization_service.dart';
 
 class VideoComposeManager extends ChangeNotifier {
   final List<String> _queueTaskIds = <String>[];
@@ -24,11 +26,15 @@ class VideoComposeManager extends ChangeNotifier {
   final VideoComposeArtifactCleaner _artifactCleaner;
   final VideoComposeOutputPathService _outputPathService;
   final VideoComposeOrchestrator _orchestrator;
+  final LibraryService _library;
+  final Map<String, Completer<void>> _materializationCancellations = {};
+  final Map<String, MediaMaterializationProgress> _materializationProgress = {};
 
   String? _runningTaskId;
   bool _isProcessing = false;
 
   factory VideoComposeManager({
+    LibraryService? library,
     VideoComposeTaskStore? taskStore,
     VideoComposeArtifactCleaner? artifactCleaner,
     VideoComposeOutputPathService? outputPathService,
@@ -41,6 +47,7 @@ class VideoComposeManager extends ChangeNotifier {
     final VideoComposeFontService resolvedFontService =
         fontService ?? VideoComposeFontService();
     return VideoComposeManager._internal(
+      library: library ?? LibraryService(),
       taskStore: taskStore ?? const VideoComposeTaskStore(),
       artifactCleaner: artifactCleaner ?? VideoComposeArtifactCleaner(),
       outputPathService:
@@ -62,11 +69,13 @@ class VideoComposeManager extends ChangeNotifier {
   }
 
   VideoComposeManager._internal({
+    required LibraryService library,
     required VideoComposeTaskStore taskStore,
     required VideoComposeArtifactCleaner artifactCleaner,
     required VideoComposeOutputPathService outputPathService,
     required VideoComposeOrchestrator orchestrator,
-  }) : _taskStore = taskStore,
+  }) : _library = library,
+       _taskStore = taskStore,
        _artifactCleaner = artifactCleaner,
        _outputPathService = outputPathService,
        _orchestrator = orchestrator {
@@ -92,6 +101,7 @@ class VideoComposeManager extends ChangeNotifier {
 
   bool _isIncompleteStage(VideoComposeStage stage) {
     return stage == VideoComposeStage.queued ||
+        stage == VideoComposeStage.materializing ||
         stage == VideoComposeStage.preparing ||
         stage == VideoComposeStage.rendering ||
         stage == VideoComposeStage.finalizing;
@@ -110,6 +120,10 @@ class VideoComposeManager extends ChangeNotifier {
     final bool isRunningTask = _runningTaskId == taskId;
     _queueTaskIds.remove(taskId);
     if (isRunningTask) {
+      final cancellation = _materializationCancellations[taskId];
+      if (cancellation != null && !cancellation.isCompleted) {
+        cancellation.complete();
+      }
       await _orchestrator.cancelRunningCompose();
     }
     final bool outputDeleted = await _artifactCleaner.cleanupTaskArtifacts(
@@ -161,6 +175,9 @@ class VideoComposeManager extends ChangeNotifier {
     if (_runningTaskId == null) return null;
     return _taskMap[_runningTaskId!];
   }
+
+  MediaMaterializationProgress? materializationProgressForTask(String taskId) =>
+      _materializationProgress[taskId];
 
   int get pendingCount =>
       _queueTaskIds.length + (_runningTaskId == null ? 0 : 1);
@@ -369,10 +386,45 @@ class VideoComposeManager extends ChangeNotifier {
     required String taskId,
     required VideoComposeRequest request,
   }) async {
+    MaterializedMediaLease? lease;
+    final cancellation = Completer<void>();
+    _materializationCancellations[taskId] = cancellation;
     try {
+      var effectiveRequest = request;
+      final item = _library.getVideo(request.videoId);
+      if (item != null && item.path.startsWith('bilibili://stream/')) {
+        _materializationProgress[taskId] = const MediaMaterializationProgress(
+          stage: MediaMaterializationStage.resolving,
+          progress: 0,
+          message: '正在准备 Bilibili 音视频素材',
+        );
+        _setTask(
+          taskId,
+          stage: VideoComposeStage.materializing,
+          progress: 0.01,
+          message: '正在准备本地视频素材',
+        );
+        lease = await _library.acquireMaterializedMedia(
+          request.videoId,
+          MediaMaterializationRequirement.completeMedia,
+          targetHeight: _targetHeight(request.resolution),
+          cancelSignal: cancellation.future,
+          onProgress: (value) {
+            _materializationProgress[taskId] = value;
+            _setTask(
+              taskId,
+              stage: VideoComposeStage.materializing,
+              progress: value.progress * 0.18,
+              message: '${value.message}${_materializationDetails(value)}',
+            );
+          },
+        );
+        effectiveRequest = request.copyWith(videoPath: lease.requiredVideoPath);
+        _materializationProgress.remove(taskId);
+      }
       await _orchestrator.run(
         taskId: taskId,
-        request: request,
+        request: effectiveRequest,
         onArtifact: (String filePath) {
           _artifactCleaner.trackTaskArtifact(taskId, filePath);
         },
@@ -386,14 +438,56 @@ class VideoComposeManager extends ChangeNotifier {
               _setTask(
                 taskId,
                 stage: stage,
-                progress: progress,
+                progress: progress == null
+                    ? null
+                    : lease == null
+                    ? progress
+                    : 0.18 + progress * 0.82,
                 message: message,
                 error: error,
               );
             },
       );
     } finally {
+      _materializationCancellations.remove(taskId);
+      _materializationProgress.remove(taskId);
+      await lease?.release();
       await _artifactCleaner.cleanupTaskArtifacts(taskId);
     }
+  }
+
+  int? _targetHeight(VideoComposeResolution resolution) => switch (resolution) {
+    VideoComposeResolution.source => null,
+    VideoComposeResolution.p360 => 360,
+    VideoComposeResolution.p480 => 480,
+    VideoComposeResolution.p720 => 720,
+    VideoComposeResolution.p1080 => 1080,
+    VideoComposeResolution.p1440 => 1440,
+    VideoComposeResolution.p2160 => 2160,
+  };
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    final kb = bytes / 1024;
+    if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
+    return '${(kb / 1024).toStringAsFixed(1)} MB';
+  }
+
+  String _materializationDetails(MediaMaterializationProgress value) {
+    if (value.stage != MediaMaterializationStage.downloadingVideo &&
+        value.stage != MediaMaterializationStage.downloadingAudio) {
+      return '';
+    }
+    final total = value.totalBytes == null
+        ? _formatBytes(value.receivedBytes)
+        : '${_formatBytes(value.receivedBytes)} / '
+              '${_formatBytes(value.totalBytes!)}';
+    final speed = value.bytesPerSecond > 0
+        ? ' · ${_formatBytes(value.bytesPerSecond.round())}/s'
+        : '';
+    final eta = value.remaining == null
+        ? ''
+        : ' · 剩余约 ${value.remaining!.inSeconds}s';
+    return ' · $total$speed$eta';
   }
 }

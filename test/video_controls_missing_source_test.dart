@@ -1,14 +1,38 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
-import 'package:video_player/video_player.dart';
 import 'package:video_player_app/models/subtitle_style.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/screens/video_player_screen.dart';
 import 'package:video_player_app/widgets/video_controls_overlay.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('missing source mounts controls without a native controller', () {
+    expect(
+      shouldMountPlaybackControls(
+        initialized: false,
+        controllerAssigned: false,
+        sourceMissing: true,
+        subtitleDragActive: false,
+        ghostDragActive: false,
+      ),
+      isTrue,
+    );
+    expect(
+      shouldMountPlaybackControls(
+        initialized: false,
+        controllerAssigned: false,
+        sourceMissing: false,
+        subtitleDragActive: false,
+        ghostDragActive: false,
+      ),
+      isFalse,
+    );
+  });
 
   testWidgets('missing source keeps the play button available for retry', (
     tester,
@@ -16,11 +40,9 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1000, 700));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    final controller = VideoPlayerController.networkUrl(
-      Uri.parse('https://example.invalid/missing.mp4'),
-    );
-    addTearDown(controller.dispose);
     var retryCount = 0;
+    var backCount = 0;
+    var exitCount = 0;
 
     await tester.pumpWidget(
       MultiProvider(
@@ -35,10 +57,11 @@ void main() {
         child: MaterialApp(
           home: Scaffold(
             body: VideoControlsOverlay(
-              controller: controller,
+              controller: null,
               isLocked: false,
               onTogglePlay: () => retryCount++,
-              onBackPressed: () {},
+              onBackPressed: () => backCount++,
+              onExitPressed: () => exitCount++,
               onToggleLock: () {},
               onSpeedUpdate: (_) async {},
               showSubtitles: false,
@@ -66,6 +89,41 @@ void main() {
     await tester.tap(playButton);
     await tester.pump();
     expect(retryCount, 1);
+
+    final closeButton = find.byKey(const ValueKey('video-controls-close'));
+    expect(closeButton, findsOneWidget);
+    await tester.tap(closeButton);
+    await tester.pump();
+    expect(exitCount, 1);
+
+    final state = tester.state<VideoControlsOverlayState>(
+      find.byType(VideoControlsOverlay),
+    );
+    final shortcutFocus = FocusNode();
+    addTearDown(shortcutFocus.dispose);
+    expect(
+      state.handleKeyEvent(
+        shortcutFocus,
+        const KeyDownEvent(
+          physicalKey: PhysicalKeyboardKey.escape,
+          logicalKey: LogicalKeyboardKey.escape,
+          timeStamp: Duration.zero,
+        ),
+      ),
+      KeyEventResult.handled,
+    );
+    expect(
+      state.handleKeyEvent(
+        shortcutFocus,
+        const KeyUpEvent(
+          physicalKey: PhysicalKeyboardKey.escape,
+          logicalKey: LogicalKeyboardKey.escape,
+          timeStamp: Duration.zero,
+        ),
+      ),
+      KeyEventResult.handled,
+    );
+    expect(backCount, 1);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 20));

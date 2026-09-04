@@ -10,7 +10,6 @@ import 'package:open_filex/open_filex.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../models/subtitle_source_type.dart';
 import '../models/subtitle_classification.dart';
-import '../services/settings_service.dart';
 import '../services/library_service.dart';
 import '../services/task_subtitle_storage_service.dart';
 import '../models/managed_subtitle_asset.dart';
@@ -110,6 +109,10 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   final Map<String, int> _subtitleFileSizes = <String, int>{};
   final Set<String> _sidecarSubtitlePaths = <String>{};
   final Set<String> _taskSubtitlePaths = <String>{};
+
+  /// 同目录伴随字幕的匹配等级（供"建议匹配/名称不匹配"标注展示）。
+  final Map<String, SubtitleMatchGrade> _sidecarGrade =
+      <String, SubtitleMatchGrade>{};
   int? _extractingTrackIndex;
   List<String> _selectedPaths = []; // Track selected items
   String? _customDownloadPath;
@@ -809,7 +812,6 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
   Future<void> _loadSubtitles() async {
     final generation = ++_scanGeneration;
-    final settings = SettingsService();
     final embeddedService = Provider.of<EmbeddedSubtitleService>(
       context,
       listen: false,
@@ -833,18 +835,21 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       };
 
       final discovered = await const SubtitleDiscoveryService()
-          .scanVideoDirectory(
-            videoPath: widget.videoPath,
-            rules: SubtitleScanRules(
-              prefixMatchMode: settings.desktopSubtitlePrefixMatchMode,
-              caseSensitive: settings.desktopSubtitleScanCaseSensitive,
-            ),
-          );
+          .scanVideoDirectory(videoPath: widget.videoPath);
       if (!mounted || generation != _scanGeneration) return;
 
+      // 只把"名称匹配（自动级别）"的同目录字幕放进管理区；名称不匹配 /
+      // 仅名称相似的其他伴随字幕一律不展示，避免干扰。
+      final sidecarEntries = discovered
+          .where(
+            (entry) =>
+                entry.sourceType == SubtitleSourceType.sidecar &&
+                entry.isAuto,
+          )
+          .toList();
       final filesByPath = <String, File>{};
       final modifiedByPath = <String, DateTime>{};
-      for (final entry in discovered) {
+      for (final entry in sidecarEntries) {
         final key = _normalizePath(entry.path);
         filesByPath[key] = File(entry.path);
         modifiedByPath[key] = entry.modifiedAt;
@@ -853,14 +858,13 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       setState(() {
         _sidecarSubtitlePaths
           ..clear()
-          ..addAll(
-            discovered
-                .where(
-                  (entry) => entry.sourceType == SubtitleSourceType.sidecar,
-                )
-                .map((entry) => _normalizePath(entry.path)),
-          );
-        _subtitleFiles = discovered.map((entry) => File(entry.path)).toList();
+          ..addAll(sidecarEntries.map((e) => _normalizePath(e.path)));
+        _sidecarGrade
+          ..clear()
+          ..addAll({
+            for (final e in sidecarEntries) _normalizePath(e.path): e.grade,
+          });
+        _subtitleFiles = sidecarEntries.map((entry) => File(entry.path)).toList();
       });
 
       final videoId = widget.videoId?.trim() ?? '';
@@ -930,126 +934,6 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     }
   }
 
-  bool get _isDesktop =>
-      Platform.isWindows || Platform.isMacOS || Platform.isLinux;
-
-  Future<void> _showScanSettingsDialog() async {
-    final settings = SettingsService();
-    var matchMode = settings.desktopSubtitlePrefixMatchMode;
-    var caseSensitive = settings.desktopSubtitleScanCaseSensitive;
-
-    final shouldApply = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: const Color(0xFF252525),
-          title: const Row(
-            children: [
-              Icon(Icons.manage_search, color: Colors.lightBlueAccent),
-              SizedBox(width: 10),
-              Text('同文件夹字幕扫描设置'),
-            ],
-          ),
-          content: SizedBox(
-            width: 520,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '前缀匹配要求',
-                  style: TextStyle(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 8),
-                DropdownButtonFormField<SubtitlePrefixMatchMode>(
-                  initialValue: matchMode,
-                  dropdownColor: const Color(0xFF303030),
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                  items: const [
-                    DropdownMenuItem(
-                      value: SubtitlePrefixMatchMode.exactOrDelimited,
-                      child: Text('同名或分隔后缀（推荐）'),
-                    ),
-                    DropdownMenuItem(
-                      value: SubtitlePrefixMatchMode.exactOnly,
-                      child: Text('仅完全同名（最严格）'),
-                    ),
-                    DropdownMenuItem(
-                      value: SubtitlePrefixMatchMode.startsWith,
-                      child: Text('任意相同前缀（兼容旧逻辑）'),
-                    ),
-                  ],
-                  onChanged: (value) {
-                    if (value == null) return;
-                    setDialogState(() => matchMode = value);
-                  },
-                ),
-                const SizedBox(height: 8),
-                Text(switch (matchMode) {
-                  SubtitlePrefixMatchMode.exactOrDelimited =>
-                    '匹配 Movie.srt、Movie.zh-CN.srt；排除 Movie2.srt。',
-                  SubtitlePrefixMatchMode.exactOnly =>
-                    '只匹配 Movie.srt，不匹配带语言或版本后缀的字幕。',
-                  SubtitlePrefixMatchMode.startsWith =>
-                    '匹配所有以 Movie 开头的字幕，也可能包含 Movie2.srt。',
-                }, style: const TextStyle(color: Colors.white54, fontSize: 12)),
-                const SizedBox(height: 12),
-                SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('区分文件名大小写'),
-                  subtitle: const Text(
-                    '默认关闭，更符合 Windows 和 macOS 的文件使用习惯。',
-                    style: TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                  value: caseSensitive,
-                  onChanged: (value) {
-                    setDialogState(() => caseSensitive = value);
-                  },
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  '扫描只读取视频所在文件夹的第一层；所有符合规则的字幕都会显示在管理区。',
-                  style: TextStyle(color: Colors.white54, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                setDialogState(() {
-                  matchMode = SubtitleScanRules.defaults.prefixMatchMode;
-                  caseSensitive = SubtitleScanRules.defaults.caseSensitive;
-                });
-              },
-              child: const Text('恢复默认'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('保存并重新扫描'),
-            ),
-          ],
-        ),
-      ),
-    );
-
-    if (shouldApply != true) return;
-    await settings.saveDesktopSubtitleScanSettings(
-      prefixMatchMode: matchMode,
-      caseSensitive: caseSensitive,
-    );
-    if (!mounted) return;
-    AppToast.show('扫描设置已保存', type: AppToastType.success);
-    await _loadSubtitles();
-  }
-
   Future<void> _addFileWithMetadata(
     File file,
     Map<String, File> filesByPath,
@@ -1072,7 +956,8 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     int generation,
     EmbeddedSubtitleService service,
   ) async {
-    if (!widget.showEmbeddedSubtitles) {
+    if (!widget.showEmbeddedSubtitles ||
+        widget.videoPath.startsWith('bilibili://stream/')) {
       if (mounted && generation == _scanGeneration) {
         setState(() {
           _embeddedTracks = [];
@@ -1989,6 +1874,46 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         SubtitleSourceType.sidecar.displayName,
         style: const TextStyle(
           color: Colors.greenAccent,
+          fontSize: 9,
+          fontWeight: FontWeight.w700,
+          height: 1,
+        ),
+      ),
+    );
+  }
+
+  /// 对名称未完全匹配的同目录字幕给出提示标注，方便用户判断是否手动选用。
+  Widget _buildSidecarMatchIndicator(String path) {
+    final grade = _sidecarGrade[_normalizePath(path)];
+    if (grade == null || grade == SubtitleMatchGrade.autoMatch) {
+      return const SizedBox.shrink();
+    }
+    final (label, color, bg, borderColor) = switch (grade) {
+      SubtitleMatchGrade.manualOnly => (
+          '名称相似',
+          Colors.orangeAccent,
+          Colors.orangeAccent.withValues(alpha: 0.12),
+          Colors.orangeAccent.withValues(alpha: 0.42),
+        ),
+      _ => (
+          '名称不匹配',
+          Colors.grey,
+          Colors.grey.withValues(alpha: 0.12),
+          Colors.grey.withValues(alpha: 0.4),
+        ),
+    };
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: borderColor),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
           fontSize: 9,
           fontWeight: FontWeight.w700,
           height: 1,
@@ -3266,19 +3191,6 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                 ),
               ),
               const Spacer(),
-              if (_isDesktop)
-                Tooltip(
-                  message: '扫描设置',
-                  child: IconButton(
-                    icon: const Icon(
-                      Icons.manage_search,
-                      color: Colors.white70,
-                    ),
-                    onPressed: _showScanSettingsDialog,
-                    constraints: const BoxConstraints(),
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                  ),
-                ),
               IconButton(
                 icon: const Icon(Icons.close, color: Colors.white70),
                 onPressed: () {
@@ -3904,6 +3816,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                           const SizedBox(width: 8),
                                           _buildSelectionBadge(file.path),
                                           _buildSubtitleSourceBadge(file.path),
+                                          _buildSidecarMatchIndicator(file.path),
                                           _buildOcrBadge(managedAsset),
                                           _buildTranslatedLanguageBadge(
                                             file.path,

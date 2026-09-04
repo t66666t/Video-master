@@ -831,7 +831,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 ),
                 subtitle: Text(
                   widget.autoPlayOnCompletion
-                      ? "开启后自动连播目标媒体总是从头开始；关闭则沿用该媒体记录的播放点"
+                      ? "开启后目标媒体总是从头开始；关闭则沿用记录的播放点（已播完或接近结尾时仍从头开始）"
                       : "请先开启上方的自动连播",
                   style: const TextStyle(color: Colors.white30, fontSize: 10),
                 ),

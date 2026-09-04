@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 /// User-facing adjustment limits for the core danmaku presentation controls.
@@ -8,8 +10,23 @@ const double kDanmakuDisplayAreaMin = 0.01;
 const double kDanmakuDisplayAreaMax = 1.0;
 const double kDanmakuFontScaleMin = 0.2;
 const double kDanmakuFontScaleMax = 4.0;
-const double kDanmakuSpeedMin = 0.1;
-const double kDanmakuSpeedMax = 8.0;
+const double kDanmakuSpeedMin = 0.05;
+const double kDanmakuSpeedMax = 16.0;
+
+/// Maps the wide speed range onto a usable slider. A logarithmic scale gives
+/// slow, normal and fast multipliers comparable physical travel on the track
+/// instead of squeezing every commonly used slow value against the left edge.
+double danmakuSpeedToSlider(double speed) {
+  final normalized = speed.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax).toDouble();
+  return math.log(normalized / kDanmakuSpeedMin) /
+      math.log(kDanmakuSpeedMax / kDanmakuSpeedMin);
+}
+
+double danmakuSpeedFromSlider(double sliderValue) {
+  final position = sliderValue.clamp(0.0, 1.0).toDouble();
+  return kDanmakuSpeedMin *
+      math.pow(kDanmakuSpeedMax / kDanmakuSpeedMin, position).toDouble();
+}
 
 /// Font families bundled by the application. `null` keeps Flutter's current
 /// default font, which is also the historical danmaku appearance.

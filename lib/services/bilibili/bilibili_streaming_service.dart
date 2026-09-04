@@ -15,10 +15,14 @@ import 'bilibili_api_service.dart';
 import 'bilibili_video_shot_service.dart';
 
 class BilibiliStreamQuality {
+  static const int localMaterializedId = -1;
+
   final int id;
   final String label;
 
   const BilibiliStreamQuality({required this.id, required this.label});
+
+  bool get isLocalMaterialized => id == localMaterializedId;
 
   @override
   bool operator ==(Object other) =>
@@ -66,6 +70,55 @@ class BilibiliStreamCacheReport {
   const BilibiliStreamCacheReport({this.bytes = 0, this.fileCount = 0});
 }
 
+/// Per-card cache breakdown distinguishing materialized assets (tracks and
+/// playable files downloaded by compose/OCR/transcription) from the playback
+/// gateway cache files written while streaming online.
+class BilibiliItemCacheBreakdown {
+  final int totalBytes;
+  final int gatewayBytes;
+  final int gatewayFileCount;
+  final int materializedBytes;
+  final int materializedFileCount;
+
+  const BilibiliItemCacheBreakdown({
+    this.totalBytes = 0,
+    this.gatewayBytes = 0,
+    this.gatewayFileCount = 0,
+    this.materializedBytes = 0,
+    this.materializedFileCount = 0,
+  });
+
+  bool get isEmpty => totalBytes <= 0;
+}
+
+bool _isMaterializedCacheFileName(String name) {
+  return name == 'materialization.json' ||
+      name == 'materialization.json.backup' ||
+      name == 'materialization.json.partial' ||
+      name == 'materialization.pending_delete' ||
+      name.startsWith('materialized_video_') ||
+      name.startsWith('materialized_playback_') ||
+      name.startsWith('transcription_audio');
+}
+
+class BilibiliAudioDownloadProgress {
+  final int receivedBytes;
+  final int? totalBytes;
+  final double bytesPerSecond;
+
+  const BilibiliAudioDownloadProgress({
+    required this.receivedBytes,
+    required this.totalBytes,
+    required this.bytesPerSecond,
+  });
+
+  double? get fraction {
+    final total = totalBytes;
+    if (total == null || total <= 0) return null;
+    return (receivedBytes / total).clamp(0.0, 1.0);
+  }
+}
+
 /// Resolves stable Bilibili identities at playback time and exposes a loopback
 /// media gateway. CDN URLs remain inside short-lived in-memory sessions and
 /// are never persisted into the media library.
@@ -86,6 +139,9 @@ class BilibiliStreamingService extends ChangeNotifier {
   final _cachePolicyByItem = <String, bool>{};
   final _videoShotLoads = <String, Future<void>>{};
   final _videoShotUnavailableByItem = <String>{};
+  final Map<String, Future<String>> _transcriptionAudioDownloads = {};
+  final Map<String, HttpClient> _transcriptionAudioClients = {};
+  final Set<String> _cancelledTranscriptionAudioItems = {};
   final _uuid = const Uuid();
   HttpServer? _server;
   Future<HttpServer>? _serverFuture;
@@ -110,6 +166,9 @@ class BilibiliStreamingService extends ChangeNotifier {
   }) : _mediaUriValidator = mediaUriValidator,
        _cacheDirectory = cacheDirectory;
 
+  @visibleForTesting
+  int get activePlaybackSessionCount => _sessions.length;
+
   Future<BilibiliPreparedPlayback> prepare(
     VideoItem item, {
     int? qualityId,
@@ -122,7 +181,9 @@ class BilibiliStreamingService extends ChangeNotifier {
       throw const FormatException('媒体库条目缺少 Bilibili 播放身份信息');
     }
     await _ensurePreferredQualityLoaded();
-    await _ensureVideoShot(item);
+    // Seek-preview sprites are optional metadata. Do not put their download
+    // on the critical media-notification -> playback path.
+    unawaited(_ensureVideoShot(item));
     final server = await _ensureServer();
     final requested =
         qualityId ?? _preferredQualityId ?? _preferredQualityByItem[item.id];
@@ -168,6 +229,19 @@ class BilibiliStreamingService extends ChangeNotifier {
       selectedQuality: selected,
       displayAspectRatio: _displayAspectRatioFor(session.streamInfo),
     );
+  }
+
+  /// Resolves the currently available online qualities without creating a
+  /// gateway playback session. This keeps a materialized local file as the
+  /// active source while still allowing the quality menu to offer online
+  /// alternatives.
+  Future<List<BilibiliStreamQuality>> listQualities(VideoItem item) async {
+    final source = item.sourceRef;
+    if (source?.bvid?.isNotEmpty != true || source?.cid == null) {
+      throw const FormatException('媒体库条目缺少 Bilibili 播放身份信息');
+    }
+    final info = await apiService.fetchPlayUrl(source!.bvid!, source.cid!);
+    return List<BilibiliStreamQuality>.unmodifiable(_qualitiesFor(info));
   }
 
   double? _displayAspectRatioFor(BilibiliStreamInfo info) {
@@ -254,6 +328,215 @@ class BilibiliStreamingService extends ChangeNotifier {
     return _inspectCacheDirectory(dir);
   }
 
+  /// Downloads and atomically caches the complete audio track used by ASR.
+  /// The file lives under this card's cache directory, so recycle-bin size
+  /// accounting and permanent deletion include it automatically.
+  Future<String> downloadAudioForTranscription(
+    VideoItem item, {
+    void Function(BilibiliAudioDownloadProgress progress)? onProgress,
+    Future<void>? cancelSignal,
+  }) {
+    final source = item.sourceRef;
+    if (source == null ||
+        source.kind != MediaSourceKind.bilibiliStream ||
+        source.bvid?.isNotEmpty != true ||
+        source.cid == null) {
+      throw const FormatException('媒体库条目缺少有效的 Bilibili 音频身份信息');
+    }
+
+    final existing = _transcriptionAudioDownloads[item.id];
+    if (existing != null) return existing;
+    _cancelledTranscriptionAudioItems.remove(item.id);
+    final operation = _downloadAudioForTranscription(
+      item,
+      onProgress: onProgress,
+      cancelSignal: cancelSignal,
+    );
+    _transcriptionAudioDownloads[item.id] = operation;
+    operation.whenComplete(() {
+      if (identical(_transcriptionAudioDownloads[item.id], operation)) {
+        _transcriptionAudioDownloads.remove(item.id);
+      }
+    }).ignore();
+    return operation;
+  }
+
+  Future<String> _downloadAudioForTranscription(
+    VideoItem item, {
+    void Function(BilibiliAudioDownloadProgress progress)? onProgress,
+    Future<void>? cancelSignal,
+  }) async {
+    final root = await _resolveCacheDirectory();
+    final itemDir = Directory(p.join(root.path, _safeName(item.id)));
+    if (!await itemDir.exists()) await itemDir.create(recursive: true);
+    final finalFile = File(p.join(itemDir.path, 'transcription_audio.m4a'));
+    final partialFile = File('${finalFile.path}.part');
+    await _deleteFileBestEffort(partialFile);
+    if (await finalFile.exists()) {
+      final length = await finalFile.length();
+      if (length > 0) {
+        onProgress?.call(
+          BilibiliAudioDownloadProgress(
+            receivedBytes: length,
+            totalBytes: length,
+            bytesPerSecond: 0,
+          ),
+        );
+        return finalFile.path;
+      }
+      await _deleteFileBestEffort(finalFile);
+    }
+
+    final client = _createMediaClient();
+    _transcriptionAudioClients[item.id] = client;
+    var cancelled = false;
+    cancelSignal?.then((_) {
+      cancelled = true;
+      client.close(force: true);
+    });
+
+    Object? lastError;
+    try {
+      final source = item.sourceRef!;
+      final info = await apiService.fetchPlayUrl(source.bvid!, source.cid!);
+      final compatibleAudio =
+          info.audioStreams.where(_hasAllowedMediaUri).toList()..sort((a, b) {
+            int codecRank(StreamItem track) {
+              final codec = track.codecs.toLowerCase();
+              if (codec.startsWith('mp4a')) return 0;
+              if (codec.contains('opus')) return 1;
+              if (codec.contains('ec-3') || codec.contains('eac3')) return 2;
+              if (codec.contains('flac')) return 3;
+              return 4;
+            }
+
+            final codec = codecRank(a).compareTo(codecRank(b));
+            return codec != 0 ? codec : b.bandwidth.compareTo(a.bandwidth);
+          });
+      if (compatibleAudio.isEmpty) {
+        throw StateError('Bilibili 未返回可下载的音轨');
+      }
+      final audio = compatibleAudio.first;
+      final candidates = <String>[
+        audio.baseUrl,
+        ...audio.backupUrls,
+      ].map(Uri.tryParse).whereType<Uri>().where(_isAllowedMediaUri);
+
+      for (final uri in candidates) {
+        if (cancelled || _cancelledTranscriptionAudioItems.contains(item.id)) {
+          throw StateError('Bilibili 音频下载已取消');
+        }
+        await _deleteFileBestEffort(partialFile);
+        IOSink? sink;
+        try {
+          final request = await client.getUrl(uri);
+          request.headers.set(HttpHeaders.userAgentHeader, _userAgent);
+          request.headers.set(HttpHeaders.refererHeader, _referer);
+          request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+          final response = await request.close();
+          if (response.statusCode != HttpStatus.ok) {
+            await response.drain<void>();
+            throw HttpException(
+              'CDN returned ${response.statusCode}',
+              uri: Uri(scheme: uri.scheme, host: uri.host),
+            );
+          }
+
+          final expected = response.contentLength > 0
+              ? response.contentLength
+              : null;
+          var received = 0;
+          var sampleBytes = 0;
+          var sampleStarted = DateTime.now();
+          sink = partialFile.openWrite();
+          await for (final chunk in response) {
+            if (cancelled ||
+                _cancelledTranscriptionAudioItems.contains(item.id)) {
+              throw StateError('Bilibili 音频下载已取消');
+            }
+            sink.add(chunk);
+            received += chunk.length;
+            sampleBytes += chunk.length;
+            final now = DateTime.now();
+            final elapsed = now.difference(sampleStarted);
+            if (elapsed >= const Duration(milliseconds: 250) ||
+                (expected != null && received >= expected)) {
+              final seconds = elapsed.inMicroseconds / 1000000;
+              onProgress?.call(
+                BilibiliAudioDownloadProgress(
+                  receivedBytes: received,
+                  totalBytes: expected,
+                  bytesPerSecond: seconds > 0 ? sampleBytes / seconds : 0,
+                ),
+              );
+              sampleBytes = 0;
+              sampleStarted = now;
+            }
+          }
+          await sink.flush();
+          await sink.close();
+          sink = null;
+          if (received <= 0 || (expected != null && received != expected)) {
+            throw StateError(
+              expected == null
+                  ? 'Bilibili 返回了空音频文件'
+                  : 'Bilibili 音频下载不完整 ($received/$expected)',
+            );
+          }
+          await partialFile.rename(finalFile.path);
+          onProgress?.call(
+            BilibiliAudioDownloadProgress(
+              receivedBytes: received,
+              totalBytes: received,
+              bytesPerSecond: 0,
+            ),
+          );
+          _notifyCacheChanged(item.id);
+          return finalFile.path;
+        } catch (error) {
+          lastError = error;
+          try {
+            await sink?.close();
+          } catch (_) {}
+          await _deleteFileBestEffort(partialFile);
+          if (cancelled ||
+              _cancelledTranscriptionAudioItems.contains(item.id)) {
+            throw StateError('Bilibili 音频下载已取消');
+          }
+        }
+      }
+      throw StateError('Bilibili 音频 CDN 不可用: $lastError');
+    } finally {
+      client.close(force: true);
+      if (identical(_transcriptionAudioClients[item.id], client)) {
+        _transcriptionAudioClients.remove(item.id);
+      }
+      _cancelledTranscriptionAudioItems.remove(item.id);
+      await _deleteFileBestEffort(partialFile);
+    }
+  }
+
+  Future<void> _deleteFileBestEffort(File file) async {
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  Future<void> _cancelTranscriptionAudioDownloads([String? itemId]) async {
+    final entries = _transcriptionAudioDownloads.entries
+        .where((entry) => itemId == null || entry.key == itemId)
+        .toList(growable: false);
+    for (final entry in entries) {
+      _cancelledTranscriptionAudioItems.add(entry.key);
+      _transcriptionAudioClients[entry.key]?.close(force: true);
+    }
+    for (final entry in entries) {
+      try {
+        await entry.value;
+      } catch (_) {}
+    }
+  }
+
   /// Returns only the cache owned by one library card.
   ///
   /// The item id is the ownership boundary. The Bilibili URL, title and
@@ -274,6 +557,45 @@ class BilibiliStreamingService extends ChangeNotifier {
     final root = cacheDirectory ?? await _resolveDefaultCacheDirectory();
     final itemDir = Directory(p.join(root.path, _safeNameStatic(itemId)));
     return _inspectCacheDirectoryStatic(itemDir);
+  }
+
+  /// Filesystem-only breakdown of one card's cache into materialized assets
+  /// and playback gateway cache files.
+  static Future<BilibiliItemCacheBreakdown> inspectItemCacheBreakdown(
+    String itemId, {
+    Directory? cacheDirectory,
+  }) async {
+    if (itemId.trim().isEmpty) return const BilibiliItemCacheBreakdown();
+    final root = cacheDirectory ?? await _resolveDefaultCacheDirectory();
+    final itemDir = Directory(p.join(root.path, _safeNameStatic(itemId)));
+    if (!await itemDir.exists()) return const BilibiliItemCacheBreakdown();
+    var gatewayBytes = 0;
+    var gatewayFiles = 0;
+    var materializedBytes = 0;
+    var materializedFiles = 0;
+    await for (final entity in itemDir.list(followLinks: false)) {
+      if (entity is! File) continue;
+      int size;
+      try {
+        size = await entity.length();
+      } catch (_) {
+        continue;
+      }
+      if (_isMaterializedCacheFileName(p.basename(entity.path))) {
+        materializedBytes += size;
+        materializedFiles++;
+      } else {
+        gatewayBytes += size;
+        gatewayFiles++;
+      }
+    }
+    return BilibiliItemCacheBreakdown(
+      totalBytes: gatewayBytes + materializedBytes,
+      gatewayBytes: gatewayBytes,
+      gatewayFileCount: gatewayFiles,
+      materializedBytes: materializedBytes,
+      materializedFileCount: materializedFiles,
+    );
   }
 
   /// Permanently removes every cache file owned by [itemId].
@@ -343,6 +665,7 @@ class BilibiliStreamingService extends ChangeNotifier {
   }
 
   Future<void> clearCache() async {
+    await _cancelTranscriptionAudioDownloads();
     // Clearing disk cache must not end the global media session. Disable every
     // current session's cache writers first; the loopback proxy and native
     // player remain usable by the mini player and system media controls.
@@ -372,6 +695,7 @@ class BilibiliStreamingService extends ChangeNotifier {
   /// removes every file belonging to that card.
   Future<void> clearCacheForItem(String itemId) async {
     if (itemId.trim().isEmpty) return;
+    await _cancelTranscriptionAudioDownloads(itemId);
     _cachePolicyByItem[itemId] = false;
     ++_cachePolicyRevision;
     final sessions = _sessions.values
@@ -438,6 +762,19 @@ class BilibiliStreamingService extends ChangeNotifier {
     await _releaseSessions(sessions);
   }
 
+  /// Releases only the temporary gateway session represented by [playback].
+  ///
+  /// Quality hand-off briefly keeps two sessions for the same card alive. In
+  /// that window [releaseItem] would also close the newly committed stream, so
+  /// the player needs a session-scoped release operation.
+  Future<void> releasePlayback(BilibiliPreparedPlayback playback) async {
+    final segments = playback.videoUri.pathSegments;
+    if (segments.length < 3 || segments.first != 'session') return;
+    final session = _sessions[segments[1]];
+    if (session == null) return;
+    await _releaseSessions(<_GatewaySession>[session]);
+  }
+
   Future<void> _releaseSessions(List<_GatewaySession> sessions) async {
     if (sessions.isEmpty) return;
     for (final session in sessions) {
@@ -454,6 +791,7 @@ class BilibiliStreamingService extends ChangeNotifier {
   }
 
   Future<void> shutdown() async {
+    await _cancelTranscriptionAudioDownloads();
     final server = _server;
     _server = null;
     _serverFuture = null;

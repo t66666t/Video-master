@@ -32,6 +32,7 @@ import '../models/bilibili_models.dart';
 import 'bilibili_download_screen.dart';
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 import '../widgets/mini_playback_card.dart';
+import '../widgets/playback_card_layout.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import '../widgets/video_action_buttons.dart';
 import '../widgets/responsive_icon_button.dart';
@@ -151,6 +152,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   // Added variables for missing definitions
   bool _hasPendingPlaybackState = false;
+  double _stablePlaybackBottomInset = 0.0;
   bool _showExportSettingsButton = false;
   DateTime? _lastTitleTapAt;
   int _titleTapCount = 0;
@@ -547,10 +549,6 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
-  double _getPlaybackCardVerticalOffset() {
-    return 6.0;
-  }
-
   Route<void> _buildVideoPlayerRoute(
     VideoItem item,
     VideoPlayerController? existingController,
@@ -562,18 +560,14 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  void _scheduleFolderPlaylistWarmup(VideoItem item) {
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final playlistManager = Provider.of<PlaylistManager>(
-        context,
-        listen: false,
-      );
-      if (playlistManager.matchesFolderPlaylist(item.parentId, item.id)) {
-        return;
-      }
-      playlistManager.loadFolderPlaylist(item.parentId, item.id);
-    });
+  void _preparePlaybackQueue(VideoItem item) {
+    if (!mounted) return;
+    final playlistManager = Provider.of<PlaylistManager>(
+      context,
+      listen: false,
+    );
+    if (playlistManager.matchesFolderPlaylist(item.parentId, item.id)) return;
+    playlistManager.loadFolderPlaylist(item.parentId, item.id);
   }
 
   void _openPlaybackScreen(
@@ -581,9 +575,9 @@ class _HomeScreenState extends State<HomeScreen>
     VideoPlayerController? existingController,
     bool useRootNavigator = false,
   }) {
+    _preparePlaybackQueue(item);
     final navigator = Navigator.of(context, rootNavigator: useRootNavigator);
     navigator.push(_buildVideoPlayerRoute(item, existingController));
-    _scheduleFolderPlaylistWarmup(item);
   }
 
   /// 检查是否有待恢复的播放状态（用于首次启动时预留空间）
@@ -1855,10 +1849,14 @@ class _HomeScreenState extends State<HomeScreen>
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsService>(context);
     final useCompactTopBar = useCompactMediaLibraryTopBar(context);
-    // 在 MediaQuery.removePadding(removeBottom: true) 外面捕获真实的安全区高度，
-    // 因为 removePadding 会同时清零 padding.bottom 和 viewPadding.bottom，
-    // 导致内部 Positioned(bottom: viewPadding.bottom) 永远等于 bottom: 0
-    final realViewPaddingBottom = MediaQuery.of(context).viewPadding.bottom;
+    _stablePlaybackBottomInset =
+        PlaybackCardOverlayLayout.resolveStableBottomInset(
+          MediaQuery.of(context),
+          _stablePlaybackBottomInset,
+        );
+    final playbackCardBottom = PlaybackCardOverlayLayout.cardBottom(
+      _stablePlaybackBottomInset,
+    );
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       if (_lastIsFullScreen != settings.isFullScreen) {
         _lastIsFullScreen = settings.isFullScreen;
@@ -2160,11 +2158,6 @@ class _HomeScreenState extends State<HomeScreen>
                                   "还没有内容",
                                   style: TextStyle(color: Colors.white54),
                                 ),
-                                const SizedBox(height: 16),
-                                const VideoActionButtons(
-                                  collectionId: null,
-                                  isHorizontal: true,
-                                ),
                               ],
                             ),
                           )
@@ -2414,18 +2407,12 @@ class _HomeScreenState extends State<HomeScreen>
 
                                 double cardBottomPadding = 0.0;
                                 if (isCardVisible || _hasPendingPlaybackState) {
-                                  final screenWidth = MediaQuery.of(
-                                    context,
-                                  ).size.width;
-                                  final isPhone = screenWidth < 600;
-                                  final isTablet =
-                                      screenWidth >= 600 && screenWidth < 1200;
-                                  final cardHeight = isPhone
-                                      ? 117.0
-                                      : (isTablet ? 127.0 : 107.0);
+                                  final cardHeight =
+                                      PlaybackCardLayout.calculate(
+                                        context,
+                                      ).height;
                                   cardBottomPadding =
-                                      cardHeight +
-                                      _getPlaybackCardVerticalOffset();
+                                      playbackCardBottom + cardHeight;
                                 }
 
                                 return _buildMediaGridOrList(
@@ -2465,7 +2452,7 @@ class _HomeScreenState extends State<HomeScreen>
                           Positioned(
                             left: 0,
                             right: 0,
-                            bottom: realViewPaddingBottom,
+                            bottom: 0,
                             child: Consumer<MediaPlaybackService>(
                               builder: (context, playbackService, child) {
                                 final isVisible =
@@ -2478,7 +2465,7 @@ class _HomeScreenState extends State<HomeScreen>
                                 return IgnorePointer(
                                   ignoring: true,
                                   child: Container(
-                                    height: _getPlaybackCardVerticalOffset(),
+                                    height: playbackCardBottom,
                                     color: const Color(0xFF2C2C2C),
                                   ),
                                 );
@@ -2488,7 +2475,7 @@ class _HomeScreenState extends State<HomeScreen>
                           Positioned(
                             left: 0,
                             right: 0,
-                            bottom: realViewPaddingBottom,
+                            bottom: playbackCardBottom,
                             child: Consumer<MediaPlaybackService>(
                               builder: (context, playbackService, child) {
                                 final isVisible =
@@ -2502,14 +2489,13 @@ class _HomeScreenState extends State<HomeScreen>
                                   isVisible: isVisible,
                                   onTap: () {
                                     // 点击卡片进入全屏播放页面
-                                    final currentItem =
-                                        playbackService.currentItem;
-                                    if (currentItem == null) return;
-                                    _openPlaybackScreen(
-                                      currentItem,
-                                      existingController:
-                                          playbackService.controller,
-                                      useRootNavigator: true,
+                                    unawaited(
+                                      PlaybackNavigationService.instance
+                                          .openCurrentPlaybackSession(
+                                            playbackService,
+                                            expectedGeneration: playbackService
+                                                .sessionGeneration,
+                                          ),
                                     );
                                   },
                                 );
@@ -2552,39 +2538,42 @@ class _HomeScreenState extends State<HomeScreen>
             ),
           ), // 关闭 MediaQuery.removePadding 的 child
         ), // 关闭 body: MediaQuery.removePadding(...)
+        floatingActionButtonLocation: const PlaybackActionButtonsLocation(),
         floatingActionButton: !_isSelectionMode
             ? Consumer<MediaPlaybackService>(
                 builder: (context, playbackService, child) {
                   final isCardVisible =
-                      playbackService.currentItem != null &&
-                      (playbackService.state == PlaybackState.playing ||
-                          playbackService.state == PlaybackState.paused);
-
-                  double bottomPadding = 0.0;
-
-                  if (isCardVisible) {
-                    final screenWidth = MediaQuery.of(context).size.width;
-                    final viewPaddingBottom = realViewPaddingBottom;
-                    final isPhone = screenWidth < 600;
-                    final isTablet = screenWidth >= 600 && screenWidth < 1200;
-
-                    final cardHeight = isPhone
-                        ? 117.0
-                        : (isTablet ? 127.0 : 107.0);
-                    bottomPadding =
-                        viewPaddingBottom +
-                        cardHeight +
-                        _getPlaybackCardVerticalOffset();
-                  }
-
+                      _hasPendingPlaybackState ||
+                      (playbackService.currentItem != null &&
+                          (playbackService.state == PlaybackState.playing ||
+                              playbackService.state == PlaybackState.paused));
+                  final cardHeight = PlaybackCardLayout.calculate(
+                    context,
+                  ).height;
+                  final actionBottom =
+                      PlaybackCardOverlayLayout.actionButtonsBottom(
+                        stableBottomInset: _stablePlaybackBottomInset,
+                        cardHeight: cardHeight,
+                        isCardVisible: isCardVisible,
+                      );
+                  final topBoundary =
+                      MediaQuery.of(context).viewPadding.top +
+                      (useCompactTopBar ? 50.0 : kToolbarHeight) +
+                      8.0;
+                  final maxExpandedHeight =
+                      MediaQuery.sizeOf(context).height -
+                      topBoundary -
+                      actionBottom;
                   return AnimatedPadding(
                     duration: const Duration(milliseconds: 300),
                     curve: Curves.easeInOut,
-                    padding: EdgeInsets.only(bottom: bottomPadding),
-                    child: child!,
+                    padding: EdgeInsets.only(bottom: actionBottom),
+                    child: VideoActionButtons(
+                      collectionId: null,
+                      maxExpandedHeight: maxExpandedHeight,
+                    ),
                   );
                 },
-                child: const VideoActionButtons(collectionId: null),
               )
             : null,
         bottomNavigationBar: _isSelectionMode && _selectedIds.isNotEmpty

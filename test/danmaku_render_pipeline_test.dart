@@ -160,9 +160,58 @@ void main() {
     );
   });
 
-  test('atlas destinations snap to physical pixels', () {
-    expect(snapDanmakuLogicalPixel(10.3, 1.25), closeTo(10.4, 0.0001));
-    expect(snapDanmakuLogicalPixel(10.3, double.nan), 10);
+  test('atlas keeps horizontal motion continuous and aligns static lanes', () {
+    final first = resolveDanmakuAtlasDestination(10.30, 10.3, 1.25);
+    final second = resolveDanmakuAtlasDestination(10.34, 10.3, 1.25);
+
+    expect(first.dx, closeTo(10.30, 0.0001));
+    expect(second.dx, closeTo(10.34, 0.0001));
+    expect(first.dy, closeTo(10.4, 0.0001));
+    expect(
+      resolveDanmakuAtlasDestination(
+        10.3,
+        10.3,
+        1.25,
+        continuousHorizontal: false,
+      ).dx,
+      closeTo(10.4, 0.0001),
+    );
+    expect(resolveDanmakuAtlasDestination(10.3, 10.3, double.nan).dy, 10);
+  });
+
+  test('prefetch protects upcoming entry deadlines before active work', () {
+    final items = <DanmakuItem>[for (var i = 0; i < 30; i++) _item(i, i)];
+
+    final indices = resolveDanmakuPrefetchIndices(
+      items,
+      positionUs: const Duration(seconds: 10).inMicroseconds,
+      speed: 1,
+      maximumActiveItems: 2,
+      maximumUpcomingItems: 3,
+      lookAheadUs: const Duration(seconds: 5).inMicroseconds,
+      atlasSegmentUs: const Duration(seconds: 1).inMicroseconds,
+    );
+
+    expect(indices, <int>[11, 12, 13, 10, 9]);
+  });
+
+  test('an asset which misses entry is suppressed instead of popping in', () {
+    final gate = DanmakuAssetAdmissionGate();
+    gate.beginFrame(const Duration(seconds: 10).inMicroseconds);
+    expect(gate.shouldPaint(itemIndex: 7, assetReady: false), isFalse);
+
+    gate.beginFrame(
+      const Duration(seconds: 10, milliseconds: 16).inMicroseconds,
+    );
+    expect(gate.shouldPaint(itemIndex: 7, assetReady: true), isFalse);
+
+    // A large forward step can be a dropped frame at a high playback rate. It
+    // must not revive a sprite in the middle of the same trajectory.
+    gate.beginFrame(const Duration(seconds: 13).inMicroseconds);
+    expect(gate.shouldPaint(itemIndex: 7, assetReady: true), isFalse);
+
+    gate.beginFrame(const Duration(seconds: 3).inMicroseconds);
+    expect(gate.shouldPaint(itemIndex: 7, assetReady: true), isTrue);
   });
 
   test('lowering the overload cap immediately trims an active burst', () {

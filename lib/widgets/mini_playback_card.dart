@@ -210,13 +210,14 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                         Container(
                           height: dimensions.height.clamp(80.0, 200.0),
                           padding: EdgeInsets.all(
-                            dimensions.padding.clamp(8.0, 20.0),
+                            dimensions.padding.clamp(6.0, 20.0),
                           ),
                           child: Column(
+                            mainAxisAlignment: MainAxisAlignment.end,
                             children: [
                               // 第一行：缩略图、标题、列表展开按钮
-                              Expanded(
-                                flex: 3,
+                              SizedBox(
+                                height: dimensions.thumbnailSize,
                                 child: _buildFirstRow(
                                   context,
                                   currentItem,
@@ -237,8 +238,10 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                               SizedBox(height: dimensions.padding / 3),
 
                               // 第二行：进度条、控制按钮
-                              Expanded(
-                                flex: 2,
+                              SizedBox(
+                                height: _resolvePrimaryControlButtonSize(
+                                  dimensions,
+                                ),
                                 child: _buildSecondRow(
                                   context,
                                   dimensions,
@@ -515,11 +518,11 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
 
   /// 显示播放列表弹窗
   void _showPlaylistBottomSheet(BuildContext context) {
-    final playlistManager = Provider.of<PlaylistManager>(
+    final playbackService = Provider.of<MediaPlaybackService>(
       context,
       listen: false,
     );
-    final playbackService = Provider.of<MediaPlaybackService>(
+    final playlistManager = Provider.of<PlaylistManager>(
       context,
       listen: false,
     );
@@ -547,7 +550,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                 if (index >= 0) {
                   playlistManager.setCurrentIndex(index);
                 }
-                playbackService.play(item);
+                playbackService.playPlaylistItem(item);
               },
             );
           },
@@ -562,22 +565,30 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     PlaybackCardDimensions dimensions,
     MediaPlaybackService playbackService,
   ) {
-    return Row(
-      children: [
-        // 进度条
-        Expanded(
-          child: ValueListenableBuilder<Duration>(
-            valueListenable: playbackService.coarsePositionNotifier,
-            builder: (_, position, _) =>
-                _buildProgressBar(playbackService, position),
+    // Consume taps in the whole control strip. This prevents the card's
+    // navigation InkWell from winning when a finger lands in a small gap
+    // between the transport buttons.
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      excludeFromSemantics: true,
+      onTap: () {},
+      child: Row(
+        children: [
+          // 进度条
+          Expanded(
+            child: ValueListenableBuilder<Duration>(
+              valueListenable: playbackService.coarsePositionNotifier,
+              builder: (_, position, _) =>
+                  _buildProgressBar(playbackService, position),
+            ),
           ),
-        ),
 
-        SizedBox(width: dimensions.padding),
+          SizedBox(width: dimensions.padding / 2),
 
-        // 控制按钮
-        _buildControlButtons(context, dimensions, playbackService),
-      ],
+          // 控制按钮
+          _buildControlButtons(context, dimensions, playbackService),
+        ],
+      ),
     );
   }
 
@@ -608,64 +619,67 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // 进度条
-          Listener(
-            behavior: HitTestBehavior.translucent,
-            onPointerMove: (event) {
-              if (!_isDraggingProgress) return;
-              final isInCancelArea = _isInCancelArea(event.position);
-              if (isInCancelArea != _isProgressDragCanceling) {
+          SizedBox(
+            height: 27.0,
+            child: Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerMove: (event) {
+                if (!_isDraggingProgress) return;
+                final isInCancelArea = _isInCancelArea(event.position);
+                if (isInCancelArea != _isProgressDragCanceling) {
+                  setState(() {
+                    _isProgressDragCanceling = isInCancelArea;
+                  });
+                }
+              },
+              onPointerCancel: (event) {
+                if (!_isDraggingProgress) return;
                 setState(() {
-                  _isProgressDragCanceling = isInCancelArea;
+                  _isDraggingProgress = false;
+                  _isProgressDragCanceling = false;
                 });
-              }
-            },
-            onPointerCancel: (event) {
-              if (!_isDraggingProgress) return;
-              setState(() {
-                _isDraggingProgress = false;
-                _isProgressDragCanceling = false;
-              });
-            },
-            child: SliderTheme(
-              data: SliderThemeData(
-                trackHeight: 2.0, // 减小轨道高度
-                thumbShape: const RoundSliderThumbShape(
-                  enabledThumbRadius: 4.0,
-                ), // 减小滑块半径
-                overlayShape: const RoundSliderOverlayShape(
-                  overlayRadius: 10.0,
-                ), // 减小覆盖层半径
-                activeTrackColor: _isProgressDragCanceling
-                    ? Colors.grey
-                    : Colors.blue,
-                inactiveTrackColor: Colors.white24,
-                thumbColor: _isProgressDragCanceling
-                    ? Colors.grey
-                    : Colors.blue,
-                overlayColor: _isProgressDragCanceling
-                    ? Colors.grey.withValues(alpha: 0.2)
-                    : Colors.blue.withValues(alpha: 0.2),
-              ),
-              child: Slider(
-                value: currentProgress.clamp(0.0, 1.0),
-                onChanged: (value) {
-                  setState(() {
-                    _isDraggingProgress = true;
-                    _dragProgressValue = value;
-                  });
-                },
-                onChangeEnd: (value) {
-                  if (!_isProgressDragCanceling) {
-                    final newPosition = Duration(
-                      milliseconds: (value * duration.inMilliseconds).round(),
-                    );
-                    playbackService.seekTo(newPosition);
-                  }
-                  setState(() {
-                    _isDraggingProgress = false;
-                    _isProgressDragCanceling = false;
-                  });
-                },
+              },
+              child: SliderTheme(
+                data: SliderThemeData(
+                  trackHeight: 2.0, // 减小轨道高度
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 4.0,
+                  ), // 减小滑块半径
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 10.0,
+                  ), // 减小覆盖层半径
+                  activeTrackColor: _isProgressDragCanceling
+                      ? Colors.grey
+                      : Colors.blue,
+                  inactiveTrackColor: Colors.white24,
+                  thumbColor: _isProgressDragCanceling
+                      ? Colors.grey
+                      : Colors.blue,
+                  overlayColor: _isProgressDragCanceling
+                      ? Colors.grey.withValues(alpha: 0.2)
+                      : Colors.blue.withValues(alpha: 0.2),
+                ),
+                child: Slider(
+                  value: currentProgress.clamp(0.0, 1.0),
+                  onChanged: (value) {
+                    setState(() {
+                      _isDraggingProgress = true;
+                      _dragProgressValue = value;
+                    });
+                  },
+                  onChangeEnd: (value) {
+                    if (!_isProgressDragCanceling) {
+                      final newPosition = Duration(
+                        milliseconds: (value * duration.inMilliseconds).round(),
+                      );
+                      playbackService.seekTo(newPosition);
+                    }
+                    setState(() {
+                      _isDraggingProgress = false;
+                      _isProgressDragCanceling = false;
+                    });
+                  },
+                ),
               ),
             ),
           ),
@@ -712,12 +726,8 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     PlaybackCardDimensions dimensions,
     MediaPlaybackService playbackService,
   ) {
-    final playlistManager = Provider.of<PlaylistManager>(
-      context,
-      listen: false,
-    );
     final buttonSize = _resolveControlButtonSize(dimensions);
-    final primaryButtonSize = (buttonSize + 4.0).clamp(46.0, 56.0);
+    final primaryButtonSize = _resolvePrimaryControlButtonSize(dimensions);
 
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -726,7 +736,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
         _buildActionButton(
           icon: Icons.skip_previous,
           tooltip: '上一项',
-          onPressed: playlistManager.hasPrevious
+          onPressed: playbackService.hasPlayablePrevious
               ? () => playbackService.playPrevious()
               : null,
           iconSize: dimensions.iconSize * 0.9,
@@ -754,7 +764,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
         _buildActionButton(
           icon: Icons.skip_next,
           tooltip: '下一项',
-          onPressed: playlistManager.hasNext
+          onPressed: playbackService.hasPlayableNext
               ? () => playbackService.playNext()
               : null,
           iconSize: dimensions.iconSize * 0.9,
@@ -795,7 +805,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
         currentSubtitle == null || currentSubtitle.text.isEmpty;
 
     return Container(
-      height: 28.0, // 略微增加高度以容纳更大的按钮
+      height: _resolveSubtitleRowHeight(dimensions),
       padding: EdgeInsets.symmetric(horizontal: dimensions.padding),
       child: Row(
         children: [
@@ -854,15 +864,23 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   }
 
   double _resolveButtonSize(PlaybackCardDimensions dimensions) {
-    return (dimensions.iconSize + 20.0).clamp(40.0, 50.0);
+    return (dimensions.iconSize + 12.0).clamp(34.0, 38.0);
   }
 
   double _resolveControlButtonSize(PlaybackCardDimensions dimensions) {
-    return (dimensions.iconSize + 28.0).clamp(48.0, 56.0);
+    return (dimensions.iconSize + 16.0).clamp(38.0, 42.0);
+  }
+
+  double _resolvePrimaryControlButtonSize(PlaybackCardDimensions dimensions) {
+    return (_resolveControlButtonSize(dimensions) + 4.0).clamp(42.0, 46.0);
+  }
+
+  double _resolveSubtitleRowHeight(PlaybackCardDimensions dimensions) {
+    return dimensions.iconSize >= 26.0 ? 28.0 : 24.0;
   }
 
   double _resolveSubtitleButtonSize(PlaybackCardDimensions dimensions) {
-    return (dimensions.iconSize + 12.0).clamp(36.0, 44.0);
+    return dimensions.iconSize >= 26.0 ? 28.0 : 24.0;
   }
 
   Widget _buildActionButton({

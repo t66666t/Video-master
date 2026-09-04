@@ -163,12 +163,15 @@ class _DanmakuSettingsDialogState extends State<_DanmakuSettingsDialog> {
               _SliderRow(
                 label: '弹幕速度',
                 valueText: _speedLabel(settings.bilibiliDanmakuSpeed),
-                value: settings.bilibiliDanmakuSpeed,
-                min: kDanmakuSpeedMin,
-                max: kDanmakuSpeedMax,
-                divisions: 79,
-                onChanged: (value) =>
-                    unawaited(settings.saveBilibiliDanmakuSpeed(value)),
+                value: danmakuSpeedToSlider(settings.bilibiliDanmakuSpeed),
+                min: 0,
+                max: 1,
+                divisions: 200,
+                onChanged: (value) => unawaited(
+                  settings.saveBilibiliDanmakuSpeed(
+                    danmakuSpeedFromSlider(value),
+                  ),
+                ),
               ),
               const SizedBox(height: 8),
               const Divider(color: Colors.white12, height: 1),
@@ -254,11 +257,17 @@ class _DanmakuSettingsDialogState extends State<_DanmakuSettingsDialog> {
   }
 
   String _speedLabel(double value) {
-    if (value < 0.75) return '很慢';
-    if (value < 0.95) return '较慢';
-    if (value <= 1.15) return '适中';
-    if (value <= 1.5) return '较快';
-    return '很快';
+    final description = switch (value) {
+      < 0.15 => '极慢',
+      < 0.5 => '很慢',
+      < 0.85 => '较慢',
+      <= 1.2 => '适中',
+      <= 2.0 => '较快',
+      <= 5.0 => '很快',
+      _ => '极快',
+    };
+    final digits = value < 1 ? 2 : (value < 10 ? 1 : 0);
+    return '$description · ${value.toStringAsFixed(digits)}×';
   }
 }
 

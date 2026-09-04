@@ -1263,8 +1263,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         content: const Text('请选择要加入转录队列的媒体来源。'),
         actions: [
           TextButton(
-            onPressed: () =>
-                Navigator.of(ctx).pop(_ExternalPickSource.folder),
+            onPressed: () => Navigator.of(ctx).pop(_ExternalPickSource.folder),
             child: const Text('导入文件夹'),
           ),
           FilledButton(
@@ -1409,6 +1408,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
 
     for (final prev in _previousTasks) {
       if (prev.status == TranscriptionStatus.idle ||
+          prev.status == TranscriptionStatus.downloading ||
           prev.status == TranscriptionStatus.extracting ||
           prev.status == TranscriptionStatus.uploading ||
           prev.status == TranscriptionStatus.transcribing ||
@@ -1543,7 +1543,9 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     final navigator = Navigator.of(context);
 
     // 桌面端或开启"跳过竖屏播放页"时直入横屏播放页，否则进入竖屏播放页
-    await navigator.push(PlaybackNavigationService.buildPlaybackEntryRoute(item));
+    await navigator.push(
+      PlaybackNavigationService.buildPlaybackEntryRoute(item),
+    );
   }
 
   /// 打开外部视频文件

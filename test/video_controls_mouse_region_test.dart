@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
@@ -10,6 +11,78 @@ import 'package:video_player_app/widgets/video_controls_overlay.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('locked mobile unlock button fades out and returns on tap', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await tester.binding.setSurfaceSize(const Size(800, 450));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final controller = VideoPlayerController.networkUrl(
+      Uri.parse('https://example.invalid/video.mp4'),
+    );
+    addTearDown(controller.dispose);
+    final playbackService = MediaPlaybackService();
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<SettingsService>.value(
+            value: SettingsService(),
+          ),
+          ChangeNotifierProvider<MediaPlaybackService>.value(
+            value: playbackService,
+          ),
+        ],
+        child: MaterialApp(
+          home: Scaffold(
+            body: VideoControlsOverlay(
+              controller: controller,
+              isLocked: true,
+              onTogglePlay: () {},
+              onBackPressed: () {},
+              onToggleLock: () {},
+              onSpeedUpdate: (_) async {},
+              showSubtitles: false,
+              onToggleSubtitles: () {},
+              onMoveSubtitles: () {},
+              isLongPressing: false,
+              longPressFeedbackText: '',
+              onLongPressStart: () => true,
+              onLongPressEnd: () {},
+              subtitleEntries: const [],
+              subtitleStyle: const SubtitleStyle(),
+              subtitleAlignment: Alignment.bottomCenter,
+              onEnterSubtitleDragMode: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final lockButton = find.byKey(const ValueKey('player-side-lock'));
+    AnimatedOpacity lockOpacity() => tester.widget<AnimatedOpacity>(
+      find
+          .ancestor(of: lockButton, matching: find.byType(AnimatedOpacity))
+          .first,
+    );
+
+    expect(lockButton, findsOneWidget);
+    expect(lockOpacity().opacity, 1);
+
+    await tester.pump(const Duration(seconds: 3));
+    expect(lockOpacity().opacity, 0);
+
+    await tester.tapAt(const Offset(400, 225));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(lockOpacity().opacity, 1);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 20));
+    debugDefaultTargetPlatformOverride = null;
+  });
 
   testWidgets(
     'desktop controls hide outside the whole player and show on re-entry',

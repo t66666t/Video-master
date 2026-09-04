@@ -3,94 +3,218 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import '../models/subtitle_source_type.dart';
+import '../utils/subtitle_duration_reader.dart';
 import '../utils/subtitle_file_matcher.dart';
 
+/// 一个被扫描到的同文件夹字幕文件。
+///
+/// [analysis] 来自 [SubtitleFileMatcher] 的纯函数判定；自动加载方只应消费
+/// [SubtitleMatchGrade.autoMatch] 且排序靠前的条目，手动面板可展示全部等级。
 class DiscoveredSubtitleFile {
   final String path;
   final DateTime modifiedAt;
   final int length;
-  final int matchQuality;
   final SubtitleSourceType sourceType;
 
-  const DiscoveredSubtitleFile({
+  /// 由引擎给出、可被时长校验降级的判定结果。
+  SubtitleFileNameAnalysis analysis;
+
+  /// 时长二次校验得到的字幕最大结束时间（毫秒），未能解析时为 null。
+  final int? subtitleDurationMs;
+
+  DiscoveredSubtitleFile({
     required this.path,
     required this.modifiedAt,
     required this.length,
-    required this.matchQuality,
     this.sourceType = SubtitleSourceType.sidecar,
+    required this.analysis,
+    this.subtitleDurationMs,
   });
+
+  SubtitleMatchGrade get grade => analysis.grade;
+  bool get isAuto => analysis.isAuto;
 }
 
+/// 同文件夹字幕发现服务。
+///
+/// 职责：
+/// 1. 枚举视频同目录中所有受支持的字幕文件（非递归）；
+/// 2. 用 [SubtitleFileMatcher] 做资格判定与分级；
+/// 3. 当传入 [videoDurationMs] 时，仅对 A 类（可自动）候选做轻量时长解析，
+///    与视频时长严重不符的候选降级为 manual（不强行自动匹配）；
+/// 4. 排序：auto（语言权重 → 名称干净度 → 时长接近度 → 修改时间）→
+///    manual → rejected。
 class SubtitleDiscoveryService {
   const SubtitleDiscoveryService();
 
+  static const SubtitleDurationReader _durationReader =
+      SubtitleDurationReader();
+
+  /// 允许进入时长二次校验的 A 类候选上限（避免对文件夹中大量同名变体
+  /// 全部读盘）。
+  static const int _durationValidationLimit = 8;
+
   Future<List<DiscoveredSubtitleFile>> scanVideoDirectory({
     required String videoPath,
-    required SubtitleScanRules rules,
+    int? videoDurationMs,
   }) async {
     final directory = File(videoPath).parent;
     if (!await directory.exists()) return const <DiscoveredSubtitleFile>[];
 
-    final candidates = <Future<DiscoveredSubtitleFile?>>[];
+    final videoStem = p.basenameWithoutExtension(videoPath);
+
+    final files = <File>[];
     await for (final entity in directory.list(followLinks: false)) {
       if (entity is! File) continue;
-      if (!SubtitleFileMatcher.matches(
-        videoPath: videoPath,
-        subtitlePath: entity.path,
-        rules: rules,
-      )) {
-        continue;
-      }
-      candidates.add(_readMetadata(entity, videoPath, rules));
+      final ext = p.extension(entity.path).toLowerCase();
+      if (!SubtitleFileMatcher.supportedExtensions.contains(ext)) continue;
+      files.add(entity);
     }
 
-    final entries = (await Future.wait(
-      candidates,
-    )).whereType<DiscoveredSubtitleFile>().toList();
-    entries.sort((first, second) {
-      final quality = second.matchQuality.compareTo(first.matchQuality);
-      if (quality != 0) return quality;
-      final modified = second.modifiedAt.compareTo(first.modifiedAt);
-      if (modified != 0) return modified;
-      return _pathKey(first.path).compareTo(_pathKey(second.path));
-    });
-    return entries;
+    // 1) 名称资格判定（纯函数，无 IO）。
+    final analyzed = <DiscoveredSubtitleFile>[];
+    for (final file in files) {
+      final analysis = SubtitleFileMatcher.analyzeStems(
+        videoStem: videoStem,
+        subtitleStem: p.basenameWithoutExtension(file.path),
+      );
+      final stat = await _tryStat(file);
+      if (stat == null) continue;
+      analyzed.add(
+        DiscoveredSubtitleFile(
+          path: p.normalize(file.path),
+          modifiedAt: stat.modified,
+          length: stat.size,
+          analysis: analysis,
+        ),
+      );
+    }
+
+    if (analyzed.isEmpty) return analyzed;
+
+    // 2) 时长二次校验：只对 A 类候选、且在提供了视频时长时才执行。
+    final autoCandidates =
+        analyzed.where((entry) => entry.analysis.isAuto).toList();
+    final durationMap = <String, int?>{};
+    if (videoDurationMs != null && videoDurationMs > 0) {
+      final limited =
+          autoCandidates.take(_durationValidationLimit).toList();
+      final results = await Future.wait(
+        limited.map(
+          (entry) => _durationReader.readMaxEndMs(File(entry.path)),
+        ),
+      );
+      for (var i = 0; i < limited.length; i++) {
+        durationMap[limited[i].path] = results[i];
+      }
+
+      // 严重不符（时长不足一半或超两倍）→ 降级为 manual，绝不允许自动匹配。
+      final autoSnapshot = analyzed
+          .where((entry) => entry.analysis.isAuto)
+          .toList();
+      for (final entry in autoSnapshot) {
+        final subDuration = durationMap[entry.path];
+        if (subDuration == null) continue; // 信息缺失：中性处理
+        final ratio = subDuration / videoDurationMs;
+        if (ratio < 0.5 || ratio > 2.0) {
+          entry.analysis = SubtitleFileNameAnalysis(
+            grade: SubtitleMatchGrade.manualOnly,
+            languageCode: entry.analysis.languageCode,
+            languageRank: entry.analysis.languageRank,
+            exactCoreMatch: entry.analysis.exactCoreMatch,
+            decorationGroupCount: entry.analysis.decorationGroupCount,
+            trailingTagCount: entry.analysis.trailingTagCount,
+            hasNoiseSuffix: true,
+          );
+        }
+      }
+    }
+
+    analyzed.sort((a, b) => _compareEntries(a, b, videoDurationMs, durationMap));
+    return analyzed;
   }
 
-  Future<DiscoveredSubtitleFile?> _readMetadata(
-    File file,
-    String videoPath,
-    SubtitleScanRules rules,
-  ) async {
+  Future<FileStat?> _tryStat(File file) async {
     try {
-      final stat = await file.stat();
-      return DiscoveredSubtitleFile(
-        path: p.normalize(file.path),
-        modifiedAt: stat.modified,
-        length: stat.size,
-        matchQuality: _matchQuality(videoPath, file.path, rules),
-      );
+      return await file.stat();
     } on FileSystemException {
       return null;
     }
   }
 
-  int _matchQuality(
-    String videoPath,
-    String subtitlePath,
-    SubtitleScanRules rules,
+  int _compareEntries(
+    DiscoveredSubtitleFile a,
+    DiscoveredSubtitleFile b,
+    int? videoDurationMs,
+    Map<String, int?> durationMap,
   ) {
-    var videoStem = p.basenameWithoutExtension(videoPath);
-    var subtitleStem = p.basenameWithoutExtension(subtitlePath);
-    if (!rules.caseSensitive) {
-      videoStem = videoStem.toLowerCase();
-      subtitleStem = subtitleStem.toLowerCase();
+    final order = _gradeOrder(a, b);
+    if (order != 0) return order;
+
+    // 同等级内部排序。
+    final aAuto = a.isAuto;
+    final langCmp = a.analysis.languageRank.compareTo(
+      b.analysis.languageRank,
+    );
+    if (langCmp != 0) return langCmp;
+
+    final cleanCmp = (a.analysis.decorationGroupCount + a.analysis.trailingTagCount)
+        .compareTo(
+      b.analysis.decorationGroupCount + b.analysis.trailingTagCount,
+    );
+    if (cleanCmp != 0) return cleanCmp;
+
+    if (aAuto && videoDurationMs != null && videoDurationMs > 0) {
+      final ratioCmp = _durationClosenessCmp(a, b, videoDurationMs, durationMap);
+      if (ratioCmp != 0) return ratioCmp;
     }
-    return subtitleStem == videoStem ? 2 : 1;
+
+    final mtimeCmp = b.modifiedAt.compareTo(a.modifiedAt);
+    if (mtimeCmp != 0) return mtimeCmp;
+    return p.basename(a.path).toLowerCase().compareTo(
+          p.basename(b.path).toLowerCase(),
+        );
   }
 
-  String _pathKey(String path) {
-    final normalized = p.normalize(path);
-    return Platform.isWindows ? normalized.toLowerCase() : normalized;
+  int _gradeOrder(DiscoveredSubtitleFile a, DiscoveredSubtitleFile b) {
+    int gradeValue(SubtitleMatchGrade g) => switch (g) {
+          SubtitleMatchGrade.autoMatch => 0,
+          SubtitleMatchGrade.manualOnly => 1,
+          SubtitleMatchGrade.rejected => 2,
+        };
+    return gradeValue(a.grade).compareTo(gradeValue(b.grade));
+  }
+
+  int _durationClosenessCmp(
+    DiscoveredSubtitleFile a,
+    DiscoveredSubtitleFile b,
+    int videoDurationMs,
+    Map<String, int?> durationMap,
+  ) {
+    double? closenessA = _closeness(durationMap[a.path], videoDurationMs);
+    double? closenessB = _closeness(durationMap[b.path], videoDurationMs);
+    final tierA = _ratioTier(closenessA);
+    final tierB = _ratioTier(closenessB);
+    if (tierA != tierB) return tierA.compareTo(tierB);
+    if (tierA == 0) {
+      // 同层时取更接近 1 的。
+      closenessA ??= double.infinity;
+      closenessB ??= double.infinity;
+      return closenessA.compareTo(closenessB);
+    }
+    return 0;
+  }
+
+  /// 字幕时长/视频时长的接近度 |ratio - 1|；字幕时长未知时为 null。
+  double? _closeness(int? subtitleMs, int videoDurationMs) {
+    if (subtitleMs == null || subtitleMs <= 0) return null;
+    final ratio = subtitleMs / videoDurationMs;
+    return (ratio - 1.0).abs();
+  }
+
+  /// 0 = 接近（0.75–1.3 区间或信息缺失），1 = 略远（0.5–0.75 / 1.3–2）。
+  int _ratioTier(double? closeness) {
+    if (closeness == null) return 0; // 信息缺失中性处理
+    return closeness <= 0.3 ? 0 : 1;
   }
 }
