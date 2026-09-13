@@ -1,5 +1,29 @@
 import 'package:flutter/material.dart';
 
+/// Stable identities for the overlays hosted by a media-library [Stack].
+///
+/// Box selection inserts and removes an overlay before the mini player while a
+/// desktop pointer is down. Without keys, Flutter can reuse the adjacent
+/// [Positioned] elements by index, disposing and recreating the mini player's
+/// state in the process.
+class MediaLibraryOverlayKeys {
+  static const emptySpaceHitTarget = ValueKey<String>(
+    'media-library-empty-space-hit-target',
+  );
+  static const boxSelection = ValueKey<String>(
+    'media-library-box-selection-overlay',
+  );
+  static const playbackBottomFill = ValueKey<String>(
+    'media-library-playback-bottom-fill',
+  );
+  static const miniPlaybackCard = ValueKey<String>(
+    'media-library-mini-playback-card',
+  );
+  static const fileDrop = ValueKey<String>('media-library-file-drop-overlay');
+
+  const MediaLibraryOverlayKeys._();
+}
+
 /// 播放卡片尺寸数据类
 class PlaybackCardDimensions {
   /// 卡片高度

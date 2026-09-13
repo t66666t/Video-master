@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'landscape_sidebar_layout.dart';
 import 'package:provider/provider.dart';
 import '../services/settings_service.dart';
 
@@ -33,14 +34,15 @@ class SubtitlePositionSidebar extends StatefulWidget {
   });
 
   @override
-  State<SubtitlePositionSidebar> createState() => _SubtitlePositionSidebarState();
+  State<SubtitlePositionSidebar> createState() =>
+      _SubtitlePositionSidebarState();
 }
 
 class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
   // Timer for long press continuous movement
   // Not implementing complex timer for now, keeping it simple with repeated taps or just relying on drag
   // But requirement said "tap or long press".
-  
+
   void _move(double dx, double dy) {
     // Small step for fine tuning
     final newX = (widget.currentAlignment.x + dx).clamp(-1.0, 1.0);
@@ -50,14 +52,21 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
-    final paddingValue = isSmallScreen ? 6.0 : 16.0;
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
+    final isSmallScreen = layout.isNarrow || layout.isCompactHeight;
+    final paddingValue = layout.horizontalPadding;
 
     // Use a fixed width for the D-Pad container or scale it slightly
-    final dPadSize = isSmallScreen ? 100.0 : 160.0; 
-    final buttonSize = isSmallScreen ? 30.0 : 42.0;
-    final iconSize = isSmallScreen ? 18.0 : 24.0;
+    final dPadSize = layout.isCompactHeight ? 96.0 : 140.0;
+    final buttonSize = layout.controlHeight;
+    final iconSize = layout.iconSize;
 
     return Container(
       color: const Color(0xFF1E1E1E),
@@ -65,7 +74,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
         children: [
           // Header - Optimized for mobile
           Container(
-            height: isSmallScreen ? 28 : 48,
+            height: layout.headerHeight,
             padding: EdgeInsets.symmetric(horizontal: paddingValue),
             decoration: const BoxDecoration(
               border: Border(bottom: BorderSide(color: Colors.white10)),
@@ -76,8 +85,8 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                 Text(
                   "字幕样式",
                   style: TextStyle(
-                    color: Colors.white, 
-                    fontSize: isSmallScreen ? 11 : 16, 
+                    color: Colors.white,
+                    fontSize: layout.titleSize,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -87,7 +96,10 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                   tooltip: "确认保存",
                   iconSize: isSmallScreen ? 16 : 24,
                   padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+                  constraints: const BoxConstraints(
+                    minWidth: 24,
+                    minHeight: 24,
+                  ),
                 ),
               ],
             ),
@@ -95,7 +107,10 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
 
           Expanded(
             child: ListView(
-              padding: EdgeInsets.symmetric(horizontal: paddingValue, vertical: isSmallScreen ? 4 : 8),
+              padding: EdgeInsets.symmetric(
+                horizontal: paddingValue,
+                vertical: isSmallScreen ? 4 : 8,
+              ),
               children: [
                 if (!widget.hideGhostModeControls)
                   Container(
@@ -107,9 +122,9 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                       children: [
                         Expanded(
                           child: Text(
-                            "幽灵模式", 
+                            "幽灵模式",
                             style: TextStyle(
-                              color: Colors.white, 
+                              color: Colors.white,
                               fontSize: isSmallScreen ? 9 : 14,
                               fontWeight: FontWeight.w500,
                             ),
@@ -124,20 +139,31 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                                 value: widget.isGhostModeEnabled,
                                 onChanged: widget.onGhostModeToggle,
                                 activeThumbColor: Colors.blueAccent,
-                                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
                               ),
                             ),
                             IconButton(
-                              icon: Icon(Icons.tune, size: isSmallScreen ? 12 : 20),
-                              onPressed: widget.isGhostModeEnabled ? widget.onEnterGhostMode : null,
+                              icon: Icon(
+                                Icons.tune,
+                                size: isSmallScreen ? 12 : 20,
+                              ),
+                              onPressed: widget.isGhostModeEnabled
+                                  ? widget.onEnterGhostMode
+                                  : null,
                               tooltip: "调整",
                               padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+                              constraints: const BoxConstraints(
+                                minWidth: 20,
+                                minHeight: 20,
+                              ),
                               style: IconButton.styleFrom(
-                                backgroundColor: widget.isGhostModeActive 
-                                    ? Colors.green.withValues(alpha: 0.2) 
+                                backgroundColor: widget.isGhostModeActive
+                                    ? Colors.green.withValues(alpha: 0.2)
                                     : Colors.white.withValues(alpha: 0.1),
-                                foregroundColor: widget.isGhostModeActive ? Colors.green : Colors.white,
+                                foregroundColor: widget.isGhostModeActive
+                                    ? Colors.green
+                                    : Colors.white,
                               ),
                             ),
                           ],
@@ -146,13 +172,16 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     ),
                   ),
                 if (!widget.hideGhostModeControls)
-                  Divider(color: Colors.white10, height: isSmallScreen ? 2 : 24),
+                  Divider(
+                    color: Colors.white10,
+                    height: isSmallScreen ? 2 : 24,
+                  ),
 
                 // 1. Font Settings (Size & Spacing)
                 Text(
-                  "字体布局", 
+                  "字体布局",
                   style: TextStyle(
-                    color: Colors.white70, 
+                    color: Colors.white70,
                     fontSize: isSmallScreen ? 10 : 12,
                   ),
                 ),
@@ -164,23 +193,41 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                         // Main Font Size
                         Row(
                           children: [
-                            const SizedBox(width: 30, child: Text("主", style: TextStyle(fontSize: 12, color: Colors.white70))),
+                            const SizedBox(
+                              width: 30,
+                              child: Text(
+                                "主",
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
                             Expanded(
                               child: SliderTheme(
                                 data: SliderTheme.of(context).copyWith(
                                   trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                                  thumbShape: const RoundSliderThumbShape(
+                                    enabledThumbRadius: 6,
+                                  ),
+                                  overlayShape: const RoundSliderOverlayShape(
+                                    overlayRadius: 12,
+                                  ),
                                 ),
                                 child: Slider(
-                                  value: settings.subtitleStyleLandscape.fontSize,
+                                  value:
+                                      settings.subtitleStyleLandscape.fontSize,
                                   min: 10,
                                   max: 100,
                                   divisions: 90,
                                   activeColor: Colors.blueAccent,
                                   inactiveColor: Colors.white24,
                                   onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(settings.subtitleStyleLandscape.copyWith(fontSize: val));
+                                    settings.saveSubtitleStyleLandscape(
+                                      settings.subtitleStyleLandscape.copyWith(
+                                        fontSize: val,
+                                      ),
+                                    );
                                   },
                                 ),
                               ),
@@ -188,34 +235,60 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                             SizedBox(
                               width: 30,
                               child: Text(
-                                settings.subtitleStyleLandscape.fontSize.toInt().toString(),
-                                style: const TextStyle(fontSize: 12, color: Colors.white70),
+                                settings.subtitleStyleLandscape.fontSize
+                                    .toInt()
+                                    .toString(),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
                                 textAlign: TextAlign.right,
                               ),
                             ),
                           ],
                         ),
-                        
+
                         // Secondary Font Size
                         Row(
                           children: [
-                            const SizedBox(width: 30, child: Text("副", style: TextStyle(fontSize: 12, color: Colors.white70))),
+                            const SizedBox(
+                              width: 30,
+                              child: Text(
+                                "副",
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
                             Expanded(
                               child: SliderTheme(
                                 data: SliderTheme.of(context).copyWith(
                                   trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                                  thumbShape: const RoundSliderThumbShape(
+                                    enabledThumbRadius: 6,
+                                  ),
+                                  overlayShape: const RoundSliderOverlayShape(
+                                    overlayRadius: 12,
+                                  ),
                                 ),
                                 child: Slider(
-                                  value: settings.subtitleStyleLandscape.secondaryFontSize ?? settings.subtitleStyleLandscape.fontSize,
+                                  value:
+                                      settings
+                                          .subtitleStyleLandscape
+                                          .secondaryFontSize ??
+                                      settings.subtitleStyleLandscape.fontSize,
                                   min: 10,
                                   max: 100,
                                   divisions: 90,
                                   activeColor: Colors.blueAccent,
                                   inactiveColor: Colors.white24,
                                   onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(settings.subtitleStyleLandscape.copyWith(secondaryFontSize: val));
+                                    settings.saveSubtitleStyleLandscape(
+                                      settings.subtitleStyleLandscape.copyWith(
+                                        secondaryFontSize: val,
+                                      ),
+                                    );
                                   },
                                 ),
                               ),
@@ -223,8 +296,18 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                             SizedBox(
                               width: 30,
                               child: Text(
-                                (settings.subtitleStyleLandscape.secondaryFontSize ?? settings.subtitleStyleLandscape.fontSize).toInt().toString(),
-                                style: const TextStyle(fontSize: 12, color: Colors.white70),
+                                (settings
+                                            .subtitleStyleLandscape
+                                            .secondaryFontSize ??
+                                        settings
+                                            .subtitleStyleLandscape
+                                            .fontSize)
+                                    .toInt()
+                                    .toString(),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
                                 textAlign: TextAlign.right,
                               ),
                             ),
@@ -234,23 +317,42 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                         // Line Spacing
                         Row(
                           children: [
-                            const SizedBox(width: 30, child: Text("距", style: TextStyle(fontSize: 12, color: Colors.white70))),
+                            const SizedBox(
+                              width: 30,
+                              child: Text(
+                                "距",
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
+                              ),
+                            ),
                             Expanded(
                               child: SliderTheme(
                                 data: SliderTheme.of(context).copyWith(
                                   trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                                  thumbShape: const RoundSliderThumbShape(
+                                    enabledThumbRadius: 6,
+                                  ),
+                                  overlayShape: const RoundSliderOverlayShape(
+                                    overlayRadius: 12,
+                                  ),
                                 ),
                                 child: Slider(
-                                  value: settings.subtitleStyleLandscape.lineSpacing,
+                                  value: settings
+                                      .subtitleStyleLandscape
+                                      .lineSpacing,
                                   min: -10,
                                   max: 100,
                                   divisions: 110,
                                   activeColor: Colors.blueAccent,
                                   inactiveColor: Colors.white24,
                                   onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(settings.subtitleStyleLandscape.copyWith(lineSpacing: val));
+                                    settings.saveSubtitleStyleLandscape(
+                                      settings.subtitleStyleLandscape.copyWith(
+                                        lineSpacing: val,
+                                      ),
+                                    );
                                   },
                                 ),
                               ),
@@ -258,8 +360,13 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                             SizedBox(
                               width: 30,
                               child: Text(
-                                settings.subtitleStyleLandscape.lineSpacing.toInt().toString(),
-                                style: const TextStyle(fontSize: 12, color: Colors.white70),
+                                settings.subtitleStyleLandscape.lineSpacing
+                                    .toInt()
+                                    .toString(),
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white70,
+                                ),
                                 textAlign: TextAlign.right,
                               ),
                             ),
@@ -267,7 +374,7 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                         ),
                       ],
                     );
-                  }
+                  },
                 ),
 
                 SizedBox(height: isSmallScreen ? 6 : 20),
@@ -275,9 +382,9 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
 
                 // 2. D-Pad for Fine Tuning
                 Text(
-                  "微调", 
+                  "微调",
                   style: TextStyle(
-                    color: Colors.white70, 
+                    color: Colors.white70,
                     fontSize: isSmallScreen ? 10 : 12,
                   ),
                 ),
@@ -290,19 +397,43 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                       children: [
                         Align(
                           alignment: Alignment.topCenter,
-                          child: _buildDirectionButton(Icons.arrow_upward, 0.0, -0.05, buttonSize, iconSize),
+                          child: _buildDirectionButton(
+                            Icons.arrow_upward,
+                            0.0,
+                            -0.05,
+                            buttonSize,
+                            iconSize,
+                          ),
                         ),
                         Align(
                           alignment: Alignment.bottomCenter,
-                          child: _buildDirectionButton(Icons.arrow_downward, 0.0, 0.05, buttonSize, iconSize),
+                          child: _buildDirectionButton(
+                            Icons.arrow_downward,
+                            0.0,
+                            0.05,
+                            buttonSize,
+                            iconSize,
+                          ),
                         ),
                         Align(
                           alignment: Alignment.centerLeft,
-                          child: _buildDirectionButton(Icons.arrow_back, -0.05, 0.0, buttonSize, iconSize),
+                          child: _buildDirectionButton(
+                            Icons.arrow_back,
+                            -0.05,
+                            0.0,
+                            buttonSize,
+                            iconSize,
+                          ),
                         ),
                         Align(
                           alignment: Alignment.centerRight,
-                          child: _buildDirectionButton(Icons.arrow_forward, 0.05, 0.0, buttonSize, iconSize),
+                          child: _buildDirectionButton(
+                            Icons.arrow_forward,
+                            0.05,
+                            0.0,
+                            buttonSize,
+                            iconSize,
+                          ),
                         ),
                         Align(
                           alignment: Alignment.center,
@@ -313,7 +444,11 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                               color: Colors.white.withValues(alpha: 0.05),
                               shape: BoxShape.circle,
                             ),
-                            child: Icon(Icons.open_with, color: Colors.white38, size: iconSize * 0.8),
+                            child: Icon(
+                              Icons.open_with,
+                              color: Colors.white38,
+                              size: iconSize * 0.8,
+                            ),
                           ),
                         ),
                       ],
@@ -330,15 +465,23 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     Expanded(
                       child: ElevatedButton.icon(
                         onPressed: widget.onSavePreset,
-                        icon: Icon(Icons.save_as, size: isSmallScreen ? 14 : 16),
+                        icon: Icon(
+                          Icons.save_as,
+                          size: isSmallScreen ? 14 : 16,
+                        ),
                         label: Text(
                           "保存",
                           style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
                         ),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blueAccent.withValues(alpha: 0.2),
+                          backgroundColor: Colors.blueAccent.withValues(
+                            alpha: 0.2,
+                          ),
                           foregroundColor: Colors.blueAccent,
-                          padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 6 : 12, vertical: isSmallScreen ? 6 : 12),
+                          padding: EdgeInsets.symmetric(
+                            horizontal: isSmallScreen ? 6 : 12,
+                            vertical: isSmallScreen ? 6 : 12,
+                          ),
                         ),
                       ),
                     ),
@@ -346,7 +489,10 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     Expanded(
                       child: OutlinedButton.icon(
                         onPressed: widget.onReset,
-                        icon: Icon(Icons.restart_alt, size: isSmallScreen ? 14 : 16),
+                        icon: Icon(
+                          Icons.restart_alt,
+                          size: isSmallScreen ? 14 : 16,
+                        ),
                         label: Text(
                           "重置",
                           style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
@@ -354,7 +500,10 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                         style: OutlinedButton.styleFrom(
                           foregroundColor: Colors.white70,
                           side: const BorderSide(color: Colors.white24),
-                          padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 6 : 12, vertical: isSmallScreen ? 6 : 12),
+                          padding: EdgeInsets.symmetric(
+                            horizontal: isSmallScreen ? 6 : 12,
+                            vertical: isSmallScreen ? 6 : 12,
+                          ),
                         ),
                       ),
                     ),
@@ -365,9 +514,9 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
 
                 // 4. Presets
                 Text(
-                  "预设位置", 
+                  "预设位置",
                   style: TextStyle(
-                    color: Colors.white70, 
+                    color: Colors.white70,
                     fontSize: isSmallScreen ? 10 : 12,
                   ),
                 ),
@@ -397,7 +546,13 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
     );
   }
 
-  Widget _buildDirectionButton(IconData icon, double dx, double dy, double size, double iconSize) {
+  Widget _buildDirectionButton(
+    IconData icon,
+    double dx,
+    double dy,
+    double size,
+    double iconSize,
+  ) {
     return GestureDetector(
       onTap: () => _move(dx, dy),
       onLongPress: () {
@@ -417,15 +572,26 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
     );
   }
 
-  Widget _buildPresetChip(String label, double x, double y, {bool isCustom = false}) {
-    final bool isSelected = (widget.currentAlignment.x - x).abs() < 0.01 && 
-                            (widget.currentAlignment.y - y).abs() < 0.01;
-    
+  Widget _buildPresetChip(
+    String label,
+    double x,
+    double y, {
+    bool isCustom = false,
+  }) {
+    final bool isSelected =
+        (widget.currentAlignment.x - x).abs() < 0.01 &&
+        (widget.currentAlignment.y - y).abs() < 0.01;
+
     return ActionChip(
       label: Text(label),
       avatar: isCustom ? const Icon(Icons.bookmark, size: 14) : null,
-      backgroundColor: isSelected ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
-      labelStyle: TextStyle(color: isSelected ? Colors.white : Colors.white70, fontSize: 12),
+      backgroundColor: isSelected
+          ? Colors.blueAccent
+          : Colors.white.withValues(alpha: 0.05),
+      labelStyle: TextStyle(
+        color: isSelected ? Colors.white : Colors.white70,
+        fontSize: 12,
+      ),
       onPressed: () => widget.onAlignmentChanged(Alignment(x, y)),
       side: BorderSide.none,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),

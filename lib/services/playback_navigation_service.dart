@@ -12,6 +12,24 @@ import '../utils/app_toast.dart';
 import 'settings_service.dart';
 import 'media_playback_service.dart';
 
+bool resolvePlaybackPageEntryAutoPlay({
+  required bool? entryAutoPlay,
+  required bool isCurrentItem,
+  required bool desiredPlaying,
+}) {
+  // Enabling page-entry auto-play is an explicit request to start/resume.
+  if (entryAutoPlay == true) return true;
+
+  // Opening the page must never pause an already-active session when the
+  // setting is off. This also preserves pause/play state during portrait ↔
+  // landscape hand-offs and notification/mini-player navigation.
+  if (isCurrentItem) return desiredPlaying;
+
+  // null is used by internal/non-library routes and keeps their legacy
+  // behavior. A library entry always supplies the persisted boolean.
+  return entryAutoPlay ?? true;
+}
+
 class PlaybackNavigationService {
   PlaybackNavigationService._();
 
@@ -75,18 +93,23 @@ class PlaybackNavigationService {
     VideoItem item, {
     VideoPlayerController? existingController,
   }) {
+    final autoPlayOnEntry = SettingsService().autoPlayOnPageEntry;
     if (entrySkipsPortraitPlayer) {
       return MaterialPageRoute<void>(
         settings: landscapeRouteSettings(item),
         builder: (context) => VideoPlayerScreen(
           videoItem: item,
           existingController: existingController,
+          autoPlayOnEntry: autoPlayOnEntry,
         ),
       );
     }
     return MaterialPageRoute<void>(
       settings: portraitRouteSettings(item),
-      builder: (context) => PortraitVideoScreen(videoItem: item),
+      builder: (context) => PortraitVideoScreen(
+        videoItem: item,
+        autoPlayOnEntry: autoPlayOnEntry,
+      ),
     );
   }
 

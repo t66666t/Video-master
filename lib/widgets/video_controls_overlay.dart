@@ -1,3 +1,4 @@
+import '../widgets/subtitle_debug_speed_gateway.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:io';
@@ -38,6 +39,7 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onToggleSidebar;
   final bool isSubtitleSidebarVisible;
   final VoidCallback? onOpenSettings;
+  final VoidCallback? onOpenSleepTimer;
   final VoidCallback? onOpenSubtitleManager;
   final VoidCallback? onOpenSubtitleEditor;
   final VoidCallback? onToggleFloatingSubtitleSettings;
@@ -110,6 +112,7 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onToggleSidebar,
     this.isSubtitleSidebarVisible = false,
     this.onOpenSettings,
+    this.onOpenSleepTimer,
     this.onOpenSubtitleManager,
     this.onOpenSubtitleEditor,
     this.onToggleFloatingSubtitleSettings,
@@ -173,6 +176,11 @@ class VideoControlsOverlay extends StatefulWidget {
 }
 
 class VideoControlsOverlayState extends State<VideoControlsOverlay> {
+  static const Duration _controlsFadeDuration = Duration(milliseconds: 250);
+  static const Duration _subtitleAvoidanceReleaseDelay = Duration(
+    milliseconds: 150,
+  );
+
   final ValueNotifier<VideoPlayerValue> _unavailableControllerValue =
       ValueNotifier<VideoPlayerValue>(VideoPlayerValue.uninitialized());
 
@@ -189,10 +197,26 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   double? _hoverProgressValue;
   int? _dragChapterIndex;
   bool _showControls = true;
+  Timer? _subtitleAvoidanceReleaseTimer;
 
   void _setShowControls(bool value) {
     _showControls = value;
-    _publishPlaybackControlsVisibility();
+    _subtitleAvoidanceReleaseTimer?.cancel();
+
+    // Showing controls must reserve subtitle space before the fade-in starts.
+    if (value || !widget.showBottomBar) {
+      _publishPlaybackControlsVisibility();
+      return;
+    }
+
+    // Release slightly before the opacity animation finishes. At this point
+    // the controls are already visually faint, so subtitles feel responsive
+    // without noticeably overlapping the progress bar.
+    _subtitleAvoidanceReleaseTimer = Timer(_subtitleAvoidanceReleaseDelay, () {
+      if (mounted && !_showControls) {
+        _publishPlaybackControlsVisibility();
+      }
+    });
   }
 
   void _publishPlaybackControlsVisibility() {
@@ -1036,6 +1060,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _doubleTapFeedbackHideTimer?.cancel();
     _doubleTapFeedbackDismissTimer?.cancel();
     _autoHideTimer?.cancel();
+    _subtitleAvoidanceReleaseTimer?.cancel();
     _unavailableControllerValue.dispose();
     super.dispose();
   }
@@ -3094,7 +3119,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                           !hideControlsForGestureSeek)
                       ? 1.0
                       : 0.0,
-                  duration: const Duration(milliseconds: 250),
+                  duration: _controlsFadeDuration,
                   curve: Curves.easeInOut,
                   child: IgnorePointer(
                     ignoring:
@@ -4527,77 +4552,121 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                         );
                                                       },
                                                     ),
-                                                    Builder(
-                                                      builder: (speedButtonContext) => Tooltip(
-                                                        message: '倍速',
-                                                        child: Material(
-                                                          color: Colors
-                                                              .transparent,
-                                                          child: InkWell(
-                                                            borderRadius:
-                                                                BorderRadius.circular(
-                                                                  8,
-                                                                ),
-                                                            onTap:
-                                                                _controllerValue
-                                                                    .isInitialized
-                                                                ? () => unawaited(
-                                                                    _showPlaybackSpeedPicker(
-                                                                      settings,
-                                                                      speedButtonContext,
+                                                    SubtitleDebugSpeedGateway(
+                                                      builder:
+                                                          (
+                                                            speedButtonContext,
+                                                            handleSpeedTap,
+                                                          ) => Tooltip(
+                                                            message: '倍速',
+                                                            child: Material(
+                                                              color: Colors
+                                                                  .transparent,
+                                                              child: InkWell(
+                                                                borderRadius:
+                                                                    BorderRadius.circular(
+                                                                      8,
                                                                     ),
-                                                                  )
-                                                                : null,
-                                                            child: AnimatedBuilder(
-                                                              animation:
-                                                                  _controllerListenable,
-                                                              builder: (context, _) {
-                                                                final speed =
+                                                                onTap:
                                                                     _controllerValue
-                                                                        .playbackSpeed;
-                                                                return SizedBox(
-                                                                  height: controlMetrics
-                                                                      .bottomButtonExtent,
-                                                                  child: Padding(
-                                                                    padding: EdgeInsets.symmetric(
-                                                                      horizontal:
-                                                                          controlMetrics
-                                                                              .controlGap,
-                                                                    ),
-                                                                    child: Row(
-                                                                      mainAxisSize:
-                                                                          MainAxisSize
-                                                                              .min,
-                                                                      children: [
-                                                                        ConstrainedBox(
-                                                                          constraints: const BoxConstraints(
-                                                                            maxWidth:
-                                                                                52,
-                                                                          ),
-                                                                          child: FittedBox(
-                                                                            fit:
-                                                                                BoxFit.scaleDown,
-                                                                            child: Text(
-                                                                              "${speed}x",
-                                                                              maxLines: 1,
-                                                                              style: TextStyle(
-                                                                                color: Colors.white,
-                                                                                fontWeight: FontWeight.bold,
-                                                                                fontSize: controlMetrics.toolFontSize,
-                                                                              ),
-                                                                            ),
+                                                                        .isInitialized
+                                                                    ? () => handleSpeedTap(
+                                                                        () => unawaited(
+                                                                          _showPlaybackSpeedPicker(
+                                                                            settings,
+                                                                            speedButtonContext,
                                                                           ),
                                                                         ),
-                                                                      ],
-                                                                    ),
-                                                                  ),
-                                                                );
-                                                              },
+                                                                      )
+                                                                    : null,
+                                                                child: AnimatedBuilder(
+                                                                  animation:
+                                                                      _controllerListenable,
+                                                                  builder: (context, _) {
+                                                                    final speed =
+                                                                        _controllerValue
+                                                                            .playbackSpeed;
+                                                                    return SizedBox(
+                                                                      height: controlMetrics
+                                                                          .bottomButtonExtent,
+                                                                      child: Padding(
+                                                                        padding: EdgeInsets.symmetric(
+                                                                          horizontal:
+                                                                              controlMetrics.controlGap,
+                                                                        ),
+                                                                        child: Row(
+                                                                          mainAxisSize:
+                                                                              MainAxisSize.min,
+                                                                          children: [
+                                                                            ConstrainedBox(
+                                                                              constraints: const BoxConstraints(
+                                                                                maxWidth: 52,
+                                                                              ),
+                                                                              child: FittedBox(
+                                                                                fit: BoxFit.scaleDown,
+                                                                                child: Text(
+                                                                                  "${speed}x",
+                                                                                  maxLines: 1,
+                                                                                  style: TextStyle(
+                                                                                    color: Colors.white,
+                                                                                    fontWeight: FontWeight.bold,
+                                                                                    fontSize: controlMetrics.toolFontSize,
+                                                                                  ),
+                                                                                ),
+                                                                              ),
+                                                                            ),
+                                                                          ],
+                                                                        ),
+                                                                      ),
+                                                                    );
+                                                                  },
+                                                                ),
+                                                              ),
                                                             ),
                                                           ),
-                                                        ),
-                                                      ),
                                                     ),
+
+                                                    if (widget
+                                                            .onOpenSleepTimer !=
+                                                        null)
+                                                      AnimatedBuilder(
+                                                        animation:
+                                                            playbackService
+                                                                .sleepTimer,
+                                                        builder: (context, _) {
+                                                          final timer =
+                                                              playbackService
+                                                                  .sleepTimer;
+                                                          return IconButton(
+                                                            iconSize: iconSize,
+                                                            style:
+                                                                bottomIconButtonStyle,
+                                                            icon: Icon(
+                                                              timer.isActive
+                                                                  ? Icons
+                                                                        .alarm_on_rounded
+                                                                  : Icons
+                                                                        .schedule_rounded,
+                                                              color:
+                                                                  timer.isActive
+                                                                  ? Colors
+                                                                        .blueAccent
+                                                                  : Colors
+                                                                        .white70,
+                                                            ),
+                                                            onPressed: () {
+                                                              _startAutoHideTimer();
+                                                              widget
+                                                                  .onOpenSleepTimer!();
+                                                            },
+                                                            tooltip:
+                                                                timer.isActive
+                                                                ? timer
+                                                                      .statusText
+                                                                : '定时关闭',
+                                                          );
+                                                        },
+                                                      ),
 
                                                     IconButton(
                                                       iconSize: iconSize,

@@ -216,7 +216,10 @@ class VideoComposeExecutor {
     final Process process = await Process.start(
       ffmpegPath,
       args,
-      runInShell: true,
+      // Arguments are already separated. Bypassing the shell prevents stale
+      // PATH aliases and special characters in media paths from being
+      // interpreted by cmd.exe or the user's login shell.
+      runInShell: false,
     );
     _activeDesktopComposeProcess = process;
     final Completer<void> completer = Completer<void>();

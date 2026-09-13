@@ -220,6 +220,94 @@ void main() {
         await controller.dispose();
       },
     );
+
+    testWidgets(
+      '${articleMode ? 'article' : 'list'} tap animation ignores stale seek callbacks',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({
+          'autoScrollSubtitles': true,
+          'subtitleViewMode': articleMode ? 1 : 0,
+          'subtitleArticleSentencesPerParagraph': 1,
+          'landscapeSidebarLocatePositionPercent': 30,
+        });
+        final settings = SettingsService();
+        settings.resetForTest();
+        await settings.init();
+
+        final controller = VideoPlayerController.networkUrl(
+          Uri.parse('https://example.invalid/stale-seek.mp4'),
+        );
+        controller.value = const VideoPlayerValue(
+          duration: Duration(minutes: 2),
+          isInitialized: true,
+          isPlaying: true,
+        );
+        final subtitles = _buildSubtitles(firstStartSeconds: 0);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 320,
+                height: 360,
+                child: SubtitleSidebar(
+                  subtitles: subtitles,
+                  controller: controller,
+                  isCompact: true,
+                  onItemTap: (position) {
+                    controller.value = controller.value.copyWith(
+                      position: position,
+                    );
+                  },
+                ),
+              ),
+            ),
+          ),
+        );
+        await _pumpPostFrameCallbacks(tester);
+
+        final target = find.text('subtitle 4', findRichText: articleMode);
+        expect(target, findsOneWidget);
+        final gesture = await tester.startGesture(tester.getCenter(target));
+        await tester.pump(const Duration(milliseconds: 120));
+        await gesture.up();
+        await tester.pump();
+
+        final positions = <double>[tester.getTopLeft(target).dy];
+        await tester.pump(const Duration(milliseconds: 40));
+        positions.add(tester.getTopLeft(target).dy);
+
+        // Some native backends briefly publish the pre-seek position after
+        // already reporting the requested one.
+        controller.value = controller.value.copyWith(position: Duration.zero);
+        await tester.pump(const Duration(milliseconds: 40));
+        positions.add(tester.getTopLeft(target).dy);
+        controller.value = controller.value.copyWith(
+          position: subtitles[4].startTime,
+        );
+
+        for (int i = 0; i < 8; i++) {
+          await tester.pump(const Duration(milliseconds: 40));
+          positions.add(tester.getTopLeft(target).dy);
+        }
+
+        for (int i = 1; i < positions.length; i++) {
+          expect(
+            positions[i],
+            lessThanOrEqualTo(positions[i - 1] + 0.5),
+            reason: 'the tapped row must move in one uninterrupted direction',
+          );
+        }
+        expect(
+          positions.last,
+          closeTo(positions[positions.length - 2], 0.1),
+          reason: '$positions',
+        );
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await controller.dispose();
+      },
+    );
   }
 
   testWidgets('changing video automatically locates the new subtitle content', (

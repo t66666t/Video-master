@@ -46,6 +46,7 @@ class TaskQueueTable extends StatefulWidget {
   final List<BatchSubtitleTaskView> tasks;
   final Map<String, bool> autoDeletedKeys;
   final void Function(String mediaKey) onStart;
+  final void Function(String mediaKey)? onPause;
   final void Function(String mediaKey) onRetry;
   final void Function(String mediaKey) onDelete;
   final void Function(String mediaKey, int newIndex) onReorder;
@@ -56,6 +57,7 @@ class TaskQueueTable extends StatefulWidget {
     required this.tasks,
     required this.autoDeletedKeys,
     required this.onStart,
+    this.onPause,
     required this.onRetry,
     required this.onDelete,
     required this.onReorder,
@@ -203,6 +205,9 @@ class _TaskQueueTableState extends State<TaskQueueTable> {
                     isHoverTarget: _hoverIndex == index,
                     btnSize: btnSize,
                     onStart: () => widget.onStart(task.mediaKey),
+                    onPause: widget.onPause == null
+                        ? null
+                        : () => widget.onPause!(task.mediaKey),
                     onRetry: () => widget.onRetry(task.mediaKey),
                     onDelete: () => widget.onDelete(task.mediaKey),
                     onTapCompleted: widget.onTapCompleted != null
@@ -234,26 +239,26 @@ class _TaskQueueTableState extends State<TaskQueueTable> {
     int taskCount,
   ) {
     if (isCompact) {
+      final theme = Theme.of(context);
       final actionWidth = btnSize * 2;
       final headerStyle = TextStyle(
-        fontSize: 10.5,
-        fontWeight: FontWeight.w600,
-        color: Theme.of(context).colorScheme.onSurfaceVariant,
+        fontSize: MediaQuery.sizeOf(context).width < 360 ? 9.5 : 10.5,
+        fontWeight: FontWeight.w700,
+        color: theme.colorScheme.onSurfaceVariant,
       );
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
-        color: Theme.of(
-          context,
-        ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.55),
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
         child: Row(
           children: [
             Tooltip(
-              message: _isDescending ? '按创建顺序升序' : '按创建顺序降序',
+              message: _isDescending ? '切换为最早优先' : '切换为最新优先',
               child: InkWell(
                 onTap: () => setState(() => _isDescending = !_isDescending),
-                borderRadius: BorderRadius.circular(5),
+                borderRadius: BorderRadius.circular(6),
                 child: SizedBox(
-                  width: 26,
+                  width: 28,
+                  height: 28,
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -263,24 +268,24 @@ class _TaskQueueTableState extends State<TaskQueueTable> {
                             ? Icons.arrow_downward_rounded
                             : Icons.arrow_upward_rounded,
                         size: 11,
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ],
                   ),
                 ),
               ),
             ),
-            const SizedBox(width: 6),
+            const SizedBox(width: 5),
             Expanded(
               child: Text(
-                '任务名称  $taskCount',
+                '名称（$taskCount）',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: headerStyle,
               ),
             ),
             SizedBox(
-              width: 72,
+              width: 70,
               child: Text(
                 '状态',
                 textAlign: TextAlign.center,
@@ -357,6 +362,7 @@ class _TaskRow extends StatelessWidget {
   final bool isHoverTarget;
   final double btnSize;
   final VoidCallback onStart;
+  final VoidCallback? onPause;
   final VoidCallback onRetry;
   final VoidCallback onDelete;
   final VoidCallback? onTapCompleted;
@@ -373,6 +379,7 @@ class _TaskRow extends StatelessWidget {
     required this.isHoverTarget,
     required this.btnSize,
     required this.onStart,
+    this.onPause,
     required this.onRetry,
     required this.onDelete,
     this.onTapCompleted,
@@ -389,6 +396,7 @@ class _TaskRow extends StatelessWidget {
         isHoverTarget: isHoverTarget,
         btnSize: btnSize,
         onStart: onStart,
+        onPause: onPause,
         onRetry: onRetry,
         onDelete: onDelete,
         onTapCompleted: onTapCompleted,
@@ -532,23 +540,14 @@ class _TaskRow extends StatelessWidget {
                           tooltip: '开始',
                           onPressed: onStart,
                         ),
-                      if (isIdle && task.isStarted)
+                      if ((isIdle && task.isStarted) || isProcessing)
                         _CompactIconButton(
-                          icon: Icons.hourglass_bottom,
+                          icon: Icons.pause_rounded,
                           size: btnSize,
                           iconSize: iconSize,
-                          color: Colors.amber.shade700,
-                          tooltip: '等待处理',
-                          onPressed: null,
-                        ),
-                      if (isProcessing)
-                        _CompactIconButton(
-                          icon: Icons.play_arrow,
-                          size: btnSize,
-                          iconSize: iconSize,
-                          color: Theme.of(context).disabledColor,
-                          tooltip: '处理中',
-                          onPressed: null,
+                          color: Theme.of(context).colorScheme.primary,
+                          tooltip: '暂停',
+                          onPressed: onPause,
                         ),
                       if (isCompleted)
                         _CompactIconButton(
@@ -597,6 +596,7 @@ class _CompactTaskTableRow extends StatelessWidget {
   final bool isHoverTarget;
   final double btnSize;
   final VoidCallback onStart;
+  final VoidCallback? onPause;
   final VoidCallback onRetry;
   final VoidCallback onDelete;
   final VoidCallback? onTapCompleted;
@@ -609,6 +609,7 @@ class _CompactTaskTableRow extends StatelessWidget {
     required this.isHoverTarget,
     required this.btnSize,
     required this.onStart,
+    this.onPause,
     required this.onRetry,
     required this.onDelete,
     this.onTapCompleted,
@@ -635,6 +636,15 @@ class _CompactTaskTableRow extends StatelessWidget {
         color: theme.colorScheme.primary,
         tooltip: '开始',
         onPressed: onStart,
+      );
+    } else if (isProcessing || (isIdle && task.isStarted)) {
+      stateButton = _CompactIconButton(
+        icon: Icons.pause_rounded,
+        size: btnSize,
+        iconSize: iconSize,
+        color: theme.colorScheme.primary,
+        tooltip: '暂停',
+        onPressed: onPause,
       );
     } else if (isError) {
       stateButton = _CompactIconButton(

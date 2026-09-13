@@ -1829,6 +1829,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                         if (contents.length <
                             20) // Only if potentially empty space at bottom
                           Positioned.fill(
+                            key: MediaLibraryOverlayKeys.emptySpaceHitTarget,
                             child: Listener(
                               behavior: HitTestBehavior.translucent,
                               onPointerDown:
@@ -1849,6 +1850,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                             _boxCurrentPos != null &&
                             !_isSelectionMode)
                           Positioned.fill(
+                            key: MediaLibraryOverlayKeys.boxSelection,
                             child: IgnorePointer(
                               child: CustomPaint(
                                 painter: _BoxSelectionPainter(
@@ -1861,6 +1863,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                             ),
                           ),
                         Positioned(
+                          key: MediaLibraryOverlayKeys.playbackBottomFill,
                           left: 0,
                           right: 0,
                           bottom: 0,
@@ -1881,6 +1884,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                           ),
                         ),
                         Positioned(
+                          key: MediaLibraryOverlayKeys.miniPlaybackCard,
                           left: 0,
                           right: 0,
                           bottom: playbackCardBottom,
@@ -1936,6 +1940,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                         ),
                         if (_isDraggingFiles && !_isSearchResults)
                           Positioned.fill(
+                            key: MediaLibraryOverlayKeys.fileDrop,
                             child: Container(
                               color: Colors.black54,
                               child: const Center(

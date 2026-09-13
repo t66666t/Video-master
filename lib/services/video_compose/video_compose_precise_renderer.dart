@@ -1,3 +1,4 @@
+import '../../models/subtitle_debug_preset.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -39,6 +40,7 @@ class VideoComposePreciseRenderer {
     required List<SubtitleItem> primary,
     required List<SubtitleItem> secondary,
     required SubtitleStyle style,
+    SubtitleDebugPreset? subtitlePreset,
     required Alignment alignment,
     required bool splitSubtitleByLine,
     required double itemGap,
@@ -81,6 +83,7 @@ class VideoComposePreciseRenderer {
             height: height,
             entries: entries,
             style: style,
+            subtitlePreset: subtitlePreset,
             alignment: alignment,
             itemGap: itemGap,
           );
@@ -246,6 +249,7 @@ class VideoComposePreciseRenderer {
     required int height,
     required List<SubtitleOverlayEntry> entries,
     required SubtitleStyle style,
+    SubtitleDebugPreset? subtitlePreset,
     required Alignment alignment,
     required double itemGap,
   }) async {
@@ -263,10 +267,7 @@ class VideoComposePreciseRenderer {
     if (supersample > maxAllowed) supersample = maxAllowed;
     if (supersample < 1.0) supersample = 1.0;
     final Size size = Size(width.toDouble(), height.toDouble());
-    final Size renderSize = Size(
-      width * supersample,
-      height * supersample,
-    );
+    final Size renderSize = Size(width * supersample, height * supersample);
     final PipelineOwner pipelineOwner = PipelineOwner();
     final BuildOwner buildOwner = BuildOwner(focusManager: FocusManager());
     final RenderRepaintBoundary boundary = RenderRepaintBoundary();
@@ -288,14 +289,13 @@ class VideoComposePreciseRenderer {
       final Widget rootWidget = Directionality(
         textDirection: TextDirection.ltr,
         child: MediaQuery(
-          data: MediaQueryData(
-            size: size,
-            devicePixelRatio: supersample,
-          ),
+          data: MediaQueryData(size: size, devicePixelRatio: supersample),
           child: SizedBox(
             width: size.width,
             height: size.height,
             child: SubtitleOverlayGroup(
+              enableDebugPreview: false,
+              presetOverride: subtitlePreset,
               entries: entries,
               style: style,
               referenceHeight: size.height,

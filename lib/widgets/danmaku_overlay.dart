@@ -71,6 +71,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
   bool _prefetchScheduled = false;
   bool _prefetchRunning = false;
   double _viewportWidth = 1920;
+  int _prefetchRevision = 0;
 
   @override
   void initState() {
@@ -146,6 +147,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
   }
 
   void _invalidatePrefetchProgress() {
+    _prefetchRevision++;
     _requestedPrefetchBucket = null;
     _completedPrefetchBucket = null;
   }
@@ -185,6 +187,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
         }
 
         final generation = _atlasManager.generation;
+        final revision = _prefetchRevision;
         final positionUs = widget.position.value.inMicroseconds;
         // Even under pressure, keep a small bounded future runway. Disabling
         // look-ahead entirely guarantees that a sprite can only be created
@@ -223,7 +226,14 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
         // while the video and the danmaku animation are already running.
         const batchSize = 32;
         for (var offset = 0; offset < indices.length; offset += batchSize) {
-          if (!mounted || generation != _atlasManager.generation) break;
+          // Abandon stale work between uploads after a seek, resize or style
+          // change. An upload already in flight is allowed to finish safely.
+          if (!mounted ||
+              generation != _atlasManager.generation ||
+              revision != _prefetchRevision ||
+              requestedBucket != _requestedPrefetchBucket) {
+            break;
+          }
           final end = math.min(offset + batchSize, indices.length);
           final items = <DanmakuItem>[
             for (var i = offset; i < end; i++) document.items[indices[i]],
@@ -251,6 +261,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
         }
 
         if (requestedBucket == _requestedPrefetchBucket &&
+            revision == _prefetchRevision &&
             generation == _atlasManager.generation) {
           _completedPrefetchBucket = requestedBucket;
           _completedPrefetchGeneration = generation;
@@ -715,6 +726,7 @@ class DanmakuActiveSet {
   int? _lastPositionUs;
   double? _lastSpeed;
   double? _lastWidthScale;
+  int? _nextExpiryUs;
 
   List<int> update({
     required int positionUs,
@@ -731,7 +743,7 @@ class DanmakuActiveSet {
         positionUs - _lastPositionUs! > 2000000 ||
         _lastSpeed != safeSpeed ||
         _lastWidthScale == null ||
-        (_lastWidthScale! - widthScale).abs() >= 0.001;
+        _lastWidthScale != widthScale;
     if (mustReset) {
       _reset(
         positionUs,
@@ -770,6 +782,7 @@ class DanmakuActiveSet {
   ) {
     _active.clear();
     _activeTextCounts.clear();
+    _nextExpiryUs = null;
     final widthScale = _safeDanmakuWidthScale(viewportWidth, referenceWidth);
     final maximumDurationUs = math.max(
       _maximumFixedDurationUs,
@@ -799,6 +812,10 @@ class DanmakuActiveSet {
     double viewportWidth,
     double referenceWidth,
   ) {
+    // Most frames have no membership changes. Keep the earliest expiry as an
+    // event boundary instead of resolving every active duration on every VSync.
+    if (_nextExpiryUs != null && positionUs < _nextExpiryUs!) return;
+    _nextExpiryUs = null;
     var write = 0;
     for (final index in _active) {
       final item = items[index];
@@ -823,6 +840,10 @@ class DanmakuActiveSet {
     double viewportWidth,
     double referenceWidth,
   ) {
+    if (_nextStartIndex >= items.length ||
+        items[_nextStartIndex].startTime.inMicroseconds > positionUs) {
+      return;
+    }
     final candidates = <int>[];
     while (_nextStartIndex < items.length &&
         items[_nextStartIndex].startTime.inMicroseconds <= positionUs) {
@@ -844,13 +865,14 @@ class DanmakuActiveSet {
     if (candidates.isEmpty) return;
     final isAdaptiveOverload = admissionCap < _normalDanmakuAdmissionCap;
     if (isAdaptiveOverload) {
+      final priorities = <int, int>{
+        for (final index in candidates) index: _stablePriority(items[index]),
+      };
       candidates.sort((left, right) {
         final leftDuplicate = _activeTextCounts.containsKey(items[left].text);
         final rightDuplicate = _activeTextCounts.containsKey(items[right].text);
         if (leftDuplicate != rightDuplicate) return leftDuplicate ? 1 : -1;
-        return _stablePriority(
-          items[right],
-        ).compareTo(_stablePriority(items[left]));
+        return priorities[right]!.compareTo(priorities[left]!);
       });
     }
     for (final index in candidates) {
@@ -884,12 +906,11 @@ class DanmakuActiveSet {
     // Keep the reduction deterministic so a policy transition never causes
     // random-looking flicker. Prefer one copy of each text before duplicates,
     // then use the same stable priority as admission for both groups.
+    final priorities = <int, int>{
+      for (final index in _active) index: _stablePriority(items[index]),
+    };
     final ranked = List<int>.of(_active)
-      ..sort(
-        (left, right) => _stablePriority(
-          items[right],
-        ).compareTo(_stablePriority(items[left])),
-      );
+      ..sort((left, right) => priorities[right]!.compareTo(priorities[left]!));
     final selected = <int>[];
     final selectedIndices = <int>{};
     final selectedTexts = <String>{};
@@ -939,7 +960,14 @@ class DanmakuActiveSet {
       viewportWidth: viewportWidth,
       referenceWidth: referenceWidth,
     );
-    return elapsedUs >= 0 && elapsedUs < durationUs;
+    final active = elapsedUs >= 0 && elapsedUs < durationUs;
+    if (active) {
+      final expiry = item.startTime.inMicroseconds + durationUs;
+      if (_nextExpiryUs == null || expiry < _nextExpiryUs!) {
+        _nextExpiryUs = expiry;
+      }
+    }
+    return active;
   }
 
   int _stablePriority(DanmakuItem item) {
@@ -1231,11 +1259,21 @@ class _DanmakuAtlasCache {
     final pending = <_DanmakuSpriteKey, _PendingDanmakuSprite>{};
     var changed = false;
     for (final item in items) {
+      // The same prefetch window is revisited repeatedly. Resolve known item
+      // IDs before normalizing and hashing potentially long comment strings.
+      final existing = _itemSprites[item.index];
+      if (existing != null) {
+        existing.page.pinned = existing.page.pinned || pinPages;
+        existing.page.lastTouch = ++_touchSequence;
+        continue;
+      }
       final normalizedText = item.text.replaceAll(RegExp(r'[\r\n]+'), ' ');
       final key = _DanmakuSpriteKey(normalizedText, item.colorValue);
       final cached = _sprites[key];
       if (cached != null) {
         _itemSprites[item.index] = cached;
+        cached.page.itemIndices.add(item.index);
+        changed = true;
         cached.page.pinned = cached.page.pinned || pinPages;
         cached.page.lastTouch = ++_touchSequence;
         continue;
@@ -1320,8 +1358,10 @@ class _DanmakuAtlasCache {
             imagePadding: prepared.imagePadding,
           );
           _sprites[pendingSprite.key] = sprite;
+          page.keys.add(pendingSprite.key);
           for (final itemIndex in pendingSprite.itemIndices) {
             _itemSprites[itemIndex] = sprite;
+            page.itemIndices.add(itemIndex);
           }
         }
         changed = true;
@@ -1345,8 +1385,14 @@ class _DanmakuAtlasCache {
       if (oldest == null) return;
       _pages.remove(oldest);
       _byteSize -= oldest.byteSize;
-      _sprites.removeWhere((_, sprite) => identical(sprite.page, oldest));
-      _itemSprites.removeWhere((_, sprite) => identical(sprite.page, oldest));
+      // Eviction cost depends on the evicted page, not the entire cache (which
+      // may contain many aliases for repeated text in a long video).
+      for (final key in oldest.keys) {
+        _sprites.remove(key);
+      }
+      for (final index in oldest.itemIndices) {
+        _itemSprites.remove(index);
+      }
       oldest.dispose();
     }
   }
@@ -1590,6 +1636,8 @@ class _DanmakuAtlasPage {
   final ui.Image image;
   final double devicePixelRatio;
   final int byteSize;
+  final Set<_DanmakuSpriteKey> keys = <_DanmakuSpriteKey>{};
+  final Set<int> itemIndices = <int>{};
   bool pinned;
   int lastTouch;
   bool inFrame = false;

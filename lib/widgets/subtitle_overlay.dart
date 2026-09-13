@@ -1,3 +1,5 @@
+import '../models/subtitle_debug_preset.dart';
+import '../services/subtitle_debug_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../models/subtitle_style.dart';
@@ -41,6 +43,7 @@ Offset resolveSubtitleOverlayOffset({
   required Size viewportSize,
   required Size subtitleSize,
   required Alignment alignment,
+  double bottomInset = 0,
   double? playbackControlsTop,
   List<Rect> playbackControlRects = const <Rect>[],
 }) {
@@ -51,7 +54,9 @@ Offset resolveSubtitleOverlayOffset({
       .clamp(0.0, double.infinity)
       .toDouble();
   final double dx = availableX * (alignment.x + 1) / 2;
-  double dy = availableY * (alignment.y + 1) / 2;
+  double dy = (availableY * (alignment.y + 1) / 2 - bottomInset)
+      .clamp(0.0, availableY)
+      .toDouble();
 
   final List<Rect> effectiveControlRects = <Rect>[
     ...playbackControlRects.where(
@@ -102,10 +107,13 @@ Offset resolveSubtitleOverlayOffset({
 
 class SubtitleOverlayGroup extends StatelessWidget {
   final List<SubtitleOverlayEntry> entries;
+  final bool enableDebugPreview;
+  final SubtitleDebugPreset? presetOverride;
   final SubtitleStyle style;
   final double? referenceHeight;
   final Alignment alignment;
   final VoidCallback? onLongPress;
+  final bool isGhostMode;
   final bool isDragging;
   final bool isGestureOnly;
   final bool isVisualOnly;
@@ -121,10 +129,13 @@ class SubtitleOverlayGroup extends StatelessWidget {
   const SubtitleOverlayGroup({
     super.key,
     required this.entries,
+    this.enableDebugPreview = true,
+    this.presetOverride,
     required this.style,
     this.referenceHeight,
     required this.alignment,
     this.onLongPress,
+    this.isGhostMode = false,
     this.isDragging = false,
     this.isGestureOnly = false,
     this.isVisualOnly = false,
@@ -139,13 +150,31 @@ class SubtitleOverlayGroup extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => !enableDebugPreview
+      ? _build(context)
+      : ListenableBuilder(
+          listenable: SubtitleDebugSession.instance,
+          builder: (context, _) => _build(context),
+        );
+
+  Widget _build(BuildContext context) {
+    final preset = entries.any((e) => e.image != null)
+        ? null
+        : presetOverride ??
+              (enableDebugPreview
+                  ? SubtitleDebugSession.instance.preset
+                  : null);
     final visibleEntries = entries.where((e) => e.hasContent).toList();
     if (visibleEntries.isEmpty && !isDragging) return const SizedBox.shrink();
 
     return LayoutBuilder(
       builder: (context, constraints) {
+        final viewport = Size(constraints.maxWidth, constraints.maxHeight);
+        final debugInset = isGhostMode
+            ? 0.0
+            : preset?.bottomInset(viewport) ?? 0.0;
         final double resolvedReferenceHeight =
+            preset?.referenceHeight(viewport) ??
             referenceHeight ??
             ((constraints.maxHeight != double.infinity &&
                     constraints.maxHeight > 0)
@@ -156,8 +185,11 @@ class SubtitleOverlayGroup extends StatelessWidget {
           referenceHeight: resolvedReferenceHeight,
         ).scale;
         final childConstraints = BoxConstraints(
-          maxWidth: constraints.maxWidth,
-          maxHeight: constraints.maxHeight,
+          maxWidth: constraints.maxWidth * (preset?.width ?? 1),
+          maxHeight: (constraints.maxHeight - debugInset).clamp(
+            0.0,
+            double.infinity,
+          ),
         );
         final Widget content = SingleChildScrollView(
           reverse: alignment.y >= 0,
@@ -168,17 +200,32 @@ class SubtitleOverlayGroup extends StatelessWidget {
               for (int i = 0; i < visibleEntries.length; i++) ...[
                 ConstrainedBox(
                   constraints: childConstraints,
-                  child: SubtitleOverlay(
-                    text: visibleEntries[i].text,
-                    secondaryText: visibleEntries[i].secondaryText,
-                    image: visibleEntries[i].image,
-                    style: style,
-                    referenceHeight: resolvedReferenceHeight,
-                    onLongPress: onLongPress,
-                    isDragging: isDragging,
-                    isGestureOnly: isGestureOnly,
-                    isVisualOnly: isVisualOnly,
-                  ),
+                  child: preset != null
+                      ? FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(
+                              maxWidth: childConstraints.maxWidth,
+                            ),
+                            child: SubtitlePresetContent(
+                              entry: visibleEntries[i],
+                              preset: preset,
+                              referenceHeight: resolvedReferenceHeight,
+                              isGestureOnly: isGestureOnly,
+                            ),
+                          ),
+                        )
+                      : SubtitleOverlay(
+                          text: visibleEntries[i].text,
+                          secondaryText: visibleEntries[i].secondaryText,
+                          image: visibleEntries[i].image,
+                          style: style,
+                          referenceHeight: resolvedReferenceHeight,
+                          onLongPress: onLongPress,
+                          isDragging: isDragging,
+                          isGestureOnly: isGestureOnly,
+                          isVisualOnly: isVisualOnly,
+                        ),
                 ),
                 if (i != visibleEntries.length - 1)
                   SizedBox(height: itemGap * scale),
@@ -196,7 +243,7 @@ class SubtitleOverlayGroup extends StatelessWidget {
               avoidPlaybackControls && controlsVisible
               ? playbackControlRects?.call() ?? const <Rect>[]
               : const <Rect>[];
-          if (animateAlignment) {
+          if (animateAlignment && (preset == null || isGhostMode)) {
             return _AnimatedSubtitlePosition(
               alignment: alignment,
               duration: alignmentDuration,
@@ -208,7 +255,10 @@ class SubtitleOverlayGroup extends StatelessWidget {
           }
           return CustomSingleChildLayout(
             delegate: _SubtitlePositionDelegate(
-              alignment: alignment,
+              alignment: preset == null || isGhostMode
+                  ? alignment
+                  : Alignment.bottomCenter,
+              bottomInset: debugInset,
               playbackControlsTop: effectiveControlsTop,
               playbackControlRects: effectiveControlRects,
             ),
@@ -236,11 +286,13 @@ class SubtitleOverlayGroup extends StatelessWidget {
 
 class _SubtitlePositionDelegate extends SingleChildLayoutDelegate {
   final Alignment alignment;
+  final double bottomInset;
   final double? playbackControlsTop;
   final List<Rect> playbackControlRects;
 
   const _SubtitlePositionDelegate({
     required this.alignment,
+    this.bottomInset = 0,
     required this.playbackControlsTop,
     this.playbackControlRects = const <Rect>[],
   });
@@ -258,6 +310,7 @@ class _SubtitlePositionDelegate extends SingleChildLayoutDelegate {
         viewportSize: size,
         subtitleSize: childSize,
         alignment: alignment,
+        bottomInset: bottomInset,
         playbackControlsTop: playbackControlsTop,
         playbackControlRects: playbackControlRects,
       );
@@ -265,6 +318,7 @@ class _SubtitlePositionDelegate extends SingleChildLayoutDelegate {
   @override
   bool shouldRelayout(_SubtitlePositionDelegate oldDelegate) =>
       alignment != oldDelegate.alignment ||
+      bottomInset != oldDelegate.bottomInset ||
       playbackControlsTop != oldDelegate.playbackControlsTop ||
       playbackControlRects != oldDelegate.playbackControlRects;
 }
@@ -319,11 +373,74 @@ class _AnimatedSubtitlePositionState
   }
 }
 
+/// Shared by playback, lyric rows, preset previews and precise export.
+class SubtitlePresetContent extends StatelessWidget {
+  final SubtitleOverlayEntry entry;
+  final SubtitleDebugPreset preset;
+  final double referenceHeight;
+  final bool isGestureOnly;
+  const SubtitlePresetContent({
+    super.key,
+    required this.entry,
+    required this.preset,
+    required this.referenceHeight,
+    this.isGestureOnly = false,
+  });
+  @override
+  Widget build(BuildContext context) {
+    final blocks = <Widget>[
+      if (entry.text.isNotEmpty)
+        SubtitleOverlay(
+          text: entry.text,
+          style: preset.styleFor(),
+          referenceHeight: referenceHeight,
+          fontFamilyFallback: const ['Noto Sans SC'],
+          contentPadding: EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: preset.backgroundPadding,
+          ),
+          isGestureOnly: isGestureOnly,
+          isVisualOnly: true,
+        ),
+      if (entry.secondaryText?.isNotEmpty ?? false)
+        SubtitleOverlay(
+          text: entry.secondaryText!,
+          style: preset.styleFor(secondary: true),
+          referenceHeight: referenceHeight,
+          fontFamilyFallback: const ['Noto Sans SC'],
+          contentPadding: EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: preset.backgroundPadding,
+          ),
+          isGestureOnly: isGestureOnly,
+          isVisualOnly: true,
+        ),
+    ];
+    final ordered = preset.secondaryFirst ? blocks.reversed.toList() : blocks;
+    return IgnorePointer(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (int i = 0; i < ordered.length; i++) ...[
+            if (i > 0)
+              SizedBox(
+                height: preset.gap * referenceHeight / kSubtitleReferenceHeight,
+              ),
+            ordered[i],
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class SubtitleOverlay extends StatelessWidget {
   final String text; // Primary text (or all text if single file + no split)
   final String? secondaryText; // Explicit secondary text
   final Uint8List? image; // New: Support for bitmap subtitles
   final SubtitleStyle style;
+  final List<String>? fontFamilyFallback;
+  final EdgeInsets contentPadding;
   final double? referenceHeight;
   final VoidCallback? onLongPress;
   final bool isDragging;
@@ -337,6 +454,11 @@ class SubtitleOverlay extends StatelessWidget {
     this.secondaryText,
     this.image,
     this.style = const SubtitleStyle(),
+    this.fontFamilyFallback,
+    this.contentPadding = const EdgeInsets.symmetric(
+      horizontal: 12,
+      vertical: 6,
+    ),
     this.referenceHeight,
     this.onLongPress,
     this.isDragging = false,
@@ -397,10 +519,7 @@ class SubtitleOverlay extends StatelessWidget {
                   ),
                 )
               : Container(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: 12 * scale,
-                    vertical: 6 * scale,
-                  ),
+                  padding: contentPadding * scale,
                   decoration: BoxDecoration(
                     color: effectiveStyle.backgroundColor.withValues(
                       alpha: effectiveStyle.backgroundOpacity,
@@ -603,6 +722,8 @@ class SubtitleOverlay extends StatelessWidget {
           ? style.fontFamilyChinese
           : style.fontFamilyEnglish,
     );
+
+    ts = ts.copyWith(fontFamilyFallback: fontFamilyFallback);
 
     if (isStroke) {
       final double effectiveBorderWidth = style.effectiveBorderWidth;

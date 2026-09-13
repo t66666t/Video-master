@@ -85,7 +85,7 @@ void main() {
   });
 
   testWidgets(
-    'desktop controls hide outside the whole player and show on re-entry',
+    'desktop subtitle avoidance follows the near-completed controls fade',
     (tester) async {
       await tester.binding.setSurfaceSize(const Size(1000, 700));
       addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -164,19 +164,33 @@ void main() {
       expect(region().cursor, MouseCursor.defer);
       expect(controlsVisibility.value, isTrue);
 
-      // Crossing into a sibling sidebar hides immediately, without a click.
+      // Crossing into a sibling sidebar starts fading without a click, but the
+      // controls still occupy subtitle space until they are almost faded out.
       await mouse.moveTo(const Offset(900, 350));
-      // The signal changes synchronously with the control state, before a
-      // frame is pumped for rendering.
-      expect(controlsVisibility.value, isFalse);
+      expect(controlsVisibility.value, isTrue);
       await tester.pump();
       expect(region().cursor, SystemMouseCursors.none);
+      await tester.pump(const Duration(milliseconds: 149));
+      expect(controlsVisibility.value, isTrue);
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(controlsVisibility.value, isFalse);
 
-      // Re-entering is sufficient to show the controls again.
+      // Re-entering reserves subtitle space before the fade-in starts.
       await mouse.moveTo(const Offset(500, 350));
       expect(controlsVisibility.value, isTrue);
       await tester.pump();
       expect(region().cursor, MouseCursor.defer);
+
+      // Re-entering during a fade-out must cancel the pending release and
+      // never let subtitles briefly return to the controls area.
+      await mouse.moveTo(const Offset(900, 350));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(controlsVisibility.value, isTrue);
+      await mouse.moveTo(const Offset(500, 350));
+      expect(controlsVisibility.value, isTrue);
+      await tester.pump(const Duration(milliseconds: 250));
+      expect(controlsVisibility.value, isTrue);
 
       // A rapid second round trip must not be affected by a stale hide timer.
       await mouse.moveTo(const Offset(900, 350));

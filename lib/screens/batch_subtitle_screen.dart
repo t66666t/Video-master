@@ -28,9 +28,32 @@ class BatchSubtitleScreen extends StatefulWidget {
 }
 
 class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
-  List<BatchSubtitleTaskView> _previousTasks = [];
-  final Map<String, bool> _autoDeletedKeys = {};
-  int _autoDeleteGeneration = 0;
+  AppToastHandle? _importToast;
+
+  @override
+  void dispose() {
+    unawaited(_importToast?.dismiss(immediate: true));
+    super.dispose();
+  }
+
+  void _showImportNotice(
+    String message, {
+    AppToastType type = AppToastType.success,
+  }) {
+    unawaited(_importToast?.dismiss(immediate: true));
+    final handle = AppToast.show(
+      message,
+      type: type,
+      duration: const Duration(milliseconds: 1800),
+    );
+    _importToast = handle;
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 2), () async {
+        await handle.dismiss(immediate: true);
+        if (identical(_importToast, handle)) _importToast = null;
+      }),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -56,7 +79,6 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
                 if (item == null || item.title.trim().isEmpty) return task;
                 return task.copyWith(videoName: item.title.trim());
               }).toList();
-              _checkForCompletedTasks(manager, tasks);
               final settings = context.watch<SettingsService>();
               return Column(
                 children: [
@@ -73,8 +95,13 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
                   Expanded(
                     child: TaskQueueTable(
                       tasks: tasks,
-                      autoDeletedKeys: _autoDeletedKeys,
+                      autoDeletedKeys: manager.pendingCompletedRemovals,
                       onStart: (mediaKey) => _startTask(manager, mediaKey),
+                      onPause: (mediaKey) {
+                        if (manager.pauseTask(mediaKey)) {
+                          AppToast.show('已暂停该任务');
+                        }
+                      },
                       onRetry: (mediaKey) => manager.retryTask(mediaKey),
                       onDelete: (mediaKey) => _deleteTask(manager, mediaKey),
                       onReorder: (mediaKey, newIndex) =>
@@ -128,6 +155,8 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         alignment: Alignment.topCenter,
         child: metrics.isCompact
             ? _buildCompactToolbar(context, settings, manager, metrics)
+            : metrics.isTablet
+            ? _buildTabletToolbar(context, settings, manager, metrics)
             : _buildExpandedToolbar(context, settings, manager, metrics),
       ),
     );
@@ -139,93 +168,198 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     TranscriptionManager manager,
     _BatchLayoutMetrics metrics,
   ) {
-    return Row(
+    return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        Expanded(
-          child: _buildCompactAction(
-            context: context,
-            label: '添加视频',
-            icon: Icons.video_library_outlined,
-            onPressed: () => _showInternalVideoPicker(context),
-          ),
-        ),
-        SizedBox(width: metrics.gap),
-        Expanded(
-          child: _buildCompactAction(
-            context: context,
-            label: '全部开始',
-            icon: Icons.play_arrow_rounded,
-            color: Colors.green.shade700,
-            onPressed: () => _startAll(manager),
-          ),
-        ),
-        SizedBox(width: metrics.gap),
-        Expanded(
-          child: _buildCompactAction(
-            context: context,
-            label: '自动移除',
-            icon: settings.batchSubtitleAutoDelete
-                ? Icons.auto_delete
-                : Icons.auto_delete_outlined,
-            selected: settings.batchSubtitleAutoDelete,
-            onPressed: () => settings.updateBatchSubtitleAutoDelete(
-              !settings.batchSubtitleAutoDelete,
-            ),
-          ),
-        ),
-        const SizedBox(width: 2),
-        PopupMenuButton<_BatchOverflowAction>(
-          tooltip: '更多操作',
-          icon: const Icon(Icons.more_vert_rounded),
-          onSelected: (action) {
-            switch (action) {
-              case _BatchOverflowAction.pickExternal:
-                _pickExternalFiles(context);
-                break;
-              case _BatchOverflowAction.settings:
-                _showBatchSettingsSheet(context);
-                break;
-              case _BatchOverflowAction.clearCompleted:
-                _clearCompleted(manager);
-                break;
-              case _BatchOverflowAction.clearAll:
-                _showClearAllConfirm(context, manager);
-                break;
-            }
-          },
-          itemBuilder: (context) => [
-            if (Platform.isWindows)
-              const PopupMenuItem(
-                value: _BatchOverflowAction.pickExternal,
-                child: _PopupMenuLabel(
-                  icon: Icons.folder_open_outlined,
-                  label: '选择外部文件',
-                ),
-              ),
-            if (metrics.isDesktopPlatform)
-              const PopupMenuItem(
-                value: _BatchOverflowAction.settings,
-                child: _PopupMenuLabel(
-                  icon: Icons.tune_rounded,
-                  label: '外部视频设置',
-                ),
-              ),
-            const PopupMenuItem(
-              value: _BatchOverflowAction.clearCompleted,
-              child: _PopupMenuLabel(
-                icon: Icons.cleaning_services_outlined,
-                label: '清除已完成',
+        Row(
+          children: [
+            Expanded(
+              child: _buildCompactAction(
+                context: context,
+                label: '添加视频',
+                icon: Icons.add_rounded,
+                color: Theme.of(context).colorScheme.primary,
+                onPressed: () => _showInternalVideoPicker(context),
               ),
             ),
-            PopupMenuItem(
-              value: _BatchOverflowAction.clearAll,
-              child: _PopupMenuLabel(
-                icon: Icons.delete_sweep_outlined,
-                label: '清除全部',
-                color: Theme.of(context).colorScheme.error,
+            SizedBox(width: metrics.gap),
+            Expanded(
+              child: _buildCompactAction(
+                context: context,
+                label: manager.canPauseAll ? '暂停全部' : '开始全部',
+                icon: manager.canPauseAll
+                    ? Icons.pause_rounded
+                    : Icons.play_arrow_rounded,
+                color: manager.canPauseAll
+                    ? Colors.orange.shade800
+                    : Theme.of(context).colorScheme.primary,
+                filled: true,
+                onPressed: () => _toggleBatch(manager),
               ),
             ),
           ],
+        ),
+        const SizedBox(height: 6),
+        Row(
+          children: [
+            Expanded(
+              child: _buildCompactAction(
+                context: context,
+                label: settings.batchSubtitleAutoDelete ? '完成后自动移除' : '保留已完成任务',
+                icon: settings.batchSubtitleAutoDelete
+                    ? Icons.auto_delete
+                    : Icons.inventory_2_outlined,
+                selected: settings.batchSubtitleAutoDelete,
+                onPressed: () => settings.updateBatchSubtitleAutoDelete(
+                  !settings.batchSubtitleAutoDelete,
+                ),
+              ),
+            ),
+            SizedBox(width: metrics.gap),
+            _buildCompactMoreMenu(context, manager, metrics),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompactMoreMenu(
+    BuildContext context,
+    TranscriptionManager manager,
+    _BatchLayoutMetrics metrics,
+  ) {
+    final theme = Theme.of(context);
+    return PopupMenuButton<_BatchOverflowAction>(
+      tooltip: '更多操作',
+      position: PopupMenuPosition.under,
+      onSelected: (action) {
+        switch (action) {
+          case _BatchOverflowAction.pickExternal:
+            _pickExternalFiles(context);
+            break;
+          case _BatchOverflowAction.settings:
+            _showBatchSettingsSheet(context);
+            break;
+          case _BatchOverflowAction.clearCompleted:
+            _clearCompleted(manager);
+            break;
+          case _BatchOverflowAction.clearAll:
+            _showClearAllConfirm(context, manager);
+            break;
+        }
+      },
+      itemBuilder: (context) => [
+        if (Platform.isWindows)
+          const PopupMenuItem(
+            value: _BatchOverflowAction.pickExternal,
+            child: _PopupMenuLabel(
+              icon: Icons.folder_open_outlined,
+              label: '选择外部文件',
+            ),
+          ),
+        if (metrics.isDesktopPlatform)
+          const PopupMenuItem(
+            value: _BatchOverflowAction.settings,
+            child: _PopupMenuLabel(icon: Icons.tune_rounded, label: '外部视频设置'),
+          ),
+        const PopupMenuItem(
+          value: _BatchOverflowAction.clearCompleted,
+          child: _PopupMenuLabel(
+            icon: Icons.cleaning_services_outlined,
+            label: '清除已完成',
+          ),
+        ),
+        PopupMenuItem(
+          value: _BatchOverflowAction.clearAll,
+          child: _PopupMenuLabel(
+            icon: Icons.delete_sweep_outlined,
+            label: '清除全部',
+            color: theme.colorScheme.error,
+          ),
+        ),
+      ],
+      child: Container(
+        height: 38,
+        padding: const EdgeInsets.symmetric(horizontal: 14),
+        decoration: BoxDecoration(
+          color: theme.colorScheme.surfaceContainerHighest.withValues(
+            alpha: 0.65,
+          ),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.tune_rounded,
+              size: 17,
+              color: theme.colorScheme.onSurface,
+            ),
+            const SizedBox(width: 5),
+            const Text(
+              '更多',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w500),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTabletToolbar(
+    BuildContext context,
+    SettingsService settings,
+    TranscriptionManager manager,
+    _BatchLayoutMetrics metrics,
+  ) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Wrap(
+          spacing: metrics.gap,
+          runSpacing: 7,
+          children: [
+            _buildActionButton(
+              context: context,
+              label: '选择内部视频',
+              icon: Icons.video_library_outlined,
+              height: metrics.buttonHeight,
+              fontSize: metrics.fontSize,
+              onPressed: () => _showInternalVideoPicker(context),
+            ),
+            if (Platform.isWindows)
+              _buildActionButton(
+                context: context,
+                label: '选择外部文件',
+                icon: Icons.folder_open_outlined,
+                height: metrics.buttonHeight,
+                fontSize: metrics.fontSize,
+                onPressed: () => _pickExternalFiles(context),
+              ),
+            _buildActionButton(
+              context: context,
+              label: manager.canPauseAll ? '暂停全部任务' : '开始全部任务',
+              icon: manager.canPauseAll
+                  ? Icons.pause_rounded
+                  : Icons.play_arrow_rounded,
+              height: metrics.buttonHeight,
+              fontSize: metrics.fontSize,
+              color: manager.canPauseAll
+                  ? Colors.orange.shade800
+                  : theme.colorScheme.primary,
+              onPressed: () => _toggleBatch(manager),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        _buildSettingsRow(
+          context,
+          settings,
+          metrics,
+          showExternalSettings: metrics.isDesktopPlatform,
+          onClearCompleted: () => _clearCompleted(manager),
+          onClearAll: () => _showClearAllConfirm(context, manager),
         ),
       ],
     );
@@ -237,10 +371,11 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     TranscriptionManager manager,
     _BatchLayoutMetrics metrics,
   ) {
+    final theme = Theme.of(context);
     return LayoutBuilder(
       builder: (context, constraints) {
         final useSingleRow =
-            constraints.maxWidth >= 1120 && metrics.isDesktopPlatform;
+            constraints.maxWidth >= 1440 && metrics.isDesktopPlatform;
         final actions = <Widget>[
           _buildActionButton(
             context: context,
@@ -261,12 +396,16 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             ),
           _buildActionButton(
             context: context,
-            label: '全部开始',
-            icon: Icons.play_arrow_rounded,
+            label: manager.canPauseAll ? '全部暂停' : '全部开始',
+            icon: manager.canPauseAll
+                ? Icons.pause_rounded
+                : Icons.play_arrow_rounded,
             height: metrics.buttonHeight,
             fontSize: metrics.fontSize,
-            color: Colors.green.shade700,
-            onPressed: () => _startAll(manager),
+            color: manager.canPauseAll
+                ? Colors.orange.shade800
+                : theme.colorScheme.primary,
+            onPressed: () => _toggleBatch(manager),
           ),
         ];
 
@@ -434,6 +573,43 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     final theme = Theme.of(context);
     final fontSize = metrics.isCompact ? 10.5 : metrics.fontSize;
 
+    if (metrics.isCompact) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        color: theme.colorScheme.surfaceContainerHighest.withValues(
+          alpha: 0.35,
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: _CompactQueueMetric(
+                label: '处理中',
+                count: processingCount,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+            _CompactMetricDivider(color: theme.dividerColor),
+            Expanded(
+              child: _CompactQueueMetric(
+                label: '排队中',
+                count: queuedCount,
+                color: Colors.orange.shade700,
+              ),
+            ),
+            _CompactMetricDivider(color: theme.dividerColor),
+            Expanded(
+              child: _CompactQueueMetric(
+                label: '总任务',
+                count: pendingCount,
+                color: theme.colorScheme.onSurface,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       width: double.infinity,
       padding: EdgeInsets.symmetric(
@@ -494,7 +670,9 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     required VoidCallback onPressed,
   }) {
     final theme = Theme.of(context);
-    final foreground = color ?? theme.colorScheme.onSurface;
+    final foreground = color == null
+        ? theme.colorScheme.onSurface
+        : theme.colorScheme.onPrimary;
     return SizedBox(
       height: height,
       child: ElevatedButton.icon(
@@ -510,8 +688,8 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
           elevation: 0,
           foregroundColor: foreground,
           backgroundColor:
-              color?.withValues(alpha: 0.09) ??
-              theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.7),
+              color ??
+              theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55),
           padding: EdgeInsets.symmetric(horizontal: fontSize * 0.85),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(10),
@@ -528,13 +706,19 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     required VoidCallback onPressed,
     Color? color,
     bool selected = false,
+    bool filled = false,
   }) {
     final theme = Theme.of(context);
-    final foreground =
-        color ??
-        (selected ? theme.colorScheme.onPrimary : theme.colorScheme.onSurface);
+    final foreground = filled
+        ? theme.colorScheme.onPrimary
+        : color ??
+              (selected
+                  ? theme.colorScheme.onPrimary
+                  : theme.colorScheme.onSurface);
     return Material(
-      color: selected
+      color: filled
+          ? color ?? theme.colorScheme.primary
+          : selected
           ? theme.colorScheme.primary
           : theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.65),
       borderRadius: BorderRadius.circular(10),
@@ -1248,7 +1432,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             }
           }
           if (selectedNodes.isNotEmpty) {
-            AppToast.show('已添加 ${selectedNodes.length} 个任务到队列');
+            _showImportNotice('已添加 ${selectedNodes.length} 个任务到队列');
           }
         },
       ),
@@ -1316,7 +1500,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     }
 
     if (added > 0) {
-      AppToast.show('已添加 $added 个外部文件到队列');
+      _showImportNotice('已添加 $added 个外部文件到队列');
     }
   }
 
@@ -1336,7 +1520,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
       if (!context.mounted) return;
 
       if (mediaPaths.isEmpty) {
-        AppToast.show('所选文件夹中没有可识别的媒体文件');
+        _showImportNotice('所选文件夹中没有可识别的媒体文件', type: AppToastType.info);
         return;
       }
 
@@ -1376,74 +1560,18 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         }
       }
       if (added > 0) {
-        AppToast.show('已添加 $added 个媒体文件到队列');
+        _showImportNotice('已添加 $added 个媒体文件到队列');
       }
     } catch (e) {
       if (e is FileSystemException) {
-        AppToast.show('所选文件夹不存在或无法访问');
+        _showImportNotice('所选文件夹不存在或无法访问', type: AppToastType.error);
       } else if (e is TimeoutException) {
-        AppToast.show(e.message ?? '文件夹扫描超时');
+        _showImportNotice(e.message ?? '文件夹扫描超时', type: AppToastType.error);
       } else {
         debugPrint('扫描文件夹失败: $e');
-        AppToast.show('扫描文件夹失败: $e');
+        _showImportNotice('扫描文件夹失败: $e', type: AppToastType.error);
       }
     }
-  }
-
-  void _checkForCompletedTasks(
-    TranscriptionManager manager,
-    List<BatchSubtitleTaskView> currentTasks,
-  ) {
-    final settings = context.read<SettingsService>();
-    if (!settings.batchSubtitleAutoDelete) {
-      // Turning the switch off also cancels removals already waiting in the
-      // two-second animation window.
-      if (_autoDeletedKeys.isNotEmpty) {
-        _autoDeletedKeys.clear();
-        _autoDeleteGeneration++;
-      }
-      _previousTasks = currentTasks;
-      return;
-    }
-
-    for (final prev in _previousTasks) {
-      if (prev.status == TranscriptionStatus.idle ||
-          prev.status == TranscriptionStatus.downloading ||
-          prev.status == TranscriptionStatus.extracting ||
-          prev.status == TranscriptionStatus.uploading ||
-          prev.status == TranscriptionStatus.transcribing ||
-          prev.status == TranscriptionStatus.embedding) {
-        final current = currentTasks.where((t) => t.mediaKey == prev.mediaKey);
-        if (current.isNotEmpty &&
-            current.first.status == TranscriptionStatus.completed) {
-          if (!_autoDeletedKeys.containsKey(prev.mediaKey)) {
-            _autoDeletedKeys[prev.mediaKey] = true;
-            final generation = _autoDeleteGeneration;
-            Future.delayed(const Duration(seconds: 2), () {
-              if (!mounted || generation != _autoDeleteGeneration) return;
-
-              final latestSettings = context.read<SettingsService>();
-              BatchSubtitleTaskView? latestTask;
-              for (final task in manager.getQueueSnapshot()) {
-                if (task.mediaKey == prev.mediaKey) {
-                  latestTask = task;
-                  break;
-                }
-              }
-              if (latestSettings.batchSubtitleAutoDelete &&
-                  latestTask?.status == TranscriptionStatus.completed) {
-                final removed = manager.removeFromQueue(prev.mediaKey);
-                _autoDeletedKeys.remove(prev.mediaKey);
-                if (!removed) setState(() {});
-              } else {
-                setState(() => _autoDeletedKeys.remove(prev.mediaKey));
-              }
-            });
-          }
-        }
-      }
-    }
-    _previousTasks = currentTasks;
   }
 
   void _startTask(TranscriptionManager manager, String mediaKey) {
@@ -1454,7 +1582,11 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
   void _startAll(TranscriptionManager manager) {
     final tasks = manager.getQueueSnapshot();
     final idleCount = tasks
-        .where((t) => t.status == TranscriptionStatus.idle && !t.isStarted)
+        .where(
+          (t) =>
+              (t.status == TranscriptionStatus.idle && !t.isStarted) ||
+              t.status == TranscriptionStatus.error,
+        )
         .length;
     if (idleCount == 0) {
       AppToast.show('没有待开始的任务');
@@ -1462,6 +1594,15 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     }
     manager.startAllTasks();
     AppToast.show('已开始处理 $idleCount 个任务');
+  }
+
+  void _toggleBatch(TranscriptionManager manager) {
+    if (manager.canPauseAll) {
+      manager.pauseAllTasks();
+      AppToast.show('正在暂停批量任务，当前任务会回到原位置');
+      return;
+    }
+    _startAll(manager);
   }
 
   void _clearCompleted(TranscriptionManager manager) {
@@ -1587,6 +1728,7 @@ class _BatchLayoutMetrics {
   final double height;
   final double shortestSide;
   final bool isCompact;
+  final bool isTablet;
   final bool isDesktopPlatform;
   final double horizontalPadding;
   final double gap;
@@ -1598,6 +1740,7 @@ class _BatchLayoutMetrics {
     required this.height,
     required this.shortestSide,
     required this.isCompact,
+    required this.isTablet,
     required this.isDesktopPlatform,
     required this.horizontalPadding,
     required this.gap,
@@ -1609,11 +1752,13 @@ class _BatchLayoutMetrics {
     final size = mediaQuery.size;
     final shortestSide = size.shortestSide;
     final isCompact = shortestSide < 600;
+    final isTablet = !isCompact && size.width < 1100;
     return _BatchLayoutMetrics(
       width: size.width,
       height: size.height,
       shortestSide: shortestSide,
       isCompact: isCompact,
+      isTablet: isTablet,
       isDesktopPlatform:
           Platform.isWindows || Platform.isLinux || Platform.isMacOS,
       horizontalPadding: (shortestSide * 0.026).clamp(8.0, 18.0),
@@ -1640,6 +1785,58 @@ class _PopupMenuLabel extends StatelessWidget {
         const SizedBox(width: 10),
         Text(label, style: TextStyle(color: foreground, fontSize: 13)),
       ],
+    );
+  }
+}
+
+class _CompactQueueMetric extends StatelessWidget {
+  final String label;
+  final int count;
+  final Color color;
+
+  const _CompactQueueMetric({
+    required this.label,
+    required this.count,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 10,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(width: 5),
+        Text(
+          '$count',
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w800,
+            color: color,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CompactMetricDivider extends StatelessWidget {
+  final Color color;
+
+  const _CompactMetricDivider({required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 1,
+      height: 18,
+      color: color.withValues(alpha: 0.55),
     );
   }
 }

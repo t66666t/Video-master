@@ -1,3 +1,4 @@
+import 'subtitle_debug_session.dart';
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
@@ -420,6 +421,10 @@ class SettingsService extends ChangeNotifier {
   // New: Enable wired/Bluetooth headset and system media controls.
   bool enableHeadsetMediaControls = true;
 
+  // Automatically start playback when a media card opens a playback page.
+  // This is deliberately separate from episode switching and completion.
+  bool autoPlayOnPageEntry = true;
+
   // New: Auto Play Next Video
   bool autoPlayNextVideo = true;
 
@@ -766,6 +771,11 @@ class SettingsService extends ChangeNotifier {
         key: 'enableHeadsetMediaControls',
         defaultValue: true,
         apply: (service, value) => service.enableHeadsetMediaControls = value,
+      ),
+      _boolSetting(
+        key: 'autoPlayOnPageEntry',
+        defaultValue: true,
+        apply: (service, value) => service.autoPlayOnPageEntry = value,
       ),
       _boolSetting(
         key: 'autoPlayNextVideo',
@@ -1296,6 +1306,7 @@ class SettingsService extends ChangeNotifier {
   Future<void> init() async {
     if (_initialized) return;
     _prefs = await SharedPreferences.getInstance();
+    await SubtitleDebugSession.instance.initialize(_prefs);
     await _loadRegisteredSettings();
     await _loadPlaybackSpeedLockState();
 
@@ -2138,6 +2149,10 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<bool>('enableHeadsetMediaControls', value);
   }
 
+  Future<void> saveAutoPlayOnPageEntry(bool value) async {
+    await _updateRegisteredSetting<bool>('autoPlayOnPageEntry', value);
+  }
+
   Future<void> saveAutoPlayNextVideo(bool value) async {
     await _updateRegisteredSetting<bool>('autoPlayNextVideo', value);
   }
@@ -2630,6 +2645,7 @@ class SettingsService extends ChangeNotifier {
         'pausePlaybackWhenAppBackgrounded': pausePlaybackWhenAppBackgrounded,
         'allowConcurrentPlayback': allowConcurrentPlayback,
         'enableHeadsetMediaControls': enableHeadsetMediaControls,
+        'autoPlayOnPageEntry': autoPlayOnPageEntry,
         'autoPlayNextVideo': autoPlayNextVideo,
         'enableVideoPreload': enableVideoPreload,
         'autoPlayOnCompletion': autoPlayOnCompletion,

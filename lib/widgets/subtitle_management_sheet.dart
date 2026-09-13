@@ -18,6 +18,7 @@ import '../services/subtitle_discovery_service.dart';
 import '../utils/app_toast.dart';
 import '../utils/subtitle_parser.dart';
 import '../utils/subtitle_file_matcher.dart';
+import 'landscape_sidebar_layout.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -843,8 +844,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       final sidecarEntries = discovered
           .where(
             (entry) =>
-                entry.sourceType == SubtitleSourceType.sidecar &&
-                entry.isAuto,
+                entry.sourceType == SubtitleSourceType.sidecar && entry.isAuto,
           )
           .toList();
       final filesByPath = <String, File>{};
@@ -864,7 +864,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           ..addAll({
             for (final e in sidecarEntries) _normalizePath(e.path): e.grade,
           });
-        _subtitleFiles = sidecarEntries.map((entry) => File(entry.path)).toList();
+        _subtitleFiles = sidecarEntries
+            .map((entry) => File(entry.path))
+            .toList();
       });
 
       final videoId = widget.videoId?.trim() ?? '';
@@ -1890,17 +1892,17 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     }
     final (label, color, bg, borderColor) = switch (grade) {
       SubtitleMatchGrade.manualOnly => (
-          '名称相似',
-          Colors.orangeAccent,
-          Colors.orangeAccent.withValues(alpha: 0.12),
-          Colors.orangeAccent.withValues(alpha: 0.42),
-        ),
+        '名称相似',
+        Colors.orangeAccent,
+        Colors.orangeAccent.withValues(alpha: 0.12),
+        Colors.orangeAccent.withValues(alpha: 0.42),
+      ),
       _ => (
-          '名称不匹配',
-          Colors.grey,
-          Colors.grey.withValues(alpha: 0.12),
-          Colors.grey.withValues(alpha: 0.4),
-        ),
+        '名称不匹配',
+        Colors.grey,
+        Colors.grey.withValues(alpha: 0.12),
+        Colors.grey.withValues(alpha: 0.4),
+      ),
     };
     return Container(
       margin: const EdgeInsets.only(left: 6),
@@ -3150,6 +3152,14 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
     final shownPaths = <String>{};
     final associatedSubtitles = <String, String>{
       ...?widget.associatedSubtitles,
@@ -3170,7 +3180,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         widget.showEmbeddedSubtitles &&
         (_embeddedTracks.isNotEmpty || _extractedTrackPaths.isNotEmpty);
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+      padding: EdgeInsets.fromLTRB(
+        layout.horizontalPadding,
+        layout.verticalPadding,
+        layout.horizontalPadding,
+        layout.verticalPadding,
+      ),
       decoration: const BoxDecoration(
         color: Color(0xFF1E1E1E),
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
@@ -3182,10 +3197,10 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
+              Text(
                 "字幕管理",
                 style: TextStyle(
-                  fontSize: 18,
+                  fontSize: layout.titleSize,
                   fontWeight: FontWeight.bold,
                   color: Colors.white,
                 ),
@@ -3207,9 +3222,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
           ),
 
           if (Platform.isWindows) ...[
-            const SizedBox(height: 12),
+            SizedBox(height: layout.sectionGap),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: EdgeInsets.symmetric(
+                horizontal: layout.horizontalPadding,
+                vertical: layout.verticalPadding,
+              ),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.05),
                 borderRadius: BorderRadius.circular(8),
@@ -3282,7 +3300,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
             ),
           ],
 
-          const SizedBox(height: 8),
+          SizedBox(height: layout.sectionGap / 2),
 
           Expanded(
             child:
@@ -3816,7 +3834,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                           const SizedBox(width: 8),
                                           _buildSelectionBadge(file.path),
                                           _buildSubtitleSourceBadge(file.path),
-                                          _buildSidecarMatchIndicator(file.path),
+                                          _buildSidecarMatchIndicator(
+                                            file.path,
+                                          ),
                                           _buildOcrBadge(managedAsset),
                                           _buildTranslatedLanguageBadge(
                                             file.path,
@@ -3887,7 +3907,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                   ),
           ),
 
-          const SizedBox(height: 12),
+          SizedBox(height: layout.sectionGap),
 
           Row(
             children: [
@@ -3895,15 +3915,21 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                 child: ElevatedButton.icon(
                   onPressed: _importSubtitle,
                   icon: const Icon(Icons.folder_open, size: 18),
-                  label: const Text("导入字幕", style: TextStyle(fontSize: 13)),
+                  label: Text(
+                    "导入字幕",
+                    style: TextStyle(fontSize: layout.bodySize),
+                  ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.white10,
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    minimumSize: Size.fromHeight(layout.controlHeight),
+                    padding: EdgeInsets.symmetric(
+                      vertical: layout.verticalPadding / 2,
+                    ),
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
+              SizedBox(width: layout.sectionGap),
               Expanded(
                 child: ElevatedButton.icon(
                   onPressed: () {
@@ -3913,11 +3939,17 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                     widget.onOpenAi(); // Open AI panel
                   },
                   icon: const Icon(Icons.auto_awesome, size: 18),
-                  label: const Text("AI 智能字幕", style: TextStyle(fontSize: 13)),
+                  label: Text(
+                    "AI 智能字幕",
+                    style: TextStyle(fontSize: layout.bodySize),
+                  ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.blueAccent,
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    minimumSize: Size.fromHeight(layout.controlHeight),
+                    padding: EdgeInsets.symmetric(
+                      vertical: layout.verticalPadding / 2,
+                    ),
                   ),
                 ),
               ),

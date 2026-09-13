@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'landscape_sidebar_layout.dart';
 import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../models/subtitle_model.dart';
@@ -544,6 +545,14 @@ class _LandscapeSubtitleEditorSidebarState
 
   @override
   Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
     final List<MapEntry<String, String>> groupEntries = widget.groups.entries
         .toList();
 
@@ -553,18 +562,18 @@ class _LandscapeSubtitleEditorSidebarState
         children: [
           // Header
           Container(
-            height: 56,
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            height: layout.headerHeight,
+            padding: EdgeInsets.symmetric(horizontal: layout.horizontalPadding),
             decoration: const BoxDecoration(
               border: Border(bottom: BorderSide(color: Colors.white10)),
             ),
             child: Row(
               children: [
-                const Text(
+                Text(
                   '字幕编辑',
                   style: TextStyle(
                     color: Colors.white,
-                    fontSize: 18,
+                    fontSize: layout.titleSize,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -579,7 +588,12 @@ class _LandscapeSubtitleEditorSidebarState
 
           // Tools Row
           Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+            padding: EdgeInsets.fromLTRB(
+              layout.horizontalPadding,
+              layout.verticalPadding,
+              layout.horizontalPadding,
+              layout.verticalPadding / 2,
+            ),
             child: Row(
               children: [
                 Expanded(
@@ -602,7 +616,7 @@ class _LandscapeSubtitleEditorSidebarState
                               entry.key,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(fontSize: 14),
+                              style: TextStyle(fontSize: layout.bodySize),
                             ),
                           ),
                         )
@@ -641,7 +655,7 @@ class _LandscapeSubtitleEditorSidebarState
             ),
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
+            padding: EdgeInsets.symmetric(horizontal: layout.horizontalPadding),
             child: Align(
               alignment: Alignment.centerLeft,
               child: Wrap(
@@ -957,6 +971,14 @@ class _SubtitleEditRowState extends State<_SubtitleEditRow> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
     final Color bgColor = widget.isCurrent
         ? Colors.white.withValues(alpha: 0.1)
         : (widget.isEven
@@ -985,14 +1007,19 @@ class _SubtitleEditRowState extends State<_SubtitleEditRow> {
                     focusNode: _textFocusNode,
                     maxLines: null,
                     keyboardType: TextInputType.multiline,
-                    style: const TextStyle(
+                    style: TextStyle(
                       color: Colors.white,
-                      fontSize: 14,
-                      height: 1.5,
+                      fontSize: layout.bodySize,
+                      height: layout.isCompactHeight ? 1.3 : 1.4,
                     ),
-                    decoration: const InputDecoration(
+                    decoration: InputDecoration(
                       isDense: true,
-                      contentPadding: EdgeInsets.fromLTRB(12, 6, 8, 6),
+                      contentPadding: EdgeInsets.fromLTRB(
+                        layout.horizontalPadding,
+                        layout.verticalPadding / 2,
+                        layout.horizontalPadding / 2,
+                        layout.verticalPadding / 2,
+                      ),
                       border: InputBorder.none,
                       focusedBorder: InputBorder.none,
                       enabledBorder: InputBorder.none,
@@ -1014,14 +1041,17 @@ class _SubtitleEditRowState extends State<_SubtitleEditRow> {
           InkWell(
             onTap: widget.onSeek,
             child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              padding: EdgeInsets.symmetric(
+                horizontal: layout.horizontalPadding / 2,
+                vertical: layout.verticalPadding,
+              ),
               child: Text(
                 _formatDuration(widget.item.startTime),
                 style: TextStyle(
                   color: widget.isCurrent
                       ? theme.colorScheme.primary
                       : Colors.white38,
-                  fontSize: 11,
+                  fontSize: layout.captionSize,
                 ),
               ),
             ),

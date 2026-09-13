@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
@@ -44,6 +46,8 @@ BilibiliDownloadTask _standaloneTask(int index) {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   test('500 个独立任务生成稳定的扁平行投影', () {
     final tasks = List.generate(500, _standaloneTask);
 
@@ -260,4 +264,159 @@ void main() {
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getInt('bilibili_connections_per_video'), 4);
   });
+
+  test(
+    'auto-delete after import does not wait for its own download operation',
+    () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final service = BilibiliDownloadService();
+      addTearDown(service.dispose);
+      final task = _standaloneTask(1);
+      final episode = task.videos.single.episodes.single
+        ..status = DownloadStatus.completed
+        ..isExported = true;
+      service.replaceTasksForTesting([task]);
+
+      final runningOperation = Completer<void>();
+      service.setRunningEpisodeOperationForTesting(
+        episode,
+        runningOperation.future,
+      );
+      service.setEpisodeImportingForTesting(episode, true);
+
+      await service
+          .removeEpisode(episode, task)
+          .timeout(const Duration(seconds: 1));
+
+      expect(service.tasks, isEmpty);
+      runningOperation.complete();
+    },
+  );
+
+  test('manual removal still waits for a running download operation', () async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    final service = BilibiliDownloadService();
+    addTearDown(service.dispose);
+    final task = _standaloneTask(1);
+    final episode = task.videos.single.episodes.single
+      ..status = DownloadStatus.completed;
+    service.replaceTasksForTesting([task]);
+
+    final runningOperation = Completer<void>();
+    service.setRunningEpisodeOperationForTesting(
+      episode,
+      runningOperation.future,
+    );
+    var removalCompleted = false;
+    final removal = service.removeEpisode(episode, task).then((_) {
+      removalCompleted = true;
+    });
+
+    await Future<void>.delayed(Duration.zero);
+    expect(removalCompleted, isFalse);
+    expect(service.tasks, contains(task));
+
+    runningOperation.complete();
+    await removal.timeout(const Duration(seconds: 1));
+    expect(service.tasks, isEmpty);
+  });
+
+  test(
+    'download settings are normalized and committed as one saved draft',
+    () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'bilibili_custom_download_path': r'D:\old-downloads',
+      });
+      final service = BilibiliDownloadService();
+      addTearDown(service.dispose);
+
+      await service.updateSettings(
+        1,
+        999,
+        'unsupported-language',
+        true,
+        false,
+        true,
+        true,
+        customPath: '',
+        videoConnections: 3,
+        shouldDownloadDanmaku: false,
+      );
+
+      expect(service.preferredQuality, 116);
+      expect(service.preferredSubtitleLang, 'zh');
+      expect(service.maxConnectionsPerVideo, 2);
+      expect(service.downloadDanmaku, isFalse);
+      expect(service.customDownloadPath, isNull);
+
+      final preferences = await SharedPreferences.getInstance();
+      expect(preferences.getInt('bilibili_preferred_quality'), 116);
+      expect(preferences.getString('bilibili_preferred_subtitle_lang'), 'zh');
+      expect(preferences.getBool('bilibili_download_danmaku'), isFalse);
+      expect(preferences.containsKey('bilibili_custom_download_path'), isFalse);
+    },
+  );
+
+  test(
+    'invalid persisted dropdown values fall back to supported defaults',
+    () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'bilibili_preferred_quality': 999,
+        'bilibili_preferred_subtitle_lang': 'unsupported-language',
+        'bilibili_custom_download_path': '',
+      });
+      final service = BilibiliDownloadService();
+      addTearDown(service.dispose);
+
+      await service.loadSettingsForTesting();
+
+      expect(service.preferredQuality, 116);
+      expect(service.preferredSubtitleLang, 'zh');
+      expect(service.customDownloadPath, isNull);
+    },
+  );
+
+  test(
+    'streaming settings refresh existing unexported subtitle selection',
+    () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final service = BilibiliDownloadService();
+      addTearDown(service.dispose);
+      final task = _standaloneTask(1)..isStreamingImport = true;
+      final episode = task.videos.single.episodes.single;
+      final manualChinese = BilibiliSubtitle(
+        id: 'zh-manual',
+        lan: 'zh-CN',
+        lanDoc: '中文',
+        url: 'https://example.com/zh-manual.json',
+        isAi: false,
+      );
+      final aiChinese = BilibiliSubtitle(
+        id: 'zh-ai',
+        lan: 'zh-CN',
+        lanDoc: '中文（AI）',
+        url: 'https://example.com/zh-ai.json',
+        isAi: true,
+      );
+      final english = BilibiliSubtitle(
+        id: 'en',
+        lan: 'en-US',
+        lanDoc: 'English',
+        url: 'https://example.com/en.json',
+        isAi: false,
+      );
+      episode
+        ..availableSubtitles = [manualChinese, aiChinese, english]
+        ..selectedSubtitle = english;
+      service.replaceTasksForTesting([task]);
+
+      await service.updateStreamingSettings(
+        subtitleLanguage: 'zh',
+        preferAi: true,
+        autoDelete: false,
+      );
+
+      expect(episode.selectedSubtitle, same(aiChinese));
+    },
+  );
 }

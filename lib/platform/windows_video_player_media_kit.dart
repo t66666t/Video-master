@@ -294,9 +294,18 @@ class NativeVideoPlayerMediaKit {
     return _audioOnlyExtensions.any(normalized.endsWith);
   }
 
-  /// Caps a decoded texture to the actual Flutter view while retaining its
-  /// aspect ratio. There is no quality benefit in moving a 4K texture through
-  /// Flutter when the window can display only 1080p worth of physical pixels.
+  /// Whether the application may override the backend's output allocation.
+  @visibleForTesting
+  static bool supportsAdaptiveTextureResizing(String operatingSystem) {
+    // Windows output uses shared D3D textures. Keep their allocation under
+    // media_kit's ownership; changing it from Flutter layout can terminate
+    // flutter_windows.dll during presentation (native fail-fast 0xc0000409).
+    // Android's Surface backend does not expose output resizing at all.
+    return operatingSystem != 'windows' && operatingSystem != 'android';
+  }
+
+  /// Caps the texture while retaining the video's aspect ratio. Windows keeps
+  /// the backend's source-sized output to avoid live shared-texture replacement.
   @visibleForTesting
   static Size adaptiveTextureSize({
     required Size source,
@@ -635,7 +644,7 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     if (UniversalPlatform.isAndroid) {
       await _platformFallback.init();
     }
-    for (final textureId in _players.keys) {
+    for (final textureId in _players.keys.toList()) {
       await dispose(textureId);
     }
 
@@ -803,8 +812,9 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
       // VideoController initialization is deliberately asynchronous and the
       // desktop media_kit plugin overwrites video-sync/video-timing-offset while
       // creating its native render context. Wait for that work before installing
-      // our final clock configuration; otherwise the intended smooth timing is
-      // silently replaced by media_kit's zero-lookahead defaults a frame later.
+      // our final clock configuration. Windows intentionally keeps the native
+      // zero-lookahead policy so render-ahead cannot hold its shared texture
+      // mutex while Flutter is trying to animate the surrounding interface.
       if (videoController != null) {
         await videoController.platform.future;
         _readyVideoOutputs.add(textureId);
@@ -1559,7 +1569,11 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
   void _scheduleAdaptiveOutputResize(int textureId, Size sourceSize) {
     // media_kit intentionally does not expose output resizing on Android.
     // Its Surface/MediaCodec path remains fully GPU accelerated instead.
-    if (UniversalPlatform.isAndroid) return;
+    if (!NativeVideoPlayerMediaKit.supportsAdaptiveTextureResizing(
+      UniversalPlatform.operatingSystem,
+    )) {
+      return;
+    }
     final epoch = (_resizeEpochs[textureId] ?? 0) + 1;
     _resizeEpochs[textureId] = epoch;
 

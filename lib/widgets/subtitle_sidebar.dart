@@ -95,8 +95,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   int _activePointerCount = 0;
   bool _didScrollWhilePointerSession = false;
   int? _pointerDownStartIndex;
+  int? _pointerDownSubtitleIndex;
   int? _pendingLocateIndex;
   bool _lastKnownIsPlaying = false;
+  int _lastSubtitleOffsetMs = 0;
   int? _suppressAutoScrollTargetIndex;
   int _suppressAutoScrollUntilMs = 0;
   int? _manualLocateLockIndex;
@@ -108,12 +110,47 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   Size? _lastScrollableViewportSize;
   bool _viewportAlignmentRestoreScheduled = false;
 
+  // 统一定位流水线。
+  // 「切页后的修复定位」与「自动跟随」是两套独立触发源：过去它们各自投递
+  // post-frame 任务、各自重试，于是出现两类竞争：
+  //   1. 后发起的修复请求会被更早发起、但仍在重试中的旧请求覆盖落点；
+  //   2. 自动跟随的动画（含远距离两段式滚动）晚于修复跳转落地，把文稿又拖
+  //      回旧位置；被横屏页覆盖时动画还会被静音挂起，回到前台集中补帧。
+  // 下面用单调递增的请求号把它们串成一条流水线：只有最新请求能落地，旧请求
+  // 的延迟回调全部作废；修复请求必须等列表真正有布局才会执行，失败会保留
+  // 请求并由视口变化/回到前台重新驱动，落地后还会校验一次列表是否真的可见。
+  int _locateRequestId = 0;
+  int _locateAttempts = 0;
+  bool _locateAnimated = false;
+  bool _locateIsRepair = false;
+  bool _repairRequestPending = false;
+  bool _locateVerificationScheduled = false;
+  int _locateVerificationRounds = 0;
+
+  // 侧边栏所在路由是否位于前台。被横屏播放页/音乐播放页覆盖时，列表既不
+  // 布局也不走帧，此期间启动的滚动动画会和切页修复定位抢同一个落点。
+  bool _isHostRouteCurrent = true;
+  bool _routeRestorePending = false;
+
+  static const int _maxLocateAttempts = 30;
+  static const int _maxLocateVerificationRounds = 3;
+  static const double _collapsedViewportHeight = 4.0;
+
   VideoPlayerValue? get _controllerValue => widget.controller?.value;
 
   Duration get _playbackPosition =>
       widget.positionListenable?.value ??
       _controllerValue?.position ??
       Duration.zero;
+
+  /// 字幕延迟（subtitleOffset）：正值表示字幕整体延后出现。
+  int get _subtitleOffsetMs => SettingsService().subtitleOffset.inMilliseconds;
+
+  /// 画面字幕用「播放位置 - subtitleOffset」判定当前句，侧边栏的高亮与
+  /// 定位必须换算到同一条字幕时间轴，否则调整「字幕同步」后两侧会整体
+  /// 错开（offset > 0 时高亮比画面字幕提前）。
+  int get _subtitleTimelinePositionMs =>
+      _playbackPosition.inMilliseconds - _subtitleOffsetMs;
 
   bool get _playbackIsPlaying => _controllerValue?.isPlaying ?? false;
 
@@ -300,11 +337,45 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     );
     _loadOrientationDisplaySettings();
     _lastKnownIsPlaying = _playbackIsPlaying;
+    _lastSubtitleOffsetMs = settings.subtitleOffset.inMilliseconds;
+    settings.addListener(_handleSubtitleOffsetChanged);
     _attachPlaybackListeners();
     _invalidateDisplaySubtitlesCache();
     _checkBilingualSync();
     _rebuildSubtitleIndex();
   }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // ModalRoute.of 会建立对路由状态的依赖：isCurrent 变化（被横屏播放页/
+    // 音乐播放页/弹窗覆盖，或重新回到前台）时会重新进入本方法。
+    _handleRouteVisibilityChanged(ModalRoute.of(context)?.isCurrent ?? true);
+  }
+
+  /// 路由从「被覆盖」回到前台时，列表恢复布局，被静音挂起的自动跟随动画会
+  /// 集中补帧。这里主动补一次修复定位，避免文稿停在切页时的旧位置或空白状态。
+  /// 反过来，被覆盖时立刻取消待执行的自动跟随，避免它与修复定位抢落点。
+  void _handleRouteVisibilityChanged(bool isCurrent) {
+    if (isCurrent == _isHostRouteCurrent) return;
+    _isHostRouteCurrent = isCurrent;
+    if (!isCurrent) {
+      _cancelPendingAutoScroll();
+      _routeRestorePending = true;
+      return;
+    }
+    if (!_routeRestorePending && !_repairRequestPending) return;
+    _routeRestorePending = false;
+    if (!mounted || !widget.isVisible || _displaySubtitles.isEmpty) return;
+    // 自动跟随打开时，回到前台主动补一次定位；自动跟随关闭时只在页面之前
+    // 显式请求过的修复仍悬空时才补，避免把用户手动滚动的位置强行拉回。
+    if (!_repairRequestPending && !SettingsService().autoScrollSubtitles) {
+      return;
+    }
+    locateToCurrentSubtitle(ignorePointer: true);
+  }
+
+  bool get _isSubtitleSidebarRouteCurrent => _isHostRouteCurrent;
 
   @override
   void didUpdateWidget(SubtitleSidebar oldWidget) {
@@ -343,6 +414,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
         _updateIndex();
         triggerLocateForAutoFollow();
       });
+      _ensureFrameScheduled();
     }
   }
 
@@ -351,6 +423,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       if (!mounted || !widget.isVisible || _displaySubtitles.isEmpty) return;
       locateToCurrentSubtitle(ignorePointer: true);
     });
+    _ensureFrameScheduled();
   }
 
   void _handleScrollableViewportLayout(BoxConstraints constraints) {
@@ -368,19 +441,19 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _viewportAlignmentRestoreScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _viewportAlignmentRestoreScheduled = false;
-      if (!mounted ||
-          !widget.isVisible ||
-          !_playbackIsPlaying ||
-          !SettingsService().autoScrollSubtitles ||
-          _displaySubtitles.isEmpty) {
-        return;
-      }
-
+      if (!mounted || !widget.isVisible || _displaySubtitles.isEmpty) return;
       // ScrollablePositionedList preserves the old pixel offset when its
       // viewport is resized. Re-apply the percentage alignment after the new
       // geometry has been painted so entering the portrait player cannot
       // leave the current subtitle visibly lower than the configured target.
-      locateToCurrentSubtitle(ignorePointer: true);
+      // 只要还有未落地的修复请求（例如切页时视口被压缩、位置又发生变化），
+      // 这里也必须重新驱动，否则该请求会一直悬空、文稿停留在空白状态。
+      final bool autoFollowRepair =
+          _playbackIsPlaying && SettingsService().autoScrollSubtitles;
+      if (!autoFollowRepair && !_repairRequestPending) return;
+      // 被不透明路由覆盖时列表没有布局，定位会被丢弃，等回到前台重新驱动。
+      if (!_isSubtitleSidebarRouteCurrent) return;
+      _beginLocateRequest(animated: false, repair: true);
     });
   }
 
@@ -417,6 +490,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   @override
   void dispose() {
     _detachPlaybackListeners(widget);
+    SettingsService().removeListener(_handleSubtitleOffsetChanged);
     _activeIndexNotifier.dispose();
     _activeIndicesNotifier.dispose();
     _autoScrollTimer?.cancel();
@@ -477,6 +551,18 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
   }
 
+  /// 暂停时播放位置不再变化，调整「字幕同步」不会触发 controller 回调；
+  /// 这里主动重算一次高亮，避免侧边栏停留在换算前的索引。
+  void _handleSubtitleOffsetChanged() {
+    final int offsetMs = SettingsService().subtitleOffset.inMilliseconds;
+    if (offsetMs == _lastSubtitleOffsetMs) return;
+    _lastSubtitleOffsetMs = offsetMs;
+    if (!mounted) return;
+    // 绕过位置节流，保证滑块落点立即生效（即使位移小于 80ms）。
+    _lastIndexComputePosMs = -1;
+    _updateIndex();
+  }
+
   bool _isBeforeFirstSubtitleAtMs(int positionMs) {
     final subtitles = _displaySubtitles;
     return subtitles.isNotEmpty &&
@@ -503,8 +589,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final bool isPlaying = _playbackIsPlaying;
     final bool playbackStateChanged = isPlaying != _lastKnownIsPlaying;
     _lastKnownIsPlaying = isPlaying;
-    final currentPosition = _playbackPosition;
-    final int posMs = currentPosition.inMilliseconds;
+    final int posMs = _subtitleTimelinePositionMs;
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
     if (!playbackStateChanged && _lastIndexComputePosMs != -1) {
       final int deltaPos = (posMs - _lastIndexComputePosMs).abs();
@@ -597,6 +682,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
             (isBeforeFirstSubtitle && activeIndicesChanged)) &&
         isPlaying &&
         widget.isVisible &&
+        _isSubtitleSidebarRouteCurrent &&
         SettingsService().autoScrollSubtitles &&
         !isInManualLocateAutoFollowCooldown &&
         !suppressAutoScrollForIndex &&
@@ -616,13 +702,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final subtitles = _displaySubtitles;
     if (subtitles.isEmpty) return;
 
-    final int posMs = target.inMilliseconds;
+    // 调用方传入的是视频时间（用于 seek），先换算到字幕时间轴再定位。
+    final int posMs = target.inMilliseconds - _subtitleOffsetMs;
     final List<int> activeIndices = _findActiveIndicesMs(
       posMs,
       continuousSubtitleEnabled: true,
     );
     if (_isBeforeFirstSubtitleAtMs(posMs)) {
       _cancelPendingAutoScroll();
+      _invalidateLocateRequests();
       _markManualLocateAutoFollowCooldown();
       _locateBeforeFirstSubtitleAtTop();
       return;
@@ -638,6 +726,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
     if (index < 0 || index >= subtitles.length) return;
 
+    _invalidateLocateRequests();
     _cancelPendingAutoScroll();
     _pendingLocateIndex = index;
     _markManualLocateLock(index);
@@ -736,12 +825,15 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _autoScrollTimer = Timer(Duration.zero, () {
       if (!mounted) return;
       if (_hasAnyActivePointer) return;
+      if (!_isSubtitleSidebarRouteCurrent) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         if (_hasAnyActivePointer) return;
         if (requestId != _autoScrollRequestId) return;
+        if (!_isSubtitleSidebarRouteCurrent) return;
         _scrollToActiveIndex(isAuto: true);
       });
+      _ensureFrameScheduled();
     });
   }
 
@@ -751,15 +843,14 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (_hasAnyActivePointer) return;
     if (_displaySubtitles.isEmpty) return;
     if (!_playbackIsPlaying) return;
-    if (_isBeforeFirstSubtitleAtMs(_playbackPosition.inMilliseconds)) {
+    if (!_isSubtitleSidebarRouteCurrent) return;
+    _ensureSubtitleIndex();
+    if (_isBeforeFirstSubtitleAtMs(_subtitleTimelinePositionMs)) {
       _locateBeforeFirstSubtitleAtTop();
       return;
     }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _locateToCurrentSubtitleAfterModeSwitch(attempt: 0, animated: animated);
-    });
+    _beginLocateRequest(animated: animated, repair: false);
   }
 
   void _triggerLocateButtonAfterModeSwitch() {
@@ -775,9 +866,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       // pre-switch bounds.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        _locateToCurrentSubtitleAfterModeSwitch(attempt: 0, animated: false);
+        _beginLocateRequest(animated: false, repair: true, immediate: true);
       });
+      _ensureFrameScheduled();
     });
+    _ensureFrameScheduled();
   }
 
   void _updateArticleChunkSize(int value) {
@@ -811,91 +904,141 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     });
   }
 
-  /// 暴露给外部页面（如从音乐播放页切换回视频播放页）的定位方法。
+  /// 暴露给外部页面（如从横屏/音乐播放页切换回视频播放页）的定位方法。
   ///
   /// 与 [triggerLocateForAutoFollow] 不同，本方法不依赖 autoScrollSubtitles
   /// 开关，也不要求当前正在播放，只要字幕文稿区可见即执行定位。
   /// 用于在页面切换完成后将字幕文稿滚动到当前播放位置对应的字幕，
-  /// 同时可修复切回页面时列表偶发空白（滚动控制器暂未重新挂载）的问题。
-  void locateToCurrentSubtitle({
+  /// 同时修复切回页面时列表偶发空白（滚动控制器暂未重新挂载）的问题。
+  ///
+  /// 返回 false 表示本次请求暂时无法受理（面板不可见、无字幕、指针仍按下），
+  /// 调用方可以稍后重试；返回 true 表示已受理，列表一旦完成布局就会落地，
+  /// 且落地后会自动校验，必要时再补一次跳转。
+  bool locateToCurrentSubtitle({
     bool animated = false,
     bool ignorePointer = false,
   }) {
-    if (!mounted) return;
-    if (!widget.isVisible) return;
+    if (!mounted) return false;
+    if (!widget.isVisible) return false;
     // 页面切换完成后的自动定位属于「显式请求」，即便切页瞬间仍有一个活动的指针
     // （例如点击返回键抬起前的那一帧）也应执行定位；此时由调用方传入 ignorePointer=true。
-    if (!ignorePointer && _hasAnyActivePointer) return;
-    if (_displaySubtitles.isEmpty) return;
+    if (!ignorePointer && _hasAnyActivePointer) return false;
+    if (_displaySubtitles.isEmpty) return false;
     _ensureSubtitleIndex();
-    if (_isBeforeFirstSubtitleAtMs(_playbackPosition.inMilliseconds)) {
-      _locateBeforeFirstSubtitleAtTop();
+    // 修复定位必须压过自动跟随：先取消待执行的自动滚动并进入冷却时间，
+    // 否则自动跟随的动画会在修复跳转之后落地，把文稿又拖回旧位置。
+    _cancelPendingAutoScroll();
+    _markManualLocateAutoFollowCooldown();
+    _beginLocateRequest(animated: animated, repair: true);
+    return true;
+  }
+
+  /// 登记一次定位请求。只有最新请求会落地，旧请求的延迟回调会因请求号变化失效。
+  ///
+  /// [immediate] 用于调用方已经等过一帧（例如视图模式切换）的场景，直接在
+  /// 当前回调里尝试落地，避免多引入一帧的位置漂移。
+  void _beginLocateRequest({
+    required bool animated,
+    required bool repair,
+    bool keepVerificationBudget = false,
+    bool immediate = false,
+  }) {
+    final int requestId = ++_locateRequestId;
+    _locateAttempts = 0;
+    _locateAnimated = animated;
+    _locateIsRepair = repair;
+    _locateVerificationScheduled = false;
+    if (!keepVerificationBudget) {
+      _locateVerificationRounds = 0;
+    }
+    if (repair) {
+      _repairRequestPending = true;
+    }
+    if (immediate) {
+      _driveLocateRequest(requestId);
       return;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      // 确保索引（起始/结束时间、显示文本缓存）是最新的，避免切页后数据陈旧
-      _ensureSubtitleIndex();
-      _locateToCurrentSubtitleAfterModeSwitch(
-        attempt: 0,
-        animated: animated,
-        ignorePointer: ignorePointer,
-      );
+      _driveLocateRequest(requestId);
     });
+    _ensureFrameScheduled();
   }
 
-  void _locateToCurrentSubtitleAfterModeSwitch({
-    required int attempt,
-    bool animated = false,
-    bool ignorePointer = false,
-  }) {
+  /// post-frame 回调只有在「有帧被调度」时才会执行。播放暂停或界面静止时
+  /// （例如横屏退出后停在暂停状态）没有任何东西会调度帧，仅注册回调会让
+  /// 修复定位悬空、文稿停留在切页时的空白状态。这里显式确保下一帧会发生。
+  void _ensureFrameScheduled() {
     if (!mounted) return;
-    if (!ignorePointer && _hasAnyActivePointer) return;
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
 
-    const int maxAttempts = 6;
-    if (_isArticleMode) {
-      if (!_articleItemScrollController.isAttached) {
-        if (attempt < maxAttempts) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            _locateToCurrentSubtitleAfterModeSwitch(
-              attempt: attempt + 1,
-              animated: animated,
-              ignorePointer: ignorePointer,
-            );
-          });
-        }
-        return;
-      }
-    } else {
-      if (!_itemScrollController.isAttached) {
-        if (attempt < maxAttempts) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            _locateToCurrentSubtitleAfterModeSwitch(
-              attempt: attempt + 1,
-              animated: animated,
-              ignorePointer: ignorePointer,
-            );
-          });
-        }
-        return;
-      }
-    }
+  /// 手动操作（点击字幕、时间轴定位等）会接管定位：作废所有在途请求，
+  /// 避免自动补位把用户的选择覆盖掉。
+  void _invalidateLocateRequests() {
+    _locateRequestId++;
+    _repairRequestPending = false;
+    _locateVerificationScheduled = false;
+  }
 
-    final positions = _isArticleMode
+  Iterable<ItemPosition> _currentItemPositions() {
+    return _isArticleMode
         ? _articleItemPositionsListener.itemPositions.value
         : _itemPositionsListener.itemPositions.value;
-    if (positions.isEmpty && attempt < maxAttempts) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _locateToCurrentSubtitleAfterModeSwitch(
-          attempt: attempt + 1,
-          animated: animated,
-          ignorePointer: ignorePointer,
-        );
-      });
+  }
+
+  /// 列表是否已经产出可用的几何信息。控制器未挂载或没有任何可见行时，
+  /// 任何 jump/scroll 都会被直接丢弃（这正是切页后文稿空白的形态）。
+  bool _hasLocateGeometry() {
+    final bool attached = _isArticleMode
+        ? _articleItemScrollController.isAttached
+        : _itemScrollController.isAttached;
+    if (!attached) return false;
+    return _currentItemPositions().isNotEmpty;
+  }
+
+  /// 视口是否具有可用高度（切页瞬间面板可能被压缩为 0，此时无法定位）。
+  bool _isScrollableViewportUsable() {
+    final Size? size = _lastScrollableViewportSize;
+    return size == null || size.height > _collapsedViewportHeight;
+  }
+
+  void _driveLocateRequest(int requestId) {
+    if (!mounted || requestId != _locateRequestId) return;
+    if (!widget.isVisible || _displaySubtitles.isEmpty) {
+      _repairRequestPending = false;
+      return;
+    }
+    // 被不透明路由覆盖时列表不参与布局，滚动会被丢弃；保持请求挂起，
+    // 回到前台（didChangeDependencies）或视口变化时会重新驱动。
+    if (!_isSubtitleSidebarRouteCurrent) return;
+    if (!_locateIsRepair &&
+        (!_playbackIsPlaying || !SettingsService().autoScrollSubtitles)) {
       return;
     }
 
-    final int posMs = _playbackPosition.inMilliseconds;
+    if (!_hasLocateGeometry() || !_isScrollableViewportUsable()) {
+      // 视口被压缩时不再空转重试，交给视口尺寸变化重新驱动。
+      if (_isScrollableViewportUsable() &&
+          _locateAttempts < _maxLocateAttempts) {
+        _locateAttempts++;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _driveLocateRequest(requestId);
+        });
+        _ensureFrameScheduled();
+      }
+      return;
+    }
+
+    _ensureSubtitleIndex();
+    _applyLocateRequest();
+    if (_locateIsRepair) {
+      _repairRequestPending = false;
+    }
+    _scheduleLocateVerification(requestId);
+  }
+
+  void _applyLocateRequest() {
+    final int posMs = _subtitleTimelinePositionMs;
     final List<int> activeIndices = _findActiveIndicesMs(
       posMs,
       continuousSubtitleEnabled: true,
@@ -924,17 +1067,53 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
 
     _activeIndexNotifier.value = targetIndex;
-    if (animated) {
+    if (_locateAnimated && !_locateIsRepair) {
       _scrollToActiveIndex();
     } else {
       _jumpToActiveIndexWithAlignment(targetIndex);
     }
   }
 
+  /// 落地后校验：列表已挂载、视口高度正常，但一帧后仍然没有任何可见行，
+  /// 说明这次定位没有真正生效（例如列表刚刚重建，或修复跳转被挂起的自动
+  /// 跟随动画覆盖）。此时再补一次跳转，确保文稿不会停在空白状态。
+  void _scheduleLocateVerification(int requestId) {
+    if (_locateVerificationScheduled) return;
+    if (_locateVerificationRounds >= _maxLocateVerificationRounds) return;
+    _locateVerificationScheduled = true;
+    final int round = ++_locateVerificationRounds;
+    _waitFramesThenVerify(requestId, round == 1 ? 2 : 10);
+  }
+
+  void _waitFramesThenVerify(int requestId, int framesLeft) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _ensureFrameScheduled();
+      if (framesLeft > 1) {
+        _waitFramesThenVerify(requestId, framesLeft - 1);
+        return;
+      }
+      _locateVerificationScheduled = false;
+      if (requestId != _locateRequestId) return;
+      if (!widget.isVisible || _displaySubtitles.isEmpty) return;
+      if (!_isSubtitleSidebarRouteCurrent) return;
+      if (!_isScrollableViewportUsable()) return;
+      if (_currentItemPositions().isNotEmpty) return;
+      // 列表仍然没有任何可见行：再补一次修复跳转（沿用本轮校验预算，
+      // 避免与持续空白互相触发造成死循环）。
+      _beginLocateRequest(
+        animated: false,
+        repair: true,
+        keepVerificationBudget: true,
+      );
+    });
+  }
+
   void _onPointerDown(PointerDownEvent event) {
     if (_activePointerCount == 0) {
       _didScrollWhilePointerSession = false;
       _pointerDownStartIndex = _activeIndexNotifier.value;
+      _pointerDownSubtitleIndex = null;
     }
     _activePointerCount++;
     _cancelPendingAutoScroll();
@@ -946,19 +1125,18 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (_activePointerCount == 0) {
       final bool shouldAnimateRelocate = _didScrollWhilePointerSession;
       final int? pointerDownStartIndex = _pointerDownStartIndex;
+      final int? tappedSubtitleIndex = _pointerDownSubtitleIndex;
       final int currentIndex = _activeIndexNotifier.value;
       _didScrollWhilePointerSession = false;
       _pointerDownStartIndex = null;
-      if (shouldAnimateRelocate) {
+      _pointerDownSubtitleIndex = null;
+      if (shouldAnimateRelocate && tappedSubtitleIndex == null) {
         triggerLocateForAutoFollow(animated: true);
-      } else if (pointerDownStartIndex != null &&
+      } else if (tappedSubtitleIndex == null &&
+          pointerDownStartIndex != null &&
           pointerDownStartIndex != currentIndex) {
-        // A subtitle tap seeks on pointer-down. Depending on how quickly the
-        // player reports the new position, the active index may therefore
-        // change before pointer-up. Keep this path animated as well; using a
-        // jump here made identical taps randomly snap or animate based solely
-        // on the seek callback timing. Large timeline seeks still use
-        // locateToTime's explicit single-stage jump optimization.
+        // Playback can advance while a non-row pointer gesture is held. Keep
+        // the regular auto-follow behavior for that case.
         triggerLocateForAutoFollow(animated: true);
       }
     }
@@ -1037,19 +1215,58 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     return text;
   }
 
-  void _handleSubtitleTap(int index) {
+  void _handleSubtitleTapDown(int index) {
     final subtitles = _displaySubtitles;
     if (index < 0 || index >= subtitles.length) return;
 
     final item = subtitles[index];
     widget.onClearSelection?.call();
+    // 手动选择接管定位：作废在途的自动修复请求。
+    _invalidateLocateRequests();
+    _cancelPendingAutoScroll();
+    _pointerDownSubtitleIndex = index;
     _pendingLocateIndex = index;
-    widget.onItemTap?.call(item.startTime);
+    _markManualLocateLock(index);
+    _markManualLocateAutoFollowCooldown();
+    _markManualAnimationFreeze(index, animated: true);
+    _markAutoScrollSuppressedForIndex(index);
+    _activeIndexNotifier.value = index;
+    final List<int> tappedIndices = <int>[index];
+    if (!_isSameIndices(tappedIndices, _activeIndicesNotifier.value)) {
+      _activeIndicesNotifier.value = tappedIndices;
+    }
+    // onItemTap 的接收方把参数当作视频时间直接 seek，字幕时间需加上
+    // 延迟换算，才能让画面字幕与点击项一致。
+    widget.onItemTap?.call(
+      item.startTime + Duration(milliseconds: _subtitleOffsetMs),
+    );
     Future.microtask(() => widget.focusNode?.requestFocus());
   }
 
+  void _completeSubtitleTap(int index) {
+    _pointerDownSubtitleIndex = null;
+    _locateTappedSubtitle(index);
+  }
+
+  void _locateTappedSubtitle(int index) {
+    if (index < 0 || index >= _displaySubtitles.length) return;
+    _invalidateLocateRequests();
+    _cancelPendingAutoScroll();
+    _pendingLocateIndex = index;
+    _markManualLocateLock(index);
+    _markManualLocateAutoFollowCooldown();
+    _markManualAnimationFreeze(index, animated: true);
+    _markAutoScrollSuppressedForIndex(index);
+    _activeIndexNotifier.value = index;
+    final List<int> tappedIndices = <int>[index];
+    if (!_isSameIndices(tappedIndices, _activeIndicesNotifier.value)) {
+      _activeIndicesNotifier.value = tappedIndices;
+    }
+    _scrollToIndex(index, isAuto: false, preferSingleStage: true);
+  }
+
   void _scrollToActiveIndex({bool isAuto = false}) {
-    if (_isBeforeFirstSubtitleAtMs(_playbackPosition.inMilliseconds)) {
+    if (_isBeforeFirstSubtitleAtMs(_subtitleTimelinePositionMs)) {
       _locateBeforeFirstSubtitleAtTop();
       return;
     }
@@ -1064,6 +1281,29 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     bool preferSingleStage = false,
   }) {
     if (index < 0 || index >= _displaySubtitles.length) return;
+    if (!widget.isVisible ||
+        !_isSubtitleSidebarRouteCurrent ||
+        !_isScrollableViewportUsable()) {
+      return;
+    }
+    final controller = _isArticleMode
+        ? _articleItemScrollController
+        : _itemScrollController;
+    if (!controller.isAttached) return;
+    final targetIndex = _isArticleMode ? index ~/ _articleChunkSize : index;
+    // scrollable_positioned_list 0.3.8 uses a second list and a deferred
+    // opacity animation when the target has not been laid out. A repair jump
+    // can remove that second list before its post-mount callback runs. The
+    // callback then fades the remaining list to zero permanently, even though
+    // ItemPositions still reports visible rows. Request IDs cannot cancel
+    // callbacks owned by the package. Only animate targets with known geometry
+    // so every animation uses its single-list animateTo path.
+    if (!_currentItemPositions().any(
+      (position) => position.index == targetIndex,
+    )) {
+      _jumpToActiveIndexWithAlignment(index);
+      return;
+    }
     if (_isArticleMode) {
       final chunkIndex = index ~/ _articleChunkSize;
 
@@ -2338,7 +2578,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                         bottom: itemGap,
                       ),
                       child: InkWell(
-                        onTapDown: (_) => _handleSubtitleTap(index),
+                        onTapDown: (_) => _handleSubtitleTapDown(index),
+                        onTap: () => _completeSubtitleTap(index),
                         canRequestFocus: false,
                         borderRadius: BorderRadius.circular(4),
                         child: Container(
@@ -2511,7 +2752,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                         endIndex: endIndex,
                         activeIndices: activeIndices.toSet(),
                         fontSizeScale: _fontSizeScale,
-                        onSubtitleTap: _handleSubtitleTap,
+                        onSubtitleTapDown: _handleSubtitleTapDown,
+                        onSubtitleTap: _completeSubtitleTap,
                         isSmallScreen: isSmallScreen,
                         lineFilterMode: _lineFilterMode,
                         secondaryTextCache: _secondaryTextCache,
@@ -2548,6 +2790,7 @@ class SubtitleArticleChunk extends StatefulWidget {
   final int endIndex;
   final Set<int> activeIndices;
   final double fontSizeScale;
+  final ValueChanged<int>? onSubtitleTapDown;
   final ValueChanged<int>? onSubtitleTap;
   final bool isSmallScreen;
   final int lineFilterMode;
@@ -2563,6 +2806,7 @@ class SubtitleArticleChunk extends StatefulWidget {
     required this.endIndex,
     required this.activeIndices,
     required this.fontSizeScale,
+    this.onSubtitleTapDown,
     this.onSubtitleTap,
     required this.isSmallScreen,
     required this.lineFilterMode,
@@ -2603,10 +2847,17 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
   }
 
   void _syncRecognizers() {
-    if (widget.onSubtitleTap == null) return;
+    if (widget.onSubtitleTapDown == null && widget.onSubtitleTap == null) {
+      return;
+    }
     for (int i = widget.startIndex; i < widget.endIndex; i++) {
       _recognizers[i] = TapGestureRecognizer()
-        ..onTapDown = (_) => widget.onSubtitleTap!(i);
+        ..onTapDown = (_) {
+          widget.onSubtitleTapDown?.call(i);
+        }
+        ..onTap = () {
+          widget.onSubtitleTap?.call(i);
+        };
     }
   }
 

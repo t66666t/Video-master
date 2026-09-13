@@ -30,6 +30,93 @@ void main() {
     );
   });
 
+  test('music player layout follows orientation across phone sizes', () {
+    expect(musicPlayerUsesVerticalLayout(const Size(390, 844)), isTrue);
+    expect(musicPlayerUsesVerticalLayout(const Size(568, 320)), isFalse);
+    expect(musicPlayerUsesVerticalLayout(const Size(844, 390)), isFalse);
+    expect(musicPlayerUsesVerticalLayout(const Size(1024, 1366)), isFalse);
+
+    expect(musicPlayerUsesCompactLandscapeLayout(const Size(568, 320)), isTrue);
+    expect(musicPlayerUsesCompactLandscapeLayout(const Size(844, 390)), isTrue);
+    expect(
+      musicPlayerUsesCompactLandscapeLayout(const Size(1180, 820)),
+      isFalse,
+    );
+  });
+
+  testWidgets('phone landscape uses balanced compact player geometry', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(844, 390));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final settings = SettingsService()..resetForTest();
+    final playback = MediaPlaybackService();
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<SettingsService>.value(value: settings),
+          ChangeNotifierProvider<MediaPlaybackService>.value(value: playback),
+        ],
+        child: const MaterialApp(
+          home: MusicPlayerScreen(title: 'Landscape track'),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey('music-portrait-controls-overlay')),
+      findsNothing,
+    );
+    final leftPanel = find.byKey(const ValueKey('music-landscape-left-panel'));
+    final lyricPanel = find.byKey(
+      const ValueKey('music-landscape-lyric-panel'),
+    );
+    expect(leftPanel, findsOneWidget);
+    expect(lyricPanel, findsOneWidget);
+    expect(
+      tester.getSize(leftPanel).width / tester.getSize(lyricPanel).width,
+      closeTo(43 / 57, 0.01),
+    );
+
+    final controls = tester.widget<MusicPlaybackControls>(
+      find.byType(MusicPlaybackControls),
+    );
+    expect(controls.compactLandscape, isTrue);
+    final previousButton = tester.widget<IconButton>(
+      find.ancestor(
+        of: find.byIcon(CupertinoIcons.backward_fill),
+        matching: find.byType(IconButton),
+      ),
+    );
+    final playButton = tester.widget<IconButton>(
+      find.ancestor(
+        of: find.byIcon(CupertinoIcons.play_fill),
+        matching: find.byType(IconButton),
+      ),
+    );
+    expect(previousButton.iconSize, lessThanOrEqualTo(28));
+    expect(playButton.iconSize, lessThanOrEqualTo(35));
+    expect(tester.takeException(), isNull);
+
+    await tester.binding.setSurfaceSize(const Size(568, 320));
+    await tester.pump();
+    expect(
+      tester
+          .widget<MusicPlaybackControls>(find.byType(MusicPlaybackControls))
+          .compactLandscape,
+      isTrue,
+    );
+    expect(tester.takeException(), isNull);
+
+    await tester.binding.setSurfaceSize(const Size(480, 320));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   test('controls lyric mask completes before controls finish entering', () {
     expect(musicControlsLyricMaskProgress(0), 0);
     expect(musicControlsLyricMaskProgress(0.10), greaterThan(0.9));
@@ -1044,6 +1131,59 @@ void main() {
     expect(find.text('Old 10'), findsNothing);
 
     await tester.pump(const Duration(seconds: 1));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('font size changes keep the current lyric at its anchor', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(400, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final position = ValueNotifier<Duration>(const Duration(seconds: 60));
+    addTearDown(position.dispose);
+    final subtitles = List<SubtitleItem>.generate(
+      30,
+      (index) => SubtitleItem(
+        index: index,
+        startTime: Duration(seconds: index * 5),
+        endTime: Duration(seconds: index * 5 + 4),
+        text: 'Resizable lyric $index',
+      ),
+    );
+    var fontScale = 0.6;
+    late StateSetter updateHost;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: StatefulBuilder(
+            builder: (context, setState) {
+              updateHost = setState;
+              return MusicLyricView(
+                subtitles: subtitles,
+                positionListenable: position,
+                lyricFontSizeScale: fontScale,
+                applyEdgeFade: false,
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final activeLyric = find.text('Resizable lyric 12');
+    expect(activeLyric, findsOneWidget);
+    final initialTop = tester.getTopLeft(activeLyric).dy;
+
+    updateHost(() => fontScale = 1.4);
+    await tester.pump();
+    await tester.pump();
+
+    expect(activeLyric, findsOneWidget);
+    expect(tester.getTopLeft(activeLyric).dy, closeTo(initialTop, 1.0));
+
     await tester.pumpWidget(const SizedBox.shrink());
   });
 

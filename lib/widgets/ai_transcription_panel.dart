@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'landscape_sidebar_layout.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
@@ -154,103 +155,145 @@ class _AiTranscriptionPanelState extends State<AiTranscriptionPanel> {
             }
             return KeyEventResult.ignored;
           },
-          child: Container(
-            padding: const EdgeInsets.all(16),
-            decoration: const BoxDecoration(
-              color: Color(0xFF1E1E1E),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final layout = LandscapeSidebarLayout.fromSize(
+                Size(constraints.maxWidth, constraints.maxHeight),
+              );
+              return Container(
+                padding: EdgeInsets.symmetric(
+                  horizontal: layout.horizontalPadding,
+                  vertical: layout.verticalPadding,
+                ),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF1E1E1E),
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
-                      tooltip: "返回",
-                      onPressed: widget.onBack,
-                    ),
-                    const SizedBox(width: 4),
-                    const Expanded(
-                      child: Text(
-                        "AI 智能字幕 (B接口)",
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
+                    SizedBox(
+                      height: layout.headerHeight,
+                      child: Row(
+                        children: [
+                          SizedBox.square(
+                            dimension: layout.controlHeight,
+                            child: IconButton(
+                              padding: EdgeInsets.zero,
+                              icon: Icon(
+                                Icons.arrow_back,
+                                color: Colors.white,
+                                size: layout.iconSize,
+                              ),
+                              tooltip: "返回",
+                              onPressed: widget.onBack,
+                            ),
+                          ),
+                          SizedBox(width: layout.isNarrow ? 2 : 6),
+                          Expanded(
+                            child: Text(
+                              "AI 智能字幕 (B接口)",
+                              style: TextStyle(
+                                fontSize: layout.titleSize,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (isProcessing)
+                            const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.blueAccent,
+                              ),
+                            ),
+                        ],
                       ),
                     ),
-                    if (isProcessing)
-                      const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.blueAccent,
-                        ),
+                    SizedBox(height: layout.sectionGap / 2),
+                    Expanded(
+                      child: ListView(
+                        padding: EdgeInsets.only(bottom: layout.sectionGap),
+                        children: [
+                          Container(
+                            padding: EdgeInsets.all(layout.horizontalPadding),
+                            decoration: BoxDecoration(
+                              color: Colors.blueGrey.withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: Colors.blueGrey.withValues(alpha: 0.45),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  "后台转录队列",
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: layout.bodySize,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  "处理中 $processingCount / 排队 $queueCount / 总计 $pendingCount",
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: layout.captionSize,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          SizedBox(height: layout.sectionGap),
+                          Text(
+                            "使用 Bilibili 接口进行云端语音转文字。\n支持中英文识别，速度快，准确率高。",
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: layout.bodySize,
+                              height: 1.35,
+                            ),
+                          ),
+                          SizedBox(height: layout.sectionGap),
+                          ElevatedButton.icon(
+                            onPressed: canQueueCurrentVideo
+                                ? _startTranscription
+                                : null,
+                            icon: const Icon(Icons.auto_awesome),
+                            label: Text(actionLabel),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.blue,
+                              foregroundColor: Colors.white,
+                              minimumSize: Size.fromHeight(
+                                layout.controlHeight,
+                              ),
+                              padding: EdgeInsets.symmetric(
+                                vertical: layout.verticalPadding / 2,
+                              ),
+                            ),
+                          ),
+                          SizedBox(height: layout.sectionGap),
+                          _buildInlineProgressSection(
+                            manager: manager,
+                            isJobForThisVideo: isJobForThisVideo,
+                            isProcessing: isProcessing,
+                            isQueued: isQueued,
+                            hasGeneratedSrt: hasGeneratedSrt,
+                            queuePosition: queuePosition,
+                            canQueueCurrentVideo: canQueueCurrentVideo,
+                          ),
+                        ],
                       ),
+                    ),
                   ],
                 ),
-                const SizedBox(height: 20),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.blueGrey.withValues(alpha: 0.2),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: Colors.blueGrey.withValues(alpha: 0.45),
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text(
-                        "后台转录队列",
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        "处理中 $processingCount / 排队 $queueCount / 总计 $pendingCount",
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  "使用 Bilibili 接口进行云端语音转文字。\n支持中英文识别，速度快，准确率高。",
-                  style: TextStyle(color: Colors.white70),
-                ),
-                const SizedBox(height: 14),
-                ElevatedButton.icon(
-                  onPressed: canQueueCurrentVideo ? _startTranscription : null,
-                  icon: const Icon(Icons.auto_awesome),
-                  label: Text(actionLabel),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.blue,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                _buildInlineProgressSection(
-                  manager: manager,
-                  isJobForThisVideo: isJobForThisVideo,
-                  isProcessing: isProcessing,
-                  isQueued: isQueued,
-                  hasGeneratedSrt: hasGeneratedSrt,
-                  queuePosition: queuePosition,
-                  canQueueCurrentVideo: canQueueCurrentVideo,
-                ),
-              ],
-            ),
+              );
+            },
           ),
         );
       },

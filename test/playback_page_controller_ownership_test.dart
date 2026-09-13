@@ -15,6 +15,28 @@ void main() {
     }
   });
 
+  test('popup routes do not report playback pages as hidden', () {
+    for (final path in <String>[
+      'lib/screens/portrait_video_screen.dart',
+      'lib/screens/video_player_screen.dart',
+    ]) {
+      final source = File(path).readAsStringSync();
+      expect(
+        RegExp(
+          r'setPlaybackPageVisible\s*\(\s*this\s*,\s*ModalRoute\.of\(context\)\?\.isCurrent',
+        ).hasMatch(source),
+        isFalse,
+        reason:
+            '$path must not disable Bilibili video merely because a popup route is open',
+      );
+      expect(
+        source,
+        contains('registerPlaybackPageIfCurrent(context, this)'),
+        reason: '$path must still register its initial visible state',
+      );
+    }
+  });
+
   test(
     'every episode navigation UI delegates playback behavior to service',
     () {

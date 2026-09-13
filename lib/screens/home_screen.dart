@@ -36,6 +36,7 @@ import '../widgets/playback_card_layout.dart';
 import 'package:desktop_drop/desktop_drop.dart';
 import '../widgets/video_action_buttons.dart';
 import '../widgets/responsive_icon_button.dart';
+import '../widgets/sleep_timer_dialog.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
 import '../services/playlist_manager.dart';
@@ -276,7 +277,9 @@ class _HomeScreenState extends State<HomeScreen>
         icon: Icons.search_rounded,
         tooltip: '搜索媒体库',
         onPressed: _openSearch,
+        width: 36,
       ),
+      _buildCompactSleepTimerButton(),
       MediaLibraryCompactIconButton(
         icon: Icons.delete_outline,
         tooltip: '回收站',
@@ -285,9 +288,10 @@ class _HomeScreenState extends State<HomeScreen>
             context,
           ).push(MaterialPageRoute(builder: (_) => const RecycleBinScreen()));
         },
+        width: 36,
       ),
       SizedBox(
-        width: 40,
+        width: 36,
         height: 48,
         child: MediaLibraryCompactMoreButton(
           itemBuilder: (menuContext) => [
@@ -321,6 +325,20 @@ class _HomeScreenState extends State<HomeScreen>
       ),
       const SizedBox(width: 2),
     ];
+  }
+
+  Widget _buildCompactSleepTimerButton() {
+    final timer = MediaPlaybackService().sleepTimer;
+    return AnimatedBuilder(
+      animation: timer,
+      builder: (context, _) => MediaLibraryCompactIconButton(
+        icon: timer.isActive ? Icons.alarm_on_rounded : Icons.schedule_rounded,
+        tooltip: timer.isActive ? timer.statusText : '定时关闭',
+        color: timer.isActive ? Colors.blueAccent : null,
+        width: 36,
+        onPressed: () => unawaited(showSleepTimerDialog(context)),
+      ),
+    );
   }
 
   // ... (existing code)
@@ -1998,6 +2016,7 @@ class _HomeScreenState extends State<HomeScreen>
               ? _buildCompactTopBarActions(settings)
               : [
                   ResponsiveActionButtons(
+                    spacing: 2,
                     buttons: [
                       if (!_isSelectionMode) ...[
                         if (Platform.isWindows ||
@@ -2038,6 +2057,23 @@ class _HomeScreenState extends State<HomeScreen>
                           icon: Icons.search_rounded,
                           tooltip: "搜索媒体库",
                           onPressed: _openSearch,
+                        ),
+                        AnimatedBuilder(
+                          animation: MediaPlaybackService().sleepTimer,
+                          builder: (context, _) {
+                            final timer = MediaPlaybackService().sleepTimer;
+                            return ResponsiveIconButton(
+                              icon: timer.isActive
+                                  ? Icons.alarm_on_rounded
+                                  : Icons.schedule_rounded,
+                              color: timer.isActive ? Colors.blueAccent : null,
+                              tooltip: timer.isActive
+                                  ? timer.statusText
+                                  : '定时关闭',
+                              onPressed: () =>
+                                  unawaited(showSleepTimerDialog(context)),
+                            );
+                          },
                         ),
                         ResponsiveIconButton(
                           icon: Icons.delete_outline,
@@ -2428,6 +2464,7 @@ class _HomeScreenState extends State<HomeScreen>
                           // Fill the rest of the screen with a transparent hit target to ensure GestureDetector catches taps in empty space
                           if (contents.length < 20)
                             Positioned.fill(
+                              key: MediaLibraryOverlayKeys.emptySpaceHitTarget,
                               child: Listener(
                                 behavior: HitTestBehavior.translucent,
                                 onPointerDown: (_) {},
@@ -2438,6 +2475,7 @@ class _HomeScreenState extends State<HomeScreen>
                               _boxCurrentPos != null &&
                               !_isSelectionMode)
                             Positioned.fill(
+                              key: MediaLibraryOverlayKeys.boxSelection,
                               child: IgnorePointer(
                                 child: CustomPaint(
                                   painter: _BoxSelectionPainter(
@@ -2450,6 +2488,7 @@ class _HomeScreenState extends State<HomeScreen>
                               ),
                             ),
                           Positioned(
+                            key: MediaLibraryOverlayKeys.playbackBottomFill,
                             left: 0,
                             right: 0,
                             bottom: 0,
@@ -2473,6 +2512,7 @@ class _HomeScreenState extends State<HomeScreen>
                             ),
                           ),
                           Positioned(
+                            key: MediaLibraryOverlayKeys.miniPlaybackCard,
                             left: 0,
                             right: 0,
                             bottom: playbackCardBottom,
@@ -2505,6 +2545,7 @@ class _HomeScreenState extends State<HomeScreen>
                         ],
                         if (_isDraggingFiles)
                           Positioned.fill(
+                            key: MediaLibraryOverlayKeys.fileDrop,
                             child: Container(
                               color: Colors.black54,
                               child: const Center(

@@ -56,13 +56,13 @@ class AppToast {
   static int _nextPresentationId = 0;
   static int? _currentPresentationId;
 
-  static void show(
+  static AppToastHandle show(
     String message, {
     AppToastType type = AppToastType.info,
     Duration duration = const Duration(milliseconds: 1500),
     AppToastAction? action,
   }) {
-    _showEntry(
+    return _showEntry(
       _ToastContent(
         message: message,
         type: type,
@@ -170,7 +170,7 @@ class AppToast {
 
     if (immediate) {
       for (final retiringEntry in _retiringEntries.toList()) {
-        if (retiringEntry.mounted) retiringEntry.remove();
+        retiringEntry.remove();
       }
       _retiringEntries.clear();
     }
@@ -189,19 +189,19 @@ class AppToast {
     }
 
     if (immediate || controller == null) {
-      if (entry.mounted) {
-        entry.remove();
-      }
+      // An inserted entry may not have built yet: mounted is not membership.
+      entry.remove();
       contentNotifier?.dispose();
       return;
     }
 
     _retiringEntries.add(entry);
     try {
-      await controller.hide(animateSwipeAway: fromSwipe);
+      await controller
+          .hide(animateSwipeAway: fromSwipe)
+          .timeout(const Duration(milliseconds: 400), onTimeout: () {});
     } finally {
-      _retiringEntries.remove(entry);
-      if (entry.mounted) {
+      if (_retiringEntries.remove(entry)) {
         entry.remove();
       }
       contentNotifier?.dispose();
@@ -273,7 +273,7 @@ class AppToast {
     _entry = null;
     _controller = null;
     _contentNotifier = null;
-    if (oldEntry != null && oldEntry.mounted) {
+    if (oldEntry != null) {
       oldEntry.remove();
     }
     oldNotifier?.dispose();

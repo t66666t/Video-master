@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'landscape_sidebar_layout.dart';
 import 'package:provider/provider.dart';
 
 import '../models/ocr_subtitle_models.dart';
@@ -53,12 +54,12 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
   MediaMaterializationProgress? _preparationProgress;
   String? _preparationError;
   Completer<void>? _preparationCancellation;
-
-  OcrSubtitleManager get _manager => context.read<OcrSubtitleManager>();
+  late final OcrSubtitleManager _manager;
 
   @override
   void initState() {
     super.initState();
+    _manager = context.read<OcrSubtitleManager>();
     _tracks = List<OcrSubtitleTrack>.from(
       _manager.tracksForVideo(widget.videoItem.id),
     );
@@ -393,6 +394,14 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
 
   @override
   Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
     final managerJob = _manager.job;
     final ownsJob = managerJob?.videoId == widget.videoItem.id;
     final running = managerJob?.isRunning ?? false;
@@ -404,308 +413,299 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
     return Container(
       color: const Color(0xFF17191D),
       child: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 24),
+        child: Column(
           children: [
-            Row(
-              children: [
-                IconButton(
-                  onPressed: widget.onBack,
-                  icon: const Icon(Icons.arrow_back, color: Colors.white),
+            SizedBox(
+              height: layout.headerHeight,
+              child: Padding(
+                padding: EdgeInsets.symmetric(
+                  horizontal: layout.horizontalPadding,
                 ),
-                const SizedBox(width: 4),
-                const Expanded(
-                  child: Text(
-                    'OCR 字幕',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 19,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-                const Icon(
-                  Icons.document_scanner_outlined,
-                  color: Color(0xFF65A2FF),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            if (_preparationProgress != null) ...[
-              MediaMaterializationProgressCard(
-                progress: _preparationProgress!,
-                error: _preparationError,
-                onCancel: _preparingOnlineFrame
-                    ? () {
-                        final cancellation = _preparationCancellation;
-                        if (cancellation != null && !cancellation.isCompleted) {
-                          cancellation.complete();
-                        }
-                      }
-                    : null,
-              ),
-              const SizedBox(height: 12),
-            ] else
-              _buildActiveTaskCard(),
-            _card(
-              title: '字幕区域',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_previewPath != null && File(_previewPath!).existsSync())
-                    SizedBox(
-                      height: 118,
-                      child: ListView.separated(
-                        scrollDirection: Axis.horizontal,
-                        itemCount: _tracks.length,
-                        separatorBuilder: (_, _) => const SizedBox(width: 8),
-                        itemBuilder: (context, index) => SizedBox(
-                          width: 190,
-                          child: Stack(
-                            children: [
-                              Positioned.fill(
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(8),
-                                  child: OcrRegionPreview(
-                                    imagePath: _previewPath!,
-                                    region: _tracks[index].region,
-                                  ),
-                                ),
-                              ),
-                              Positioned(
-                                left: 6,
-                                top: 6,
-                                child: _numberBadge(index + 1),
-                              ),
-                            ],
-                          ),
+                child: Row(
+                  children: [
+                    SizedBox.square(
+                      dimension: layout.controlHeight,
+                      child: IconButton(
+                        padding: EdgeInsets.zero,
+                        onPressed: widget.onBack,
+                        icon: Icon(
+                          Icons.arrow_back,
+                          color: Colors.white,
+                          size: layout.iconSize,
                         ),
                       ),
                     ),
-                  const SizedBox(height: 9),
-                  for (final track in _tracks)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 3),
+                    SizedBox(width: layout.isNarrow ? 2 : 6),
+                    Expanded(
                       child: Text(
-                        '区域 ${track.number} · ${_regionSummary(track.region)}',
-                        style: const TextStyle(
-                          color: Colors.white54,
-                          fontSize: 11,
+                        'OCR 字幕',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: layout.titleSize,
+                          fontWeight: FontWeight.w700,
                         ),
                       ),
                     ),
-                  const SizedBox(height: 5),
-                  const Text(
-                    '下方任务会锁定使用这组坐标；切换页面或横竖屏不会恢复默认范围。',
-                    style: TextStyle(color: Colors.white38, fontSize: 10),
-                  ),
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: running ? null : _selectRegion,
-                        icon: const Icon(Icons.crop_free),
-                        label: const Text('精确框选字幕区域'),
-                      ),
-                    ],
-                  ),
-                ],
+                    Icon(
+                      Icons.document_scanner_outlined,
+                      size: layout.iconSize,
+                      color: const Color(0xFF65A2FF),
+                    ),
+                  ],
+                ),
               ),
             ),
-            const SizedBox(height: 12),
-            _card(
-              title: '识别设置',
-              child: Column(
+            const Divider(color: Colors.white10, height: 1),
+            Expanded(
+              child: ListView(
+                padding: EdgeInsets.fromLTRB(
+                  layout.horizontalPadding,
+                  layout.sectionGap,
+                  layout.horizontalPadding,
+                  layout.sectionGap,
+                ),
                 children: [
-                  for (var index = 0; index < _tracks.length; index++) ...[
-                    Row(
+                  if (_preparationProgress != null) ...[
+                    MediaMaterializationProgressCard(
+                      progress: _preparationProgress!,
+                      error: _preparationError,
+                      onCancel: _preparingOnlineFrame
+                          ? () {
+                              final cancellation = _preparationCancellation;
+                              if (cancellation != null &&
+                                  !cancellation.isCompleted) {
+                                cancellation.complete();
+                              }
+                            }
+                          : null,
+                    ),
+                    const SizedBox(height: 12),
+                  ] else
+                    _buildActiveTaskCard(),
+                  _card(
+                    title: '字幕区域',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        _numberBadge(index + 1),
-                        const SizedBox(width: 9),
-                        Expanded(
-                          child: DropdownButtonFormField<OcrSubtitleLanguage>(
-                            key: ValueKey(
-                              'ocr_language_${index}_${_tracks[index].language.name}',
-                            ),
-                            initialValue: _tracks[index].language,
-                            dropdownColor: const Color(0xFF252930),
-                            style: const TextStyle(color: Colors.white),
-                            decoration: InputDecoration(
-                              labelText: '区域 ${index + 1} 的字幕语言',
-                              border: const OutlineInputBorder(),
-                              isDense: true,
-                            ),
-                            items: [
-                              for (final language in OcrSubtitleLanguage.values)
-                                DropdownMenuItem(
-                                  value: language,
-                                  child: Text(language.label),
+                        if (_previewPath != null &&
+                            File(_previewPath!).existsSync())
+                          SizedBox(
+                            height: 118,
+                            child: ListView.separated(
+                              scrollDirection: Axis.horizontal,
+                              itemCount: _tracks.length,
+                              separatorBuilder: (_, _) =>
+                                  const SizedBox(width: 8),
+                              itemBuilder: (context, index) => SizedBox(
+                                width: 190,
+                                child: Stack(
+                                  children: [
+                                    Positioned.fill(
+                                      child: ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: OcrRegionPreview(
+                                          imagePath: _previewPath!,
+                                          region: _tracks[index].region,
+                                        ),
+                                      ),
+                                    ),
+                                    Positioned(
+                                      left: 6,
+                                      top: 6,
+                                      child: _numberBadge(index + 1),
+                                    ),
+                                  ],
                                 ),
-                            ],
-                            onChanged: running
-                                ? null
-                                : (value) {
-                                    if (value == null) return;
-                                    setState(() {
-                                      _tracks[index] = _tracks[index].copyWith(
-                                        language: value,
-                                      );
-                                      _tracksEditedInThisPanel = true;
-                                    });
-                                    _manager.rememberTracks(
-                                      widget.videoItem.id,
-                                      _tracks,
-                                    );
-                                    _refreshModelAndEstimate();
-                                  },
+                              ),
+                            ),
                           ),
+                        const SizedBox(height: 9),
+                        for (final track in _tracks)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 3),
+                            child: Text(
+                              '区域 ${track.number} · ${_regionSummary(track.region)}',
+                              style: const TextStyle(
+                                color: Colors.white54,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ),
+                        const SizedBox(height: 5),
+                        const Text(
+                          '下方任务会锁定使用这组坐标；切换页面或横竖屏不会恢复默认范围。',
+                          style: TextStyle(color: Colors.white38, fontSize: 10),
+                        ),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            OutlinedButton.icon(
+                              onPressed: running ? null : _selectRegion,
+                              icon: const Icon(Icons.crop_free),
+                              label: const Text('精确框选字幕区域'),
+                            ),
+                          ],
                         ),
                       ],
                     ),
-                    if (index != _tracks.length - 1) const SizedBox(height: 10),
-                  ],
-                  const SizedBox(height: 4),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: const Text(
-                      '自选时间范围',
-                      style: TextStyle(color: Colors.white),
-                    ),
-                    subtitle: Text(
-                      _customRange
-                          ? '${_formatMs(_startMs)} — ${_formatMs(_endMs)}'
-                          : '整个视频',
-                      style: const TextStyle(color: Colors.white54),
-                    ),
-                    value: _customRange,
-                    onChanged: running
-                        ? null
-                        : (value) => setState(() => _customRange = value),
-                  ),
-                  if (_customRange) ...[
-                    RangeSlider(
-                      values: RangeValues(_startMs, _endMs),
-                      min: 0,
-                      max: widget.duration.inMilliseconds.toDouble().clamp(
-                        1,
-                        double.infinity,
-                      ),
-                      labels: RangeLabels(
-                        _formatMs(_startMs),
-                        _formatMs(_endMs),
-                      ),
-                      onChanged: running
-                          ? null
-                          : (value) => setState(() {
-                              _startMs = value.start;
-                              _endMs = value.end;
-                            }),
-                      onChangeEnd: (_) => _refreshModelAndEstimate(),
-                    ),
-                  ],
-                  Row(
-                    children: [
-                      Icon(
-                        _modelInstalled
-                            ? Icons.offline_pin
-                            : Icons.inventory_2_outlined,
-                        size: 17,
-                        color: _modelInstalled
-                            ? Colors.greenAccent
-                            : const Color(0xFF65A2FF),
-                      ),
-                      const SizedBox(width: 7),
-                      Expanded(
-                        child: Text(
-                          _modelInstalled
-                              ? '所选语言模型均已就绪，可完全离线识别'
-                              : '全部模型已内置；首次开始仅复制并校验，无需下载',
-                          style: const TextStyle(
-                            color: Colors.white60,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            _card(
-              title: '处理流程',
-              child: Text(
-                '内置 ${_manager.totalBundledOnnxModelCount} 个 ONNX 模型，当前有 ${_tracks.length} 个独立字幕区域。\n'
-                '① 按编号串行处理各区域  →  ② 每种语言实测 CPU/GPU  →  '
-                '③ 首个 5 秒校准 ETA，其后每 15 秒按真实 PTS 提取 10 FPS 候选帧  →  '
-                '④ SSIM 变化筛选与双帧 OCR  →  ⑤ 每个区域分别保存一个 SRT。\n'
-                '每张图片处理后立即删除；取消、失败、重启或永久删除视频时也会清理。',
-                style: const TextStyle(
-                  color: Colors.white60,
-                  fontSize: 12,
-                  height: 1.55,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            _card(
-              title: running || job != null ? '任务状态' : '准备开始',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    runningOtherVideo
-                        ? '正在处理其他视频的 OCR 字幕'
-                        : _taskStatusText(job),
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-                  if (job?.error != null) ...[
-                    const SizedBox(height: 6),
-                    Text(
-                      job!.error!,
-                      style: const TextStyle(
-                        color: Colors.redAccent,
-                        fontSize: 11,
-                      ),
-                      maxLines: 4,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                  const SizedBox(height: 10),
-                  LinearProgressIndicator(
-                    value: displayedProgress.clamp(0, 1),
-                    minHeight: 6,
-                  ),
-                  const SizedBox(height: 7),
-                  Text(
-                    running
-                        ? '${(displayedProgress * 100).round()}%  ·  '
-                              '剩余约 ${_formatDuration(job?.remaining)}  ·  '
-                              '${_manager.activeBackend}'
-                        : '${((job?.progress ?? 0) * 100).round()}%',
-                    style: const TextStyle(color: Colors.white38, fontSize: 11),
                   ),
                   const SizedBox(height: 12),
-                  if (running)
-                    OutlinedButton.icon(
-                      onPressed: _manager.cancel,
-                      icon: const Icon(Icons.stop_circle_outlined),
-                      label: const Text('取消任务'),
-                    )
-                  else
-                    FilledButton.icon(
-                      onPressed: _start,
-                      icon: const Icon(Icons.document_scanner_outlined),
-                      label: Text(
-                        job?.status == OcrSubtitleJobStatus.failed
-                            ? '重试 OCR 识别'
-                            : '开始 OCR 识别',
+                  _card(
+                    title: '识别设置',
+                    child: Column(
+                      children: [
+                        for (
+                          var index = 0;
+                          index < _tracks.length;
+                          index++
+                        ) ...[
+                          Row(
+                            children: [
+                              _numberBadge(index + 1),
+                              const SizedBox(width: 9),
+                              Expanded(
+                                child: DropdownButtonFormField<OcrSubtitleLanguage>(
+                                  isExpanded: true,
+                                  key: ValueKey(
+                                    'ocr_language_${index}_${_tracks[index].language.name}',
+                                  ),
+                                  initialValue: _tracks[index].language,
+                                  dropdownColor: const Color(0xFF252930),
+                                  style: const TextStyle(color: Colors.white),
+                                  decoration: InputDecoration(
+                                    labelText: '区域 ${index + 1} 的字幕语言',
+                                    border: const OutlineInputBorder(),
+                                    isDense: true,
+                                  ),
+                                  items: [
+                                    for (final language
+                                        in OcrSubtitleLanguage.values)
+                                      DropdownMenuItem(
+                                        value: language,
+                                        child: Text(
+                                          language.label,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                  ],
+                                  onChanged: running
+                                      ? null
+                                      : (value) {
+                                          if (value == null) return;
+                                          setState(() {
+                                            _tracks[index] = _tracks[index]
+                                                .copyWith(language: value);
+                                            _tracksEditedInThisPanel = true;
+                                          });
+                                          _manager.rememberTracks(
+                                            widget.videoItem.id,
+                                            _tracks,
+                                          );
+                                          _refreshModelAndEstimate();
+                                        },
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (index != _tracks.length - 1)
+                            const SizedBox(height: 10),
+                        ],
+                        const SizedBox(height: 4),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text(
+                            '自选时间范围',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                          subtitle: Text(
+                            _customRange
+                                ? '${_formatMs(_startMs)} — ${_formatMs(_endMs)}'
+                                : '整个视频',
+                            style: const TextStyle(color: Colors.white54),
+                          ),
+                          value: _customRange,
+                          onChanged: running
+                              ? null
+                              : (value) => setState(() => _customRange = value),
+                        ),
+                        if (_customRange) ...[
+                          RangeSlider(
+                            values: RangeValues(_startMs, _endMs),
+                            min: 0,
+                            max: widget.duration.inMilliseconds
+                                .toDouble()
+                                .clamp(1, double.infinity),
+                            labels: RangeLabels(
+                              _formatMs(_startMs),
+                              _formatMs(_endMs),
+                            ),
+                            onChanged: running
+                                ? null
+                                : (value) => setState(() {
+                                    _startMs = value.start;
+                                    _endMs = value.end;
+                                  }),
+                            onChangeEnd: (_) => _refreshModelAndEstimate(),
+                          ),
+                        ],
+                        Row(
+                          children: [
+                            Icon(
+                              _modelInstalled
+                                  ? Icons.offline_pin
+                                  : Icons.inventory_2_outlined,
+                              size: 17,
+                              color: _modelInstalled
+                                  ? Colors.greenAccent
+                                  : const Color(0xFF65A2FF),
+                            ),
+                            const SizedBox(width: 7),
+                            Expanded(
+                              child: Text(
+                                _modelInstalled
+                                    ? '所选语言模型均已就绪，可完全离线识别'
+                                    : '全部模型已内置；首次开始仅复制并校验，无需下载',
+                                style: const TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _card(
+                    title: '处理流程',
+                    child: Text(
+                      '内置 ${_manager.totalBundledOnnxModelCount} 个 ONNX 模型，当前有 ${_tracks.length} 个独立字幕区域。\n'
+                      '① 按编号串行处理各区域  →  ② 每种语言实测 CPU/GPU  →  '
+                      '③ 首个 5 秒校准 ETA，其后每 15 秒按真实 PTS 提取 10 FPS 候选帧  →  '
+                      '④ SSIM 变化筛选与双帧 OCR  →  ⑤ 每个区域分别保存一个 SRT。\n'
+                      '每张图片处理后立即删除；取消、失败、重启或永久删除视频时也会清理。',
+                      style: const TextStyle(
+                        color: Colors.white60,
+                        fontSize: 12,
+                        height: 1.55,
                       ),
                     ),
+                  ),
                 ],
               ),
+            ),
+            _buildPinnedTaskAction(
+              layout: layout,
+              job: job,
+              running: running,
+              runningOtherVideo: runningOtherVideo,
+              displayedProgress: displayedProgress,
             ),
           ],
         ),
@@ -713,26 +713,146 @@ class _OcrSubtitlePanelState extends State<OcrSubtitlePanel> {
     );
   }
 
-  Widget _card({required String title, required Widget child}) => Container(
-    padding: const EdgeInsets.all(14),
-    decoration: BoxDecoration(
-      color: const Color(0xFF20242A),
-      borderRadius: BorderRadius.circular(14),
-      border: Border.all(color: Colors.white10),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text(
-          title,
-          style: const TextStyle(
-            color: Colors.white,
-            fontWeight: FontWeight.w700,
+  Widget _buildPinnedTaskAction({
+    required LandscapeSidebarLayout layout,
+    required OcrSubtitleJob? job,
+    required bool running,
+    required bool runningOtherVideo,
+    required double displayedProgress,
+  }) {
+    final status = runningOtherVideo
+        ? '正在处理其他视频的 OCR 字幕'
+        : _taskStatusText(job);
+    final compactFooter = layout.isNarrow || layout.isCompactHeight;
+    final progressText = running
+        ? compactFooter
+              ? '${(displayedProgress * 100).round()}%'
+              : '${(displayedProgress * 100).round()}% · 剩余约 ${_formatDuration(job?.remaining)} · ${_manager.activeBackend}'
+        : '${((job?.progress ?? 0) * 100).round()}%';
+
+    return Container(
+      key: const ValueKey('ocr-pinned-task-action'),
+      padding: EdgeInsets.fromLTRB(
+        layout.horizontalPadding,
+        layout.verticalPadding,
+        layout.horizontalPadding,
+        layout.verticalPadding,
+      ),
+      decoration: const BoxDecoration(
+        color: Color(0xFF20242A),
+        border: Border(top: BorderSide(color: Colors.white12)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black38,
+            blurRadius: 10,
+            offset: Offset(0, -3),
           ),
-        ),
-        const SizedBox(height: 12),
-        child,
-      ],
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                running ? Icons.sync_rounded : Icons.info_outline_rounded,
+                size: layout.iconSize - 2,
+                color: running ? const Color(0xFF65A2FF) : Colors.white54,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  status,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: layout.captionSize,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                progressText,
+                maxLines: 1,
+                overflow: TextOverflow.fade,
+                softWrap: false,
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: layout.captionSize,
+                ),
+              ),
+            ],
+          ),
+          if (job?.error != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              job!.error!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.redAccent,
+                fontSize: layout.captionSize,
+              ),
+            ),
+          ],
+          const SizedBox(height: 6),
+          LinearProgressIndicator(
+            key: const ValueKey('ocr-pinned-progress'),
+            value: displayedProgress.clamp(0, 1),
+            minHeight: 4,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          const SizedBox(height: 7),
+          SizedBox(
+            height: layout.controlHeight,
+            child: running
+                ? OutlinedButton.icon(
+                    key: const ValueKey('ocr-pinned-cancel'),
+                    onPressed: _manager.cancel,
+                    icon: const Icon(Icons.stop_circle_outlined, size: 17),
+                    label: const Text('取消任务'),
+                  )
+                : FilledButton.icon(
+                    key: const ValueKey('ocr-pinned-start'),
+                    onPressed: _start,
+                    icon: const Icon(Icons.document_scanner_outlined, size: 17),
+                    label: Text(
+                      job?.status == OcrSubtitleJobStatus.failed
+                          ? '重试 OCR 识别'
+                          : '开始 OCR 识别',
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _card({required String title, required Widget child}) => Material(
+    color: const Color(0xFF20242A),
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(14),
+      side: const BorderSide(color: Colors.white10),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: Padding(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 12),
+          child,
+        ],
+      ),
     ),
   );
 

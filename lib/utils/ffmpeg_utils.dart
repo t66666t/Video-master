@@ -7,26 +7,26 @@ class FFmpegUtils {
   static Future<String>? _ffprobePathFuture;
 
   static Future<String> get ffmpegPath async {
-    if (!Platform.isWindows) {
-      return 'ffmpeg'; // Not used on other platforms usually (they use FFmpegKit)
+    if (!(Platform.isWindows || Platform.isMacOS)) {
+      return 'ffmpeg';
     }
-    return _ffmpegPathFuture ??= _resolveWindowsBinaryPath(
-      fileName: 'ffmpeg.exe',
+    return _ffmpegPathFuture ??= _resolveDesktopBinaryPath(
+      fileName: Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg',
       pathFallback: 'ffmpeg',
     );
   }
 
   static Future<String> get ffprobePath async {
-    if (!Platform.isWindows) {
+    if (!(Platform.isWindows || Platform.isMacOS)) {
       return 'ffprobe';
     }
-    return _ffprobePathFuture ??= _resolveWindowsBinaryPath(
-      fileName: 'ffprobe.exe',
+    return _ffprobePathFuture ??= _resolveDesktopBinaryPath(
+      fileName: Platform.isWindows ? 'ffprobe.exe' : 'ffprobe',
       pathFallback: 'ffprobe',
     );
   }
 
-  static Future<String> _resolveWindowsBinaryPath({
+  static Future<String> _resolveDesktopBinaryPath({
     required String fileName,
     required String pathFallback,
   }) async {
@@ -60,10 +60,9 @@ class FFmpegUtils {
 
   static Future<bool> _isBinaryOperational(String binaryPath) async {
     try {
-      final result = await Process.run(
-        binaryPath,
-        const ['-version'],
-      ).timeout(const Duration(seconds: 8));
+      final result = await Process.run(binaryPath, const [
+        '-version',
+      ]).timeout(const Duration(seconds: 8));
       return result.exitCode == 0;
     } catch (_) {
       return false;

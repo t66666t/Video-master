@@ -200,7 +200,8 @@ class VideoComposeOrchestrator {
     String? assPath;
     String? preciseSubtitleConcatPath;
     if (shouldRenderVideoSubtitles &&
-        request.renderMode == VideoComposeRenderMode.approximate) {
+        request.renderMode == VideoComposeRenderMode.approximate &&
+        request.subtitlePreset == null) {
       assPath = p.join(
         tempDir.path,
         'compose_${DateTime.now().millisecondsSinceEpoch}.ass',
@@ -219,7 +220,8 @@ class VideoComposeOrchestrator {
       );
     }
     if (shouldRenderVideoSubtitles &&
-        request.renderMode == VideoComposeRenderMode.precise) {
+        (request.renderMode == VideoComposeRenderMode.precise ||
+            request.subtitlePreset != null)) {
       final Directory preciseDir = Directory(
         p.join(
           tempDir.path,
@@ -237,6 +239,7 @@ class VideoComposeOrchestrator {
           width: target.width,
           height: target.height,
         ),
+        subtitlePreset: request.subtitlePreset,
         alignment: request.subtitleAlignment,
         splitSubtitleByLine: request.splitSubtitleByLine,
         itemGap: request.subtitleItemGap,
@@ -276,19 +279,22 @@ class VideoComposeOrchestrator {
 
     String? fontsDir;
     if (shouldRenderVideoSubtitles &&
-        request.renderMode == VideoComposeRenderMode.approximate) {
+        request.renderMode == VideoComposeRenderMode.approximate &&
+        request.subtitlePreset == null) {
       fontsDir = await _fontService.resolveAssFontsDir();
     }
     if ((Platform.isAndroid || Platform.isIOS) &&
         shouldRenderVideoSubtitles &&
         request.renderMode == VideoComposeRenderMode.approximate &&
+        request.subtitlePreset == null &&
         _fontService.requiresBundledFonts(request.subtitleStyle) &&
         (fontsDir == null || fontsDir.isEmpty)) {
       throw StateError('移动端内置字体资源加载失败');
     }
     if ((Platform.isAndroid || Platform.isIOS) &&
         shouldRenderVideoSubtitles &&
-        request.renderMode == VideoComposeRenderMode.approximate) {
+        request.renderMode == VideoComposeRenderMode.approximate &&
+        request.subtitlePreset == null) {
       await _fontService.configureForRender(fontsDir: fontsDir);
     }
 

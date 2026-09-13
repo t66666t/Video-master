@@ -7,7 +7,6 @@ import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_collection.dart';
@@ -22,6 +21,7 @@ import 'package:video_player_app/utils/subtitle_util.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
+import 'package:video_player_app/widgets/adaptive_settings_dialog.dart';
 
 class BilibiliDownloadScreen extends StatefulWidget {
   final String? initialInput;
@@ -473,284 +473,364 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     bool tempAutoImport = service.autoImportToLibrary;
     bool tempAutoDelete = service.autoDeleteTaskAfterImport;
     bool tempSeqExport = service.sequentialExport;
-    String defaultDownloadDir;
-    if (Platform.isWindows) {
-      final dataRootPath = await SettingsService()
-          .getDefaultLargeDataRootPath();
-      defaultDownloadDir = p.join(dataRootPath, 'imported_videos');
-    } else if (Platform.isMacOS) {
-      final downloadDir = await getDownloadsDirectory();
-      if (downloadDir != null) {
-        defaultDownloadDir = p.join(downloadDir.path, 'imported_videos');
-      } else {
-        final appDir = await getApplicationDocumentsDirectory();
-        defaultDownloadDir = p.join(appDir.path, 'imported_videos');
-      }
-    } else {
-      final appDir = await getApplicationDocumentsDirectory();
-      defaultDownloadDir = p.join(appDir.path, 'imported_videos');
-    }
+    final defaultDownloadDir =
+        (await service.resolveDefaultImportDirectory()).path;
     String? tempCustomPath = service.customDownloadPath;
     if (!mounted) return;
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setState) {
-          return AlertDialog(
-            title: const Text("下载设置"),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SwitchListTile(
-                    title: const Text('下载弹幕'),
-                    subtitle: const Text('下载后自动绑定到对应的 B 站视频'),
-                    value: tempDownloadDanmaku,
-                    onChanged: (value) {
-                      setState(() => tempDownloadDanmaku = value);
-                      unawaited(service.setDownloadDanmaku(value));
-                    },
-                    contentPadding: EdgeInsets.zero,
+          final metrics = AdaptiveSettingsDialogMetrics.fromSize(
+            MediaQuery.sizeOf(context),
+            preferredWidth: 720,
+          );
+          return AdaptiveSettingsDialogTheme(
+            metrics: metrics,
+            child: AlertDialog(
+              insetPadding: metrics.insetPadding,
+              titlePadding: metrics.titlePadding,
+              contentPadding: metrics.contentPadding,
+              actionsPadding: metrics.actionsPadding,
+              constraints: BoxConstraints(
+                maxWidth: metrics.dialogWidth,
+                maxHeight: metrics.dialogMaxHeight,
+              ),
+              title: Text(
+                "下载设置",
+                style: TextStyle(fontSize: metrics.titleSize),
+              ),
+              content: SizedBox(
+                width: metrics.dialogWidth - metrics.contentPadding.horizontal,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: metrics.contentMaxHeight,
                   ),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      const Text("最大并发下载数: "),
-                      DropdownButton<int>(
-                        value: tempMax,
-                        items:
-                            List.generate(
-                                  Platform.isWindows
-                                      ? _windowsMaxConcurrentDownloadsCap
-                                      : 10,
-                                  (i) => i + 1,
-                                )
-                                .map(
-                                  (e) => DropdownMenuItem(
-                                    value: e,
-                                    child: Text("$e"),
-                                  ),
-                                )
-                                .toList(),
-                        onChanged: (val) {
-                          if (val != null) setState(() => tempMax = val);
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      const Expanded(child: Text('单视频连接数:')),
-                      DropdownButton<int>(
-                        value: tempVideoConnections,
-                        items: const [
-                          DropdownMenuItem(value: 1, child: Text('1（稳定）')),
-                          DropdownMenuItem(value: 2, child: Text('2（推荐）')),
-                          DropdownMenuItem(value: 4, child: Text('4（高速）')),
-                        ],
-                        onChanged: (value) {
-                          if (value != null) {
-                            setState(() => tempVideoConnections = value);
-                          }
-                        },
-                      ),
-                    ],
-                  ),
-                  const Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      '按文件大小和任务并发数自动降级；CDN 不支持分片时会回退单连接。',
-                      style: TextStyle(fontSize: 10, color: Colors.white54),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      const Text("首选清晰度: "),
-                      DropdownButton<int>(
-                        value: tempQuality,
-                        items: const [
-                          DropdownMenuItem(value: 127, child: Text("8K")),
-                          DropdownMenuItem(value: 120, child: Text("4K")),
-                          DropdownMenuItem(
-                            value: 116,
-                            child: Text("1080P 60帧"),
-                          ),
-                          DropdownMenuItem(value: 80, child: Text("1080P")),
-                          DropdownMenuItem(value: 64, child: Text("720P")),
-                          DropdownMenuItem(value: 32, child: Text("480P")),
-                        ],
-                        onChanged: (val) {
-                          if (val != null) setState(() => tempQuality = val);
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      const Text("字幕偏好: "),
-                      DropdownButton<String>(
-                        value: tempSubLang,
-                        items: const [
-                          DropdownMenuItem(value: "none", child: Text("无")),
-                          DropdownMenuItem(value: "zh", child: Text("中文")),
-                          DropdownMenuItem(value: "en", child: Text("English")),
-                          DropdownMenuItem(value: "ja", child: Text("日本語")),
-                        ],
-                        onChanged: (val) {
-                          if (val != null) setState(() => tempSubLang = val);
-                        },
-                      ),
-                    ],
-                  ),
-                  CheckboxListTile(
-                    title: const Text("AI 字幕优先"),
-                    value: tempAi,
-                    onChanged: (val) {
-                      if (val != null) setState(() => tempAi = val);
-                    },
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  CheckboxListTile(
-                    title: const Text("下载完成后自动导入媒体库"),
-                    value: tempAutoImport,
-                    onChanged: (val) {
-                      if (val != null) setState(() => tempAutoImport = val);
-                    },
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  CheckboxListTile(
-                    title: const Text("导入媒体库后自动删除任务"),
-                    value: tempAutoDelete,
-                    onChanged: (val) {
-                      if (val != null) setState(() => tempAutoDelete = val);
-                    },
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  CheckboxListTile(
-                    title: Text(
-                      "批量合成并导出时按顺序导出",
-                      style: TextStyle(
-                        color: tempAutoImport ? Colors.white : Colors.white38,
-                      ),
-                    ),
-                    subtitle: Text(
-                      "等待前置任务导出后再进行当前任务导出",
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: tempAutoImport ? Colors.white54 : Colors.white24,
-                      ),
-                    ),
-                    value: tempSeqExport,
-                    onChanged: tempAutoImport
-                        ? (val) {
-                            if (val != null) {
-                              setState(() => tempSeqExport = val);
-                            }
-                          }
-                        : null,
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                  if (!Platform.isAndroid && !Platform.isIOS) ...[
-                    const SizedBox(height: 16),
-                    const Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        "下载保存目录",
-                        style: TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.05),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            _formatPath(
-                              tempCustomPath?.isNotEmpty == true
-                                  ? tempCustomPath!
-                                  : defaultDownloadDir,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AdaptiveSettingsTileGrid(
+                          gap: metrics.gap,
+                          children: [
+                            SwitchListTile(
+                              title: const Text('下载弹幕'),
+                              subtitle: const Text('下载后自动绑定到对应视频'),
+                              value: tempDownloadDanmaku,
+                              onChanged: (value) {
+                                setState(() => tempDownloadDanmaku = value);
+                              },
+                              contentPadding: EdgeInsets.zero,
                             ),
-                            style: const TextStyle(
-                              fontSize: 12,
-                              color: Colors.white70,
-                            ),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              ElevatedButton(
-                                onPressed: () async {
-                                  try {
-                                    final path = await FilePicker.platform
-                                        .getDirectoryPath(
-                                          dialogTitle: "选择下载保存目录",
-                                          lockParentWindow: true,
-                                        );
-                                    if (path != null && path.isNotEmpty) {
-                                      setState(() => tempCustomPath = path);
+                            Row(
+                              children: [
+                                const Expanded(child: Text("最大并发下载数")),
+                                DropdownButton<int>(
+                                  value: tempMax,
+                                  items:
+                                      List.generate(
+                                            Platform.isWindows
+                                                ? _windowsMaxConcurrentDownloadsCap
+                                                : 10,
+                                            (i) => i + 1,
+                                          )
+                                          .map(
+                                            (e) => DropdownMenuItem(
+                                              value: e,
+                                              child: Text("$e"),
+                                            ),
+                                          )
+                                          .toList(),
+                                  onChanged: (val) {
+                                    if (val != null) {
+                                      setState(() => tempMax = val);
                                     }
-                                  } catch (e) {
-                                    AppToast.show(
-                                      "打开目录选择失败，请重试",
-                                      type: AppToastType.error,
-                                    );
-                                  }
-                                },
-                                child: const Text("选择目录"),
+                                  },
+                                ),
+                              ],
+                            ),
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Expanded(child: Text('单视频连接数')),
+                                    DropdownButton<int>(
+                                      value: tempVideoConnections,
+                                      items: const [
+                                        DropdownMenuItem(
+                                          value: 1,
+                                          child: Text('1（稳定）'),
+                                        ),
+                                        DropdownMenuItem(
+                                          value: 2,
+                                          child: Text('2（推荐）'),
+                                        ),
+                                        DropdownMenuItem(
+                                          value: 4,
+                                          child: Text('4（高速）'),
+                                        ),
+                                      ],
+                                      onChanged: (value) {
+                                        if (value != null) {
+                                          setState(
+                                            () => tempVideoConnections = value,
+                                          );
+                                        }
+                                      },
+                                    ),
+                                  ],
+                                ),
+                                Text(
+                                  '会按文件大小与任务数自动降级，不支持分片时回退单连接。',
+                                  style: TextStyle(
+                                    fontSize: metrics.captionSize,
+                                    color: Colors.white54,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            Row(
+                              children: [
+                                const Expanded(child: Text("首选清晰度")),
+                                DropdownButton<int>(
+                                  value: tempQuality,
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: 127,
+                                      child: Text("8K"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 120,
+                                      child: Text("4K"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 116,
+                                      child: Text("1080P 60帧"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 80,
+                                      child: Text("1080P"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 64,
+                                      child: Text("720P"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 32,
+                                      child: Text("480P"),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                    if (val != null) {
+                                      setState(() => tempQuality = val);
+                                    }
+                                  },
+                                ),
+                              ],
+                            ),
+                            Row(
+                              children: [
+                                const Expanded(child: Text("字幕偏好")),
+                                DropdownButton<String>(
+                                  value: tempSubLang,
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: "none",
+                                      child: Text("无"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: "zh",
+                                      child: Text("中文"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: "en",
+                                      child: Text("English"),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: "ja",
+                                      child: Text("日本語"),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                    if (val != null) {
+                                      setState(() => tempSubLang = val);
+                                    }
+                                  },
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                        AdaptiveSettingsTileGrid(
+                          gap: metrics.gap,
+                          children: [
+                            CheckboxListTile(
+                              title: const Text("AI 字幕优先"),
+                              value: tempAi,
+                              onChanged: (val) {
+                                if (val != null) setState(() => tempAi = val);
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            CheckboxListTile(
+                              title: const Text("下载完成后自动导入媒体库"),
+                              value: tempAutoImport,
+                              onChanged: (val) {
+                                if (val != null) {
+                                  setState(() => tempAutoImport = val);
+                                }
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            CheckboxListTile(
+                              title: const Text("导入媒体库后自动删除任务"),
+                              value: tempAutoDelete,
+                              onChanged: (val) {
+                                if (val != null) {
+                                  setState(() => tempAutoDelete = val);
+                                }
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            CheckboxListTile(
+                              title: Text(
+                                "批量合成并导出时按顺序导出",
+                                style: TextStyle(
+                                  color: tempAutoImport
+                                      ? Colors.white
+                                      : Colors.white38,
+                                ),
                               ),
-                              const SizedBox(width: 8),
-                              TextButton(
-                                onPressed: () {
-                                  setState(
-                                    () => tempCustomPath = defaultDownloadDir,
-                                  );
-                                },
-                                child: const Text("使用默认"),
+                              subtitle: Text(
+                                "等待前置任务导出后再进行当前任务导出",
+                                style: TextStyle(
+                                  fontSize: metrics.captionSize,
+                                  color: tempAutoImport
+                                      ? Colors.white54
+                                      : Colors.white24,
+                                ),
                               ),
-                            ],
+                              value: tempSeqExport,
+                              onChanged: tempAutoImport
+                                  ? (val) {
+                                      if (val != null) {
+                                        setState(() => tempSeqExport = val);
+                                      }
+                                    }
+                                  : null,
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                          ],
+                        ),
+                        if (!Platform.isAndroid && !Platform.isIOS) ...[
+                          SizedBox(height: metrics.gap),
+                          const Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              "下载保存目录",
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          SizedBox(height: metrics.gap),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.05),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _formatPath(
+                                    tempCustomPath?.isNotEmpty == true
+                                        ? tempCustomPath!
+                                        : defaultDownloadDir,
+                                  ),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 8),
+                                Row(
+                                  children: [
+                                    ElevatedButton(
+                                      onPressed: () async {
+                                        try {
+                                          final path = await FilePicker.platform
+                                              .getDirectoryPath(
+                                                dialogTitle: "选择下载保存目录",
+                                                lockParentWindow: true,
+                                              );
+                                          if (path != null && path.isNotEmpty) {
+                                            setState(
+                                              () => tempCustomPath = path,
+                                            );
+                                          }
+                                        } catch (e) {
+                                          AppToast.show(
+                                            "打开目录选择失败，请重试",
+                                            type: AppToastType.error,
+                                          );
+                                        }
+                                      },
+                                      child: const Text("选择目录"),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    TextButton(
+                                      onPressed: () {
+                                        setState(() => tempCustomPath = null);
+                                      },
+                                      child: const Text("使用默认"),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
                           ),
                         ],
-                      ),
+                      ],
                     ),
-                  ],
-                ],
+                  ),
+                ),
               ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text("取消"),
+                ),
+                ElevatedButton(
+                  onPressed: () async {
+                    try {
+                      await service.updateSettings(
+                        tempMax,
+                        tempQuality,
+                        tempSubLang,
+                        tempAi,
+                        tempAutoImport,
+                        tempAutoDelete,
+                        tempSeqExport,
+                        customPath: tempCustomPath,
+                        videoConnections: tempVideoConnections,
+                        shouldDownloadDanmaku: tempDownloadDanmaku,
+                      );
+                      if (!ctx.mounted) return;
+                      Navigator.pop(ctx);
+                      AppToast.show("设置已保存", type: AppToastType.success);
+                    } catch (_) {
+                      if (!ctx.mounted) return;
+                      AppToast.show("设置保存失败，请重试", type: AppToastType.error);
+                    }
+                  },
+                  child: const Text("保存"),
+                ),
+              ],
             ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text("取消"),
-              ),
-              ElevatedButton(
-                onPressed: () {
-                  service.updateSettings(
-                    tempMax,
-                    tempQuality,
-                    tempSubLang,
-                    tempAi,
-                    tempAutoImport,
-                    tempAutoDelete,
-                    tempSeqExport,
-                    customPath: tempCustomPath,
-                    videoConnections: tempVideoConnections,
-                  );
-                  Navigator.pop(ctx);
-                  AppToast.show("设置已保存", type: AppToastType.success);
-                },
-                child: const Text("保存"),
-              ),
-            ],
           );
         },
       ),
@@ -764,72 +844,107 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('解析设置'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  const Expanded(child: Text('默认字幕偏好')),
-                  DropdownButton<String>(
-                    value: subtitleLanguage,
-                    items: const [
-                      DropdownMenuItem(value: 'none', child: Text('无')),
-                      DropdownMenuItem(value: 'zh', child: Text('中文')),
-                      DropdownMenuItem(value: 'en', child: Text('English')),
-                      DropdownMenuItem(value: 'ja', child: Text('日本語')),
+        builder: (context, setDialogState) {
+          final metrics = AdaptiveSettingsDialogMetrics.fromSize(
+            MediaQuery.sizeOf(context),
+            preferredWidth: 520,
+          );
+          return AdaptiveSettingsDialogTheme(
+            metrics: metrics,
+            child: AlertDialog(
+              insetPadding: metrics.insetPadding,
+              titlePadding: metrics.titlePadding,
+              contentPadding: metrics.contentPadding,
+              actionsPadding: metrics.actionsPadding,
+              constraints: BoxConstraints(
+                maxWidth: metrics.dialogWidth,
+                maxHeight: metrics.dialogMaxHeight,
+              ),
+              title: Text(
+                '解析设置',
+                style: TextStyle(fontSize: metrics.titleSize),
+              ),
+              content: SizedBox(
+                width: metrics.dialogWidth - metrics.contentPadding.horizontal,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          const Expanded(child: Text('默认字幕偏好')),
+                          DropdownButton<String>(
+                            value: subtitleLanguage,
+                            items: const [
+                              DropdownMenuItem(value: 'none', child: Text('无')),
+                              DropdownMenuItem(value: 'zh', child: Text('中文')),
+                              DropdownMenuItem(
+                                value: 'en',
+                                child: Text('English'),
+                              ),
+                              DropdownMenuItem(value: 'ja', child: Text('日本語')),
+                            ],
+                            onChanged: (value) {
+                              if (value != null) {
+                                setDialogState(() => subtitleLanguage = value);
+                              }
+                            },
+                          ),
+                        ],
+                      ),
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('AI 字幕优先'),
+                        subtitle: const Text('仅影响导出时默认绑定的字幕'),
+                        value: preferAi,
+                        onChanged: (value) =>
+                            setDialogState(() => preferAi = value ?? false),
+                      ),
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('导出后自动删除解析任务'),
+                        value: autoDelete,
+                        onChanged: (value) =>
+                            setDialogState(() => autoDelete = value ?? false),
+                      ),
+                      const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          '视频清晰度在播放时选择；这里只解析稳定的 BV/cid 身份、封面、字幕和章节。',
+                          style: TextStyle(fontSize: 11, color: Colors.white54),
+                        ),
+                      ),
                     ],
-                    onChanged: (value) {
-                      if (value != null) {
-                        setDialogState(() => subtitleLanguage = value);
-                      }
-                    },
                   ),
-                ],
-              ),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('AI 字幕优先'),
-                subtitle: const Text('仅影响导出时默认绑定的字幕'),
-                value: preferAi,
-                onChanged: (value) =>
-                    setDialogState(() => preferAi = value ?? false),
-              ),
-              CheckboxListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('导出后自动删除解析任务'),
-                value: autoDelete,
-                onChanged: (value) =>
-                    setDialogState(() => autoDelete = value ?? false),
-              ),
-              const Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  '视频清晰度在播放时选择；这里只解析稳定的 BV/cid 身份、封面、字幕和章节。',
-                  style: TextStyle(fontSize: 11, color: Colors.white54),
                 ),
               ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('取消'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    try {
+                      await service.updateStreamingSettings(
+                        subtitleLanguage: subtitleLanguage,
+                        preferAi: preferAi,
+                        autoDelete: autoDelete,
+                      );
+                      if (!dialogContext.mounted) return;
+                      Navigator.pop(dialogContext);
+                      AppToast.show("设置已保存", type: AppToastType.success);
+                    } catch (_) {
+                      if (!dialogContext.mounted) return;
+                      AppToast.show("设置保存失败，请重试", type: AppToastType.error);
+                    }
+                  },
+                  child: const Text('保存'),
+                ),
+              ],
             ),
-            FilledButton(
-              onPressed: () {
-                service
-                  ..preferredSubtitleLang = subtitleLanguage
-                  ..preferAiSubtitles = preferAi
-                  ..autoDeleteTaskAfterImport = autoDelete;
-                unawaited(service.saveSettings());
-                Navigator.pop(dialogContext);
-              },
-              child: const Text('保存'),
-            ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

@@ -26,7 +26,7 @@ class TranscriptionManager extends ChangeNotifier {
   static const String _managedTempAudioDirName = 'ai_transcription_temp_audio';
   static const String _managedTempAudioPrefix = 'temp_audio_';
   static const String _persistenceFileName = 'transcription_queue_cache.json';
-  final BcutAsrService _asrService = BcutAsrService();
+  final BcutAsrService _asrService;
   final SettingsService _settings;
   final List<_TranscriptionJob> _queue = <_TranscriptionJob>[];
   final Set<String> _queuedMediaKeys = <String>{};
@@ -37,6 +37,7 @@ class TranscriptionManager extends ChangeNotifier {
   final Map<String, _TranscriptionJob> _completedJobs =
       <String, _TranscriptionJob>{};
   final Set<String> _startedMediaKeys = <String>{};
+  final List<String> _taskOrder = <String>[];
   final Map<String, String> _statusMessagesByMediaKey = <String, String>{};
 
   // State
@@ -51,9 +52,16 @@ class TranscriptionManager extends ChangeNotifier {
   LibraryService? _libraryService;
   bool _autoCache = false;
   bool _initialized = false;
+  bool _disposed = false;
   _TranscriptionJob? _currentJob;
   _JobCancellation? _currentCancellation;
   bool _currentTaskRemoved = false;
+  bool _currentPauseRequested = false;
+  int _consecutiveRiskControlFailures = 0;
+  DateTime? _nextRemoteRequestAt;
+  static const int _riskControlStopThreshold = 2;
+  static const Duration _normalInterTaskDelay = Duration(seconds: 8);
+  static const Duration _riskControlCooldown = Duration(seconds: 30);
 
   // ── 持久化 ──
   Timer? _saveDebounceTimer;
@@ -61,8 +69,49 @@ class TranscriptionManager extends ChangeNotifier {
   static const Duration _saveDebounce = Duration(milliseconds: 500);
   bool _savePending = false;
 
-  TranscriptionManager({SettingsService? settings})
-    : _settings = settings ?? SettingsService();
+  TranscriptionManager({SettingsService? settings, BcutAsrService? asrService})
+    : _settings = settings ?? SettingsService(),
+      _asrService = asrService ?? BcutAsrService() {
+    addListener(_syncCompletedRemovals);
+    _settings.addListener(_syncCompletedRemovals);
+  }
+
+  final Map<String, Timer> _completedRemovalTimers = {};
+
+  Map<String, bool> get pendingCompletedRemovals => {
+    for (final key in _completedRemovalTimers.keys) key: true,
+  };
+
+  void _syncCompletedRemovals() {
+    if (_disposed) return;
+    for (final key in _completedRemovalTimers.keys.toList()) {
+      if (!_settings.batchSubtitleAutoDelete ||
+          !_completedJobs.containsKey(key)) {
+        _completedRemovalTimers.remove(key)?.cancel();
+      }
+    }
+    if (!_settings.batchSubtitleAutoDelete) return;
+    for (final entry in _completedJobs.entries) {
+      final key = entry.key;
+      final job = entry.value;
+      _completedRemovalTimers.putIfAbsent(key, () {
+        return Timer(const Duration(seconds: 2), () {
+          _completedRemovalTimers.remove(key);
+          if (_disposed ||
+              !_settings.batchSubtitleAutoDelete ||
+              !identical(_completedJobs[key], job)) {
+            return;
+          }
+          // Remove the queue row, preserving the generated subtitle for playback.
+          _completedJobs.remove(key);
+          _taskOrder.remove(key);
+          _statusMessagesByMediaKey.remove(key);
+          _scheduleSave();
+          notifyListeners();
+        });
+      });
+    }
+  }
 
   // Getters
   TranscriptionStatus get status => _status;
@@ -81,6 +130,7 @@ class TranscriptionManager extends ChangeNotifier {
   int get queuedCount => _queue.length;
   int get processingCount => isProcessing ? 1 : 0;
   int get pendingCount => queuedCount + processingCount;
+  bool get canPauseAll => isProcessing || _startedMediaKeys.isNotEmpty;
 
   bool get isProcessing =>
       _status != TranscriptionStatus.idle &&
@@ -154,13 +204,18 @@ class TranscriptionManager extends ChangeNotifier {
   }
 
   void clearPendingQueue() {
+    final removedKeys = <String>{
+      ..._queue.map((job) => job.mediaKey),
+      ..._failedJobs.keys,
+    };
     _queue.clear();
     _queuedMediaKeys.clear();
     _startedMediaKeys.clear();
     _failedJobs.clear();
     _statusMessagesByMediaKey.clear();
+    _taskOrder.removeWhere(removedKeys.contains);
     _scheduleSave();
-    notifyListeners();
+    if (!_disposed) notifyListeners();
   }
 
   Future<void> initialize() async {
@@ -169,6 +224,7 @@ class TranscriptionManager extends ChangeNotifier {
     await _cleanupManagedTempAudioDirectory();
     await _initPersistenceDir();
     await _loadState();
+    _syncCompletedRemovals();
   }
 
   Future<void> shutdown() async {
@@ -192,7 +248,7 @@ class TranscriptionManager extends ChangeNotifier {
 
   /// 带防抖的保存调度：500ms 内的多次变更合并为一次写入
   void _scheduleSave() {
-    if (_persistenceDirPath == null) return;
+    if (_disposed || _persistenceDirPath == null) return;
     _savePending = true;
     _saveDebounceTimer?.cancel();
     _saveDebounceTimer = Timer(_saveDebounce, () {
@@ -236,6 +292,7 @@ class TranscriptionManager extends ChangeNotifier {
         'completed': completedJson,
         'failed': failedJson,
         'startedKeys': _startedMediaKeys.toList(),
+        'taskOrder': _taskOrder,
         // 持久化已消费标记，确保“AI 字幕已自动加载”提示在转录完成后
         // 仅向用户展示一次，应用重启后不会重复弹出。
         'consumedKeys': _consumedResultMediaKeys.toList(),
@@ -339,6 +396,23 @@ class TranscriptionManager extends ChangeNotifier {
       // 用户可以再次点击“开始全部”，不会出现幽灵任务自动堵队列。
       _startedMediaKeys.clear();
 
+      final persistedOrder = data['taskOrder'];
+      if (persistedOrder is List) {
+        for (final key in persistedOrder.whereType<String>()) {
+          if (_containsTask(key) && !_taskOrder.contains(key)) {
+            _taskOrder.add(key);
+          }
+        }
+      }
+      final restoredJobs = <_TranscriptionJob>[
+        ..._queue,
+        ..._failedJobs.values,
+        ..._completedJobs.values,
+      ]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      for (final job in restoredJobs) {
+        if (!_taskOrder.contains(job.mediaKey)) _taskOrder.add(job.mediaKey);
+      }
+
       if (_queue.isNotEmpty ||
           _completedJobs.isNotEmpty ||
           _failedJobs.isNotEmpty) {
@@ -414,6 +488,7 @@ class TranscriptionManager extends ChangeNotifier {
         _nonEmpty(videoTitle) ??
         _nonEmpty(libraryTitle) ??
         p.basename(videoPath);
+    _prepareTaskForNewRun(mediaKey);
     _queue.add(
       _TranscriptionJob(
         videoPath: videoPath,
@@ -429,6 +504,7 @@ class TranscriptionManager extends ChangeNotifier {
         durationLabel: videoDuration ?? '',
       ),
     );
+    if (!_taskOrder.contains(mediaKey)) _taskOrder.add(mediaKey);
     _queuedMediaKeys.add(mediaKey);
     if (autoStart) {
       _startedMediaKeys.add(mediaKey);
@@ -442,6 +518,8 @@ class TranscriptionManager extends ChangeNotifier {
 
   /// 开始处理单个任务（只处理这一个，处理完不会自动开始下一个）
   void startTask(String mediaKey) {
+    _requeueFailedTask(mediaKey);
+    if (!_queuedMediaKeys.contains(mediaKey)) return;
     _startedMediaKeys.add(mediaKey);
     _scheduleSave();
     notifyListeners();
@@ -450,12 +528,44 @@ class TranscriptionManager extends ChangeNotifier {
 
   /// 开始处理所有排队任务（逐个处理直到全部完成）
   void startAllTasks() {
+    // Requeue failures before scheduling so original task order is preserved.
+    for (final key in _failedJobs.keys.toList()) {
+      _requeueFailedTask(key);
+    }
     for (final job in _queue) {
       _startedMediaKeys.add(job.mediaKey);
     }
     _scheduleSave();
     notifyListeners();
     _ensureQueueProcessing();
+  }
+
+  /// Pause only this task; other explicitly started tasks keep running.
+  bool pauseTask(String mediaKey) {
+    if (_currentJob?.mediaKey == mediaKey && isProcessing) {
+      _currentPauseRequested = true;
+      _currentCancellation?.cancel('用户暂停了任务');
+    } else if (_queuedMediaKeys.contains(mediaKey)) {
+      _startedMediaKeys.remove(mediaKey);
+      _statusMessagesByMediaKey[mediaKey] = '已暂停';
+    } else {
+      return false;
+    }
+    _scheduleSave();
+    notifyListeners();
+    return true;
+  }
+
+  /// 暂停整批任务：停止后续调度，并取消当前底层工作。当前任务会回到
+  /// 原来的显示位置，之后可用“全部开始”或单项开始继续。
+  void pauseAllTasks() {
+    _startedMediaKeys.clear();
+    if (_currentJob != null && isProcessing) {
+      _currentPauseRequested = true;
+      _currentCancellation?.cancel('用户暂停了批量任务');
+    }
+    _scheduleSave();
+    notifyListeners();
   }
 
   /// 某任务是否已被用户显式开始
@@ -496,8 +606,28 @@ class TranscriptionManager extends ChangeNotifier {
         });
         try {
           await _runJob(job, cancellation);
+        } on BcutAsrException catch (e) {
+          if (e.isRiskControl) {
+            _consecutiveRiskControlFailures++;
+            _nextRemoteRequestAt = DateTime.now().add(_riskControlCooldown);
+            if (_consecutiveRiskControlFailures >= _riskControlStopThreshold) {
+              _startedMediaKeys.clear();
+              for (final queuedJob in _queue) {
+                _statusMessagesByMediaKey[queuedJob.mediaKey] =
+                    '检测到连续风控，批量任务已自动暂停，请稍后再开始';
+              }
+            }
+          } else {
+            // 断网、DNS 失败、服务端故障都不计入风控次数。
+            _consecutiveRiskControlFailures = 0;
+          }
         } on _JobCancelledException catch (e) {
-          if (e.timedOut && !_currentTaskRemoved) {
+          if (_currentPauseRequested && !_currentTaskRemoved) {
+            _prepareTaskForNewRun(job.mediaKey);
+            _insertQueuedByTaskOrder(job);
+            _statusMessagesByMediaKey[job.mediaKey] = '已暂停';
+            debugPrint("转录任务已暂停: ${job.videoPath}");
+          } else if (e.timedOut && !_currentTaskRemoved) {
             _failedJobs[job.mediaKey] = job;
             _statusMessagesByMediaKey[job.mediaKey] = e.message;
             debugPrint("转录任务超时，已中断并跳过: ${job.videoPath}");
@@ -513,12 +643,13 @@ class TranscriptionManager extends ChangeNotifier {
             _currentCancellation = null;
             _currentJob = null;
             _currentTaskRemoved = false;
+            _currentPauseRequested = false;
             _currentVideoPath = null;
             _currentVideoId = null;
             _status = TranscriptionStatus.idle;
             _statusMessage = '';
             _progress = 0.0;
-            notifyListeners();
+            if (!_disposed) notifyListeners();
           }
           _scheduleSave();
         }
@@ -551,12 +682,13 @@ class TranscriptionManager extends ChangeNotifier {
     _status = TranscriptionStatus.extracting;
     _statusMessage = "";
     _progress = 0.0;
-    notifyListeners();
+    if (!_disposed) notifyListeners();
 
     _PreparedAudioResult? preparedAudio;
     MaterializedMediaLease? materializedLease;
     try {
       cancellation.throwIfCancelled();
+      await _waitForRemoteRequestSlot(cancellation);
       var transcriptionMediaPath = job.videoPath;
       final libraryItem = job.videoId == null
           ? null
@@ -633,6 +765,8 @@ class TranscriptionManager extends ChangeNotifier {
         },
       );
       cancellation.throwIfCancelled();
+      _consecutiveRiskControlFailures = 0;
+      _nextRemoteRequestAt = DateTime.now().add(_normalInterTaskDelay);
 
       _updateStatus(TranscriptionStatus.transcribing, "正在保存字幕文件...", 0.95);
       final srtContent = _generateSrt(subtitles);
@@ -690,11 +824,19 @@ class TranscriptionManager extends ChangeNotifier {
 
       _updateStatus(TranscriptionStatus.completed, "转录完成", 1.0);
       _completedJobs[job.mediaKey] = job;
+      _syncCompletedRemovals();
       _scheduleSave();
     } on _JobCancelledException {
       rethrow;
+    } on BcutAsrException catch (e) {
+      cancellation.throwIfCancelled();
+      _failedJobs[job.mediaKey] = job;
+      _updateStatus(TranscriptionStatus.error, '转录失败: ${e.message}', 0.0);
+      _scheduleSave();
+      rethrow;
     } catch (e) {
       cancellation.throwIfCancelled();
+      _consecutiveRiskControlFailures = 0;
       _failedJobs[job.mediaKey] = job;
       _updateStatus(TranscriptionStatus.error, "转录失败: $e", 0.0);
       _scheduleSave();
@@ -714,6 +856,19 @@ class TranscriptionManager extends ChangeNotifier {
     }
   }
 
+  Future<void> _waitForRemoteRequestSlot(_JobCancellation cancellation) async {
+    final nextAt = _nextRemoteRequestAt;
+    if (nextAt == null) return;
+    final remaining = nextAt.difference(DateTime.now());
+    if (remaining <= Duration.zero) return;
+    _updateStatus(
+      TranscriptionStatus.extracting,
+      '正在等待安全请求间隔（约 ${remaining.inSeconds + 1} 秒）...',
+      0.0,
+    );
+    await cancellation.delay(remaining);
+  }
+
   void _updateStatus(
     TranscriptionStatus status,
     String message,
@@ -731,7 +886,7 @@ class TranscriptionManager extends ChangeNotifier {
     if (key != null) {
       _statusMessagesByMediaKey[key] = message;
     }
-    notifyListeners();
+    if (!_disposed) notifyListeners();
   }
 
   String _formatTransferBytes(int bytes) {
@@ -819,9 +974,8 @@ class TranscriptionManager extends ChangeNotifier {
           return fallbackInfo;
         }
       } else {
-        if (cancellation != null) {
-          unawaited(cancellation.whenCancelled.then((_) => FFmpegKit.cancel()));
-        }
+        // Do not use FFmpegKit.cancel() without a session id here: it cancels
+        // unrelated playback/download/compose work in the same process.
         final session = await FFprobeKit.getMediaInformation(mediaPath);
         cancellation?.throwIfCancelled();
         final info = session.getMediaInformation();
@@ -859,10 +1013,14 @@ class TranscriptionManager extends ChangeNotifier {
       }
     }
     debugPrint("探测媒体音频信息失败: ${lastError ?? '未知错误'}");
+    final sourceExists = await File(mediaPath).exists();
     return _MediaProbeInfo(
       codec: null,
       durationSeconds: null,
-      hasAudioStream: isAudioInput,
+      // Some damaged/unusual containers cannot be probed but FFmpeg can still
+      // decode them. Let the extraction attempt decide instead of rejecting a
+      // valid source solely because metadata probing failed.
+      hasAudioStream: sourceExists,
       isAudioInput: isAudioInput,
     );
   }
@@ -1120,6 +1278,15 @@ class TranscriptionManager extends ChangeNotifier {
   }) async {
     final args = <String>[
       '-y',
+      '-nostdin',
+      '-hide_banner',
+      '-loglevel',
+      'warning',
+      '-progress',
+      'pipe:2',
+      '-nostats',
+      '-thread_queue_size',
+      '512',
       '-i',
       mediaPath,
       '-map',
@@ -1131,7 +1298,20 @@ class TranscriptionManager extends ChangeNotifier {
     if (useCopy) {
       args.addAll(['-c:a', 'copy']);
     } else {
-      args.addAll(['-c:a', 'aac', '-b:a', '64k']);
+      // Speech recognition does not benefit from multi-channel/high-rate
+      // audio. A single encoder thread leaves CPU headroom for media playback.
+      args.addAll([
+        '-c:a',
+        'aac',
+        '-ac',
+        '1',
+        '-ar',
+        '16000',
+        '-b:a',
+        '48k',
+        '-threads',
+        '1',
+      ]);
     }
     args.add(audioPath);
 
@@ -1330,7 +1510,7 @@ class TranscriptionManager extends ChangeNotifier {
     final dir = await _managedTempAudioDirectory();
     return p.join(
       dir.path,
-      '$_managedTempAudioPrefix${DateTime.now().millisecondsSinceEpoch}.m4a',
+      '$_managedTempAudioPrefix${DateTime.now().microsecondsSinceEpoch}.m4a',
     );
   }
 
@@ -1570,7 +1750,9 @@ class TranscriptionManager extends ChangeNotifier {
           isExternal: job.isExternal,
           status: TranscriptionStatus.idle,
           progress: 0.0,
-          statusMessage: isStarted ? '已加入队列，当前顺位：$effectiveQueuePos' : '',
+          statusMessage: isStarted
+              ? '已加入队列，当前顺位：$effectiveQueuePos'
+              : (_statusMessagesByMediaKey[job.mediaKey] ?? ''),
           createdAt: job.createdAt,
           outputPathStrategy: job.isExternal
               ? _settings.batchSubtitleOutputPathStrategy
@@ -1627,7 +1809,16 @@ class TranscriptionManager extends ChangeNotifier {
       );
     }
 
-    return tasks;
+    final byKey = <String, BatchSubtitleTaskView>{
+      for (final task in tasks) task.mediaKey: task,
+    };
+    final ordered = <BatchSubtitleTaskView>[];
+    for (final key in _taskOrder) {
+      final task = byKey.remove(key);
+      if (task != null) ordered.add(task);
+    }
+    ordered.addAll(byKey.values);
+    return ordered;
   }
 
   bool removeFromQueue(String mediaKey) {
@@ -1648,6 +1839,7 @@ class TranscriptionManager extends ChangeNotifier {
       _failedJobs.remove(mediaKey);
       _completedJobs.remove(mediaKey);
       _statusMessagesByMediaKey.remove(mediaKey);
+      _taskOrder.remove(mediaKey);
       _scheduleSave();
       notifyListeners();
       return true;
@@ -1657,6 +1849,7 @@ class TranscriptionManager extends ChangeNotifier {
       _failedJobs.remove(mediaKey);
       _queuedMediaKeys.remove(mediaKey);
       _statusMessagesByMediaKey.remove(mediaKey);
+      _taskOrder.remove(mediaKey);
       _scheduleSave();
       notifyListeners();
       return true;
@@ -1667,6 +1860,7 @@ class TranscriptionManager extends ChangeNotifier {
       _resultSrtByMediaKey.remove(mediaKey);
       _consumedResultMediaKeys.remove(mediaKey);
       _statusMessagesByMediaKey.remove(mediaKey);
+      _taskOrder.remove(mediaKey);
       _scheduleSave();
       notifyListeners();
       return true;
@@ -1676,6 +1870,7 @@ class TranscriptionManager extends ChangeNotifier {
       _resultSrtByMediaKey.remove(mediaKey);
       _consumedResultMediaKeys.remove(mediaKey);
       _statusMessagesByMediaKey.remove(mediaKey);
+      _taskOrder.remove(mediaKey);
       _scheduleSave();
       notifyListeners();
       return true;
@@ -1684,31 +1879,17 @@ class TranscriptionManager extends ChangeNotifier {
     return false;
   }
 
+  bool _requeueFailedTask(String mediaKey) {
+    final job = _failedJobs.remove(mediaKey);
+    if (job == null) return false;
+    _prepareTaskForNewRun(mediaKey);
+    _insertQueuedByTaskOrder(job);
+    return true;
+  }
+
   bool retryTask(String mediaKey) {
-    final failedJob = _failedJobs.remove(mediaKey);
-    if (failedJob == null) return false;
-
-    _queuedMediaKeys.remove(mediaKey);
-    _statusMessagesByMediaKey.remove(mediaKey);
-
-    final newJob = _TranscriptionJob(
-      videoPath: failedJob.videoPath,
-      videoId: failedJob.videoId,
-      mediaKey: failedJob.mediaKey,
-      libraryService: failedJob.libraryService,
-      autoCache: failedJob.autoCache,
-      isExternal: failedJob.isExternal,
-      outputPathStrategy: failedJob.outputPathStrategy,
-      customOutputDir: failedJob.customOutputDir,
-      createdAt: DateTime.now().millisecondsSinceEpoch,
-      displayName: failedJob.displayName,
-      durationLabel: failedJob.durationLabel,
-    );
-
-    _queue.add(newJob);
-    _queuedMediaKeys.add(mediaKey);
-    _scheduleSave();
-    notifyListeners();
+    if (!_requeueFailedTask(mediaKey)) return false;
+    startTask(mediaKey);
     return true;
   }
 
@@ -1732,6 +1913,7 @@ class TranscriptionManager extends ChangeNotifier {
 
     final job = _queue.removeAt(currentIndex);
     _queue.insert(newIndex, job);
+    _syncTaskOrderForQueuedMove(job.mediaKey, newIndex);
     _scheduleSave();
     notifyListeners();
     return true;
@@ -1750,6 +1932,7 @@ class TranscriptionManager extends ChangeNotifier {
       return;
     }
 
+    _prepareTaskForNewRun(mediaKey);
     _queue.add(
       _TranscriptionJob(
         videoPath: videoPath,
@@ -1765,6 +1948,7 @@ class TranscriptionManager extends ChangeNotifier {
         durationLabel: '',
       ),
     );
+    if (!_taskOrder.contains(mediaKey)) _taskOrder.add(mediaKey);
     _queuedMediaKeys.add(mediaKey);
     _scheduleSave();
     notifyListeners();
@@ -1772,6 +1956,7 @@ class TranscriptionManager extends ChangeNotifier {
 
   /// 清除所有已完成的任务
   void clearAllCompleted() {
+    final completedKeys = _completedJobs.keys.toSet();
     _completedJobs.clear();
     for (final key in List<String>.from(_statusMessagesByMediaKey.keys)) {
       if (_resultSrtByMediaKey.containsKey(key) &&
@@ -1782,15 +1967,18 @@ class TranscriptionManager extends ChangeNotifier {
     }
     _resultSrtByMediaKey.clear();
     _consumedResultMediaKeys.clear();
+    _taskOrder.removeWhere(completedKeys.contains);
     _scheduleSave();
     notifyListeners();
   }
 
   /// 清除所有排队的任务（不删除已完成和失败的任务）
   void clearQueuedTasks() {
+    final queuedKeys = _queue.map((job) => job.mediaKey).toSet();
     _queue.clear();
     _queuedMediaKeys.clear();
     _startedMediaKeys.clear();
+    _taskOrder.removeWhere(queuedKeys.contains);
     _scheduleSave();
     notifyListeners();
   }
@@ -1810,6 +1998,7 @@ class TranscriptionManager extends ChangeNotifier {
     _resultSrtByMediaKey.clear();
     _consumedResultMediaKeys.clear();
     _statusMessagesByMediaKey.clear();
+    _taskOrder.clear();
     _scheduleSave();
     notifyListeners();
   }
@@ -1821,6 +2010,13 @@ class TranscriptionManager extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _settings.removeListener(_syncCompletedRemovals);
+    for (final timer in _completedRemovalTimers.values) {
+      timer.cancel();
+    }
+    _completedRemovalTimers.clear();
+    _saveDebounceTimer?.cancel();
     _currentCancellation?.cancel('转录管理器已释放');
     _queue.clear();
     _queuedMediaKeys.clear();
@@ -1830,6 +2026,7 @@ class TranscriptionManager extends ChangeNotifier {
     _resultSrtByMediaKey.clear();
     _consumedResultMediaKeys.clear();
     _statusMessagesByMediaKey.clear();
+    _taskOrder.clear();
     super.dispose();
   }
 
@@ -1865,6 +2062,65 @@ class TranscriptionManager extends ChangeNotifier {
     _resultSrtByMediaKey.remove(mediaKey);
     _consumedResultMediaKeys.remove(mediaKey);
     _statusMessagesByMediaKey.remove(mediaKey);
+    _taskOrder.remove(mediaKey);
+  }
+
+  void _prepareTaskForNewRun(String mediaKey) {
+    _failedJobs.remove(mediaKey);
+    _completedJobs.remove(mediaKey);
+    _resultSrtByMediaKey.remove(mediaKey);
+    _consumedResultMediaKeys.remove(mediaKey);
+    _statusMessagesByMediaKey.remove(mediaKey);
+  }
+
+  bool _containsTask(String mediaKey) {
+    return _queue.any((job) => job.mediaKey == mediaKey) ||
+        _failedJobs.containsKey(mediaKey) ||
+        _completedJobs.containsKey(mediaKey) ||
+        _currentJob?.mediaKey == mediaKey;
+  }
+
+  void _insertQueuedByTaskOrder(_TranscriptionJob job) {
+    if (_queue.any((queued) => queued.mediaKey == job.mediaKey)) return;
+    final jobOrder = _taskOrder.indexOf(job.mediaKey);
+    if (jobOrder < 0) {
+      _taskOrder.add(job.mediaKey);
+      _queue.add(job);
+    } else {
+      final insertAt = _queue.indexWhere((queued) {
+        final queuedOrder = _taskOrder.indexOf(queued.mediaKey);
+        return queuedOrder >= 0 && queuedOrder > jobOrder;
+      });
+      if (insertAt < 0) {
+        _queue.add(job);
+      } else {
+        _queue.insert(insertAt, job);
+      }
+    }
+    _queuedMediaKeys.add(job.mediaKey);
+  }
+
+  void _syncTaskOrderForQueuedMove(String mediaKey, int queueIndex) {
+    _taskOrder.remove(mediaKey);
+    if (_queue.length == 1) {
+      _taskOrder.add(mediaKey);
+      return;
+    }
+    if (queueIndex < _queue.length - 1) {
+      final nextKey = _queue[queueIndex + 1].mediaKey;
+      final nextOrder = _taskOrder.indexOf(nextKey);
+      _taskOrder.insert(
+        nextOrder < 0 ? _taskOrder.length : nextOrder,
+        mediaKey,
+      );
+    } else {
+      final previousKey = _queue[queueIndex - 1].mediaKey;
+      final previousOrder = _taskOrder.indexOf(previousKey);
+      _taskOrder.insert(
+        previousOrder < 0 ? _taskOrder.length : previousOrder + 1,
+        mediaKey,
+      );
+    }
   }
 
   String _aiSubtitleFileName(String videoPath, {String? videoId}) {

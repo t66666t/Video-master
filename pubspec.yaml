@@ -117,6 +117,7 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/fonts/licenses/
     - assets/models/ocr/
     # Reuse the small Android launcher artwork for the lightweight Flutter
     # startup frame. The 2048px source is intentionally avoided here so image
@@ -175,6 +176,8 @@ flutter:
           weight: 900
     - family: Noto Serif CJK SC
       fonts:
+        - asset: assets/fonts/NotoSerifCJKsc-Regular.otf
+          weight: 400
         - asset: assets/fonts/NotoSerifCJKsc-Bold.otf
           weight: 700
     - family: Swei Gothic CJK SC
@@ -184,6 +187,12 @@ flutter:
     - family: 方正楷体
       fonts:
         - asset: assets/fonts/方正楷体 简体中文.ttf
+    - family: Brawler
+      fonts:
+        - asset: assets/fonts/Brawler-Regular.otf
+          weight: 400
+        - asset: assets/fonts/Brawler-Bold.otf
+          weight: 700
     - family: Comic Relief
       fonts:
         - asset: assets/fonts/ComicRelief-Regular.ttf

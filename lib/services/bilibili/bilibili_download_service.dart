@@ -42,6 +42,20 @@ class BilibiliDanmakuUpdateException implements Exception {
 }
 
 class BilibiliDownloadService extends ChangeNotifier {
+  static const Set<int> _supportedPreferredQualities = {
+    127,
+    120,
+    116,
+    80,
+    64,
+    32,
+  };
+  static const Set<String> _supportedSubtitleLanguages = {
+    'none',
+    'zh',
+    'en',
+    'ja',
+  };
   static const String _pendingTempCleanupPrefsKey =
       'bilibili_pending_temp_cleanup_keys';
   static const int _maxDownloadRetryCount = 5;
@@ -58,6 +72,7 @@ class BilibiliDownloadService extends ChangeNotifier {
   late BilibiliDownloadManager _downloadManager;
   Future<void>? _initFuture;
   Future<void>? _shutdownFuture;
+  Future<void> _settingsSaveQueue = Future<void>.value();
   Timer? _persistDebounceTimer;
   Timer? _progressNotifyTimer;
   bool _hasPendingTaskPersistence = false;
@@ -309,6 +324,20 @@ class BilibiliDownloadService extends ChangeNotifier {
     return 1;
   }
 
+  int _sanitizePreferredQuality(int value) {
+    return _supportedPreferredQualities.contains(value) ? value : 116;
+  }
+
+  String _sanitizePreferredSubtitleLanguage(String value) {
+    final normalized = value.trim().toLowerCase();
+    return _supportedSubtitleLanguages.contains(normalized) ? normalized : 'zh';
+  }
+
+  String? _sanitizeCustomDownloadPath(String? value) {
+    if (value == null || value.trim().isEmpty) return null;
+    return value;
+  }
+
   int get effectiveMaxConnectionsPerVideo {
     // Keep newly-created media connections within an eight-connection budget.
     // Existing task concurrency remains respected, and high task concurrency
@@ -440,6 +469,31 @@ class BilibiliDownloadService extends ChangeNotifier {
   void markEpisodeProgressChangedForTesting(BilibiliDownloadEpisode episode) {
     _episodeRevisions[episode] = (_episodeRevisions[episode] ?? 0) + 1;
     _notifyListenersWithoutRenderInvalidation();
+  }
+
+  @visibleForTesting
+  void setRunningEpisodeOperationForTesting(
+    BilibiliDownloadEpisode episode,
+    Future<void>? operation,
+  ) {
+    if (operation == null) {
+      _runningEpisodeOperations.remove(episode);
+    } else {
+      _runningEpisodeOperations[episode] = operation;
+    }
+  }
+
+  @visibleForTesting
+  void setEpisodeImportingForTesting(
+    BilibiliDownloadEpisode episode,
+    bool importing,
+  ) {
+    final key = _episodeKey(episode);
+    if (importing) {
+      _importingEpisodeKeys.add(key);
+    } else {
+      _importingEpisodeKeys.remove(key);
+    }
   }
 
   void _notifyTaskRows(
@@ -583,9 +637,12 @@ class BilibiliDownloadService extends ChangeNotifier {
     maxConnectionsPerVideo = _sanitizeMaxConnectionsPerVideo(
       prefs.getInt('bilibili_connections_per_video') ?? 2,
     );
-    preferredQuality = prefs.getInt('bilibili_preferred_quality') ?? 116;
-    preferredSubtitleLang =
-        prefs.getString('bilibili_preferred_subtitle_lang') ?? "zh";
+    preferredQuality = _sanitizePreferredQuality(
+      prefs.getInt('bilibili_preferred_quality') ?? 116,
+    );
+    preferredSubtitleLang = _sanitizePreferredSubtitleLanguage(
+      prefs.getString('bilibili_preferred_subtitle_lang') ?? 'zh',
+    );
     preferAiSubtitles = prefs.getBool('bilibili_prefer_ai_subtitles') ?? false;
     downloadDanmaku = prefs.getBool('bilibili_download_danmaku') ?? true;
     autoImportToLibrary = prefs.getBool('bilibili_auto_import') ?? true;
@@ -594,46 +651,64 @@ class BilibiliDownloadService extends ChangeNotifier {
     sequentialExport = prefs.getBool('bilibili_sequential_export') ?? false;
     keepScreenAwakeDuringProcessing =
         prefs.getBool('bilibili_keep_screen_awake_during_processing') ?? false;
-    customDownloadPath = prefs.getString('bilibili_custom_download_path');
+    customDownloadPath = _sanitizeCustomDownloadPath(
+      prefs.getString('bilibili_custom_download_path'),
+    );
     notifyListeners();
   }
+
+  @visibleForTesting
+  Future<void> loadSettingsForTesting() => _loadSettings();
 
   Future<void> saveSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('bilibili_max_concurrent', maxConcurrentDownloads);
-    await prefs.setInt(
-      'bilibili_connections_per_video',
-      maxConnectionsPerVideo,
-    );
-    await prefs.setInt('bilibili_preferred_quality', preferredQuality);
-    await prefs.setString(
-      'bilibili_preferred_subtitle_lang',
-      preferredSubtitleLang,
-    );
-    await prefs.setBool('bilibili_prefer_ai_subtitles', preferAiSubtitles);
-    await prefs.setBool('bilibili_download_danmaku', downloadDanmaku);
-    await prefs.setBool('bilibili_auto_import', autoImportToLibrary);
-    await prefs.setBool(
-      'bilibili_auto_delete_import',
-      autoDeleteTaskAfterImport,
-    );
-    await prefs.setBool('bilibili_sequential_export', sequentialExport);
-    await prefs.setBool(
-      'bilibili_keep_screen_awake_during_processing',
-      keepScreenAwakeDuringProcessing,
-    );
-    if (customDownloadPath != null) {
+    final snapshotMaxConcurrent = maxConcurrentDownloads;
+    final snapshotConnections = maxConnectionsPerVideo;
+    final snapshotQuality = preferredQuality;
+    final snapshotSubtitleLanguage = preferredSubtitleLang;
+    final snapshotPreferAi = preferAiSubtitles;
+    final snapshotDownloadDanmaku = downloadDanmaku;
+    final snapshotAutoImport = autoImportToLibrary;
+    final snapshotAutoDelete = autoDeleteTaskAfterImport;
+    final snapshotSequentialExport = sequentialExport;
+    final snapshotKeepAwake = keepScreenAwakeDuringProcessing;
+    final snapshotCustomPath = customDownloadPath;
+
+    final operation = _settingsSaveQueue.then((_) async {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('bilibili_max_concurrent', snapshotMaxConcurrent);
+      await prefs.setInt('bilibili_connections_per_video', snapshotConnections);
+      await prefs.setInt('bilibili_preferred_quality', snapshotQuality);
       await prefs.setString(
-        'bilibili_custom_download_path',
-        customDownloadPath!,
+        'bilibili_preferred_subtitle_lang',
+        snapshotSubtitleLanguage,
       );
-    } else {
-      await prefs.remove('bilibili_custom_download_path');
-    }
+      await prefs.setBool('bilibili_prefer_ai_subtitles', snapshotPreferAi);
+      await prefs.setBool('bilibili_download_danmaku', snapshotDownloadDanmaku);
+      await prefs.setBool('bilibili_auto_import', snapshotAutoImport);
+      await prefs.setBool('bilibili_auto_delete_import', snapshotAutoDelete);
+      await prefs.setBool(
+        'bilibili_sequential_export',
+        snapshotSequentialExport,
+      );
+      await prefs.setBool(
+        'bilibili_keep_screen_awake_during_processing',
+        snapshotKeepAwake,
+      );
+      if (snapshotCustomPath != null) {
+        await prefs.setString(
+          'bilibili_custom_download_path',
+          snapshotCustomPath,
+        );
+      } else {
+        await prefs.remove('bilibili_custom_download_path');
+      }
+    });
+    _settingsSaveQueue = operation.catchError((_) {});
+    await operation;
     notifyListeners();
   }
 
-  void updateSettings(
+  Future<void> updateSettings(
     int maxConcurrent,
     int quality,
     String subLang,
@@ -643,35 +718,52 @@ class BilibiliDownloadService extends ChangeNotifier {
     bool seqExport, {
     String? customPath,
     int? videoConnections,
-  }) {
+    bool? shouldDownloadDanmaku,
+  }) async {
     maxConcurrentDownloads = _sanitizeMaxConcurrentDownloads(maxConcurrent);
     if (videoConnections != null) {
       maxConnectionsPerVideo = _sanitizeMaxConnectionsPerVideo(
         videoConnections,
       );
     }
-    preferredQuality = quality;
-    preferredSubtitleLang = subLang;
+    preferredQuality = _sanitizePreferredQuality(quality);
+    preferredSubtitleLang = _sanitizePreferredSubtitleLanguage(subLang);
     preferAiSubtitles = preferAi;
+    if (shouldDownloadDanmaku != null) {
+      downloadDanmaku = shouldDownloadDanmaku;
+    }
     autoImportToLibrary = autoImport;
     autoDeleteTaskAfterImport = autoDelete;
     sequentialExport = seqExport;
-    customDownloadPath = customPath;
-    saveSettings();
+    customDownloadPath = _sanitizeCustomDownloadPath(customPath);
     applyQualitySettingsToPendingTasks();
     processQueue();
     _refreshCompletedEpisodeHints();
     if (autoImportToLibrary && sequentialExport && libraryService != null) {
       unawaited(_processSequentialAutoImports());
     }
+    await saveSettings();
+  }
+
+  Future<void> updateStreamingSettings({
+    required String subtitleLanguage,
+    required bool preferAi,
+    required bool autoDelete,
+  }) async {
+    preferredSubtitleLang = _sanitizePreferredSubtitleLanguage(
+      subtitleLanguage,
+    );
+    preferAiSubtitles = preferAi;
+    autoDeleteTaskAfterImport = autoDelete;
+    applyQualitySettingsToPendingTasks(updateQuality: false);
+    await saveSettings();
   }
 
   Future<void> setDownloadDanmaku(bool value) async {
     if (downloadDanmaku == value) return;
     downloadDanmaku = value;
     notifyListeners();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('bilibili_download_danmaku', value);
+    await saveSettings();
   }
 
   bool get supportsProcessingKeepAwakeToggle =>
@@ -3050,7 +3142,13 @@ class BilibiliDownloadService extends ChangeNotifier {
       _downloadQueue.remove(ep);
     }
 
-    await _awaitEpisodeOperationStopped(ep);
+    // Auto-import can execute inside this episode's own download operation.
+    // Waiting for that same operation here would deadlock before the imported
+    // task can be removed. Manual deletion still waits, so it cannot race with
+    // a download that is writing files.
+    if (!_importingEpisodeKeys.contains(_episodeKey(ep))) {
+      await _awaitEpisodeOperationStopped(ep);
+    }
 
     await _cleanupEpisodeArtifacts(
       ep,
@@ -3207,8 +3305,10 @@ class BilibiliDownloadService extends ChangeNotifier {
     notifyListeners();
   }
 
-  void applyQualitySettingsToPendingTasks() {
-    for (var task in tasks) {
+  void applyQualitySettingsToPendingTasks({bool updateQuality = true}) {
+    var changed = false;
+    for (final task in tasks) {
+      var taskChanged = false;
       for (var video in task.videos) {
         for (var ep in video.episodes) {
           if (ep.status == DownloadStatus.pending ||
@@ -3216,7 +3316,7 @@ class BilibiliDownloadService extends ChangeNotifier {
               (ep.status == DownloadStatus.completed &&
                   ep.outputPath == null)) {
             // Update Video Quality
-            if (ep.availableVideoQualities.isNotEmpty) {
+            if (updateQuality && ep.availableVideoQualities.isNotEmpty) {
               StreamItem? bestMatch;
               try {
                 bestMatch = ep.availableVideoQualities.firstWhere(
@@ -3225,18 +3325,33 @@ class BilibiliDownloadService extends ChangeNotifier {
               } catch (_) {
                 bestMatch = ep.availableVideoQualities.first;
               }
-              ep.selectedVideoQuality = bestMatch;
+              if (!identical(ep.selectedVideoQuality, bestMatch)) {
+                ep.selectedVideoQuality = bestMatch;
+                taskChanged = true;
+              }
             }
 
             // Update Subtitle Selection
             if (ep.availableSubtitles.isNotEmpty) {
-              ep.selectedSubtitle = _selectBestSubtitle(ep.availableSubtitles);
+              final selectedSubtitle = _selectBestSubtitle(
+                ep.availableSubtitles,
+              );
+              if (!identical(ep.selectedSubtitle, selectedSubtitle)) {
+                ep.selectedSubtitle = selectedSubtitle;
+                taskChanged = true;
+              }
             }
           }
         }
       }
+      if (taskChanged) {
+        changed = true;
+        scheduleSaveTasks(task: task);
+      }
     }
-    notifyListeners();
+    if (changed) {
+      notifyListeners();
+    }
   }
 
   // --- Helper Methods for Library Import ---
@@ -3690,7 +3805,7 @@ class BilibiliDownloadService extends ChangeNotifier {
 
     if (completedEpisodes.isEmpty) return 0;
 
-    Directory baseDir;
+    var baseDir = await resolveDefaultImportDirectory();
     if (customDownloadPath != null && customDownloadPath!.isNotEmpty) {
       baseDir = Directory(customDownloadPath!);
       if (!await baseDir.exists()) {
@@ -3700,23 +3815,8 @@ class BilibiliDownloadService extends ChangeNotifier {
           debugPrint(
             "Failed to create custom dir, falling back to default: $e",
           );
-          baseDir = Directory(
-            '${(await getApplicationDocumentsDirectory()).path}/imported_videos',
-          );
+          baseDir = await resolveDefaultImportDirectory();
         }
-      }
-    } else {
-      if (Platform.isMacOS) {
-        final downloadDir = await getDownloadsDirectory();
-        if (downloadDir != null) {
-          baseDir = Directory(p.join(downloadDir.path, 'imported_videos'));
-        } else {
-          final dataRoot = await SettingsService().resolveLargeDataRootDir();
-          baseDir = Directory(p.join(dataRoot.path, 'imported_videos'));
-        }
-      } else {
-        final dataRoot = await SettingsService().resolveLargeDataRootDir();
-        baseDir = Directory(p.join(dataRoot.path, 'imported_videos'));
       }
     }
 
@@ -4092,5 +4192,20 @@ class BilibiliDownloadService extends ChangeNotifier {
       }
     }
     return count;
+  }
+
+  Future<Directory> resolveDefaultImportDirectory() async {
+    if (Platform.isMacOS) {
+      final downloadDir = await getDownloadsDirectory();
+      if (downloadDir != null) {
+        return Directory(p.join(downloadDir.path, 'imported_videos'));
+      }
+    }
+    final settings = SettingsService();
+    final configuredRoot = settings.largeDataRootPath?.trim();
+    final rootPath = Platform.isWindows && configuredRoot?.isNotEmpty == true
+        ? configuredRoot!
+        : await settings.getDefaultLargeDataRootPath();
+    return Directory(p.join(rootPath, 'imported_videos'));
   }
 }

@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'landscape_sidebar_layout.dart';
 
 import 'playback_speed_dialog.dart';
 
@@ -72,6 +73,9 @@ class SettingsPanel extends StatefulWidget {
   final bool skipPortraitPlayer;
   final ValueChanged<bool> onSkipPortraitPlayerChanged;
 
+  final bool autoPlayOnPageEntry;
+  final ValueChanged<bool> onAutoPlayOnPageEntryChanged;
+
   final bool autoPlayNextVideo;
   final ValueChanged<bool> onAutoPlayNextVideoChanged;
 
@@ -141,6 +145,8 @@ class SettingsPanel extends StatefulWidget {
     this.showSkipPortraitPlayerSetting = false,
     required this.skipPortraitPlayer,
     required this.onSkipPortraitPlayerChanged,
+    required this.autoPlayOnPageEntry,
+    required this.onAutoPlayOnPageEntryChanged,
     required this.autoPlayNextVideo,
     required this.onAutoPlayNextVideoChanged,
     required this.autoPlayOnCompletion,
@@ -215,11 +221,16 @@ class _SettingsPanelState extends State<SettingsPanel> {
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
-
-    final paddingValue = isSmallScreen ? 8.0 : 20.0;
-    final spacingValue = isSmallScreen ? 12.0 : 24.0;
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
+    final paddingValue = layout.horizontalPadding;
+    final spacingValue = layout.sectionGap;
 
     return Container(
       width: double.infinity,
@@ -237,11 +248,11 @@ class _SettingsPanelState extends State<SettingsPanel> {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text(
+                Text(
                   "播放设置",
                   style: TextStyle(
                     color: Colors.white,
-                    fontSize: 15,
+                    fontSize: layout.titleSize,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -787,6 +798,22 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 ),
                 value: widget.autoPauseOnExit,
                 onChanged: widget.onAutoPauseOnExitChanged,
+                activeThumbColor: Colors.blueAccent,
+                dense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                visualDensity: VisualDensity.compact,
+              ),
+              SwitchListTile(
+                title: const Text(
+                  "进入媒体播放页自动开始播放",
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                subtitle: const Text(
+                  "从媒体库进入播放页时自动开始；不影响上下集切换、自动连播或页面切换",
+                  style: TextStyle(color: Colors.white30, fontSize: 10),
+                ),
+                value: widget.autoPlayOnPageEntry,
+                onChanged: widget.onAutoPlayOnPageEntryChanged,
                 activeThumbColor: Colors.blueAccent,
                 dense: true,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 12),

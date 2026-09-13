@@ -35,6 +35,7 @@ class MusicPlaybackControls extends StatefulWidget {
   final bool isMuted;
   final ValueChanged<double>? onVolumeChanged;
   final VoidCallback? onToggleMute;
+  final bool compactLandscape;
 
   const MusicPlaybackControls({
     super.key,
@@ -55,6 +56,7 @@ class MusicPlaybackControls extends StatefulWidget {
     this.isMuted = false,
     this.onVolumeChanged,
     this.onToggleMute,
+    this.compactLandscape = false,
   });
 
   @override
@@ -92,7 +94,9 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
 
     // 基准尺寸：竖屏时使用高度（较长边），横屏时使用宽度（较长边）
     // 这样可以避免细长手机上按钮过小的问题
-    final baseDimension = orientation == Orientation.portrait
+    final baseDimension = widget.compactLandscape
+        ? screenHeight
+        : orientation == Orientation.portrait
         ? screenHeight // 竖屏：使用高度（较长边）
         : screenWidth; // 横屏：使用宽度（较长边）
 
@@ -104,7 +108,11 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
       mainAxisSize: MainAxisSize.min,
       children: [
         _buildProgressBar(baseDimension, isMobile),
-        SizedBox(height: (screenHeight * 0.05).clamp(34.0, 54.0)),
+        SizedBox(
+          height: widget.compactLandscape
+              ? (screenHeight * 0.035).clamp(10.0, 16.0)
+              : (screenHeight * 0.05).clamp(34.0, 54.0),
+        ),
         _buildControlButtons(baseDimension, screenHeight, isMobile),
       ],
     );
@@ -117,11 +125,15 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
   /// 如果没有提供 positionListenable，则直接使用 currentPosition 和 progress。
   Widget _buildProgressBar(double baseDim, bool isMobile) {
     // 时间文字字号：手机 ~3.2% clamp(10,13)；桌面 ~3.8% clamp(11,16)
-    final timeFontSize = isMobile
+    final timeFontSize = widget.compactLandscape
+        ? (baseDim * 0.03).clamp(9.0, 11.0)
+        : isMobile
         ? (baseDim * 0.032).clamp(10.0, 13.0)
         : (baseDim * 0.038).clamp(11.0, 16.0);
     // 进度条轨道高度：手机 ~0.5% clamp(3,6)；桌面 ~0.6% clamp(4,8)
-    final trackH = isMobile
+    final trackH = widget.compactLandscape
+        ? (baseDim * 0.009).clamp(2.5, 3.5)
+        : isMobile
         ? (baseDim * 0.005).clamp(3.0, 6.0)
         : (baseDim * 0.006).clamp(4.0, 8.0);
     // 静止状态不显示拇指；拖动时才淡入接近 Apple Music 的小圆点。
@@ -191,7 +203,7 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
-          height: 24,
+          height: widget.compactLandscape ? 18 : 24,
           child: SliderTheme(
             data: SliderThemeData(
               trackHeight: effectiveTrackHeight,
@@ -273,19 +285,27 @@ class _MusicPlaybackControlsState extends State<MusicPlaybackControls> {
   ) {
     // 主控图标（上一曲/播放/下一曲）：
     // 手机 ~5.5% clamp(16,24)；桌面 ~6.5% clamp(20,34)
-    final mainIconSize = isMobile
+    final mainIconSize = widget.compactLandscape
+        ? (screenHeight * 0.072).clamp(22.0, 28.0)
+        : isMobile
         ? (baseDim * 0.055).clamp(30.0, 42.0)
         : (baseDim * 0.065).clamp(20.0, 34.0);
     // 次要图标（音量/字号）：
     // 手机 ~3.5% clamp(12,18)；桌面 ~4.2% clamp(14,24)
-    final secondaryIconSize = isMobile
+    final secondaryIconSize = widget.compactLandscape
+        ? (screenHeight * 0.045).clamp(14.0, 17.0)
+        : isMobile
         ? (baseDim * 0.035).clamp(12.0, 18.0)
         : (baseDim * 0.042).clamp(14.0, 24.0);
     final playIconSize = mainIconSize * 1.22;
     // 统一按钮颜色
     final secondaryColor = Colors.white.withValues(alpha: 0.7);
     // 统一按钮触控区域
-    final buttonMinSize = isMobile ? 44.0 : 48.0;
+    final buttonMinSize = widget.compactLandscape
+        ? (screenHeight * 0.11).clamp(36.0, 42.0)
+        : isMobile
+        ? 44.0
+        : 48.0;
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,

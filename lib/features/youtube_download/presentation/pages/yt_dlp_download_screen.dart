@@ -16,6 +16,7 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_input
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_version.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/widgets/adaptive_settings_dialog.dart';
 
 class YtDlpDownloadScreen extends StatefulWidget {
   final String? initialInput;
@@ -452,6 +453,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setState) {
+            final metrics = AdaptiveSettingsDialogMetrics.fromSize(
+              MediaQuery.sizeOf(context),
+              preferredWidth: 740,
+            );
             Future<void> pickCookies() async {
               final result = await FilePicker.platform.pickFiles(
                 dialogTitle: '选择 cookies.txt',
@@ -487,462 +492,509 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
               }
             }
 
-            return AlertDialog(
-              backgroundColor: const Color(0xFF222326),
-              title: InkWell(
-                borderRadius: BorderRadius.circular(8),
-                onTap: () {
-                  setState(() {
-                    titleTapCount += 1;
-                    if (titleTapCount >= 5) {
-                      showAdvancedSettings = !showAdvancedSettings;
-                      titleTapCount = 0;
-                    }
-                  });
-                  if (titleTapCount == 0) {
-                    AppToast.show(
-                      showAdvancedSettings ? '已显示高级设置' : '已隐藏高级设置',
-                      type: AppToastType.info,
-                    );
-                  }
-                },
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text('YT-DLP 下载设置'),
-                      const SizedBox(height: 4),
-                      Text(
-                        showAdvancedSettings
-                            ? '连续点击 5 次标题可隐藏高级设置'
-                            : '连续点击 5 次标题可显示高级设置',
-                        style: const TextStyle(
-                          color: Colors.white54,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ],
-                  ),
+            return AdaptiveSettingsDialogTheme(
+              metrics: metrics,
+              child: AlertDialog(
+                backgroundColor: const Color(0xFF222326),
+                insetPadding: metrics.insetPadding,
+                titlePadding: metrics.titlePadding,
+                contentPadding: metrics.contentPadding,
+                actionsPadding: metrics.actionsPadding,
+                constraints: BoxConstraints(
+                  maxWidth: metrics.dialogWidth,
+                  maxHeight: metrics.dialogMaxHeight,
                 ),
-              ),
-              content: SizedBox(
-                width: 680,
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      _buildSettingsSectionTitle('默认下载偏好'),
-                      _buildSettingsDropdownRow(
-                        leftLabel: '首选清晰度',
-                        leftValue: tempPreferences.preferredQuality,
-                        leftItems: const [
-                          DropdownMenuItem(
-                            value: 'best',
-                            child: Text('推荐（兼容优先）'),
-                          ),
-                          DropdownMenuItem(
-                            value: '2160p',
-                            child: Text('2160p'),
-                          ),
-                          DropdownMenuItem(
-                            value: '1440p',
-                            child: Text('1440p'),
-                          ),
-                          DropdownMenuItem(
-                            value: '1080p',
-                            child: Text('1080p'),
-                          ),
-                          DropdownMenuItem(value: '720p', child: Text('720p')),
-                          DropdownMenuItem(value: '480p', child: Text('480p')),
-                          DropdownMenuItem(value: '360p', child: Text('360p')),
-                        ],
-                        onLeftChanged: (value) {
-                          if (value == null) return;
-                          setState(() {
-                            tempPreferences = tempPreferences.copyWith(
-                              preferredQuality: value,
-                            );
-                          });
-                        },
-                        rightLabel: '字幕语言选择',
-                        rightValue: _formatPreferredSubtitleLanguageSummary(
-                          tempPreferences.preferredSubtitleLanguages,
+                title: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () {
+                    setState(() {
+                      titleTapCount += 1;
+                      if (titleTapCount >= 5) {
+                        showAdvancedSettings = !showAdvancedSettings;
+                        titleTapCount = 0;
+                      }
+                    });
+                    if (titleTapCount == 0) {
+                      AppToast.show(
+                        showAdvancedSettings ? '已显示高级设置' : '已隐藏高级设置',
+                        type: AppToastType.info,
+                      );
+                    }
+                  },
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(
+                      vertical: metrics.isCompact ? 1 : 3,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'YT-DLP 下载设置',
+                          style: TextStyle(fontSize: metrics.titleSize),
                         ),
-                        rightAsText: true,
-                        onRightTap: () async {
-                          final selected =
-                              await _showPreferredSubtitleLanguagesDialog(
-                                tempPreferences.preferredSubtitleLanguages,
-                              );
-                          if (selected == null) {
-                            return;
-                          }
-                          setState(() {
-                            tempPreferences = tempPreferences.copyWith(
-                              preferredSubtitleLanguages: selected,
-                            );
-                          });
-                        },
-                      ),
-                      _buildLabeledField(
-                        label: '分片并发数',
-                        controller: fragmentsController,
-                        hintText: '1–16，建议 4',
-                        keyboardType: TextInputType.number,
-                      ),
-                      SwitchListTile(
-                        title: const Text('下载完成自动导入媒体库'),
-                        value: tempPreferences.autoImportToLibrary,
-                        onChanged: (value) {
-                          setState(() {
-                            tempPreferences = tempPreferences.copyWith(
-                              autoImportToLibrary: value,
-                              autoDeleteTaskAfterImport: value
-                                  ? tempPreferences.autoDeleteTaskAfterImport
-                                  : false,
-                            );
-                          });
-                        },
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      SwitchListTile(
-                        title: const Text('任务下拉选项默认展开'),
-                        subtitle: const Text(
-                          '默认开启。进入页面时会自动展开所有任务，但手动收起的任务会保持收起，以你的操作为准。',
-                          style: TextStyle(fontSize: 11),
-                        ),
-                        value: tempPreferences.autoExpandTaskOptions,
-                        onChanged: (value) async {
-                          final updatedPreferences = tempPreferences.copyWith(
-                            autoExpandTaskOptions: value,
-                          );
-                          setState(() {
-                            tempPreferences = updatedPreferences;
-                          });
-                          await service.saveDownloadPreferences(
-                            updatedPreferences,
-                          );
-                        },
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      SwitchListTile(
-                        title: Text(
-                          '导入媒体库后自动删除任务',
-                          style: TextStyle(
-                            color: tempPreferences.autoImportToLibrary
-                                ? Colors.white
-                                : Colors.white38,
-                          ),
-                        ),
-                        subtitle: Text(
-                          '只移除下载任务记录，不删除已导入媒体库的视频文件',
-                          style: TextStyle(
-                            color: tempPreferences.autoImportToLibrary
-                                ? Colors.white54
-                                : Colors.white24,
+                        SizedBox(height: metrics.isCompact ? 1 : 3),
+                        Text(
+                          showAdvancedSettings
+                              ? '连续点击 5 次标题可隐藏高级设置'
+                              : '连续点击 5 次标题可显示高级设置',
+                          style: const TextStyle(
+                            color: Colors.white54,
                             fontSize: 11,
                           ),
                         ),
-                        value: tempPreferences.autoDeleteTaskAfterImport,
-                        onChanged: tempPreferences.autoImportToLibrary
-                            ? (value) {
-                                setState(() {
-                                  tempPreferences = tempPreferences.copyWith(
-                                    autoDeleteTaskAfterImport: value,
-                                  );
-                                });
-                              }
-                            : null,
-                        contentPadding: EdgeInsets.zero,
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        tempPreferences.preferredSubtitleLanguages.isEmpty
-                            ? '未设置字幕语言偏好时，将按解析结果的默认推荐选择。'
-                            : '被选中的所有字幕语言都会下载；命中的自带字幕和自动生成字幕都会参与下载与封装。',
-                        style: const TextStyle(
-                          color: Colors.white54,
-                          fontSize: 11,
-                          height: 1.35,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      if (showAdvancedSettings) ...[
-                        const Divider(height: 24),
-                        _buildSettingsSectionTitle('高级设置'),
-                        SwitchListTile(
-                          title: const Text('启用 Cookies'),
-                          value: temp.useCookies,
-                          onChanged: (value) {
-                            setState(() {
-                              temp = temp.copyWith(useCookies: value);
-                            });
-                          },
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        _buildLabeledField(
-                          label: 'Cookies 文件',
-                          controller: cookiesController,
-                          trailing: TextButton(
-                            onPressed: pickCookies,
-                            child: const Text('选择'),
-                          ),
-                        ),
-                        SwitchListTile(
-                          title: const Text('启用自定义 User-Agent'),
-                          value: temp.useCustomUserAgent,
-                          onChanged: (value) {
-                            setState(() {
-                              temp = temp.copyWith(useCustomUserAgent: value);
-                            });
-                          },
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        _buildLabeledField(
-                          label: 'User-Agent',
-                          controller: userAgentController,
-                        ),
-                        SwitchListTile(
-                          title: const Text('启用代理'),
-                          value: temp.useProxy,
-                          onChanged: (value) {
-                            setState(() {
-                              temp = temp.copyWith(useProxy: value);
-                            });
-                          },
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        _buildLabeledField(
-                          label: '代理地址',
-                          controller: proxyController,
-                        ),
-                        if (showOutputDirectoryControls)
-                          _buildLabeledField(
-                            label: '输出目录',
-                            controller: outputDirController,
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                TextButton(
-                                  onPressed: pickOutputDir,
-                                  child: const Text('选择'),
-                                ),
-                                TextButton(
-                                  onPressed: outputDirController.clear,
-                                  child: const Text('默认'),
-                                ),
-                              ],
-                            ),
-                          ),
-                        if (showOutputDirectoryControls)
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Text(
-                                '留空时默认保存到: $defaultOutputDir',
-                                style: const TextStyle(
-                                  color: Colors.white54,
-                                  fontSize: 11,
-                                ),
+                      ],
+                    ),
+                  ),
+                ),
+                content: SizedBox(
+                  width:
+                      metrics.dialogWidth - metrics.contentPadding.horizontal,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: metrics.contentMaxHeight,
+                    ),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _buildSettingsSectionTitle('默认下载偏好'),
+                          _buildSettingsDropdownRow(
+                            leftLabel: '首选清晰度',
+                            leftValue: tempPreferences.preferredQuality,
+                            leftItems: const [
+                              DropdownMenuItem(
+                                value: 'best',
+                                child: Text('推荐（兼容优先）'),
                               ),
-                            ),
-                          ),
-                        _buildNumericRow(
-                          leftLabel: '超时秒数',
-                          leftController: timeoutController,
-                          rightLabel: '重试次数',
-                          rightController: retriesController,
-                        ),
-                        _buildLabeledField(
-                          label: '分片重试',
-                          controller: fragmentRetriesController,
-                          keyboardType: TextInputType.number,
-                        ),
-                        _buildLabeledField(
-                          label: '限速',
-                          controller: rateLimitController,
-                          hintText: '例如 2M 或 500K',
-                        ),
-                        _buildLabeledField(
-                          label: 'Player Clients',
-                          controller: clientsController,
-                          hintText: '例如 android,visionos',
-                        ),
-                        _buildLabeledField(
-                          label: 'Visitor Data',
-                          controller: visitorDataController,
-                        ),
-                        SwitchListTile(
-                          title: const Text('强制 IPv4'),
-                          value: temp.forceIpv4,
-                          onChanged: (value) {
-                            setState(() {
-                              temp = temp.copyWith(forceIpv4: value);
-                            });
-                          },
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        SwitchListTile(
-                          title: const Text('记录脱敏调试日志'),
-                          value: temp.debugLoggingEnabled,
-                          onChanged: (value) {
-                            setState(() {
-                              temp = temp.copyWith(debugLoggingEnabled: value);
-                            });
-                          },
-                          contentPadding: EdgeInsets.zero,
-                        ),
-                        const SizedBox(height: 8),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: Text(
-                            'PO Token 列表',
-                            style: Theme.of(context).textTheme.titleSmall,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        ...poTokenControllers.map((draft) {
-                          return Container(
-                            margin: const EdgeInsets.only(bottom: 8),
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.04),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Column(
-                              children: [
-                                SwitchListTile(
-                                  title: const Text('启用该 Token'),
-                                  value: draft.enabled,
-                                  onChanged: (value) {
-                                    setState(() {
-                                      draft.enabled = value;
-                                    });
-                                  },
-                                  contentPadding: EdgeInsets.zero,
-                                ),
-                                _buildInlineTextField(
-                                  label: 'Client',
-                                  initialValue: draft.client,
-                                  onChanged: (value) => draft.client = value,
-                                ),
-                                _buildInlineTextField(
-                                  label: 'Context',
-                                  initialValue: draft.context,
-                                  onChanged: (value) => draft.context = value,
-                                ),
-                                _buildInlineTextField(
-                                  label: 'Token',
-                                  initialValue: draft.token,
-                                  onChanged: (value) => draft.token = value,
-                                ),
-                              ],
-                            ),
-                          );
-                        }),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: TextButton.icon(
-                            onPressed: () {
+                              DropdownMenuItem(
+                                value: '2160p',
+                                child: Text('2160p'),
+                              ),
+                              DropdownMenuItem(
+                                value: '1440p',
+                                child: Text('1440p'),
+                              ),
+                              DropdownMenuItem(
+                                value: '1080p',
+                                child: Text('1080p'),
+                              ),
+                              DropdownMenuItem(
+                                value: '720p',
+                                child: Text('720p'),
+                              ),
+                              DropdownMenuItem(
+                                value: '480p',
+                                child: Text('480p'),
+                              ),
+                              DropdownMenuItem(
+                                value: '360p',
+                                child: Text('360p'),
+                              ),
+                            ],
+                            onLeftChanged: (value) {
+                              if (value == null) return;
                               setState(() {
-                                poTokenControllers.add(_PoTokenDraft());
+                                tempPreferences = tempPreferences.copyWith(
+                                  preferredQuality: value,
+                                );
                               });
                             },
-                            icon: const Icon(Icons.add),
-                            label: const Text('添加 PO Token'),
+                            rightLabel: '字幕语言选择',
+                            rightValue: _formatPreferredSubtitleLanguageSummary(
+                              tempPreferences.preferredSubtitleLanguages,
+                            ),
+                            rightAsText: true,
+                            onRightTap: () async {
+                              final selected =
+                                  await _showPreferredSubtitleLanguagesDialog(
+                                    tempPreferences.preferredSubtitleLanguages,
+                                  );
+                              if (selected == null) {
+                                return;
+                              }
+                              setState(() {
+                                tempPreferences = tempPreferences.copyWith(
+                                  preferredSubtitleLanguages: selected,
+                                );
+                              });
+                            },
                           ),
-                        ),
-                      ] else
-                        const Text(
-                          '高级设置已隐藏，连续点击标题 5 次后会在底部显示原先的 Cookies、代理、UA、Player Clients 等设置。',
-                          style: TextStyle(
-                            color: Colors.white38,
-                            fontSize: 11,
-                            height: 1.35,
+                          _buildLabeledField(
+                            label: '分片并发数',
+                            controller: fragmentsController,
+                            hintText: '1–16，建议 4',
+                            keyboardType: TextInputType.number,
                           ),
-                        ),
-                    ],
+                          AdaptiveSettingsTileGrid(
+                            gap: metrics.gap,
+                            children: [
+                              SwitchListTile(
+                                title: const Text('下载完成自动导入媒体库'),
+                                value: tempPreferences.autoImportToLibrary,
+                                onChanged: (value) {
+                                  setState(() {
+                                    tempPreferences = tempPreferences.copyWith(
+                                      autoImportToLibrary: value,
+                                      autoDeleteTaskAfterImport: value
+                                          ? tempPreferences
+                                                .autoDeleteTaskAfterImport
+                                          : false,
+                                    );
+                                  });
+                                },
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                              SwitchListTile(
+                                title: const Text('任务下拉选项默认展开'),
+                                subtitle: Text(
+                                  '默认开启。手动收起的任务会保持收起，以你的操作为准。',
+                                  style: TextStyle(
+                                    fontSize: metrics.captionSize,
+                                  ),
+                                ),
+                                value: tempPreferences.autoExpandTaskOptions,
+                                onChanged: (value) async {
+                                  final updatedPreferences = tempPreferences
+                                      .copyWith(autoExpandTaskOptions: value);
+                                  setState(() {
+                                    tempPreferences = updatedPreferences;
+                                  });
+                                  await service.saveDownloadPreferences(
+                                    updatedPreferences,
+                                  );
+                                },
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                              SwitchListTile(
+                                title: Text(
+                                  '导入媒体库后自动删除任务',
+                                  style: TextStyle(
+                                    color: tempPreferences.autoImportToLibrary
+                                        ? Colors.white
+                                        : Colors.white38,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  '只移除任务记录，不删除已导入的视频文件',
+                                  style: TextStyle(
+                                    color: tempPreferences.autoImportToLibrary
+                                        ? Colors.white54
+                                        : Colors.white24,
+                                    fontSize: metrics.captionSize,
+                                  ),
+                                ),
+                                value:
+                                    tempPreferences.autoDeleteTaskAfterImport,
+                                onChanged: tempPreferences.autoImportToLibrary
+                                    ? (value) {
+                                        setState(() {
+                                          tempPreferences = tempPreferences
+                                              .copyWith(
+                                                autoDeleteTaskAfterImport:
+                                                    value,
+                                              );
+                                        });
+                                      }
+                                    : null,
+                                contentPadding: EdgeInsets.zero,
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            tempPreferences.preferredSubtitleLanguages.isEmpty
+                                ? '未设置字幕语言偏好时，将按解析结果的默认推荐选择。'
+                                : '被选中的所有字幕语言都会下载；命中的自带字幕和自动生成字幕都会参与下载与封装。',
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 11,
+                              height: 1.35,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          if (showAdvancedSettings) ...[
+                            const Divider(height: 24),
+                            _buildSettingsSectionTitle('高级设置'),
+                            SwitchListTile(
+                              title: const Text('启用 Cookies'),
+                              value: temp.useCookies,
+                              onChanged: (value) {
+                                setState(() {
+                                  temp = temp.copyWith(useCookies: value);
+                                });
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            _buildLabeledField(
+                              label: 'Cookies 文件',
+                              controller: cookiesController,
+                              trailing: TextButton(
+                                onPressed: pickCookies,
+                                child: const Text('选择'),
+                              ),
+                            ),
+                            SwitchListTile(
+                              title: const Text('启用自定义 User-Agent'),
+                              value: temp.useCustomUserAgent,
+                              onChanged: (value) {
+                                setState(() {
+                                  temp = temp.copyWith(
+                                    useCustomUserAgent: value,
+                                  );
+                                });
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            _buildLabeledField(
+                              label: 'User-Agent',
+                              controller: userAgentController,
+                            ),
+                            SwitchListTile(
+                              title: const Text('启用代理'),
+                              value: temp.useProxy,
+                              onChanged: (value) {
+                                setState(() {
+                                  temp = temp.copyWith(useProxy: value);
+                                });
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            _buildLabeledField(
+                              label: '代理地址',
+                              controller: proxyController,
+                            ),
+                            if (showOutputDirectoryControls)
+                              _buildLabeledField(
+                                label: '输出目录',
+                                controller: outputDirController,
+                                trailing: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    TextButton(
+                                      onPressed: pickOutputDir,
+                                      child: const Text('选择'),
+                                    ),
+                                    TextButton(
+                                      onPressed: outputDirController.clear,
+                                      child: const Text('默认'),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            if (showOutputDirectoryControls)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Padding(
+                                  padding: const EdgeInsets.only(bottom: 8),
+                                  child: Text(
+                                    '留空时默认保存到: $defaultOutputDir',
+                                    style: const TextStyle(
+                                      color: Colors.white54,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            _buildNumericRow(
+                              leftLabel: '超时秒数',
+                              leftController: timeoutController,
+                              rightLabel: '重试次数',
+                              rightController: retriesController,
+                            ),
+                            _buildLabeledField(
+                              label: '分片重试',
+                              controller: fragmentRetriesController,
+                              keyboardType: TextInputType.number,
+                            ),
+                            _buildLabeledField(
+                              label: '限速',
+                              controller: rateLimitController,
+                              hintText: '例如 2M 或 500K',
+                            ),
+                            _buildLabeledField(
+                              label: 'Player Clients',
+                              controller: clientsController,
+                              hintText: '例如 android,visionos',
+                            ),
+                            _buildLabeledField(
+                              label: 'Visitor Data',
+                              controller: visitorDataController,
+                            ),
+                            SwitchListTile(
+                              title: const Text('强制 IPv4'),
+                              value: temp.forceIpv4,
+                              onChanged: (value) {
+                                setState(() {
+                                  temp = temp.copyWith(forceIpv4: value);
+                                });
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            SwitchListTile(
+                              title: const Text('记录脱敏调试日志'),
+                              value: temp.debugLoggingEnabled,
+                              onChanged: (value) {
+                                setState(() {
+                                  temp = temp.copyWith(
+                                    debugLoggingEnabled: value,
+                                  );
+                                });
+                              },
+                              contentPadding: EdgeInsets.zero,
+                            ),
+                            const SizedBox(height: 8),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                'PO Token 列表',
+                                style: Theme.of(context).textTheme.titleSmall,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            ...poTokenControllers.map((draft) {
+                              return Container(
+                                margin: const EdgeInsets.only(bottom: 8),
+                                padding: const EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.04),
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Column(
+                                  children: [
+                                    SwitchListTile(
+                                      title: const Text('启用该 Token'),
+                                      value: draft.enabled,
+                                      onChanged: (value) {
+                                        setState(() {
+                                          draft.enabled = value;
+                                        });
+                                      },
+                                      contentPadding: EdgeInsets.zero,
+                                    ),
+                                    _buildInlineTextField(
+                                      label: 'Client',
+                                      initialValue: draft.client,
+                                      onChanged: (value) =>
+                                          draft.client = value,
+                                    ),
+                                    _buildInlineTextField(
+                                      label: 'Context',
+                                      initialValue: draft.context,
+                                      onChanged: (value) =>
+                                          draft.context = value,
+                                    ),
+                                    _buildInlineTextField(
+                                      label: 'Token',
+                                      initialValue: draft.token,
+                                      onChanged: (value) => draft.token = value,
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: TextButton.icon(
+                                onPressed: () {
+                                  setState(() {
+                                    poTokenControllers.add(_PoTokenDraft());
+                                  });
+                                },
+                                icon: const Icon(Icons.add),
+                                label: const Text('添加 PO Token'),
+                              ),
+                            ),
+                          ] else
+                            const Text(
+                              '高级设置已隐藏，连续点击标题 5 次后会在底部显示原先的 Cookies、代理、UA、Player Clients 等设置。',
+                              style: TextStyle(
+                                color: Colors.white38,
+                                fontSize: 11,
+                                height: 1.35,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('取消'),
+                  ),
+                  ElevatedButton(
+                    onPressed: () async {
+                      final normalizedPreferences = tempPreferences.copyWith(
+                        autoDeleteTaskAfterImport:
+                            tempPreferences.autoImportToLibrary
+                            ? tempPreferences.autoDeleteTaskAfterImport
+                            : false,
+                      );
+                      final updated = temp.copyWith(
+                        cookiesFilePath: cookiesController.text.trim().isEmpty
+                            ? null
+                            : cookiesController.text.trim(),
+                        userAgent: userAgentController.text.trim().isEmpty
+                            ? null
+                            : userAgentController.text.trim(),
+                        proxy: proxyController.text.trim().isEmpty
+                            ? null
+                            : proxyController.text.trim(),
+                        socketTimeoutSeconds: int.tryParse(
+                          timeoutController.text.trim(),
+                        ),
+                        retries: int.tryParse(retriesController.text.trim()),
+                        fragmentRetries: int.tryParse(
+                          fragmentRetriesController.text.trim(),
+                        ),
+                        concurrentFragments: int.tryParse(
+                          fragmentsController.text.trim(),
+                        )?.clamp(1, 16),
+                        rateLimit: rateLimitController.text.trim().isEmpty
+                            ? null
+                            : rateLimitController.text.trim(),
+                        enabledPlayerClients: clientsController.text
+                            .split(',')
+                            .map((item) => item.trim())
+                            .where((item) => item.isNotEmpty)
+                            .toList(),
+                        visitorData: visitorDataController.text.trim().isEmpty
+                            ? null
+                            : visitorDataController.text.trim(),
+                        outputDirectory: showOutputDirectoryControls
+                            ? outputDirController.text.trim().isEmpty
+                                  ? null
+                                  : outputDirController.text.trim()
+                            : null,
+                        poTokens: poTokenControllers
+                            .where((draft) => draft.token.trim().isNotEmpty)
+                            .map(
+                              (draft) => PoTokenConfig(
+                                client: draft.client.trim(),
+                                context: draft.context.trim(),
+                                token: draft.token.trim(),
+                                enabled: draft.enabled,
+                              ),
+                            )
+                            .toList(),
+                      );
+                      await service.saveDownloadPreferences(
+                        normalizedPreferences,
+                      );
+                      await service.saveSessionConfig(updated);
+                      if (dialogContext.mounted) {
+                        Navigator.pop(dialogContext);
+                      }
+                      if (!mounted) return;
+                      AppToast.show('设置已保存', type: AppToastType.success);
+                    },
+                    child: const Text('保存'),
+                  ),
+                ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('取消'),
-                ),
-                ElevatedButton(
-                  onPressed: () async {
-                    final normalizedPreferences = tempPreferences.copyWith(
-                      autoDeleteTaskAfterImport:
-                          tempPreferences.autoImportToLibrary
-                          ? tempPreferences.autoDeleteTaskAfterImport
-                          : false,
-                    );
-                    final updated = temp.copyWith(
-                      cookiesFilePath: cookiesController.text.trim().isEmpty
-                          ? null
-                          : cookiesController.text.trim(),
-                      userAgent: userAgentController.text.trim().isEmpty
-                          ? null
-                          : userAgentController.text.trim(),
-                      proxy: proxyController.text.trim().isEmpty
-                          ? null
-                          : proxyController.text.trim(),
-                      socketTimeoutSeconds: int.tryParse(
-                        timeoutController.text.trim(),
-                      ),
-                      retries: int.tryParse(retriesController.text.trim()),
-                      fragmentRetries: int.tryParse(
-                        fragmentRetriesController.text.trim(),
-                      ),
-                      concurrentFragments: int.tryParse(
-                        fragmentsController.text.trim(),
-                      )?.clamp(1, 16),
-                      rateLimit: rateLimitController.text.trim().isEmpty
-                          ? null
-                          : rateLimitController.text.trim(),
-                      enabledPlayerClients: clientsController.text
-                          .split(',')
-                          .map((item) => item.trim())
-                          .where((item) => item.isNotEmpty)
-                          .toList(),
-                      visitorData: visitorDataController.text.trim().isEmpty
-                          ? null
-                          : visitorDataController.text.trim(),
-                      outputDirectory: showOutputDirectoryControls
-                          ? outputDirController.text.trim().isEmpty
-                                ? null
-                                : outputDirController.text.trim()
-                          : null,
-                      poTokens: poTokenControllers
-                          .where((draft) => draft.token.trim().isNotEmpty)
-                          .map(
-                            (draft) => PoTokenConfig(
-                              client: draft.client.trim(),
-                              context: draft.context.trim(),
-                              token: draft.token.trim(),
-                              enabled: draft.enabled,
-                            ),
-                          )
-                          .toList(),
-                    );
-                    await service.saveDownloadPreferences(
-                      normalizedPreferences,
-                    );
-                    await service.saveSessionConfig(updated);
-                    if (dialogContext.mounted) {
-                      Navigator.pop(dialogContext);
-                    }
-                    if (!mounted) return;
-                    AppToast.show('设置已保存', type: AppToastType.success);
-                  },
-                  child: const Text('保存'),
-                ),
-              ],
             );
           },
         );

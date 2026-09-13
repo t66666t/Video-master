@@ -1,4 +1,7 @@
+import '../services/subtitle_debug_session.dart';
+import 'subtitle_debug_panel.dart';
 import 'package:flutter/material.dart';
+import 'landscape_sidebar_layout.dart';
 import 'package:provider/provider.dart';
 import '../models/subtitle_style.dart';
 import '../services/settings_service.dart';
@@ -7,6 +10,19 @@ import '../services/settings_service.dart';
 /// 文字样式（字体、颜色、描边、阴影等）会同步到横竖屏
 /// 布局样式（字号、行间距、字间距等）同步到横竖屏
 class SubtitleSettingsSheet extends StatelessWidget {
+  bool _useCompactLayout(BuildContext context) {
+    final media = MediaQuery.of(context);
+    if (media.orientation != Orientation.landscape) {
+      return media.size.width < 600;
+    }
+    final sidebarSize = Size(
+      LandscapeSidebarLayout.functionalWidthFor(media.size),
+      media.size.height,
+    );
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
+    return layout.isNarrow || layout.isCompactHeight;
+  }
+
   /// 当前完整样式（包含文字样式和布局样式）
   final SubtitleStyle style;
 
@@ -60,7 +76,10 @@ class SubtitleSettingsSheet extends StatelessWidget {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: const Text("我知道了", style: TextStyle(color: Colors.blueAccent)),
+            child: const Text(
+              "我知道了",
+              style: TextStyle(color: Colors.blueAccent),
+            ),
           ),
         ],
       ),
@@ -68,29 +87,108 @@ class SubtitleSettingsSheet extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: SubtitleDebugSession.instance,
+    builder: (context, _) => _build(context),
+  );
+
+  Widget _build(BuildContext context) {
+    final presetSession = SubtitleDebugSession.instance;
+    if (presetSession.catalogVisible) {
+      return Material(
+        color: const Color(0xFF1E1E1E),
+        child: Column(
+          children: [
+            SafeArea(
+              bottom: false,
+              child: Row(
+                children: [
+                  if (onBack != null)
+                    IconButton(
+                      onPressed: onBack,
+                      icon: const Icon(Icons.arrow_back, color: Colors.white),
+                    ),
+                  const Expanded(
+                    child: Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Text(
+                        '字幕排版',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: onClose,
+                    icon: const Icon(Icons.close, color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+            if (!isAudio && !hideGhostModeToggle)
+              Consumer<SettingsService>(
+                builder: (context, settings, _) => SwitchListTile(
+                  dense: true,
+                  title: const Text(
+                    '幽灵模式',
+                    style: TextStyle(color: Colors.white, fontSize: 13),
+                  ),
+                  value: settings.isGhostModeEnabled,
+                  onChanged: (value) =>
+                      settings.updateSetting('isGhostModeEnabled', value),
+                ),
+              ),
+            const Expanded(child: SubtitleDebugPanel()),
+          ],
+        ),
+      );
+    }
+
+    final media = MediaQuery.of(context);
+    final sidebarSize = media.orientation == Orientation.landscape
+        ? Size(
+            LandscapeSidebarLayout.functionalWidthFor(media.size),
+            media.size.height,
+          )
+        : media.size;
+    final layout = LandscapeSidebarLayout.fromSize(sidebarSize);
+    final isSmallScreen = layout.isNarrow || layout.isCompactHeight;
     final bool showAudioSyncRow =
         isAudio && onSyncAudioSubtitleStyleWithVideoChanged != null;
-    final paddingValue = isSmallScreen ? 6.0 : 20.0;
-    final headerHPadding = isSmallScreen ? 4.0 : 12.0;
-    final headerVPadding = isSmallScreen ? 2.0 : 6.0;
+    final paddingValue = layout.horizontalPadding;
+    final headerHPadding = layout.horizontalPadding;
+    final headerVPadding = layout.verticalPadding / 2;
     final headerIconSize = isSmallScreen ? 16.0 : 18.0;
-    final headerTitleFontSize = isSmallScreen ? 13.0 : 14.0;
+    final headerTitleFontSize = layout.titleSize;
     final headerButtonSize = isSmallScreen ? 28.0 : 32.0;
     final headerTopRowHeight = isSmallScreen ? 28.0 : 32.0;
     final headerBottomRowHeight = isSmallScreen ? 20.0 : 24.0;
     final headerRowGap = isSmallScreen ? 0.0 : 2.0;
-    final bool showBottomRow = showAudioSyncRow || (!isAudio && !hideGhostModeToggle);
-    final headerHeight = headerTopRowHeight +
+    final bool showBottomRow =
+        showAudioSyncRow || (!isAudio && !hideGhostModeToggle);
+    final headerHeight =
+        headerTopRowHeight +
         (showBottomRow ? (headerBottomRowHeight + headerRowGap) : 0.0) +
         headerVPadding * 2;
 
     // Adaptive sizes
     final double titleFontSize = isSmallScreen ? 11 : 12;
 
-    final fonts = ['System', 'OPPO Sans 4.0', '方正黑体', 'MiSans', 'Noto Sans SC', 'Noto Serif CJK SC', 'Swei Gothic CJK SC', '方正楷体', 'Inter', 'Comic Relief', 'Roboto'];
+    final fonts = [
+      'System',
+      'OPPO Sans 4.0',
+      '方正黑体',
+      'MiSans',
+      'Noto Sans SC',
+      'Noto Serif CJK SC',
+      'Swei Gothic CJK SC',
+      '方正楷体',
+      'Inter',
+      'Comic Relief',
+      'Roboto',
+    ];
 
     return Container(
       color: const Color(0xFF1E1E1E), // 深色背景
@@ -105,7 +203,10 @@ class SubtitleSettingsSheet extends StatelessWidget {
                 visualDensity: VisualDensity.compact,
               ),
               child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: headerHPadding, vertical: headerVPadding),
+                padding: EdgeInsets.symmetric(
+                  horizontal: headerHPadding,
+                  vertical: headerVPadding,
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -115,10 +216,17 @@ class SubtitleSettingsSheet extends StatelessWidget {
                         children: [
                           if (onBack != null)
                             IconButton(
-                              icon: Icon(Icons.arrow_back, color: Colors.white70, size: headerIconSize),
+                              icon: Icon(
+                                Icons.arrow_back,
+                                color: Colors.white70,
+                                size: headerIconSize,
+                              ),
                               onPressed: onBack,
                               padding: EdgeInsets.zero,
-                              constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                              constraints: BoxConstraints.tightFor(
+                                width: headerButtonSize,
+                                height: headerButtonSize,
+                              ),
                               splashRadius: headerButtonSize / 2,
                               tooltip: "返回",
                             ),
@@ -126,16 +234,27 @@ class SubtitleSettingsSheet extends StatelessWidget {
                           Expanded(
                             child: Text(
                               isAudio ? "音频字幕样式" : "视频字幕样式",
-                              style: TextStyle(color: Colors.white, fontSize: headerTitleFontSize, fontWeight: FontWeight.w600),
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: headerTitleFontSize,
+                                fontWeight: FontWeight.w600,
+                              ),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
                           IconButton(
-                            icon: Icon(Icons.close, color: Colors.white70, size: headerIconSize),
+                            icon: Icon(
+                              Icons.close,
+                              color: Colors.white70,
+                              size: headerIconSize,
+                            ),
                             onPressed: onClose,
                             padding: EdgeInsets.zero,
-                            constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                            constraints: BoxConstraints.tightFor(
+                              width: headerButtonSize,
+                              height: headerButtonSize,
+                            ),
                             splashRadius: headerButtonSize / 2,
                             tooltip: "关闭",
                           ),
@@ -148,7 +267,8 @@ class SubtitleSettingsSheet extends StatelessWidget {
                         height: headerBottomRowHeight,
                         child: Row(
                           children: [
-                            if (onBack != null) SizedBox(width: headerButtonSize + 4.0),
+                            if (onBack != null)
+                              SizedBox(width: headerButtonSize + 4.0),
                             Text(
                               isSmallScreen ? "同步视频样式" : "同步视频播放页样式",
                               style: TextStyle(
@@ -162,7 +282,8 @@ class SubtitleSettingsSheet extends StatelessWidget {
                               alignment: Alignment.centerLeft,
                               child: Switch(
                                 value: syncAudioSubtitleStyleWithVideo,
-                                onChanged: onSyncAudioSubtitleStyleWithVideoChanged,
+                                onChanged:
+                                    onSyncAudioSubtitleStyleWithVideoChanged,
                                 activeThumbColor: Colors.blueAccent,
                               ),
                             ),
@@ -172,30 +293,49 @@ class SubtitleSettingsSheet extends StatelessWidget {
                     if (!isAudio && !hideGhostModeToggle)
                       Consumer<SettingsService>(
                         builder: (context, settings, child) {
-                          final titleIndent = onBack != null ? (headerButtonSize + 4.0) : 0.0;
+                          final titleIndent = onBack != null
+                              ? (headerButtonSize + 4.0)
+                              : 0.0;
                           final ghostLabel = isSmallScreen ? "幽灵" : "幽灵模式";
                           return SizedBox(
                             height: headerBottomRowHeight,
                             child: Row(
                               children: [
-                                if (titleIndent > 0) SizedBox(width: titleIndent),
-                                Text(ghostLabel, style: TextStyle(color: Colors.white70, fontSize: isSmallScreen ? 11 : 12)),
+                                if (titleIndent > 0)
+                                  SizedBox(width: titleIndent),
+                                Text(
+                                  ghostLabel,
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: isSmallScreen ? 11 : 12,
+                                  ),
+                                ),
                                 const SizedBox(width: 6),
                                 Transform.scale(
                                   scale: isSmallScreen ? 0.66 : 0.85,
                                   alignment: Alignment.centerLeft,
                                   child: Switch(
                                     value: settings.isGhostModeEnabled,
-                                    onChanged: (val) => settings.updateSetting('isGhostModeEnabled', val),
+                                    onChanged: (val) => settings.updateSetting(
+                                      'isGhostModeEnabled',
+                                      val,
+                                    ),
                                     activeThumbColor: Colors.blueAccent,
                                   ),
                                 ),
                                 IconButton(
-                                  icon: Icon(Icons.help_outline, color: Colors.white70, size: headerIconSize),
+                                  icon: Icon(
+                                    Icons.help_outline,
+                                    color: Colors.white70,
+                                    size: headerIconSize,
+                                  ),
                                   onPressed: () => _showGhostModeHelp(context),
                                   tooltip: "幽灵模式说明",
                                   padding: EdgeInsets.zero,
-                                  constraints: BoxConstraints.tightFor(width: headerButtonSize, height: headerButtonSize),
+                                  constraints: BoxConstraints.tightFor(
+                                    width: headerButtonSize,
+                                    height: headerButtonSize,
+                                  ),
                                   splashRadius: headerButtonSize / 2,
                                 ),
                               ],
@@ -212,339 +352,490 @@ class SubtitleSettingsSheet extends StatelessWidget {
 
           Expanded(
             child: ListView(
-              padding: EdgeInsets.symmetric(horizontal: paddingValue, vertical: 8),
+              padding: EdgeInsets.symmetric(
+                horizontal: paddingValue,
+                vertical: 8,
+              ),
               children: [
-                // 1. Layout Settings (Size & Spacing) - 仅影响当前方向
-                _buildSectionTitle(context, "布局 (横竖屏同步)", Icons.format_size, color: Colors.orangeAccent),
-                // Main Font Size
-                Row(
-                  children: [
-                    Text("主字号", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildSlider(
-                        context,
-                        value: style.fontSize,
-                        min: 10,
-                        max: 100,
-                        label: style.fontSize.toInt().toString(),
-                        onChanged: (val) => _updateLayoutStyle(style.layoutStyle.copyWith(fontSize: val)),
-                      ),
-                    ),
-                  ],
-                ),
-                // Secondary Font Size
-                Row(
-                  children: [
-                    Text("副字号", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildSlider(
-                        context,
-                        value: style.secondaryFontSize ?? style.fontSize,
-                        min: 10,
-                        max: 100,
-                        label: (style.secondaryFontSize ?? style.fontSize).toInt().toString(),
-                        onChanged: (val) => _updateLayoutStyle(style.layoutStyle.copyWith(secondaryFontSize: val)),
-                      ),
-                    ),
-                  ],
-                ),
-                // Line Spacing
-                Row(
-                  children: [
-                    Text("行间距", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildSlider(
-                        context,
-                        value: style.lineSpacing,
-                        min: -10,
-                        max: 100,
-                        label: style.lineSpacing.toInt().toString(),
-                        onChanged: (val) => _updateLayoutStyle(style.layoutStyle.copyWith(lineSpacing: val)),
-                      ),
-                    ),
-                  ],
-                ),
-                // Letter Spacing
-                Row(
-                  children: [
-                    Text("字间距", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildSlider(
-                        context,
-                        value: style.letterSpacing,
-                        min: -5,
-                        max: 20,
-                        label: style.letterSpacing.toStringAsFixed(1),
-                        onChanged: (val) => _updateLayoutStyle(style.layoutStyle.copyWith(letterSpacing: val)),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-
-                const Divider(color: Colors.white10, height: 24),
-
-                // 2. Text Style Settings - 同步到横竖屏
-                _buildSectionTitle(context, "文字样式 (横竖屏同步)", Icons.text_fields, color: Colors.greenAccent),
-
-                // 2. Font Family
-                _buildSectionTitle(context, "中文字体 (Chinese Font)", Icons.font_download),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: fonts.map((f) {
-                    final isSelected = style.fontFamilyChinese == f || (f == 'System' && style.fontFamilyChinese == 'System');
-                    return _buildCompactChip(
-                      context,
-                      label: f,
-                      isSelected: isSelected,
-                      onTap: () => _updateTextStyle(style.textStyle.copyWith(fontFamilyChinese: f)),
-                    );
-                  }).toList(),
-                ),
-
-                // Chinese Weight Selector (if applicable)
-                if (_hasMultipleWeights(style.fontFamilyChinese)) ...[
-                  const SizedBox(height: 12),
-                  _buildSectionTitle(context, "中文字重 (Chinese Weight)", Icons.line_weight),
-                  _buildWeightSelector(
-                    context,
-                    fontFamily: style.fontFamilyChinese,
-                    currentWeight: style.fontWeightChinese,
-                    onChanged: (w) => _updateTextStyle(style.textStyle.copyWith(fontWeightChinese: w)),
+                if (presetSession.enabled)
+                  TextButton.icon(
+                    onPressed: presetSession.openCatalog,
+                    icon: const Icon(Icons.auto_awesome),
+                    label: const Text('选择字幕预设'),
                   ),
-                ] else ...[
-                   const SizedBox(height: 8),
-                   Row(
-                     children: [
-                        const Text("粗体 (Bold)", style: TextStyle(color: Colors.white70, fontSize: 12)),
+                if (SubtitleDebugSession.instance.preset == null) ...[
+                  // 1. Layout Settings (Size & Spacing) - 仅影响当前方向
+                  _buildSectionTitle(
+                    context,
+                    "布局 (横竖屏同步)",
+                    Icons.format_size,
+                    color: Colors.orangeAccent,
+                  ),
+                  // Main Font Size
+                  Row(
+                    children: [
+                      Text(
+                        "主字号",
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: titleFontSize,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildSlider(
+                          context,
+                          value: style.fontSize,
+                          min: 10,
+                          max: 100,
+                          label: style.fontSize.toInt().toString(),
+                          onChanged: (val) => _updateLayoutStyle(
+                            style.layoutStyle.copyWith(fontSize: val),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  // Secondary Font Size
+                  Row(
+                    children: [
+                      Text(
+                        "副字号",
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: titleFontSize,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildSlider(
+                          context,
+                          value: style.secondaryFontSize ?? style.fontSize,
+                          min: 10,
+                          max: 100,
+                          label: (style.secondaryFontSize ?? style.fontSize)
+                              .toInt()
+                              .toString(),
+                          onChanged: (val) => _updateLayoutStyle(
+                            style.layoutStyle.copyWith(secondaryFontSize: val),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  // Line Spacing
+                  Row(
+                    children: [
+                      Text(
+                        "行间距",
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: titleFontSize,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildSlider(
+                          context,
+                          value: style.lineSpacing,
+                          min: -10,
+                          max: 100,
+                          label: style.lineSpacing.toInt().toString(),
+                          onChanged: (val) => _updateLayoutStyle(
+                            style.layoutStyle.copyWith(lineSpacing: val),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  // Letter Spacing
+                  Row(
+                    children: [
+                      Text(
+                        "字间距",
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: titleFontSize,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildSlider(
+                          context,
+                          value: style.letterSpacing,
+                          min: -5,
+                          max: 20,
+                          label: style.letterSpacing.toStringAsFixed(1),
+                          onChanged: (val) => _updateLayoutStyle(
+                            style.layoutStyle.copyWith(letterSpacing: val),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  const Divider(color: Colors.white10, height: 24),
+
+                  // 2. Text Style Settings - 同步到横竖屏
+                  _buildSectionTitle(
+                    context,
+                    "文字样式 (横竖屏同步)",
+                    Icons.text_fields,
+                    color: Colors.greenAccent,
+                  ),
+
+                  // 2. Font Family
+                  _buildSectionTitle(
+                    context,
+                    "中文字体 (Chinese Font)",
+                    Icons.font_download,
+                  ),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: fonts.map((f) {
+                      final isSelected =
+                          style.fontFamilyChinese == f ||
+                          (f == 'System' &&
+                              style.fontFamilyChinese == 'System');
+                      return _buildCompactChip(
+                        context,
+                        label: f,
+                        isSelected: isSelected,
+                        onTap: () => _updateTextStyle(
+                          style.textStyle.copyWith(fontFamilyChinese: f),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+
+                  // Chinese Weight Selector (if applicable)
+                  if (_hasMultipleWeights(style.fontFamilyChinese)) ...[
+                    const SizedBox(height: 12),
+                    _buildSectionTitle(
+                      context,
+                      "中文字重 (Chinese Weight)",
+                      Icons.line_weight,
+                    ),
+                    _buildWeightSelector(
+                      context,
+                      fontFamily: style.fontFamilyChinese,
+                      currentWeight: style.fontWeightChinese,
+                      onChanged: (w) => _updateTextStyle(
+                        style.textStyle.copyWith(fontWeightChinese: w),
+                      ),
+                    ),
+                  ] else ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Text(
+                          "粗体 (Bold)",
+                          style: TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
                         const Spacer(),
                         Switch(
                           value: style.fontWeightChinese == FontWeight.bold,
-                          onChanged: (val) => _updateTextStyle(style.textStyle.copyWith(fontWeightChinese: val ? FontWeight.bold : FontWeight.normal)),
+                          onChanged: (val) => _updateTextStyle(
+                            style.textStyle.copyWith(
+                              fontWeightChinese: val
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
                           activeThumbColor: Colors.blueAccent,
-                        )
-                     ],
-                   ),
-                ],
+                        ),
+                      ],
+                    ),
+                  ],
 
-                const SizedBox(height: 16),
-                _buildSectionTitle(context, "英文字体 (English Font)", Icons.abc),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: fonts.map((f) {
-                    final isSelected = style.fontFamilyEnglish == f || (f == 'System' && style.fontFamilyEnglish == 'System');
-                    return _buildCompactChip(
-                      context,
-                      label: f,
-                      isSelected: isSelected,
-                      onTap: () => _updateTextStyle(style.textStyle.copyWith(fontFamilyEnglish: f)),
-                    );
-                  }).toList(),
-                ),
-
-                // English Weight Selector (if applicable)
-                if (_hasMultipleWeights(style.fontFamilyEnglish)) ...[
-                  const SizedBox(height: 12),
-                  _buildSectionTitle(context, "英文字重 (English Weight)", Icons.line_weight),
-                  _buildWeightSelector(
-                    context,
-                    fontFamily: style.fontFamilyEnglish,
-                    currentWeight: style.fontWeightEnglish,
-                    onChanged: (w) => _updateTextStyle(style.textStyle.copyWith(fontWeightEnglish: w)),
+                  const SizedBox(height: 16),
+                  _buildSectionTitle(context, "英文字体 (English Font)", Icons.abc),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: fonts.map((f) {
+                      final isSelected =
+                          style.fontFamilyEnglish == f ||
+                          (f == 'System' &&
+                              style.fontFamilyEnglish == 'System');
+                      return _buildCompactChip(
+                        context,
+                        label: f,
+                        isSelected: isSelected,
+                        onTap: () => _updateTextStyle(
+                          style.textStyle.copyWith(fontFamilyEnglish: f),
+                        ),
+                      );
+                    }).toList(),
                   ),
-                ] else ...[
-                   const SizedBox(height: 8),
-                   Row(
-                     children: [
-                        const Text("粗体 (Bold)", style: TextStyle(color: Colors.white70, fontSize: 12)),
+
+                  // English Weight Selector (if applicable)
+                  if (_hasMultipleWeights(style.fontFamilyEnglish)) ...[
+                    const SizedBox(height: 12),
+                    _buildSectionTitle(
+                      context,
+                      "英文字重 (English Weight)",
+                      Icons.line_weight,
+                    ),
+                    _buildWeightSelector(
+                      context,
+                      fontFamily: style.fontFamilyEnglish,
+                      currentWeight: style.fontWeightEnglish,
+                      onChanged: (w) => _updateTextStyle(
+                        style.textStyle.copyWith(fontWeightEnglish: w),
+                      ),
+                    ),
+                  ] else ...[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Text(
+                          "粗体 (Bold)",
+                          style: TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
                         const Spacer(),
                         Switch(
                           value: style.fontWeightEnglish == FontWeight.bold,
-                          onChanged: (val) => _updateTextStyle(style.textStyle.copyWith(fontWeightEnglish: val ? FontWeight.bold : FontWeight.normal)),
+                          onChanged: (val) => _updateTextStyle(
+                            style.textStyle.copyWith(
+                              fontWeightEnglish: val
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
                           activeThumbColor: Colors.blueAccent,
-                        )
-                     ],
-                   ),
-                ],
-
-                const SizedBox(height: 16),
-
-                // 3. Font Style
-                _buildSectionTitle(context, "样式", Icons.format_paint),
-                Row(
-                  children: [
-                    _buildStyleToggle(
-                      context,
-                      icon: Icons.format_italic,
-                      isActive: style.isItalic,
-                      onTap: () => _updateTextStyle(style.textStyle.copyWith(isItalic: !style.isItalic)),
-                    ),
-                    const SizedBox(width: 8),
-                    _buildStyleToggle(
-                      context,
-                      icon: Icons.format_underlined,
-                      isActive: style.isUnderline,
-                      onTap: () => _updateTextStyle(style.textStyle.copyWith(isUnderline: !style.isUnderline)),
+                        ),
+                      ],
                     ),
                   ],
-                ),
-                const SizedBox(height: 16),
 
-                // 4. Text Color
-                _buildSectionTitle(context, "文本颜色", Icons.color_lens),
-                _buildColorPicker(
-                  context,
-                  selectedColor: style.textColor,
-                  onColorChanged: (c) => _updateTextStyle(style.textStyle.copyWith(textColor: c)),
-                ),
-                const SizedBox(height: 16),
+                  const SizedBox(height: 16),
 
-                // 5. Background
-                _buildSectionTitle(context, "背景颜色", Icons.format_color_fill),
-                _buildColorPicker(
-                  context,
-                  selectedColor: style.backgroundColor.withValues(alpha: 1.0),
-                  onColorChanged: (c) => _updateTextStyle(style.textStyle.copyWith(
-                    backgroundColor: c.withValues(alpha: style.backgroundOpacity),
-                  )),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    Text("透明度", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: _buildSlider(
+                  // 3. Font Style
+                  _buildSectionTitle(context, "样式", Icons.format_paint),
+                  Row(
+                    children: [
+                      _buildStyleToggle(
                         context,
-                        value: style.backgroundOpacity,
-                        min: 0,
-                        max: 1,
-                        label: "${(style.backgroundOpacity * 100).round()}%",
-                        onChanged: (val) => _updateTextStyle(style.textStyle.copyWith(
-                          backgroundOpacity: val,
-                          backgroundColor: style.backgroundColor.withValues(alpha: val),
-                        )),
+                        icon: Icons.format_italic,
+                        isActive: style.isItalic,
+                        onTap: () => _updateTextStyle(
+                          style.textStyle.copyWith(isItalic: !style.isItalic),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _buildStyleToggle(
+                        context,
+                        icon: Icons.format_underlined,
+                        isActive: style.isUnderline,
+                        onTap: () => _updateTextStyle(
+                          style.textStyle.copyWith(
+                            isUnderline: !style.isUnderline,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  // 4. Text Color
+                  _buildSectionTitle(context, "文本颜色", Icons.color_lens),
+                  _buildColorPicker(
+                    context,
+                    selectedColor: style.textColor,
+                    onColorChanged: (c) => _updateTextStyle(
+                      style.textStyle.copyWith(textColor: c),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // 5. Background
+                  _buildSectionTitle(context, "背景颜色", Icons.format_color_fill),
+                  _buildColorPicker(
+                    context,
+                    selectedColor: style.backgroundColor.withValues(alpha: 1.0),
+                    onColorChanged: (c) => _updateTextStyle(
+                      style.textStyle.copyWith(
+                        backgroundColor: c.withValues(
+                          alpha: style.backgroundOpacity,
+                        ),
                       ),
                     ),
-                  ],
-                ),
-
-                const Divider(color: Colors.white10, height: 24),
-
-                // 6. Border & Shadow
-                _buildSwitchSection(
-                  context,
-                  "描边 (Outline)",
-                  style.hasBorder,
-                  (val) => _updateTextStyle(style.textStyle.copyWith(hasBorder: val)),
-                  children: [
-                    _buildColorPicker(
-                      context,
-                      selectedColor: style.borderColor,
-                      onColorChanged: (c) => _updateTextStyle(style.textStyle.copyWith(borderColor: c)),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Text("宽度", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _buildSlider(
-                            context,
-                            value: style.effectiveBorderWidth,
-                            min: 0,
-                            max: 10,
-                            label: style.effectiveBorderWidth.toStringAsFixed(1),
-                            onChanged: (val) => _updateTextStyle(
-                              style.textStyle.copyWith(
-                                borderWidth: style.textStyle
-                                    .normalizeBorderWidthForFontSize(
-                                      val,
-                                      style.fontSize,
-                                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Text(
+                        "透明度",
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: titleFontSize,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildSlider(
+                          context,
+                          value: style.backgroundOpacity,
+                          min: 0,
+                          max: 1,
+                          label: "${(style.backgroundOpacity * 100).round()}%",
+                          onChanged: (val) => _updateTextStyle(
+                            style.textStyle.copyWith(
+                              backgroundOpacity: val,
+                              backgroundColor: style.backgroundColor.withValues(
+                                alpha: val,
                               ),
                             ),
                           ),
                         ),
-                      ],
-                    ),
-                  ],
-                ),
+                      ),
+                    ],
+                  ),
 
-                const SizedBox(height: 16),
+                  const Divider(color: Colors.white10, height: 24),
 
-                _buildSwitchSection(
-                  context,
-                  "阴影 (Shadow)",
-                  style.hasShadow,
-                  (val) => _updateTextStyle(style.textStyle.copyWith(hasShadow: val)),
-                  children: [
-                    _buildColorPicker(
-                      context,
-                      selectedColor: style.shadowColor,
-                      onColorChanged: (c) => _updateTextStyle(style.textStyle.copyWith(shadowColor: c)),
+                  // 6. Border & Shadow
+                  _buildSwitchSection(
+                    context,
+                    "描边 (Outline)",
+                    style.hasBorder,
+                    (val) => _updateTextStyle(
+                      style.textStyle.copyWith(hasBorder: val),
                     ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Text("模糊", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _buildSlider(
-                            context,
-                            value: style.effectiveShadowBlur,
-                            min: 0,
-                            max: 10,
-                            label: style.effectiveShadowBlur.toStringAsFixed(1),
-                            onChanged: (val) => _updateTextStyle(
-                              style.textStyle.copyWith(
-                                shadowBlur: style.textStyle
-                                    .normalizeShadowBlurForFontSize(
-                                      val,
-                                      style.fontSize,
-                                    ),
+                    children: [
+                      _buildColorPicker(
+                        context,
+                        selectedColor: style.borderColor,
+                        onColorChanged: (c) => _updateTextStyle(
+                          style.textStyle.copyWith(borderColor: c),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Text(
+                            "宽度",
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: titleFontSize,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _buildSlider(
+                              context,
+                              value: style.effectiveBorderWidth,
+                              min: 0,
+                              max: 10,
+                              label: style.effectiveBorderWidth.toStringAsFixed(
+                                1,
+                              ),
+                              onChanged: (val) => _updateTextStyle(
+                                style.textStyle.copyWith(
+                                  borderWidth: style.textStyle
+                                      .normalizeBorderWidthForFontSize(
+                                        val,
+                                        style.fontSize,
+                                      ),
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  _buildSwitchSection(
+                    context,
+                    "阴影 (Shadow)",
+                    style.hasShadow,
+                    (val) => _updateTextStyle(
+                      style.textStyle.copyWith(hasShadow: val),
                     ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        Text("距离", style: TextStyle(color: Colors.white60, fontSize: titleFontSize)),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _buildSlider(
-                            context,
-                            value: style.effectiveShadowOffset.dx,
-                            min: 0,
-                            max: 10,
-                            label: style.effectiveShadowOffset.dx
-                                .toStringAsFixed(1),
-                            onChanged: (val) => _updateTextStyle(
-                              style.textStyle.copyWith(
-                                shadowOffset: style.textStyle
-                                    .normalizeShadowOffsetForFontSize(
-                                      Offset(val, val),
-                                      style.fontSize,
-                                    ),
+                    children: [
+                      _buildColorPicker(
+                        context,
+                        selectedColor: style.shadowColor,
+                        onColorChanged: (c) => _updateTextStyle(
+                          style.textStyle.copyWith(shadowColor: c),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Text(
+                            "模糊",
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: titleFontSize,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _buildSlider(
+                              context,
+                              value: style.effectiveShadowBlur,
+                              min: 0,
+                              max: 10,
+                              label: style.effectiveShadowBlur.toStringAsFixed(
+                                1,
+                              ),
+                              onChanged: (val) => _updateTextStyle(
+                                style.textStyle.copyWith(
+                                  shadowBlur: style.textStyle
+                                      .normalizeShadowBlurForFontSize(
+                                        val,
+                                        style.fontSize,
+                                      ),
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Text(
+                            "距离",
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: titleFontSize,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _buildSlider(
+                              context,
+                              value: style.effectiveShadowOffset.dx,
+                              min: 0,
+                              max: 10,
+                              label: style.effectiveShadowOffset.dx
+                                  .toStringAsFixed(1),
+                              onChanged: (val) => _updateTextStyle(
+                                style.textStyle.copyWith(
+                                  shadowOffset: style.textStyle
+                                      .normalizeShadowOffsetForFontSize(
+                                        Offset(val, val),
+                                        style.fontSize,
+                                      ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
 
-                const SizedBox(height: 24),
+                  const SizedBox(height: 24),
+                ],
               ],
             ),
           ),
@@ -559,10 +850,9 @@ class SubtitleSettingsSheet extends StatelessWidget {
       onTextStyleChanged!.call(newTextStyle);
       return;
     }
-    onStyleChanged?.call(SubtitleStyle(
-      textStyle: newTextStyle,
-      layoutStyle: style.layoutStyle,
-    ));
+    onStyleChanged?.call(
+      SubtitleStyle(textStyle: newTextStyle, layoutStyle: style.layoutStyle),
+    );
   }
 
   /// 更新布局样式 - 只影响当前方向
@@ -571,10 +861,9 @@ class SubtitleSettingsSheet extends StatelessWidget {
       onLayoutStyleChanged!.call(newLayoutStyle);
       return;
     }
-    onStyleChanged?.call(SubtitleStyle(
-      textStyle: style.textStyle,
-      layoutStyle: newLayoutStyle,
-    ));
+    onStyleChanged?.call(
+      SubtitleStyle(textStyle: style.textStyle, layoutStyle: newLayoutStyle),
+    );
   }
 
   bool _hasMultipleWeights(String fontFamily) {
@@ -585,7 +874,8 @@ class SubtitleSettingsSheet extends StatelessWidget {
     return false;
   }
 
-  Widget _buildWeightSelector(BuildContext context, {
+  Widget _buildWeightSelector(
+    BuildContext context, {
     required String fontFamily,
     required FontWeight currentWeight,
     required ValueChanged<FontWeight> onChanged,
@@ -604,7 +894,16 @@ class SubtitleSettingsSheet extends StatelessWidget {
         FontWeight.w700,
         FontWeight.w900,
       ];
-      labels = ["Thin", "X-Light", "Light", "Regular", "Medium", "SemiBold", "Bold", "Heavy"];
+      labels = [
+        "Thin",
+        "X-Light",
+        "Light",
+        "Regular",
+        "Medium",
+        "SemiBold",
+        "Bold",
+        "Heavy",
+      ];
     } else if (fontFamily == 'Roboto') {
       weights = [
         FontWeight.w100,
@@ -617,7 +916,17 @@ class SubtitleSettingsSheet extends StatelessWidget {
         FontWeight.w800,
         FontWeight.w900,
       ];
-      labels = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"];
+      labels = [
+        "Thin",
+        "ExtraLight",
+        "Light",
+        "Regular",
+        "Medium",
+        "SemiBold",
+        "Bold",
+        "ExtraBold",
+        "Black",
+      ];
     } else if (fontFamily == 'Inter') {
       // Inter 字体字重：Thin(100), ExtraLight(200), Light(300), Regular(400), Medium(500), SemiBold(600), Bold(700), ExtraBold(800), Black(900)
       weights = [
@@ -631,7 +940,17 @@ class SubtitleSettingsSheet extends StatelessWidget {
         FontWeight.w800,
         FontWeight.w900,
       ];
-      labels = ["Thin", "ExtraLight", "Light", "Regular", "Medium", "SemiBold", "Bold", "ExtraBold", "Black"];
+      labels = [
+        "Thin",
+        "ExtraLight",
+        "Light",
+        "Regular",
+        "Medium",
+        "SemiBold",
+        "Bold",
+        "ExtraBold",
+        "Black",
+      ];
     } else if (fontFamily == 'Noto Sans SC') {
       // Noto Sans SC 字体字重：Thin(100), DemiLight(200), Light(300), Regular(400), Medium(500), Bold(700), Black(900)
       // 注意：Noto Sans SC 没有 w600, w800，只有 100, 200, 300, 400, 500, 700, 900
@@ -644,7 +963,15 @@ class SubtitleSettingsSheet extends StatelessWidget {
         FontWeight.w700,
         FontWeight.w900,
       ];
-      labels = ["Thin", "DemiLight", "Light", "Regular", "Medium", "Bold", "Black"];
+      labels = [
+        "Thin",
+        "DemiLight",
+        "Light",
+        "Regular",
+        "Medium",
+        "Bold",
+        "Black",
+      ];
     } else {
       // Fallback (shouldn't happen given logic)
       weights = [FontWeight.normal, FontWeight.bold];
@@ -658,15 +985,15 @@ class SubtitleSettingsSheet extends StatelessWidget {
 
     // If no exact match, try to find closest
     if (currentIndex == -1) {
-       // ... logic to find closest ...
-       // For now, default to Regular (w400) index
-       if (fontFamily == 'MiSans') {
-         currentIndex = 3;
-       } else if (fontFamily == 'Roboto') {
-         currentIndex = 3;
-       } else {
-         currentIndex = 0;
-       }
+      // ... logic to find closest ...
+      // For now, default to Regular (w400) index
+      if (fontFamily == 'MiSans') {
+        currentIndex = 3;
+      } else if (fontFamily == 'Roboto') {
+        currentIndex = 3;
+      } else {
+        currentIndex = 0;
+      }
     }
 
     return Column(
@@ -698,9 +1025,22 @@ class SubtitleSettingsSheet extends StatelessWidget {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(labels[0], style: const TextStyle(color: Colors.white38, fontSize: 10)),
-              Text(labels[currentIndex], style: const TextStyle(color: Colors.blueAccent, fontSize: 11, fontWeight: FontWeight.bold)),
-              Text(labels.last, style: const TextStyle(color: Colors.white38, fontSize: 10)),
+              Text(
+                labels[0],
+                style: const TextStyle(color: Colors.white38, fontSize: 10),
+              ),
+              Text(
+                labels[currentIndex],
+                style: const TextStyle(
+                  color: Colors.blueAccent,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              Text(
+                labels.last,
+                style: const TextStyle(color: Colors.white38, fontSize: 10),
+              ),
             ],
           ),
         ),
@@ -708,35 +1048,56 @@ class SubtitleSettingsSheet extends StatelessWidget {
     );
   }
 
-  Widget _buildSectionTitle(BuildContext context, String text, IconData icon, {Color? color}) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+  Widget _buildSectionTitle(
+    BuildContext context,
+    String text,
+    IconData icon, {
+    Color? color,
+  }) {
+    final isSmallScreen = _useCompactLayout(context);
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Row(
         children: [
-          Icon(icon, size: isSmallScreen ? 12 : 14, color: (color ?? Colors.blueAccent).withValues(alpha: 0.8)),
+          Icon(
+            icon,
+            size: isSmallScreen ? 12 : 14,
+            color: (color ?? Colors.blueAccent).withValues(alpha: 0.8),
+          ),
           const SizedBox(width: 6),
-          Text(text, style: TextStyle(color: color ?? Colors.white70, fontSize: isSmallScreen ? 11 : 12, fontWeight: FontWeight.w500)),
+          Text(
+            text,
+            style: TextStyle(
+              color: color ?? Colors.white70,
+              fontSize: isSmallScreen ? 11 : 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildSlider(BuildContext context, {
+  Widget _buildSlider(
+    BuildContext context, {
     required double value,
     required double min,
     required double max,
     required String label,
     required ValueChanged<double> onChanged,
   }) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+    final isSmallScreen = _useCompactLayout(context);
     return SizedBox(
       height: isSmallScreen ? 24 : 30,
       child: SliderTheme(
         data: SliderTheme.of(context).copyWith(
           trackHeight: 2,
-          thumbShape: RoundSliderThumbShape(enabledThumbRadius: isSmallScreen ? 4 : 6),
-          overlayShape: RoundSliderOverlayShape(overlayRadius: isSmallScreen ? 8 : 12),
+          thumbShape: RoundSliderThumbShape(
+            enabledThumbRadius: isSmallScreen ? 4 : 6,
+          ),
+          overlayShape: RoundSliderOverlayShape(
+            overlayRadius: isSmallScreen ? 8 : 12,
+          ),
           valueIndicatorShape: const PaddleSliderValueIndicatorShape(),
           valueIndicatorTextStyle: TextStyle(fontSize: isSmallScreen ? 10 : 12),
         ),
@@ -753,16 +1114,28 @@ class SubtitleSettingsSheet extends StatelessWidget {
     );
   }
 
-  Widget _buildCompactChip(BuildContext context, {required String label, required bool isSelected, required VoidCallback onTap}) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+  Widget _buildCompactChip(
+    BuildContext context, {
+    required String label,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    final isSmallScreen = _useCompactLayout(context);
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: EdgeInsets.symmetric(horizontal: isSmallScreen ? 8 : 12, vertical: isSmallScreen ? 4 : 6),
+        padding: EdgeInsets.symmetric(
+          horizontal: isSmallScreen ? 8 : 12,
+          vertical: isSmallScreen ? 4 : 6,
+        ),
         decoration: BoxDecoration(
-          color: isSelected ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
+          color: isSelected
+              ? Colors.blueAccent
+              : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: isSelected ? Colors.blueAccent : Colors.white10),
+          border: Border.all(
+            color: isSelected ? Colors.blueAccent : Colors.white10,
+          ),
         ),
         child: Text(
           label,
@@ -776,32 +1149,52 @@ class SubtitleSettingsSheet extends StatelessWidget {
     );
   }
 
-  Widget _buildStyleToggle(BuildContext context, {
+  Widget _buildStyleToggle(
+    BuildContext context, {
     required IconData icon,
     required bool isActive,
     required VoidCallback onTap,
   }) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+    final isSmallScreen = _useCompactLayout(context);
     return GestureDetector(
       onTap: onTap,
       child: Container(
         padding: EdgeInsets.all(isSmallScreen ? 6 : 8),
         decoration: BoxDecoration(
-          color: isActive ? Colors.blueAccent : Colors.white.withValues(alpha: 0.05),
+          color: isActive
+              ? Colors.blueAccent
+              : Colors.white.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: isActive ? Colors.blueAccent : Colors.white10),
+          border: Border.all(
+            color: isActive ? Colors.blueAccent : Colors.white10,
+          ),
         ),
-        child: Icon(icon, color: isActive ? Colors.white : Colors.white60, size: isSmallScreen ? 16 : 18),
+        child: Icon(
+          icon,
+          color: isActive ? Colors.white : Colors.white60,
+          size: isSmallScreen ? 16 : 18,
+        ),
       ),
     );
   }
 
-  Widget _buildColorPicker(BuildContext context, {required Color selectedColor, required ValueChanged<Color> onColorChanged}) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+  Widget _buildColorPicker(
+    BuildContext context, {
+    required Color selectedColor,
+    required ValueChanged<Color> onColorChanged,
+  }) {
+    final isSmallScreen = _useCompactLayout(context);
     final colors = [
-      Colors.white, Colors.black, Colors.redAccent, Colors.blueAccent,
-      Colors.greenAccent, Colors.amberAccent, Colors.cyanAccent, Colors.purpleAccent,
-      Colors.grey, Colors.brown,
+      Colors.white,
+      Colors.black,
+      Colors.redAccent,
+      Colors.blueAccent,
+      Colors.greenAccent,
+      Colors.amberAccent,
+      Colors.cyanAccent,
+      Colors.purpleAccent,
+      Colors.grey,
+      Colors.brown,
     ];
 
     return SingleChildScrollView(
@@ -822,12 +1215,24 @@ class SubtitleSettingsSheet extends StatelessWidget {
                   color: isSelected ? Colors.white : Colors.white24,
                   width: isSelected ? 2 : 1,
                 ),
-                boxShadow: isSelected ? [
-                  BoxShadow(color: Colors.white.withValues(alpha: 0.3), blurRadius: 4, spreadRadius: 1)
-                ] : null,
+                boxShadow: isSelected
+                    ? [
+                        BoxShadow(
+                          color: Colors.white.withValues(alpha: 0.3),
+                          blurRadius: 4,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : null,
               ),
               child: isSelected
-                  ? Icon(Icons.check, size: isSmallScreen ? 14 : 16, color: color.computeLuminance() > 0.5 ? Colors.black : Colors.white)
+                  ? Icon(
+                      Icons.check,
+                      size: isSmallScreen ? 14 : 16,
+                      color: color.computeLuminance() > 0.5
+                          ? Colors.black
+                          : Colors.white,
+                    )
                   : null,
             ),
           );
@@ -836,15 +1241,28 @@ class SubtitleSettingsSheet extends StatelessWidget {
     );
   }
 
-  Widget _buildSwitchSection(BuildContext context, String title, bool value, ValueChanged<bool> onChanged, {required List<Widget> children}) {
-    final isSmallScreen = MediaQuery.of(context).size.width < 600;
+  Widget _buildSwitchSection(
+    BuildContext context,
+    String title,
+    bool value,
+    ValueChanged<bool> onChanged, {
+    required List<Widget> children,
+  }) {
+    final isSmallScreen = _useCompactLayout(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(title, style: TextStyle(color: Colors.white70, fontSize: isSmallScreen ? 12 : 13, fontWeight: FontWeight.w500)),
+            Text(
+              title,
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: isSmallScreen ? 12 : 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
             SizedBox(
               height: 24,
               child: Transform.scale(

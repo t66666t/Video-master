@@ -1,3 +1,4 @@
+import '../services/subtitle_debug_session.dart';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
@@ -869,7 +870,10 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
       softSubtitleUseSourceQuality: _softSubtitleUseSourceQuality,
       softSubtitleTracks: softTracks,
       resolution: _resolution,
-      renderMode: _renderMode,
+      renderMode: SubtitleDebugSession.instance.usesPresets
+          ? VideoComposeRenderMode.precise
+          : _renderMode,
+      subtitlePreset: SubtitleDebugSession.instance.preset,
       subtitleStyle: landscapeStyle,
       subtitleStylePortrait: portraitStyle,
       subtitleAlignment: settings.subtitleAlignment,
@@ -2049,28 +2053,49 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
                     ),
                     if (!_softSubtitleOnly) ...[
                       SizedBox(height: spacing),
-                      _ComposeSelect<VideoComposeRenderMode>(
-                        key: const ValueKey('compose_render_mode_dropdown'),
-                        value: _renderMode,
-                        label: '字幕烧录方式',
-                        fontSize: textSize,
-                        items: VideoComposeRenderMode.values
-                            .map(
-                              (mode) => _ComposeSelectItem(
-                                value: mode,
-                                label: mode == VideoComposeRenderMode.precise
-                                    ? '精确渲染（推荐）'
-                                    : '粗略渲染',
+                      ListenableBuilder(
+                        listenable: SubtitleDebugSession.instance,
+                        builder: (context, _) =>
+                            SubtitleDebugSession.instance.usesPresets
+                            ? Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 8,
+                                ),
+                                child: Text(
+                                  '字幕预设：${SubtitleDebugSession.instance.preset!.name} · 精确渲染',
+                                  style: TextStyle(
+                                    color: Colors.tealAccent,
+                                    fontSize: textSize,
+                                  ),
+                                ),
+                              )
+                            : _ComposeSelect<VideoComposeRenderMode>(
+                                key: const ValueKey(
+                                  'compose_render_mode_dropdown',
+                                ),
+                                value: _renderMode,
+                                label: '字幕烧录方式',
+                                fontSize: textSize,
+                                items: VideoComposeRenderMode.values
+                                    .map(
+                                      (mode) => _ComposeSelectItem(
+                                        value: mode,
+                                        label:
+                                            mode ==
+                                                VideoComposeRenderMode.precise
+                                            ? '精确渲染（推荐）'
+                                            : '粗略渲染',
+                                      ),
+                                    )
+                                    .toList(),
+                                onChanged: (mode) {
+                                  setState(() => _renderMode = mode);
+                                  settings.updateSetting(
+                                    'videoComposeRenderMode',
+                                    mode.storageValue,
+                                  );
+                                },
                               ),
-                            )
-                            .toList(),
-                        onChanged: (mode) {
-                          setState(() => _renderMode = mode);
-                          settings.updateSetting(
-                            'videoComposeRenderMode',
-                            mode.storageValue,
-                          );
-                        },
                       ),
                       SizedBox(height: spacing * 0.5),
                       if (useTwoColumnForm)

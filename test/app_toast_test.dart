@@ -13,6 +13,32 @@ void main() {
     await tester.pump();
   }
 
+  testWidgets('replacing a toast before its first frame leaves no orphan', (
+    tester,
+  ) async {
+    addTearDown(() => AppToast.dismiss(immediate: true));
+    await pumpToastHost(tester);
+    AppToast.show('旧任务通知');
+    final current = AppToast.show('新任务通知');
+    await tester.pump();
+    expect(find.text('旧任务通知'), findsNothing);
+    expect(find.text('新任务通知'), findsOneWidget);
+    await current.dismiss(immediate: true);
+    await tester.pump();
+    expect(find.text('新任务通知'), findsNothing);
+  });
+
+  testWidgets('a toast dismissed before its first frame never appears', (
+    tester,
+  ) async {
+    addTearDown(() => AppToast.dismiss(immediate: true));
+    await pumpToastHost(tester);
+    final notice = AppToast.show('已添加任务');
+    await notice.dismiss(immediate: true);
+    await tester.pump();
+    expect(find.text('已添加任务'), findsNothing);
+  });
+
   testWidgets('loading toast has a hard auto-dismiss timeout', (tester) async {
     addTearDown(() => AppToast.dismiss(immediate: true));
     await pumpToastHost(tester);
@@ -78,6 +104,21 @@ void main() {
     await tester.pump();
 
     expect(find.text('处理中'), findsNothing);
+  });
+
+  testWidgets('ordinary toast handle can force-remove an import notice', (
+    tester,
+  ) async {
+    addTearDown(() => AppToast.dismiss(immediate: true));
+    await pumpToastHost(tester);
+
+    final handle = AppToast.show('已添加 3 个任务到队列');
+    await tester.pump();
+    expect(find.text('已添加 3 个任务到队列'), findsOneWidget);
+
+    await handle.dismiss(immediate: true);
+    await tester.pump();
+    expect(find.text('已添加 3 个任务到队列'), findsNothing);
   });
 
   testWidgets('any upward swipe fades out and removes the toast', (

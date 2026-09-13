@@ -135,6 +135,8 @@ class SubtitleTextStyle {
         return 'Swei Gothic CJK SC';
       case '方正楷体':
         return '方正楷体';
+      case 'Brawler':
+        return 'Brawler';
       case 'Inter':
         return 'Inter';
       case 'Comic Relief':

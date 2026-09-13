@@ -1,3 +1,5 @@
+import '../services/subtitle_debug_session.dart';
+import '../widgets/subtitle_debug_speed_gateway.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:developer' as developer;
@@ -25,6 +27,7 @@ import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_settings_sheet.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/playback_speed_dialog.dart';
+import '../widgets/sleep_timer_dialog.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_dialog.dart';
 import '../widgets/subtitle_overlay.dart';
@@ -40,6 +43,8 @@ import 'music_player_screen.dart'; // Experimental Apple Music page
 import 'package:path/path.dart' as p;
 import '../services/embedded_subtitle_service.dart';
 import '../utils/app_toast.dart';
+import '../utils/playback_page_visibility.dart';
+import '../utils/stable_system_ui_insets.dart';
 import '../utils/subtitle_drag_snap.dart';
 import '../utils/subtitle_file_picker.dart';
 
@@ -62,8 +67,13 @@ enum PortraitPanel {
 
 class PortraitVideoScreen extends StatefulWidget {
   final VideoItem videoItem;
+  final bool? autoPlayOnEntry;
 
-  const PortraitVideoScreen({super.key, required this.videoItem});
+  const PortraitVideoScreen({
+    super.key,
+    required this.videoItem,
+    this.autoPlayOnEntry,
+  });
 
   @override
   State<PortraitVideoScreen> createState() => _PortraitVideoScreenState();
@@ -88,6 +98,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   );
   late VideoPlayerController _controller;
   bool _initialized = false;
+  bool _pageEntryAutoPlayConsumed = false;
   bool _isControllerAssigned = false;
   bool _isSourceMissing = false;
   int _danmakuRevision = 0;
@@ -156,6 +167,19 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _isOpeningMusicPlayer = false;
   bool _pendingSubtitleSidebarViewportRestore = false;
   bool _subtitleSidebarRestoreCallbackScheduled = false;
+  int _subtitleSidebarRestoreRetries = 0;
+  static const int _subtitleSidebarRestoreMaxRetries = 30;
+  /// 状态栏/底部触控条的稳定安全区预留。
+  ///
+  /// 退出沉浸式横屏页时系统栏带回场动画，实时 MediaQuery.padding 会被逐帧
+  /// 压缩底部字幕面板（"被触控条挤一下"）。这里记住稳定值并作为 SafeArea 的
+  /// minimum 使用，系统栏显示/隐藏不再改变页面几何。
+  late final StableSystemUiInsetController _systemUiInsetController =
+      StableSystemUiInsetController(
+        onChanged: () {
+          if (mounted) setState(() {});
+        },
+      );
   bool _forceExit = false;
   bool _explicitPlaybackExitRequested = false;
   final PlaybackExitGuard _exitGuard = PlaybackExitGuard();
@@ -718,10 +742,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      MediaPlaybackService().setPlaybackPageVisible(
-        this,
-        ModalRoute.of(context)?.isCurrent == true,
-      );
+      registerPlaybackPageIfCurrent(context, this);
     });
 
     // Listen to TranscriptionManager for auto-mounting subtitles
@@ -854,6 +875,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
   void _requestSubtitleSidebarViewportRestore() {
     _pendingSubtitleSidebarViewportRestore = true;
+    _subtitleSidebarRestoreRetries = 0;
     _tryRestoreSubtitleSidebarForCurrentViewport();
   }
 
@@ -864,6 +886,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       return;
     }
     _subtitleSidebarRestoreCallbackScheduled = true;
+    // post-frame 回调只在有帧被调度时执行；播放已暂停、界面静止时没有任何
+    // 东西会调度帧，只注册回调会让修复定位永远悬空。
+    WidgetsBinding.instance.ensureVisualUpdate();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _subtitleSidebarRestoreCallbackScheduled = false;
       if (!mounted || !_pendingSubtitleSidebarViewportRestore) return;
@@ -877,12 +902,35 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       }
 
       final sidebar = _subtitleSidebarKey.currentState;
-      if (sidebar == null) return;
-      _pendingSubtitleSidebarViewportRestore = false;
+      if (sidebar == null) {
+        _scheduleSubtitleSidebarRestoreRetry();
+        return;
+      }
       // Route restoration is a viewport repair, not playback auto-follow. It
       // must run while paused and when automatic following is disabled.
-      sidebar.locateToCurrentSubtitle(ignorePointer: true);
+      if (!sidebar.locateToCurrentSubtitle(ignorePointer: true)) {
+        // 面板/列表尚未就绪（切页瞬间仍在用横屏尺寸布局）。请求保持挂起并
+        // 在后续帧重试，避免修复被静默丢弃后文稿停在空白状态。
+        _scheduleSubtitleSidebarRestoreRetry();
+        return;
+      }
+      _pendingSubtitleSidebarViewportRestore = false;
+      _subtitleSidebarRestoreRetries = 0;
     });
+  }
+
+  void _scheduleSubtitleSidebarRestoreRetry() {
+    if (_subtitleSidebarRestoreRetries >= _subtitleSidebarRestoreMaxRetries) {
+      _pendingSubtitleSidebarViewportRestore = false;
+      _subtitleSidebarRestoreRetries = 0;
+      return;
+    }
+    _subtitleSidebarRestoreRetries++;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _tryRestoreSubtitleSidebarForCurrentViewport();
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
   }
 
   @override
@@ -1168,6 +1216,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         _bindControllerListener();
         _scheduleDeferredPostInitWork(currentItem);
 
+        final bool? pageEntryAutoPlay = _consumePageEntryAutoPlay();
+        if (pageEntryAutoPlay == true && !playbackService.desiredPlaying) {
+          unawaited(playbackService.resume());
+          return;
+        }
+
         // MediaPlaybackService owns the authoritative position and state for
         // this controller. Do not read the native position here: an online
         // backend can briefly expose its byte-zero probe during hand-off.
@@ -1207,14 +1261,22 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       unawaited(
         playbackService.play(
           currentItem,
-          autoPlay: playbackService.currentItem?.id == currentItem.id
-              ? playbackService.desiredPlaying
-              : true,
+          autoPlay: resolvePlaybackPageEntryAutoPlay(
+            entryAutoPlay: _consumePageEntryAutoPlay(),
+            isCurrentItem: playbackService.currentItem?.id == currentItem.id,
+            desiredPlaying: playbackService.desiredPlaying,
+          ),
         ),
       );
     } catch (error) {
       debugPrint('Unable to start service-owned playback: $error');
     }
+  }
+
+  bool? _consumePageEntryAutoPlay() {
+    if (_pageEntryAutoPlayConsumed) return null;
+    _pageEntryAutoPlayConsumed = true;
+    return widget.autoPlayOnEntry;
   }
 
   void _videoListener() {
@@ -1517,6 +1579,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   void _enterSubtitleDragMode() {
+    if (SubtitleDebugSession.instance.usesPresets) return;
     setState(() {
       _isSubtitleDragMode = true;
       _isStylePanelDragMode = false;
@@ -1564,6 +1627,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     DragUpdateDetails details,
     BoxConstraints constraints,
   ) {
+    if (SubtitleDebugSession.instance.usesPresets) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
     final currentAlignment = _isAudio
         ? settings.audioSubtitleAlignment
@@ -2308,10 +2372,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
       final suppressRouteCleanup =
           PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      final exitSessionIsPlaying = serviceOwnsExitSession()
+          ? playbackService.isPlaying || exitController.value.isPlaying
+          : exitController.value.isPlaying;
       if (_explicitPlaybackExitRequested &&
           !suppressRouteCleanup &&
           settings.autoPauseOnExit &&
-          exitController.value.isPlaying) {
+          exitSessionIsPlaying) {
         if (serviceOwnsExitSession()) {
           await playbackService.pause(
             expectedItemId: itemId,
@@ -2469,6 +2536,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     _subtitleSeekTimer?.cancel();
     _customAspectDraftSaveTimer?.cancel();
     _manualSubtitleWriteTimer?.cancel();
+    _systemUiInsetController.dispose();
 
     WidgetsBinding.instance.removeObserver(this);
     _showSystemBars();
@@ -3580,27 +3648,29 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               // Tools
 
               // Speed
-              Builder(
-                builder: (speedButtonContext) => Tooltip(
+              SubtitleDebugSpeedGateway(
+                builder: (speedButtonContext, handleSpeedTap) => Tooltip(
                   message: '倍速',
                   child: Material(
                     color: Colors.transparent,
                     child: InkWell(
                       borderRadius: BorderRadius.circular(8),
                       onTap: value.isInitialized
-                          ? () => unawaited(
-                              showPlaybackSpeedDialog(
-                                context: context,
-                                anchorContext: speedButtonContext,
-                                initialSpeed: value.playbackSpeed,
-                                settings: settings,
-                                onSpeedSelected: _handlePlaybackSpeedSelected,
+                          ? () => handleSpeedTap(
+                              () => unawaited(
+                                showPlaybackSpeedDialog(
+                                  context: context,
+                                  anchorContext: speedButtonContext,
+                                  initialSpeed: value.playbackSpeed,
+                                  settings: settings,
+                                  onSpeedSelected: _handlePlaybackSpeedSelected,
+                                ),
                               ),
                             )
                           : null,
                       child: Padding(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
+                          horizontal: 3,
                           vertical: 5,
                         ),
                         child: Row(
@@ -3626,6 +3696,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                 ),
               ),
 
+              _buildSleepTimerSmallButton(playbackService),
+
               // Subtitle Toggle
               IconButton(
                 icon: Icon(
@@ -3635,12 +3707,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                   color: settings.showSubtitles
                       ? Colors.blueAccent
                       : Colors.white70,
-                  size: 18,
+                  size: 17,
                 ),
                 onPressed: () => _setFloatingSubtitles(!settings.showSubtitles),
                 tooltip: "字幕开关",
-                padding: const EdgeInsets.all(4),
-                constraints: const BoxConstraints(),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                constraints: const BoxConstraints.tightFor(
+                  width: 21,
+                  height: 28,
+                ),
               ),
 
               // Volume Toggle (Mute/Unmute)
@@ -3650,17 +3726,42 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                   color: playbackService.isMuted
                       ? Colors.redAccent
                       : Colors.white,
-                  size: 18,
+                  size: 17,
                 ),
                 onPressed: () {
                   unawaited(playbackService.toggleMute());
                 },
                 tooltip: playbackService.isMuted ? "取消静音" : "静音",
-                padding: const EdgeInsets.all(4),
-                constraints: const BoxConstraints(),
+                padding: EdgeInsets.zero,
+                visualDensity: VisualDensity.compact,
+                constraints: const BoxConstraints.tightFor(
+                  width: 21,
+                  height: 28,
+                ),
               ),
             ],
           ),
+        );
+      },
+    );
+  }
+
+  Widget _buildSleepTimerSmallButton(MediaPlaybackService playbackService) {
+    return AnimatedBuilder(
+      animation: playbackService.sleepTimer,
+      builder: (context, _) {
+        final timer = playbackService.sleepTimer;
+        return IconButton(
+          icon: Icon(
+            timer.isActive ? Icons.alarm_on_rounded : Icons.schedule_rounded,
+            color: timer.isActive ? Colors.blueAccent : Colors.white70,
+            size: 17,
+          ),
+          onPressed: () => unawaited(showSleepTimerDialog(context)),
+          tooltip: timer.isActive ? timer.statusText : '定时关闭',
+          padding: EdgeInsets.zero,
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints.tightFor(width: 21, height: 28),
         );
       },
     );
@@ -3990,7 +4091,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
             ),
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 5),
+            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 5),
             child: Text(
               '${settings.effectiveGlobalPlaybackSpeed}x',
               style: const TextStyle(
@@ -4000,29 +4101,32 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               ),
             ),
           ),
+          _buildSleepTimerSmallButton(playbackService),
           IconButton(
             icon: Icon(
               settings.showSubtitles ? Icons.subtitles : Icons.subtitles_off,
               color: settings.showSubtitles
                   ? Colors.blueAccent
                   : Colors.white70,
-              size: 18,
+              size: 17,
             ),
             onPressed: () => _setFloatingSubtitles(!settings.showSubtitles),
             tooltip: '字幕开关',
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(),
+            padding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(width: 21, height: 28),
           ),
           IconButton(
             icon: Icon(
               playbackService.isMuted ? Icons.volume_off : Icons.volume_up,
               color: playbackService.isMuted ? Colors.redAccent : Colors.white,
-              size: 18,
+              size: 17,
             ),
             onPressed: () => unawaited(playbackService.toggleMute()),
             tooltip: playbackService.isMuted ? '取消静音' : '静音',
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(),
+            padding: EdgeInsets.zero,
+            visualDensity: VisualDensity.compact,
+            constraints: const BoxConstraints.tightFor(width: 21, height: 28),
           ),
         ],
       ),
@@ -4033,6 +4137,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   Widget build(BuildContext context) {
     return Consumer<SettingsService>(
       builder: (context, settings, child) {
+        // 稳定化后的状态栏/触控条安全区（见 _systemUiInsetController 的说明）。
+        final EdgeInsets stableSystemUiInsets = _systemUiInsetController.observe(
+          MediaQuery.of(context),
+        );
         // Use WillPopScope to handle back button and reset orientation early
         // This helps reduce the "jank" when returning to a landscape screen
         return PopScope(
@@ -4070,6 +4178,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                           child: SafeArea(
                             top: true,
                             bottom: true,
+                            // 从沉浸式横屏播放页退回时，状态栏与底部触控条会带动画
+                            // 重新出现，实时安全区逐帧变化会把底部字幕面板压缩
+                            // （看上去被触控条"挤"了一下）。这里提前把安全区预留
+                            // 稳定下来，系统栏的显示/隐藏不再改变页面几何。
+                            minimum: stableSystemUiInsets,
                             child: Stack(
                               children: [
                                 Column(
@@ -4247,6 +4360,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                           settings
                                                               .toggleFullScreen(),
                                                       onOpenSettings: null,
+                                                      onOpenSleepTimer: () =>
+                                                          unawaited(
+                                                            showSleepTimerDialog(
+                                                              context,
+                                                            ),
+                                                          ),
                                                       onOpenSubtitleEditor:
                                                           null,
                                                       onOpenVideoCompose: null,
@@ -5050,6 +5169,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           onEnableHeadsetMediaControlsChanged: (val) =>
               settings.saveEnableHeadsetMediaControls(val),
           showMobilePlaybackControls: showMobilePlaybackControls,
+          autoPlayOnPageEntry: settings.autoPlayOnPageEntry,
+          onAutoPlayOnPageEntryChanged: (val) =>
+              settings.saveAutoPlayOnPageEntry(val),
           autoPlayNextVideo: settings.autoPlayNextVideo,
           onAutoPlayNextVideoChanged: (val) =>
               settings.saveAutoPlayNextVideo(val),

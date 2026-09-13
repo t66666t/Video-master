@@ -1,3 +1,4 @@
+import 'subtitle_debug_preset.dart';
 import 'package:flutter/material.dart';
 import 'subtitle_style.dart';
 
@@ -69,6 +70,7 @@ class VideoComposeRequest {
 
   /// 普通（非幽灵）横屏字幕样式。保留 subtitleStyle 名称兼容旧任务。
   final SubtitleStyle subtitleStyle;
+  final SubtitleDebugPreset? subtitlePreset;
 
   /// 普通（非幽灵）竖屏字幕样式。
   final SubtitleStyle subtitleStylePortrait;
@@ -93,6 +95,7 @@ class VideoComposeRequest {
     required this.resolution,
     this.renderMode = VideoComposeRenderMode.precise,
     required this.subtitleStyle,
+    this.subtitlePreset,
     SubtitleStyle? subtitleStylePortrait,
     required this.subtitleAlignment,
     this.splitSubtitleByLine = true,
@@ -116,6 +119,7 @@ class VideoComposeRequest {
     resolution: resolution,
     renderMode: renderMode,
     subtitleStyle: subtitleStyle,
+    subtitlePreset: subtitlePreset,
     subtitleStylePortrait: subtitleStylePortrait,
     subtitleAlignment: subtitleAlignment,
     splitSubtitleByLine: splitSubtitleByLine,
@@ -143,6 +147,7 @@ class VideoComposeRequest {
       'resolution': resolution.index,
       'renderMode': renderMode.storageValue,
       'subtitleStyle': subtitleStyle.toJson(),
+      if (subtitlePreset != null) 'subtitlePreset': subtitlePreset!.toJson(),
       'subtitleStyleLandscape': subtitleStyle.toJson(),
       'subtitleStylePortrait': subtitleStylePortrait.toJson(),
       'subtitleAlignmentX': subtitleAlignment.x,
@@ -178,6 +183,7 @@ class VideoComposeRequest {
       resolution:
           VideoComposeResolution.values[(json['resolution'] as int?) ?? 0],
       renderMode: VideoComposeRenderMode.fromStorage(json['renderMode']),
+      subtitlePreset: SubtitleDebugPreset.restore(json['subtitlePreset']),
       subtitleStyle: SubtitleStyle.fromJson(
         (json['subtitleStyleLandscape'] ??
                 json['subtitleStyle'] ??

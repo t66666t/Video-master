@@ -7,6 +7,19 @@ import 'package:media_kit/media_kit.dart';
 import 'package:video_player_app/platform/pitch_preserving_audio_pipeline.dart';
 
 void main() {
+  test(
+    'Windows shared texture rendering does not wait ahead under its mutex',
+    () {
+      expect(PitchPreservingAudioPipeline.videoTimingOffsetFor('windows'), 0.0);
+      for (final platform in ['android', 'ios', 'macos', 'linux']) {
+        expect(
+          PitchPreservingAudioPipeline.videoTimingOffsetFor(platform),
+          0.05,
+        );
+      }
+    },
+  );
+
   final runNativeTest =
       Platform.environment['RUN_NATIVE_MEDIA_KIT_TESTS'] == '1';
   final nativeTestSkip = runNativeTest

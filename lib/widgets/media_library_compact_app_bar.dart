@@ -46,12 +46,14 @@ class MediaLibraryCompactIconButton extends StatelessWidget {
     required this.tooltip,
     required this.onPressed,
     this.color,
+    this.width = 40,
   });
 
   final IconData icon;
   final String tooltip;
   final VoidCallback onPressed;
   final Color? color;
+  final double width;
 
   @override
   Widget build(BuildContext context) {
@@ -62,7 +64,7 @@ class MediaLibraryCompactIconButton extends StatelessWidget {
       iconSize: 21,
       padding: EdgeInsets.zero,
       visualDensity: VisualDensity.compact,
-      constraints: const BoxConstraints.tightFor(width: 40, height: 48),
+      constraints: BoxConstraints.tightFor(width: width, height: 48),
       splashRadius: 20,
     );
   }

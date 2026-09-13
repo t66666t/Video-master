@@ -125,4 +125,22 @@ void main() {
       );
     }
   });
+
+  test(
+    'desktop playback page exit honors auto-pause without a platform gate',
+    () {
+      final source = File(
+        'lib/screens/video_player_screen.dart',
+      ).readAsStringSync();
+      final start = source.indexOf('Future<void> _handleExitOnce()');
+      final end = source.indexOf('  @override', start);
+      expect(start, greaterThanOrEqualTo(0));
+      expect(end, greaterThan(start));
+      final exitLogic = source.substring(start, end);
+      expect(exitLogic, contains('settings.autoPauseOnExit'));
+      expect(exitLogic, contains('await playbackService.pause('));
+      expect(exitLogic, isNot(contains('Platform.isAndroid')));
+      expect(exitLogic, isNot(contains('Platform.isIOS')));
+    },
+  );
 }

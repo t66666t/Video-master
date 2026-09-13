@@ -17,7 +17,7 @@ class ResponsiveIconButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
-    
+
     // Calculate relative sizes based on screen width
     final double buttonSize = (screenWidth * 0.032).clamp(32.0, 40.0);
     final double iconSize = (buttonSize * 0.58).clamp(20.0, 24.0);
@@ -34,11 +34,7 @@ class ResponsiveIconButton extends StatelessWidget {
             width: buttonSize,
             height: buttonSize,
             alignment: Alignment.center,
-            child: Icon(
-              icon,
-              size: iconSize,
-              color: color ?? Colors.white,
-            ),
+            child: Icon(icon, size: iconSize, color: color ?? Colors.white),
           ),
         ),
       ),
@@ -48,26 +44,29 @@ class ResponsiveIconButton extends StatelessWidget {
 
 class ResponsiveActionButtons extends StatelessWidget {
   final List<Widget> buttons;
+  final double? spacing;
 
   const ResponsiveActionButtons({
     super.key,
     required this.buttons,
+    this.spacing,
   });
 
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     // Relative spacing
-    final double spacing = (screenWidth * 0.005).clamp(2.0, 8.0);
+    final double resolvedSpacing =
+        spacing ?? (screenWidth * 0.005).clamp(2.0, 8.0);
 
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         for (int i = 0; i < buttons.length; i++) ...[
           buttons[i],
-          if (i < buttons.length - 1) SizedBox(width: spacing),
+          if (i < buttons.length - 1) SizedBox(width: resolvedSpacing),
         ],
-        SizedBox(width: spacing), // Padding at the end of AppBar
+        SizedBox(width: resolvedSpacing), // Padding at the end of AppBar
       ],
     );
   }

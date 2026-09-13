@@ -66,6 +66,17 @@ SystemUiMode musicPlayerSystemUiModeForSize(Size viewportSize) {
 }
 
 @visibleForTesting
+bool musicPlayerUsesVerticalLayout(Size viewportSize) {
+  return viewportSize.width < 768 && viewportSize.width <= viewportSize.height;
+}
+
+@visibleForTesting
+bool musicPlayerUsesCompactLandscapeLayout(Size viewportSize) {
+  return viewportSize.width > viewportSize.height &&
+      viewportSize.shortestSide < 600;
+}
+
+@visibleForTesting
 double musicControlsLyricMaskProgress(double controllerValue) {
   return const Interval(
     0.0,
@@ -757,8 +768,11 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                     children: [
                       LayoutBuilder(
                         builder: (context, constraints) {
-                          final isNarrow = constraints.maxWidth < 768;
-                          if (isNarrow) {
+                          final viewportSize = Size(
+                            constraints.maxWidth,
+                            constraints.maxHeight,
+                          );
+                          if (musicPlayerUsesVerticalLayout(viewportSize)) {
                             return _buildVerticalLayout(
                               mediaService,
                               snapshot.itemId,
@@ -797,7 +811,8 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   }
 
   /// 当前是否为竖屏（窄屏）布局：与 build 中 LayoutBuilder 的断点保持一致（<768px）
-  bool get _isPortraitLayout => MediaQuery.of(context).size.width < 768;
+  bool get _isPortraitLayout =>
+      musicPlayerUsesVerticalLayout(MediaQuery.sizeOf(context));
 
   /// 当前布局下应使用的歌词字号缩放比例（竖屏 / 横屏分别记忆）
   double get _currentLyricFontSizeScale => _isPortraitLayout
@@ -1049,16 +1064,29 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
         final availableWidth = constraints.maxWidth;
 
         // === 检测手机横屏：宽但矮，需要更紧凑、更横向铺满的左侧面板 ===
-        final isMobileLandscape =
-            availableWidth >= 600 && availableHeight < 450;
+        final isMobileLandscape = musicPlayerUsesCompactLandscapeLayout(
+          Size(availableWidth, availableHeight),
+        );
 
         // 左右面板比例：手机横屏让歌词区稍宽，桌面端保持 50:50
-        final leftFlex = isMobileLandscape ? 45 : 50;
-        final rightFlex = isMobileLandscape ? 55 : 50;
+        final leftFlex = isMobileLandscape
+            ? (availableWidth < 540
+                  ? 55
+                  : availableWidth < 700
+                  ? 46
+                  : 43)
+            : 50;
+        final rightFlex = isMobileLandscape
+            ? (availableWidth < 540
+                  ? 45
+                  : availableWidth < 700
+                  ? 54
+                  : 57)
+            : 50;
 
         // 左侧面板内边距：手机横屏给内容留呼吸边距，消除贴边/黑边感
         final leftPanelPadding = isMobileLandscape
-            ? (availableWidth * 0.03).clamp(12.0, 24.0)
+            ? (availableWidth * 0.022).clamp(12.0, 20.0)
             : 0.0;
 
         // 左侧面板可用内部宽度
@@ -1068,7 +1096,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
         // === CD 尺寸计算（关键：基于可用高度，确保不溢出）===
         // 手机横屏封面更小，给歌曲信息和控制栏留出更多纵向空间
-        final maxByHeight = availableHeight * (isMobileLandscape ? 0.35 : 0.42);
+        final maxByHeight = availableHeight * (isMobileLandscape ? 0.32 : 0.42);
         final maxByWidth = isMobileLandscape
             ? leftPanelInnerWidth * 0.85
             : (availableWidth * 0.5) - 24;
@@ -1088,7 +1116,9 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
             : cdSize;
 
         // 歌曲信息到进度条间距
-        final infoToControlsGap = (screenHeight * 0.025).clamp(6.0, 24.0);
+        final infoToControlsGap = isMobileLandscape
+            ? (availableHeight * 0.018).clamp(5.0, 8.0)
+            : (screenHeight * 0.025).clamp(6.0, 24.0);
 
         return Row(
           crossAxisAlignment: CrossAxisAlignment.center,
@@ -1097,6 +1127,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
             Expanded(
               flex: leftFlex,
               child: Center(
+                key: const ValueKey('music-landscape-left-panel'),
                 child: SingleChildScrollView(
                   physics: const ClampingScrollPhysics(),
                   child: Padding(
@@ -1120,6 +1151,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                         SizedBox(
                           width: controlsWidth,
                           child: MusicPlaybackControls(
+                            compactLandscape: isMobileLandscape,
                             positionListenable: _displayPosition,
                             progress: _getEffectiveProgress(),
                             totalDuration: effectiveTotalDuration,
@@ -1161,9 +1193,14 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
             Expanded(
               flex: rightFlex,
               child: Padding(
+                key: const ValueKey('music-landscape-lyric-panel'),
                 padding: EdgeInsets.only(
-                  left: screenWidth * 0.03,
-                  right: screenWidth * 0.02,
+                  left: isMobileLandscape
+                      ? (availableWidth * 0.018).clamp(10.0, 16.0)
+                      : screenWidth * 0.03,
+                  right: isMobileLandscape
+                      ? (availableWidth * 0.018).clamp(10.0, 16.0)
+                      : screenWidth * 0.02,
                 ),
                 child: _buildEpisodeLyricTransition(
                   itemId: itemId,

@@ -1,4 +1,5 @@
 import 'package:media_kit/media_kit.dart';
+import 'package:universal_platform/universal_platform.dart';
 
 /// Establishes a low-latency, pitch-neutral playback clock for a whole
 /// session, including while the effective speed is exactly 1.0x.
@@ -17,12 +18,17 @@ abstract final class PitchPreservingAudioPipeline {
   /// equally large audio-device queue.
   static const double responsiveAudioBufferSeconds = 0.02;
 
-  /// media_kit's Windows & Linux texture backends force this to zero while
-  /// creating their native render context. Zero removes mpv's render-ahead
-  /// allowance, so a frame which takes any time to draw is already late. Put
-  /// back mpv's normal 50 ms scheduling headroom after VideoController has
-  /// finished initializing.
-  static const double videoTimingOffsetSeconds = 0.05;
+  /// Windows renders through a shared texture protected by a native mutex.
+  /// mpv_render_context_render blocks for the target presentation time by
+  /// default while that mutex is held. Render-ahead therefore blocks Flutter's
+  /// raster thread in ANGLESurfaceManager::Read, even for unrelated animation.
+  /// Preserve media_kit's zero-offset policy on this backend. Other platforms
+  /// retain their existing clock behavior until measured on native hardware.
+  static double videoTimingOffsetFor(String operatingSystem) =>
+      operatingSystem == 'windows' ? 0.0 : 0.05;
+
+  static double get videoTimingOffsetSeconds =>
+      videoTimingOffsetFor(UniversalPlatform.operatingSystem);
 
   /// In audio-master mode a rate change temporarily makes the audio driver's
   /// queued delay look as if it was all produced at the new rate. With the mpv

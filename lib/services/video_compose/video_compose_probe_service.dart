@@ -1,20 +1,17 @@
-import 'dart:convert';
-import 'dart:io';
-
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 
 import '../../models/video_compose_models.dart';
-import '../../utils/ffmpeg_utils.dart';
 import 'video_compose_types.dart';
 
 class VideoComposeProbeService {
   const VideoComposeProbeService();
 
   Future<VideoProbeInfo> probeVideoInfo(String videoPath) async {
-    if (Platform.isWindows || Platform.isMacOS) {
-      return _probeByDesktop(videoPath);
-    }
-    return _probeByMobile(videoPath);
+    // Use the embedded FFprobe implementation on every platform. In
+    // particular, do not resolve `ffprobe` through PATH on desktop: Windows
+    // app launches commonly inherit stale WinGet links, while GUI apps on
+    // macOS do not reliably inherit the user's shell PATH.
+    return _probeByFfmpegKit(videoPath);
   }
 
   TargetResolution targetResolution({
@@ -49,40 +46,33 @@ class VideoComposeProbeService {
     return safe.isEven ? safe : safe + 1;
   }
 
-  Future<VideoProbeInfo> _probeByDesktop(String videoPath) async {
-    final String ffprobePath = await FFmpegUtils.ffprobePath;
-    final ProcessResult result = await Process.run(ffprobePath, <String>[
-      '-v',
-      'error',
-      '-print_format',
-      'json',
-      '-show_format',
-      '-show_streams',
+  Future<VideoProbeInfo> _probeByFfmpegKit(String videoPath) async {
+    final dynamic session = await FFprobeKit.getMediaInformation(
       videoPath,
-    ], runInShell: true).timeout(const Duration(seconds: 15));
-    if (result.exitCode != 0) {
-      throw StateError(result.stderr.toString());
+    ).timeout(const Duration(seconds: 15));
+    final dynamic mediaInfo = session.getMediaInformation();
+    if (mediaInfo == null) {
+      final String? logs = await session.getAllLogsAsString();
+      throw StateError(
+        logs?.trim().isNotEmpty == true ? logs!.trim() : '无法读取视频信息',
+      );
     }
-    final Map<String, dynamic> jsonMap =
-        jsonDecode(result.stdout.toString()) as Map<String, dynamic>;
-    final Map<String, dynamic>? format = jsonMap['format'] as Map<String, dynamic>?;
-    final List<dynamic> streams =
-        jsonMap['streams'] as List<dynamic>? ?? const <dynamic>[];
-    double durationSec = 0;
-    if (format != null) {
-      durationSec = double.tryParse(format['duration']?.toString() ?? '') ?? 0;
-    }
+    final double durationSec =
+        double.tryParse(mediaInfo.getDuration() ?? '') ?? 0;
     int width = 0;
     int height = 0;
     int rotation = 0;
     String? sar;
+    final List<dynamic> streams = mediaInfo.getStreams();
     for (final dynamic stream in streams) {
-      final Map<String, dynamic> map = stream as Map<String, dynamic>;
-      if (map['codec_type']?.toString() == 'video') {
-        width = int.tryParse(map['width']?.toString() ?? '') ?? 0;
-        height = int.tryParse(map['height']?.toString() ?? '') ?? 0;
-        rotation = _parseRotationFromDesktopStream(map);
-        sar = map['sample_aspect_ratio']?.toString();
+      if (stream.getType() == 'video') {
+        width = _toInt(stream.getWidth());
+        height = _toInt(stream.getHeight());
+        sar = stream.getSampleAspectRatio()?.toString();
+        final dynamic properties = stream.getAllProperties();
+        if (properties is Map) {
+          rotation = _parseRotationFromStream(properties);
+        }
         break;
       }
     }
@@ -104,41 +94,6 @@ class VideoComposeProbeService {
     );
   }
 
-  Future<VideoProbeInfo> _probeByMobile(String videoPath) async {
-    final dynamic session = await FFprobeKit.getMediaInformation(videoPath);
-    final dynamic mediaInfo = session.getMediaInformation();
-    double durationSec = 0;
-    if (mediaInfo != null) {
-      durationSec = double.tryParse(mediaInfo.getDuration() ?? '') ?? 0;
-      int width = 0;
-      int height = 0;
-      final List<dynamic> streams = mediaInfo.getStreams();
-      for (final dynamic stream in streams) {
-        if (stream.getType() == 'video') {
-          width = _toInt(stream.getWidth());
-          height = _toInt(stream.getHeight());
-          break;
-        }
-      }
-      return VideoProbeInfo(
-        width: width <= 0 ? 1920 : width,
-        height: height <= 0 ? 1080 : height,
-        displayWidth: width <= 0 ? 1920 : width,
-        displayHeight: height <= 0 ? 1080 : height,
-        rotation: 0,
-        duration: Duration(milliseconds: (durationSec * 1000).round()),
-      );
-    }
-    return const VideoProbeInfo(
-      width: 1920,
-      height: 1080,
-      displayWidth: 1920,
-      displayHeight: 1080,
-      rotation: 0,
-      duration: Duration.zero,
-    );
-  }
-
   int _toInt(Object? value) {
     if (value == null) return 0;
     if (value is int) return value;
@@ -146,7 +101,7 @@ class VideoComposeProbeService {
     return int.tryParse(value.toString()) ?? 0;
   }
 
-  int _parseRotationFromDesktopStream(Map<String, dynamic> stream) {
+  int _parseRotationFromStream(Map<dynamic, dynamic> stream) {
     int normalize(int raw) {
       final int value = raw % 360;
       if (value < 0) return value + 360;
@@ -154,14 +109,14 @@ class VideoComposeProbeService {
     }
 
     final dynamic tags = stream['tags'];
-    if (tags is Map<String, dynamic>) {
+    if (tags is Map) {
       final int? fromTag = int.tryParse(tags['rotate']?.toString() ?? '');
       if (fromTag != null) return normalize(fromTag);
     }
     final dynamic sideDataList = stream['side_data_list'];
     if (sideDataList is List) {
       for (final dynamic item in sideDataList) {
-        if (item is! Map<String, dynamic>) continue;
+        if (item is! Map) continue;
         final dynamic rotationValue = item['rotation'];
         final int? rotation = rotationValue is int
             ? rotationValue
@@ -180,8 +135,10 @@ class VideoComposeProbeService {
     required String? sar,
     required int rotation,
   }) {
-    final List<String> sarParts =
-        (sar ?? '').split(':').where((String e) => e.isNotEmpty).toList();
+    final List<String> sarParts = (sar ?? '')
+        .split(':')
+        .where((String e) => e.isNotEmpty)
+        .toList();
     int sarNum = 1;
     int sarDen = 1;
     if (sarParts.length == 2) {

@@ -1,3 +1,5 @@
+import '../services/subtitle_debug_session.dart';
+import 'subtitle_overlay.dart';
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -190,6 +192,7 @@ class MusicLyricViewState extends State<MusicLyricView>
   Timer? _seekDispatchTimer;
   bool _disposed = false;
   int _locateRevealRequestId = 0;
+  int _layoutRelocateRequestId = 0;
 
   /// Only the newest scroll request may reset the shared interaction guards.
   /// ItemScrollController cancels its previous transition when scrollTo is
@@ -282,6 +285,7 @@ class MusicLyricViewState extends State<MusicLyricView>
   @override
   void initState() {
     super.initState();
+    SubtitleDebugSession.instance.addListener(_scheduleLayoutRelocate);
     _resetWindowsLineKeys();
     _precomputeSecondaryTexts();
 
@@ -380,6 +384,30 @@ class MusicLyricViewState extends State<MusicLyricView>
       if (!widget.stabilizeAlacDirectSeek) _alacLatchedTapIndex = null;
       _updateActiveIndex(animate: false);
     }
+
+    // Changing the font changes every row's measured height. Preserve the
+    // playback anchor by locating again after the new text layout is committed.
+    if (oldWidget.lyricFontSizeScale != widget.lyricFontSizeScale) {
+      _scheduleLayoutRelocate();
+    }
+  }
+
+  void _scheduleLayoutRelocate() {
+    final requestId = ++_layoutRelocateRequestId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_disposed ||
+          !mounted ||
+          requestId != _layoutRelocateRequestId ||
+          widget.subtitles.isEmpty) {
+        return;
+      }
+
+      _currentPosition = widget.positionListenable?.value ?? _currentPosition;
+      _resumeTimer?.cancel();
+      _isUserScrolling = false;
+      _updateActiveIndex(animate: false);
+      scrollToCurrentIndex(animate: false);
+    });
   }
 
   void _resetWindowsLineKeys() {
@@ -1013,6 +1041,7 @@ class MusicLyricViewState extends State<MusicLyricView>
 
   @override
   void dispose() {
+    SubtitleDebugSession.instance.removeListener(_scheduleLayoutRelocate);
     _disposed = true;
     _resumeTimer?.cancel();
     _programmaticScrollResetTimer?.cancel();
@@ -1067,7 +1096,12 @@ class MusicLyricViewState extends State<MusicLyricView>
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: SubtitleDebugSession.instance,
+    builder: (context, _) => _build(context),
+  );
+
+  Widget _build(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
     final screenWidth = MediaQuery.of(context).size.width; // ✅ 获取屏幕宽度用于计算边距
     // 统一字号：Apple Music 风格 — 不改变字号，只改变透明度（亮度）
@@ -1373,6 +1407,7 @@ class MusicLyricViewState extends State<MusicLyricView>
       mainText = lines[0];
       translatedText = lines.sublist(1).join('\n');
     }
+    final preset = SubtitleDebugSession.instance.preset;
     final mainIsChinese = _isChineseText(mainText);
     final translationIsChinese = _isChineseText(translatedText);
 
@@ -1431,65 +1466,79 @@ class MusicLyricViewState extends State<MusicLyricView>
               ),
             ),
           ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
-              MusicTextOpticalAlignment(
-                applyCjkRaise: mainIsChinese,
-                fontSize: engFontSize,
-                child: Text(
-                  mainText,
-                  textAlign: TextAlign.left,
-                  softWrap: true,
-                  maxLines: null,
-                  style: TextStyle(
-                    fontFamily: mainIsChinese ? _fontFamilyZh : _fontFamilyEng,
-                    fontSize: engFontSize,
-                    fontWeight: mainIsChinese
-                        ? FontWeight.w600
-                        : FontWeight.w800,
-                    color: Colors.white,
-                    height: 1.3,
-                    letterSpacing: -0.5,
-                    leadingDistribution: mainIsChinese
-                        ? TextLeadingDistribution.even
-                        : null,
-                  ),
-                ),
+          if (preset != null)
+            SubtitlePresetContent(
+              entry: SubtitleOverlayEntry(
+                text: mainText,
+                secondaryText: translatedText,
               ),
-
-              if (translatedText.isNotEmpty)
-                Padding(
-                  padding: EdgeInsets.only(top: engZhGap),
-                  child: MusicTextOpticalAlignment(
-                    applyCjkRaise: translationIsChinese,
-                    fontSize: zhFontSize,
-                    child: Text(
-                      translatedText,
-                      textAlign: TextAlign.left,
-                      softWrap: true,
-                      maxLines: null,
-                      style: TextStyle(
-                        fontFamily: _fontFamilyZh,
-                        fontSize: zhFontSize,
-                        fontWeight: translationIsChinese
-                            ? FontWeight.w600
-                            : FontWeight.w800,
-                        color: Colors.white.withValues(
-                          alpha: highlight ? 0.70 : 0.50,
-                        ),
-                        height: 1.5,
-                        leadingDistribution: translationIsChinese
-                            ? TextLeadingDistribution.even
-                            : null,
-                      ),
+              preset: preset,
+              referenceHeight: preset.referenceHeight(
+                MediaQuery.sizeOf(context),
+              ),
+            )
+          else
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
+                MusicTextOpticalAlignment(
+                  applyCjkRaise: mainIsChinese,
+                  fontSize: engFontSize,
+                  child: Text(
+                    mainText,
+                    textAlign: TextAlign.left,
+                    softWrap: true,
+                    maxLines: null,
+                    style: TextStyle(
+                      fontFamily: mainIsChinese
+                          ? _fontFamilyZh
+                          : _fontFamilyEng,
+                      fontSize: engFontSize,
+                      fontWeight: mainIsChinese
+                          ? FontWeight.w600
+                          : FontWeight.w800,
+                      color: Colors.white,
+                      height: 1.3,
+                      letterSpacing: -0.5,
+                      leadingDistribution: mainIsChinese
+                          ? TextLeadingDistribution.even
+                          : null,
                     ),
                   ),
                 ),
-            ],
-          ),
+
+                if (translatedText.isNotEmpty)
+                  Padding(
+                    padding: EdgeInsets.only(top: engZhGap),
+                    child: MusicTextOpticalAlignment(
+                      applyCjkRaise: translationIsChinese,
+                      fontSize: zhFontSize,
+                      child: Text(
+                        translatedText,
+                        textAlign: TextAlign.left,
+                        softWrap: true,
+                        maxLines: null,
+                        style: TextStyle(
+                          fontFamily: _fontFamilyZh,
+                          fontSize: zhFontSize,
+                          fontWeight: translationIsChinese
+                              ? FontWeight.w600
+                              : FontWeight.w800,
+                          color: Colors.white.withValues(
+                            alpha: highlight ? 0.70 : 0.50,
+                          ),
+                          height: 1.5,
+                          leadingDistribution: translationIsChinese
+                              ? TextLeadingDistribution.even
+                              : null,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
         ],
       ),
     );

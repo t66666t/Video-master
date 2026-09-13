@@ -16,6 +16,7 @@ class SubtitleDisplayLayer extends StatelessWidget {
   final Alignment alignment;
   final SubtitleStyle style;
   final double? referenceHeight;
+  final bool isGhostMode;
   final bool isDragging;
   final bool isGestureOnly;
   final bool isVisualOnly;
@@ -35,6 +36,7 @@ class SubtitleDisplayLayer extends StatelessWidget {
     required this.alignment,
     required this.style,
     this.referenceHeight,
+    this.isGhostMode = false,
     this.isDragging = false,
     this.isGestureOnly = false,
     this.isVisualOnly = false,
@@ -59,6 +61,7 @@ class SubtitleDisplayLayer extends StatelessWidget {
           alignment: alignment,
           style: style,
           referenceHeight: referenceHeight,
+          isGhostMode: isGhostMode,
           isDragging: isDragging,
           isGestureOnly: isGestureOnly,
           isVisualOnly: isVisualOnly,

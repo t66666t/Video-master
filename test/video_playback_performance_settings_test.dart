@@ -13,6 +13,23 @@ import 'package:video_player_platform_interface/video_player_platform_interface.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('Windows leaves native texture allocation to media_kit', () {
+    expect(
+      NativeVideoPlayerMediaKit.supportsAdaptiveTextureResizing('windows'),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.supportsAdaptiveTextureResizing('android'),
+      isFalse,
+    );
+    for (final platform in ['macos', 'linux', 'ios']) {
+      expect(
+        NativeVideoPlayerMediaKit.supportsAdaptiveTextureResizing(platform),
+        isTrue,
+      );
+    }
+  });
+
   test('hardware video decoding is the persisted default', () async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
     final settings = SettingsService()..resetForTest();

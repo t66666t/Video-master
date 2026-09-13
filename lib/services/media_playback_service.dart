@@ -21,6 +21,7 @@ import 'app_wakelock_coordinator.dart';
 import 'audio_playback_compatibility_service.dart';
 import 'playback_timeline_clock.dart';
 import 'playback_behavior_policy.dart';
+import 'sleep_timer_controller.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../services/library_service.dart';
 import '../services/media_materialization_service.dart';
@@ -95,6 +96,7 @@ class MediaPlaybackService extends ChangeNotifier {
   final Set<Object> _playbackPageOwners = <Object>{};
   final Set<Object> _miniPlaybackCardOwners = <Object>{};
   bool _mediaNotificationVisible = false;
+  final SleepTimerController sleepTimer = SleepTimerController();
 
   // 播放状态
   PlaybackState _state = PlaybackState.idle;
@@ -350,6 +352,9 @@ class MediaPlaybackService extends ChangeNotifier {
 
   bool get _hasVisiblePlaybackPage =>
       _isAppInForeground && _playbackPageOwners.isNotEmpty;
+
+  @visibleForTesting
+  bool get hasVisiblePlaybackPageForTest => _hasVisiblePlaybackPage;
 
   /// Registers the mini playback card independently from the full page.
   void setMiniPlaybackCardVisible(Object owner, bool visible) {
@@ -660,6 +665,7 @@ class MediaPlaybackService extends ChangeNotifier {
         state == AppLifecycleState.resumed ||
         state == AppLifecycleState.inactive;
     _setAppForegroundState(isForeground);
+    sleepTimer.checkNow();
 
     final bool shouldPauseForBackground =
         !kIsWeb &&
@@ -1326,6 +1332,18 @@ class MediaPlaybackService extends ChangeNotifier {
     _bilibiliStreamingService = bilibiliStreamingService;
     _attachPlaybackMaterializedListener();
     await _restorePersistedMuteState(notify: false);
+    await sleepTimer.initialize(
+      playbackListenable: this,
+      isPlaybackRunning: () {
+        final controller = _controller;
+        return _state == PlaybackState.playing &&
+            controller != null &&
+            controller.value.isInitialized &&
+            controller.value.isPlaying &&
+            !controller.value.isBuffering;
+      },
+      onExpired: () => pause(),
+    );
     _syncBilibiliCachePolicy();
   }
 
@@ -5247,6 +5265,24 @@ class MediaPlaybackService extends ChangeNotifier {
         return;
       }
 
+      // Sleep-timer completion rules take precedence over repeat/auto-play.
+      // The controller has naturally reached the end, so parking the session
+      // as paused preserves the completed progress without briefly starting
+      // the next item.
+      final stopForSleepTimer = sleepTimer.consumeItemCompletion(
+        hasNextItem: nextPlayableItem != null,
+      );
+      if (stopForSleepTimer) {
+        _hasPlaybackCompleted = true;
+        _state = PlaybackState.paused;
+        _setDesiredPlaying(false);
+        _syncWakelockWithState();
+        _stopProgressTracking();
+        await _savePlaybackStateSnapshot();
+        notifyListeners();
+        return;
+      }
+
       final settings = SettingsService();
       final shouldAutoPlay = settings.autoPlayOnCompletion;
       if (!shouldAutoPlay) {
@@ -5839,6 +5875,7 @@ class MediaPlaybackService extends ChangeNotifier {
       AppWakelockCoordinator.mediaPlaybackReason,
       false,
     );
+    sleepTimer.dispose();
     super.dispose();
   }
 

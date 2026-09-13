@@ -1,3 +1,4 @@
+import '../models/subtitle_debug_preset.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -213,6 +214,7 @@ class VideoComposeManager extends ChangeNotifier {
     required VideoComposeRenderMode renderMode,
     required SubtitleStyle subtitleStyle,
     required SubtitleStyle subtitleStylePortrait,
+    SubtitleDebugPreset? subtitlePreset,
     required Alignment subtitleAlignment,
     required bool splitSubtitleByLine,
     String? customOutputPath,
@@ -239,6 +241,7 @@ class VideoComposeManager extends ChangeNotifier {
       resolution: resolution,
       renderMode: renderMode,
       subtitleStyle: subtitleStyle,
+      subtitlePreset: subtitlePreset,
       subtitleStylePortrait: subtitleStylePortrait,
       subtitleAlignment: subtitleAlignment,
       splitSubtitleByLine: splitSubtitleByLine,
@@ -275,6 +278,7 @@ class VideoComposeManager extends ChangeNotifier {
       renderMode: old.request.renderMode,
       subtitleStyle: subtitleStyle,
       subtitleStylePortrait: old.request.subtitleStylePortrait,
+      subtitlePreset: old.request.subtitlePreset,
       subtitleAlignment: subtitleAlignment,
       splitSubtitleByLine: old.request.splitSubtitleByLine,
       subtitleItemGap: old.request.subtitleItemGap,

@@ -1,3 +1,4 @@
+import '../services/subtitle_debug_session.dart';
 import 'dart:async';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
@@ -36,6 +37,7 @@ import '../widgets/subtitle_display_layer.dart';
 import '../models/subtitle_display_state.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/player_control_metrics.dart';
+import '../widgets/sleep_timer_dialog.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_dialog.dart';
 import '../widgets/episode_picker_panel.dart';
@@ -49,11 +51,14 @@ import '../widgets/ai_transcription_panel.dart';
 import '../widgets/video_compose_panel.dart';
 import '../widgets/ocr_subtitle_panel.dart';
 import '../widgets/chapter_sidebar.dart';
+import '../widgets/landscape_sidebar_layout.dart';
+import '../widgets/desktop_player_sidebar.dart';
 import '../services/transcription_manager.dart';
 import '../services/ocr_subtitle_manager.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
+import '../utils/playback_page_visibility.dart';
 import '../utils/subtitle_drag_snap.dart';
 import '../utils/subtitle_file_picker.dart';
 import '../utils/video_gesture_session_gate.dart';
@@ -85,11 +90,24 @@ bool shouldMountPlaybackControls({
       !ghostDragActive;
 }
 
+@visibleForTesting
+bool isLandscapeSubtitleViewportReady({
+  required Size size,
+  required bool isMobilePlatform,
+}) {
+  if (!isMobilePlatform) return true;
+  // Phones must wait until the forced-orientation metrics have reached the
+  // landscape page. Tablets can legitimately keep a portrait-shaped viewport
+  // in split-screen or when the platform does not enforce app orientation.
+  return size.shortestSide >= 600 || size.width >= size.height;
+}
+
 class VideoPlayerScreen extends StatefulWidget {
   final XFile? videoFile; // Optional now
   final VideoPlayerController? existingController; // New
   final VideoItem? videoItem; // New
   final bool skipAutoPauseOnExit;
+  final bool? autoPlayOnEntry;
 
   const VideoPlayerScreen({
     super.key,
@@ -97,6 +115,7 @@ class VideoPlayerScreen extends StatefulWidget {
     this.existingController,
     this.videoItem,
     this.skipAutoPauseOnExit = false,
+    this.autoPlayOnEntry,
   });
 
   @override
@@ -125,6 +144,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   late VideoPlayerController _controller;
   bool _controllerAssigned = false;
   bool _initialized = false;
+  bool _pageEntryAutoPlayConsumed = false;
   bool _isSourceMissing = false;
   bool _isPlaying = false;
   bool _isControllerOwner = false;
@@ -132,6 +152,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   bool _initialControllerConsumed = false;
   bool _routeObserverSubscribed = false;
   bool _isOpeningMusicPlayer = false;
+  bool _pendingSubtitleSidebarViewportRestore = false;
+  bool _subtitleSidebarRestoreCallbackScheduled = false;
+  int _subtitleSidebarRestoreRetries = 0;
+  static const int _subtitleSidebarRestoreMaxRetries = 30;
   int _danmakuRevision = 0;
   bool get _supportsOcrSubtitle =>
       Platform.isAndroid ||
@@ -237,14 +261,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (_activeSidebar == SidebarType.subtitleStyle && canEditGhostStyle) {
       return effectiveSubtitleSidebarWidth + _subtitleSidebarResizerLayoutWidth;
     }
-    final screenWidth = MediaQuery.of(context).size.width;
+    final screenSize = MediaQuery.sizeOf(context);
+    final screenWidth = screenSize.width;
     if (_activeSidebar == SidebarType.chapters) {
       return screenWidth < 600
           ? screenWidth * 0.78
           : (screenWidth * 0.3).clamp(300.0, 440.0);
     }
-    final isSmallScreen = screenWidth < 600;
-    return isSmallScreen ? (screenWidth * 0.75).clamp(240.0, 300.0) : 320.0;
+    return LandscapeSidebarLayout.functionalWidthFor(screenSize);
   }
 
   void _startSidebarResize(SettingsService settings, BuildContext context) {
@@ -297,6 +321,77 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       if (!mounted) return;
       _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
     });
+  }
+
+  bool _isLandscapeSidebarViewportReady() {
+    final mediaQuery = MediaQuery.maybeOf(context);
+    if (mediaQuery == null) return false;
+    return isLandscapeSubtitleViewportReady(
+      size: mediaQuery.size,
+      isMobilePlatform: !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+    );
+  }
+
+  void _requestSubtitleSidebarViewportRestore() {
+    _pendingSubtitleSidebarViewportRestore = true;
+    _subtitleSidebarRestoreRetries = 0;
+    _tryRestoreSubtitleSidebarForCurrentViewport();
+  }
+
+  void _tryRestoreSubtitleSidebarForCurrentViewport() {
+    if (!mounted ||
+        !_pendingSubtitleSidebarViewportRestore ||
+        _subtitleSidebarRestoreCallbackScheduled) {
+      return;
+    }
+    _subtitleSidebarRestoreCallbackScheduled = true;
+    // post-frame 回调只在有帧被调度时执行；播放已暂停、界面静止时没有任何
+    // 东西会调度帧，只注册回调会让修复定位永远悬空。
+    WidgetsBinding.instance.ensureVisualUpdate();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _subtitleSidebarRestoreCallbackScheduled = false;
+      if (!mounted || !_pendingSubtitleSidebarViewportRestore) return;
+      if (ModalRoute.of(context)?.isCurrent != true ||
+          !_isLandscapeSidebarViewportReady()) {
+        return;
+      }
+      if (!_isSubtitleSidebarVisible ||
+          _activeSidebar != SidebarType.subtitles) {
+        _pendingSubtitleSidebarViewportRestore = false;
+        return;
+      }
+      if (_subtitles.isEmpty && _secondarySubtitles.isEmpty) return;
+
+      final sidebar = _subtitleSidebarKey.currentState;
+      if (sidebar == null) {
+        _scheduleSubtitleSidebarRestoreRetry();
+        return;
+      }
+      // Entering/restoring the route is a viewport repair. It must work while
+      // paused and when automatic subtitle following is disabled.
+      if (!sidebar.locateToCurrentSubtitle(ignorePointer: true)) {
+        // 列表尚未挂载（旋转/转场那一帧）：保留请求并在后续帧重试，避免
+        // 修复被静默丢弃后文稿停在空白状态。
+        _scheduleSubtitleSidebarRestoreRetry();
+        return;
+      }
+      _pendingSubtitleSidebarViewportRestore = false;
+      _subtitleSidebarRestoreRetries = 0;
+    });
+  }
+
+  void _scheduleSubtitleSidebarRestoreRetry() {
+    if (_subtitleSidebarRestoreRetries >= _subtitleSidebarRestoreMaxRetries) {
+      _pendingSubtitleSidebarViewportRestore = false;
+      _subtitleSidebarRestoreRetries = 0;
+      return;
+    }
+    _subtitleSidebarRestoreRetries++;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _tryRestoreSubtitleSidebarForCurrentViewport();
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
   }
 
   bool _canShowGhostSidebarControls(BuildContext context) {
@@ -751,6 +846,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         builder: (context, constraints) {
           Widget overlay = SizedBox.expand(
             child: SubtitleDisplayLayer(
+              isGhostMode: isGhost,
               notifier: displayNotifier ?? subtitleDisplayNotifier,
               alignment: alignment,
               style: style,
@@ -869,6 +965,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         ignorePointer: true,
       );
     });
+    // 音乐播放页返回可能与播放暂停同时发生：没有帧被调度时 post-frame 回调
+    // 不会执行，显式确保下一帧发生，修复定位才能落地。
+    WidgetsBinding.instance.ensureVisualUpdate();
   }
 
   void _resetVideoUserTransform({bool animated = true}) {
@@ -1287,19 +1386,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _onSettingsChanged();
     });
 
-    // 自动跟随字幕开启时，进入横屏后自动定位
-    // 等待转场动画完成 (约300ms)
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final settings = Provider.of<SettingsService>(context, listen: false);
-      if (settings.autoScrollSubtitles) {
-        Future.delayed(const Duration(milliseconds: 400), () {
-          if (mounted) {
-            _subtitleSidebarKey.currentState?.triggerLocateForAutoFollow();
-          }
-        });
-      }
-    });
+    // Keep this request pending until route transition/orientation, controller,
+    // subtitle data, and the sidebar's first layout have all settled.
+    _requestSubtitleSidebarViewportRestore();
   }
 
   Future<void> _requestNotificationPermissionForMediaSession() async {
@@ -1609,6 +1698,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _triggerSubtitleRefreshBurst() {
+    _requestSubtitleSidebarViewportRestore();
     final int token = ++_subtitleRefreshToken;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && token == _subtitleRefreshToken) {
@@ -1857,6 +1947,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       subtitleDisplayNotifier.value = SubtitleDisplayState.empty;
     });
     _rebuildSubtitleIndex();
+    _requestSubtitleSidebarViewportRestore();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _updateSubtitle();
     });
@@ -1955,11 +2046,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
       final suppressRouteCleanup =
           PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      final exitSessionIsPlaying = serviceOwnsExitSession()
+          ? playbackService.isPlaying || exitController.value.isPlaying
+          : exitController.value.isPlaying;
       if (_explicitPlaybackExitRequested &&
           !suppressRouteCleanup &&
           !shouldSkipAutoPause &&
           settings.autoPauseOnExit &&
-          exitController.value.isPlaying) {
+          exitSessionIsPlaying) {
         if (serviceOwnsExitSession()) {
           await playbackService.pause(
             expectedItemId: itemId,
@@ -2152,18 +2246,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (insetChanged) {
       _keyboardInsetBottom.value = nextInset;
     }
+    _tryRestoreSubtitleSidebarForCurrentViewport();
   }
 
   @override
   void didPush() {
     MediaPlaybackService().setPlaybackPageVisible(this, true);
     _enterImmersiveMode();
+    _requestSubtitleSidebarViewportRestore();
   }
 
   @override
   void didPopNext() {
     MediaPlaybackService().setPlaybackPageVisible(this, true);
     _enterImmersiveMode();
+    _requestSubtitleSidebarViewportRestore();
   }
 
   @override
@@ -2250,10 +2347,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      MediaPlaybackService().setPlaybackPageVisible(
-        this,
-        ModalRoute.of(context)?.isCurrent == true,
-      );
+      registerPlaybackPageIfCurrent(context, this);
     });
 
     // Listen to TranscriptionManager
@@ -2737,6 +2831,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         );
         _isPlaying = playbackService.isPlaying;
 
+        final bool? pageEntryAutoPlay = _consumePageEntryAutoPlay();
+        if (pageEntryAutoPlay == true && !playbackService.desiredPlaying) {
+          unawaited(playbackService.resume());
+        }
+
         // MediaPlaybackService already owns this controller and its
         // authoritative position. Avoid replacing it with a transient native
         // byte-zero sample while an online stream is being handed off.
@@ -2744,7 +2843,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         // never the transient isPlaying flag: during an episode switch the
         // service still reports "loading" while the controller already plays,
         // and pausing here used to kill the auto-play-after-switch setting.
-        if (playbackService.state != PlaybackState.loading) {
+        if (pageEntryAutoPlay != true &&
+            playbackService.state != PlaybackState.loading) {
           if (playbackService.desiredPlaying) {
             if (!_controller.value.isPlaying) playbackService.resume();
           } else {
@@ -2898,6 +2998,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _bindControllerListener();
             _triggerSubtitleRefreshBurst();
             _scheduleDeferredPostInitWork(currentItem);
+
+            final bool? pageEntryAutoPlay = _consumePageEntryAutoPlay();
+            if (pageEntryAutoPlay == true && !playbackService.desiredPlaying) {
+              unawaited(playbackService.resume());
+              return;
+            }
           }
         } catch (e) {
           debugPrint("Check MediaPlaybackService failed: $e");
@@ -2932,9 +3038,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           unawaited(
             playbackService.play(
               currentItem,
-              autoPlay: playbackService.currentItem?.id == currentItem.id
-                  ? playbackService.desiredPlaying
-                  : true,
+              autoPlay: resolvePlaybackPageEntryAutoPlay(
+                entryAutoPlay: _consumePageEntryAutoPlay(),
+                isCurrentItem:
+                    playbackService.currentItem?.id == currentItem.id,
+                desiredPlaying: playbackService.desiredPlaying,
+              ),
             ),
           );
         } catch (error) {
@@ -2942,6 +3051,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         }
       }
     }
+  }
+
+  bool? _consumePageEntryAutoPlay() {
+    if (_pageEntryAutoPlayConsumed) return null;
+    _pageEntryAutoPlayConsumed = true;
+    return widget.autoPlayOnEntry;
   }
 
   void _videoListener() {
@@ -3865,6 +3980,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   // --- Drag Logic ---
   void _enterSubtitleDragMode() {
+    if (SubtitleDebugSession.instance.usesPresets) return;
     setState(() {
       _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
       _isSubtitleDragMode = true;
@@ -3967,6 +4083,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     BoxConstraints constraints, {
     bool isGhost = false,
   }) {
+    if (SubtitleDebugSession.instance.usesPresets && !isGhost) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
     final currentAlign = isGhost
         ? settings.ghostModeAlignment
@@ -4243,41 +4360,53 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         // 缓存 sidebarWidth，避免单次 build 调用 3 次 _getSidebarWidth
         final double sidebarWidth = _getSidebarWidth(context, settings);
         // 侧边栏动画面板：RepaintBoundary 隔离重绘，内容保持开启状态以支持淡出效果
-        final Widget sidebarPanel = AnimatedContainer(
-          duration: _isResizingSidebar
-              ? Duration.zero
-              : const Duration(milliseconds: 250),
-          curve: Curves.easeOutCubic,
-          width: _isSidebarOpen ? sidebarWidth : 0,
-          child: RepaintBoundary(
-            child: ClipRect(
-              child: OverflowBox(
-                minWidth: sidebarWidth,
-                maxWidth: sidebarWidth,
-                alignment: isLeftHandedMode
-                    ? Alignment.centerRight
-                    : Alignment.centerLeft,
-                child: AnimatedOpacity(
-                  opacity: _isSidebarOpen ? 1.0 : 0.0,
-                  duration: const Duration(milliseconds: 200),
-                  curve: Curves.easeOut,
-                  child: Padding(
-                    key: const ValueKey('player-sidebar-safe-padding'),
-                    padding: sidebarSafePadding,
-                    child: MediaQuery.removePadding(
-                      context: context,
-                      removeLeft: true,
-                      removeRight: true,
-                      child:
-                          _buildSidebarContent(settings) ??
-                          const SizedBox.shrink(),
+        final isDesktop =
+            !kIsWeb &&
+            (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+        final Widget sidebarPanel = isDesktop
+            ? const SizedBox.shrink()
+            : AnimatedContainer(
+                duration: _isResizingSidebar
+                    ? Duration.zero
+                    : const Duration(milliseconds: 250),
+                curve: Curves.easeOutCubic,
+                width: _isSidebarOpen ? sidebarWidth : 0,
+                child: RepaintBoundary(
+                  child: ClipRect(
+                    child: OverflowBox(
+                      minWidth: sidebarWidth,
+                      maxWidth: sidebarWidth,
+                      alignment: isLeftHandedMode
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: AnimatedOpacity(
+                        opacity: _isSidebarOpen ? 1.0 : 0.0,
+                        duration: const Duration(milliseconds: 200),
+                        curve: Curves.easeOut,
+                        child: Padding(
+                          key: const ValueKey('player-sidebar-safe-padding'),
+                          padding: sidebarSafePadding,
+                          child: MediaQuery.removePadding(
+                            context: context,
+                            removeLeft: true,
+                            removeRight: true,
+                            child:
+                                (_activeSidebar == SidebarType.subtitles ||
+                                    _activeSidebar == SidebarType.chapters)
+                                ? (_buildSidebarContent(settings) ??
+                                      const SizedBox.shrink())
+                                : LandscapeSidebarTheme(
+                                    child:
+                                        _buildSidebarContent(settings) ??
+                                        const SizedBox.shrink(),
+                                  ),
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 ),
-              ),
-            ),
-          ),
-        );
+              );
         final bool showResizer =
             _isSidebarOpen &&
             (_activeSidebar == SidebarType.subtitles ||
@@ -4291,16 +4420,62 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           _subtitleSidebarWidthOverride ?? settings.userSubtitleSidebarWidth,
         );
 
-        final List<Widget> sidebarWidgets = [
-          if (showResizer && isLeftHandedMode) ...[
-            sidebarPanel,
-            sidebarResizer,
-          ] else if (showResizer) ...[
-            sidebarResizer,
-            sidebarPanel,
-          ] else
-            sidebarPanel,
-        ];
+        Widget sidebarContent(Widget content) => Padding(
+          key: const ValueKey('player-sidebar-safe-padding'),
+          padding: sidebarSafePadding,
+          child: MediaQuery.removePadding(
+            context: context,
+            removeLeft: true,
+            removeRight: true,
+            child: content,
+          ),
+        );
+        final List<Widget> sidebarWidgets = isDesktop
+            ? [
+                DesktopPlayerSidebar(
+                  key: const ValueKey('desktop-player-sidebar'),
+                  panelId: _isSidebarOpen ? _activeSidebar : null,
+                  panel:
+                      _activeSidebar == SidebarType.subtitles || !_isSidebarOpen
+                      ? null
+                      : sidebarContent(
+                          _activeSidebar == SidebarType.chapters
+                              ? (_buildSidebarContent(settings) ??
+                                    const SizedBox.shrink())
+                              : LandscapeSidebarTheme(
+                                  child:
+                                      _buildSidebarContent(settings) ??
+                                      const SizedBox.shrink(),
+                                ),
+                        ),
+                  width: sidebarWidth,
+                  retainedId: SidebarType.subtitles,
+                  retainedPanel: sidebarContent(
+                    _buildSidebarContent(
+                      settings,
+                      panelType: SidebarType.subtitles,
+                    )!,
+                  ),
+                  retainedWidth: resizableSidebarWidth,
+                  viewportSize: MediaQuery.sizeOf(context),
+                  divider: showResizer ? sidebarResizer : null,
+                  dividerWidth: showResizer
+                      ? _subtitleSidebarResizerLayoutWidth
+                      : 0,
+                  onLeft: isLeftHandedMode,
+                  resizing: _isResizingSidebar,
+                ),
+              ]
+            : [
+                if (showResizer && isLeftHandedMode) ...[
+                  sidebarPanel,
+                  sidebarResizer,
+                ] else if (showResizer) ...[
+                  sidebarResizer,
+                  sidebarPanel,
+                ] else
+                  sidebarPanel,
+              ];
         return PopScope(
           canPop: false,
           onPopInvokedWithResult: (didPop, result) {
@@ -4346,6 +4521,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                           children: [
                             if (isLeftHandedMode) ...sidebarWidgets,
                             Expanded(
+                              key: const ValueKey('landscape-player-surface'),
                               child: ValueListenableBuilder<double>(
                                 valueListenable: _keyboardInsetBottom,
                                 builder: (context, keyboardInsetBottom, child) {
@@ -4752,6 +4928,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                         SidebarType.settings;
                                                   },
                                                 ),
+                                                onOpenSleepTimer: () =>
+                                                    unawaited(
+                                                      showSleepTimerDialog(
+                                                        context,
+                                                      ),
+                                                    ),
                                                 onOpenSubtitleManager:
                                                     _showSubtitleManager,
                                                 onOpenSubtitleEditor:
@@ -4798,26 +4980,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                       .saveLandscapeSubtitleSidebarVisible(
                                                         _isSubtitleSidebarVisible,
                                                       );
-                                                  WidgetsBinding.instance
-                                                      .addPostFrameCallback((
-                                                        _,
-                                                      ) {
-                                                        if (!mounted) {
-                                                          return;
-                                                        }
-                                                        if (_isSubtitleSidebarVisible &&
-                                                            _activeSidebar ==
-                                                                SidebarType
-                                                                    .subtitles) {
-                                                          _userRequestedSubtitles =
-                                                              true;
-                                                          unawaited(
-                                                            _maybeLoadSubtitlesForCurrentItem(
-                                                              force: true,
-                                                            ),
-                                                          );
-                                                        }
-                                                      });
+                                                  WidgetsBinding.instance.addPostFrameCallback((
+                                                    _,
+                                                  ) {
+                                                    if (!mounted) {
+                                                      return;
+                                                    }
+                                                    if (_isSubtitleSidebarVisible &&
+                                                        _activeSidebar ==
+                                                            SidebarType
+                                                                .subtitles) {
+                                                      _requestSubtitleSidebarViewportRestore();
+                                                      _userRequestedSubtitles =
+                                                          true;
+                                                      unawaited(
+                                                        _maybeLoadSubtitlesForCurrentItem(
+                                                          force: true,
+                                                        ),
+                                                      );
+                                                    }
+                                                  });
                                                 },
                                                 isSubtitleSidebarVisible:
                                                     _isSubtitleSidebarVisible,
@@ -5120,6 +5302,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                               child: IgnorePointer(
                                                 ignoring: !_isGhostDragMode,
                                                 child: GestureDetector(
+                                                  behavior: HitTestBehavior
+                                                      .translucent,
                                                   onPanUpdate: _isGhostDragMode
                                                       ? (details) =>
                                                             _updateSubtitlePosition(
@@ -5129,6 +5313,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                             )
                                                       : null,
                                                   child: SubtitleDisplayLayer(
+                                                    isGhostMode: true,
                                                     notifier:
                                                         subtitleDisplayNotifier,
                                                     alignment: settings
@@ -5572,10 +5757,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     });
   }
 
-  Widget? _buildSidebarContent(SettingsService settings) {
-    if (!_isSidebarOpen) return null;
+  Widget? _buildSidebarContent(
+    SettingsService settings, {
+    SidebarType? panelType,
+  }) {
+    final type = panelType ?? _activeSidebar;
+    if (type == SidebarType.none) return null;
 
-    switch (_activeSidebar) {
+    switch (type) {
       case SidebarType.chapters:
         final item = _currentItem;
         if (item == null) return null;
@@ -5902,7 +6091,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               settings.saveEnableHeadsetMediaControls(value),
           showMobilePlaybackControls: showMobilePlaybackControls,
 
-          // New: Auto Play Next Video
+          autoPlayOnPageEntry: settings.autoPlayOnPageEntry,
+          onAutoPlayOnPageEntryChanged: (value) =>
+              settings.saveAutoPlayOnPageEntry(value),
           autoPlayNextVideo: settings.autoPlayNextVideo,
           onAutoPlayNextVideoChanged: (value) =>
               settings.saveAutoPlayNextVideo(value),
