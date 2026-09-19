@@ -4,27 +4,29 @@
 
 ## 定向阅读
 
-- MediaPlaybackService：_onControllerUpdate、_handlePlaybackCompleted、_startProgressTracking、pause/resume、persistCurrentProgress、seekTo 和当前播放请求身份。先定位后取片段。
-- lib/services/progress_tracker.dart：位置持久化与状态快照，不重写既有职责。
-- lib/models/playback_session.dart：控制器/请求generation；辨别媒体逻辑观看周期与控制器重建。
-- S01活动API；test/media_playback_session_state_test.dart、test/background_playback_handoff_test.dart、test/playback_page_controller_ownership_test.dart 的相关夹具。
+- `MediaPlaybackService`：`_onControllerUpdate`、`_handlePlaybackCompleted`、`_startProgressTracking`、`pause`/`resume`、`persistCurrentProgress`、`seekTo`、`_playRequestId`、`sessionGeneration`。先定位后取片段。
+- `lib/services/playback_behavior_policy.dart`：`isConfirmedPlaybackCompletion` / `hasReachedPlaybackEnd`。完成判定复用它，不要再写一套 95% 猜测。
+- `lib/services/progress_tracker.dart`：位置持久化与状态快照，不重写既有职责。
+- `lib/models/playback_session.dart`：控制器/请求 generation；辨别媒体逻辑观看周期与控制器重建。
+- S01 活动 API；`test/media_playback_session_state_test.dart`、`test/background_playback_handoff_test.dart`、`test/playback_page_controller_ownership_test.dart`、`test/playback_behavior_policy_test.dart` 的相关夹具。
+
+拟新增：小型可测计量器，例如 `lib/services/library_watch_meter.dart`。
 
 ## 规则
 
-1. 使用小型可独立测试的活动计量器，输入为媒体身份、逻辑会话、单调时钟、播放/缓冲状态、实际位置与seek/完成事件。不能通过跨媒体静态全局秒表累加。
-2. 实际播放并有真实推进时才计时；暂停、缓冲、停止、缺失源、仅恢复UI、初始化seek、预加载、拖动进度条不计。
-3. 已知时长的入列门槛=min(30秒,总时长20%)，未知时长30秒；累计实际经过秒数，2倍速看10秒只累计10秒。计量间隔可复用现有低频更新或单个轻量计时器，不监听每帧重建主页。
+1. 使用小型可独立测试的活动计量器，输入为媒体身份、逻辑会话、单调时钟、播放/缓冲状态、实际位置与 seek/完成事件。不能通过跨媒体静态全局秒表累加。
+2. 实际播放并有真实推进时才计时；暂停、缓冲、停止、缺失源、仅恢复 UI、初始化 seek、预加载、拖动进度条不计。
+3. 已知时长的入列门槛 = min(30秒, 总时长20%)，未知时长 30 秒；累计实际经过秒数，2 倍速看 10 秒只累计 10 秒。计量间隔可复用现有低频更新或单个轻量计时器，不监听每帧重建主页。
 4. 未隐藏且未完成的观看周期可以跨正常暂停/重开累计；只有进度位置但未知活动的旧库显示“之前未看完”，不赋虚假最近时间。
-5. 自然完成事件先可靠记录完成，再允许原逻辑把位置归零。保留原自动连播/循环/定时关闭行为。不能把停止、异常、seek到接近末尾直接当自然完成。
+5. 自然完成：先 `isConfirmedPlaybackCompletion`，再可靠记录完成，再允许原逻辑把位置归零。保留原自动连播/循环/定时关闭行为。不能把停止、异常、seek 到接近末尾直接当自然完成。
 6. 已完成项开始新观看周期后，达到门槛才清除完成状态并重新入列；在此之前保持已完成，不因控制器加载立刻复活。
-7. 隐藏立即生效，不修改位置。隐藏后的同次播放周期剩余tick及自动重播不解除隐藏；新一次用户主动打开/开始观看并达到门槛才解除。横竖屏、画质、音视频模式切换只延续原周期。
-8. lastPlayedAt 只由真实观看活动更新，暂停恢复UI、字幕编辑、缩略图补齐均不更新。异步回调必须带媒体ID/有效会话身份，防止A回调写进B。
+7. 隐藏立即生效，不修改位置。隐藏后的同次播放周期剩余 tick 及自动重播不解除隐藏；新一次用户主动打开/开始观看并达到门槛才解除。横竖屏、画质、音视频模式切换只延续原周期。
+8. lastPlayedAt 只由真实观看活动更新，暂停恢复 UI、字幕编辑、缩略图补齐均不更新。异步回调必须带媒体 ID/有效会话身份，防止 A 回调写进 B。
 9. 活动内存可低频更新；入列/隐藏/完成等边界发轻量变更，进度写入使用已有节流和快照队列。暂停/切片/退出生命周期 flush 相关活动，不每秒全库落盘。
 10. 不增加“学习统计”展示，不存每秒事件日志、不追踪隐私内容或下载账号。
 
 ## 必要测试
 
-纯规则用fake clock覆盖：29秒/30秒、短片阈值、未知时长、倍速、暂停/缓冲/seek、时钟跳变、A→B切换、旧回调丢弃、完成后位置归零、重看门槛、隐藏后同会话仍隐藏、主动新会话重新出现。
-另补至少一条真实服务接线测试，验证完成事件和pause/切片flush确实调用活动写入口，不能只测一个未被实际播放器使用的辅助类。
-回归现有播放会话、后台handoff、控制器所有权和请求竞态的受影响测试。不要修改原有播放正确性断言来迁就活动计时器。
-
+纯规则用 fake clock 覆盖：29秒/30秒、短片阈值、未知时长、倍速、暂停/缓冲/seek、时钟跳变、A→B 切换、旧回调丢弃、完成后位置归零、重看门槛、隐藏后同会话仍隐藏、主动新会话重新出现。
+另补至少一条真实服务接线测试，验证完成事件和 pause/切片 flush 确实调用活动写入口，不能只测一个未被实际播放器使用的辅助类。
+回归现有播放会话、后台 handoff、控制器所有权、请求竞态和 `playback_behavior_policy_test.dart`。不要修改原有播放正确性断言来迁就活动计时器。

@@ -4,20 +4,22 @@
 
 ## 阅读范围
 
-读取交接中的活动投影API；home_screen.dart 的新入口挂接段；media_library_list_tile.dart、media_library_grid_card.dart、media_library_layout_profile.dart 的接口；video_action_buttons.dart 中导入结果通知和 media_library_top_bar_import_progress.dart。
+读取交接中的活动投影 API；home_screen.dart 的新入口挂接段；`media_library_list_tile.dart`、`media_library_grid_card.dart`、`media_library_layout_profile.dart` 的接口；`video_action_buttons.dart` 中导入完成 SnackBar（已有“压缩包/文件夹导入完成：新增 N 个媒体”文案）和 `media_library_top_bar_import_progress.dart`。
 只有结果通知仍在来源页面时，定位对应来源的单个通知函数，不重读下载服务。
+
+拟新增：小型最近添加视图 widget，例如 `lib/widgets/media_library_recent_view.dart`。挂到 HomeScreen 宿主，不要复制整页。
 
 ## 展示与交互
 
-1. 批次按本机开始时间倒序，同时间以稳定批次ID做确定性次序；批次成员按既有导入序列展示。
+1. 批次按本机开始时间倒序，同时间以稳定批次 ID 做确定性次序；批次成员按既有导入序列展示。
 2. 单媒体批次直接呈现视频/音频。多媒体批次呈现“标题·当前N项”的折叠组，展开或进入只读详情后只显示这批新项，不显示目标目录里的旧资料。
-3. 未知旧时间统一折叠为“更早添加”，采用稳定现有遍历顺序，不显示编造的年月日。有addedAt但无有效批次的已提交项按单项显示，作为中断导入的安全兜底；已有有效批次的媒体不再重复单列。组内采用惰性列表/网格，不能一次构建全部媒体。
-4. 批次不是 VideoCollection，不写入 childrenIds，不改变文件夹数量和播放队列。重命名/移动后通过ID显示当前标题/位置，不保存一份副本。
+3. 未知旧时间统一折叠为“更早添加”，采用稳定现有遍历顺序，不显示编造的年月日。有 addedAt 但无有效批次的已提交项按单项显示，作为中断导入的安全兜底；已有有效批次的媒体不再重复单列。组内采用惰性列表/网格，不能一次构建全部媒体。
+4. 批次不是 VideoCollection，不写入 childrenIds，不改变文件夹数量和播放队列。重命名/移动后通过 ID 显示当前标题/位置，不保存一份副本。
 5. 已回收媒体和回收祖先下媒体不可见。组头展示“当前N项”，按当前可见媒体计数；完成通知的“新增N项”来自当次结果，二者不要混用。全部不可见时不留下可点击空组，不为原始数量再加一套历史统计。
-6. 导入完成通知提供“查看”，点击才切换入口并定位/展开对应批次；无人点击则保持当前滚动位置和播放器状态。
+6. 导入完成通知提供“查看”，点击才切换入口并定位/展开对应批次；无人点击则保持当前滚动位置和播放器状态。复用现有 SnackBar/通知，不要再做第三条进度条。
 7. 在列表中部出现新批次时不突然跳到顶部或推走视口；显示“有新添加内容”轻提示，点击回顶。用户已经在顶部且没有交互时可直接刷新。
-8. 复用卡片/列表样式；批次标题只是分组容器。真实媒体项支持打开/固定/定位；S07未接固定时先不展示该操作。不提供虚拟拖拽重排。
-9. 播放必须调用 prepareLibraryPlayback(item)，不能把批次成员当默认连播列表。
+8. 复用卡片/列表样式；批次标题只是分组容器。真实媒体项支持打开/固定/定位；S07 未接固定时先不展示该操作。不提供虚拟拖拽重排。
+9. 播放必须调用 `prepareLibraryPlayback(item)`，不能把批次成员当默认连播列表。
 10. 任何“已添加”提示仍受现有保存失败提示约束；不掩盖 library.json 未落盘的状态。
 
 ## 验收场景
@@ -25,8 +27,8 @@
 - 同一天两批、单片、100个媒体批次、空库、旧库未知日期。
 - 改字幕/播放/改名不会让旧批次变新；复用/恢复不制造新增。
 - 从多层目标目录导入后，一次“查看”直接看到本次新增。
-- 播放A课程第1集后下一集仍为A第2集，哪怕批次还含课程B。
+- 播放 A 课程第 1 集后下一集仍为 A 第 2 集，哪怕批次还含课程 B。
 - 在旧位置阅读时后台导入不抢位置；旋转或卡片/列表切换保留上下文。
-- 滚动大批次时按可见项构建，无每build磁盘探测。
+- 滚动大批次时按可见项构建，无每 build 磁盘探测。
 
-为投影和导航行为增加有意义测试；继续执行 search_playback_queue_test.dart、media_library_grid_card_test.dart、media_library_list_tile_responsive_test.dart、media_library_top_bar_import_progress_test.dart。
+为投影和导航行为增加有意义测试；继续执行 `search_playback_queue_test.dart`、`media_library_grid_card_test.dart`、`media_library_list_tile_responsive_test.dart`、`media_library_top_bar_import_progress_test.dart`。
