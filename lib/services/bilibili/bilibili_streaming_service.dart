@@ -101,6 +101,148 @@ bool _isMaterializedCacheFileName(String name) {
       name.startsWith('transcription_audio');
 }
 
+/// Rolling throughput estimate for one gateway item while bytes stream through
+/// the loopback proxy.
+class _GatewayTransferMeter {
+  final List<({DateTime at, int bytes})> _samples = <({DateTime at, int bytes})>[];
+
+  void record(int bytes) {
+    if (bytes <= 0) return;
+    final now = DateTime.now();
+    _samples.add((at: now, bytes: bytes));
+    final cutoff = now.subtract(const Duration(seconds: 1));
+    while (_samples.isNotEmpty && _samples.first.at.isBefore(cutoff)) {
+      _samples.removeAt(0);
+    }
+  }
+
+  double get bytesPerSecond {
+    return measureGatewayBytesPerSecond(_samples, now: DateTime.now());
+  }
+
+  void reset() {
+    _samples.clear();
+  }
+}
+
+/// Bytes in the last [window], divided by the full window — not by the time
+/// since the first burst. A 2 MB chunk in 50 ms is 2 MB/s over 1 s, not 40.
+@visibleForTesting
+double measureGatewayBytesPerSecond(
+  Iterable<({DateTime at, int bytes})> samples, {
+  required DateTime now,
+  Duration window = const Duration(seconds: 1),
+}) {
+  final windowMs = window.inMilliseconds;
+  if (windowMs <= 0) return 0;
+  final cutoff = now.subtract(window);
+  var totalBytes = 0;
+  for (final sample in samples) {
+    if (sample.at.isBefore(cutoff)) continue;
+    totalBytes += sample.bytes;
+  }
+  if (totalBytes <= 0) return 0;
+  return totalBytes * 1000.0 / windowMs;
+}
+
+/// Persisted byte-interval map for one DASH track. libmpv does not replay the
+/// same Range boundaries after a process restart, so slices must merge.
+class _TrackCacheIndex {
+  int? totalBytes;
+  List<({int start, int endExclusive})> ranges;
+  bool dirty;
+
+  _TrackCacheIndex({
+    this.totalBytes,
+    List<({int start, int endExclusive})>? ranges,
+    this.dirty = false,
+  }) : ranges = _mergeCachedRanges(ranges ?? const []);
+
+  bool get isComplete {
+    final total = totalBytes;
+    return total != null && total > 0 && covers(0, total);
+  }
+
+  bool covers(int start, int endExclusive) {
+    if (endExclusive <= start) return false;
+    for (final range in ranges) {
+      if (range.start <= start && endExclusive <= range.endExclusive) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  int? contiguousEndExclusive(int start) {
+    for (final range in ranges) {
+      if (range.start <= start && start < range.endExclusive) {
+        return range.endExclusive;
+      }
+    }
+    return null;
+  }
+
+  void addRange(int start, int endExclusive, {int? totalBytes}) {
+    if (endExclusive <= start) return;
+    ranges = _mergeCachedRanges([
+      ...ranges,
+      (start: start, endExclusive: endExclusive),
+    ]);
+    if (totalBytes != null && totalBytes > 0) this.totalBytes = totalBytes;
+    dirty = true;
+  }
+
+  Map<String, Object?> toJson() => <String, Object?>{
+    'totalBytes': totalBytes,
+    'ranges': [
+      for (final range in ranges) [range.start, range.endExclusive],
+    ],
+  };
+
+  factory _TrackCacheIndex.fromJson(Map<String, dynamic> json) {
+    final rawRanges = json['ranges'];
+    final ranges = <({int start, int endExclusive})>[];
+    if (rawRanges is List) {
+      for (final entry in rawRanges) {
+        if (entry is! List || entry.length < 2) continue;
+        final start = (entry[0] as num?)?.toInt();
+        final endExclusive = (entry[1] as num?)?.toInt();
+        if (start == null || endExclusive == null || endExclusive <= start) {
+          continue;
+        }
+        ranges.add((start: start, endExclusive: endExclusive));
+      }
+    }
+    return _TrackCacheIndex(
+      totalBytes: (json['totalBytes'] as num?)?.toInt(),
+      ranges: ranges,
+    );
+  }
+}
+
+List<({int start, int endExclusive})> _mergeCachedRanges(
+  List<({int start, int endExclusive})> input,
+) {
+  if (input.isEmpty) return const [];
+  final sorted = [...input]..sort((a, b) => a.start.compareTo(b.start));
+  final merged = <({int start, int endExclusive})>[sorted.first];
+  for (var i = 1; i < sorted.length; i++) {
+    final current = sorted[i];
+    final last = merged.last;
+    if (current.start <= last.endExclusive) {
+      merged[merged.length - 1] = (
+        start: last.start,
+        endExclusive: current.endExclusive > last.endExclusive
+            ? current.endExclusive
+            : last.endExclusive,
+      );
+    } else {
+      merged.add(current);
+    }
+  }
+  return merged;
+}
+
 class BilibiliAudioDownloadProgress {
   final int receivedBytes;
   final int? totalBytes;
@@ -143,10 +285,22 @@ class BilibiliStreamingService extends ChangeNotifier {
   final Map<String, HttpClient> _transcriptionAudioClients = {};
   final Set<String> _cancelledTranscriptionAudioItems = {};
   final _uuid = const Uuid();
+  final _playUrlCache =
+      <String, ({BilibiliStreamInfo info, DateTime obtainedAt})>{};
+  /// Next/previous episodes pre-built so a notification skip does not wait on
+  /// playurl. Spotify/YouTube/Bilibili all warm the adjacent item this way.
+  final _warmPlaybacks = <String, BilibiliPreparedPlayback>{};
+  final _warmPrepareFutures = <String, Future<BilibiliPreparedPlayback>>{};
+  /// Shared CDN client so episode switches reuse TLS instead of handshaking
+  /// bilivideo.com again. Per-session clients made every skip look like a
+  /// cold download even on gigabit LAN.
+  HttpClient? _sharedMediaClient;
+  final _gatewayTransferMeters = <String, _GatewayTransferMeter>{};
+  DateTime? _lastGatewayTransferNotifyAt;
+  final _cacheIoLocks = <String, Future<void>>{};
   HttpServer? _server;
   Future<HttpServer>? _serverFuture;
   Directory? _cacheDirectory;
-  int _cacheSequence = 0;
   int _cachePolicyRevision = 0;
   int? _preferredQualityId;
   bool _preferredQualityLoaded = false;
@@ -169,10 +323,97 @@ class BilibiliStreamingService extends ChangeNotifier {
   @visibleForTesting
   int get activePlaybackSessionCount => _sessions.length;
 
+  /// Rolling download speed for the active gateway session of [itemId].
+  double gatewayBytesPerSecondFor(String? itemId) {
+    if (itemId == null || itemId.isEmpty) return 0;
+    return _gatewayTransferMeters[itemId]?.bytesPerSecond ?? 0;
+  }
+
+  void _recordGatewayTransfer(String itemId, int bytes) {
+    if (bytes <= 0 || itemId.isEmpty) return;
+    final meter = _gatewayTransferMeters.putIfAbsent(
+      itemId,
+      () => _GatewayTransferMeter(),
+    );
+    meter.record(bytes);
+    final now = DateTime.now();
+    final lastNotify = _lastGatewayTransferNotifyAt;
+    if (lastNotify != null &&
+        now.difference(lastNotify) < const Duration(milliseconds: 120)) {
+      return;
+    }
+    _lastGatewayTransferNotifyAt = now;
+    notifyListeners();
+  }
+
+  void _resetGatewayTransferMeter(String itemId) {
+    _gatewayTransferMeters.remove(itemId)?.reset();
+  }
+
+  /// Warms playurl + a gateway session + the CDN TCP/TLS session for [item]
+  /// without opening a native player. Notification/Mini skip then only has to
+  /// point libmpv at an already-live loopback URL.
+  Future<void> prefetch(VideoItem item) async {
+    final source = item.sourceRef;
+    if (source?.kind != MediaSourceKind.bilibiliStream ||
+        source?.cid == null ||
+        (source?.bvid?.isEmpty ?? true)) {
+      return;
+    }
+    try {
+      await _warmPrepare(item);
+    } catch (error) {
+      debugPrint('Bilibili neighbor prefetch failed: $error');
+    }
+  }
+
+  /// Drop warm sessions that are no longer the next/previous queue neighbors.
+  void retainWarmPlaybacks(Set<String> itemIds) {
+    final staleIds = _warmPlaybacks.keys
+        .where((id) => !itemIds.contains(id))
+        .toList(growable: false);
+    for (final id in staleIds) {
+      final playback = _warmPlaybacks.remove(id);
+      if (playback != null) unawaited(releasePlayback(playback));
+    }
+  }
+
+  Future<BilibiliPreparedPlayback> _warmPrepare(VideoItem item) {
+    final existing = _warmPlaybacks[item.id];
+    if (existing != null) return Future<BilibiliPreparedPlayback>.value(existing);
+    return _warmPrepareFutures[item.id] ??= () async {
+      try {
+        final playback = await prepare(item, allowWarmReuse: false);
+        _warmPlaybacks[item.id] = playback;
+        unawaited(_warmCdnConnections(playback));
+        return playback;
+      } finally {
+        _warmPrepareFutures.remove(item.id);
+      }
+    }();
+  }
+
   Future<BilibiliPreparedPlayback> prepare(
     VideoItem item, {
     int? qualityId,
+    bool allowWarmReuse = true,
   }) async {
+    if (allowWarmReuse) {
+      final warm = _takeWarmPlayback(item.id, qualityId: qualityId);
+      if (warm != null) {
+        _bindCachePolicy(warm, item.id);
+        return warm;
+      }
+      final inFlight = _warmPrepareFutures[item.id];
+      if (inFlight != null) {
+        final warmed = await inFlight;
+        if (qualityId == null || warmed.selectedQuality.id == qualityId) {
+          _warmPlaybacks.remove(item.id);
+          _bindCachePolicy(warmed, item.id);
+          return warmed;
+        }
+      }
+    }
     final source = item.sourceRef;
     if (source == null ||
         source.kind != MediaSourceKind.bilibiliStream ||
@@ -180,19 +421,24 @@ class BilibiliStreamingService extends ChangeNotifier {
         (source.bvid?.isEmpty ?? true)) {
       throw const FormatException('媒体库条目缺少 Bilibili 播放身份信息');
     }
-    await _ensurePreferredQualityLoaded();
+    final preferredFuture = _ensurePreferredQualityLoaded();
     // Seek-preview sprites are optional metadata. Do not put their download
     // on the critical media-notification -> playback path.
     unawaited(_ensureVideoShot(item));
-    final server = await _ensureServer();
+    final serverFuture = _ensureServer();
+    final playUrlFuture = _playUrlFor(source.bvid!, source.cid!);
+    await preferredFuture;
     final requested =
         qualityId ?? _preferredQualityId ?? _preferredQualityByItem[item.id];
+    final streamInfo = await playUrlFuture;
     final session = await _createSession(
       itemId: item.id,
       source: source,
       fallbackDurationMs: item.durationMs,
       requestedQualityId: requested,
+      streamInfo: streamInfo,
     );
+    final server = await serverFuture;
     // Direct service callers (including low-level gateway clients) retain the
     // historical cache-enabled behavior until a playback context explicitly
     // supplies a policy. MediaPlaybackService always supplies that policy
@@ -240,8 +486,102 @@ class BilibiliStreamingService extends ChangeNotifier {
     if (source?.bvid?.isNotEmpty != true || source?.cid == null) {
       throw const FormatException('媒体库条目缺少 Bilibili 播放身份信息');
     }
-    final info = await apiService.fetchPlayUrl(source!.bvid!, source.cid!);
+    final info = await _playUrlFor(source!.bvid!, source.cid!);
     return List<BilibiliStreamQuality>.unmodifiable(_qualitiesFor(info));
+  }
+
+  String _playUrlCacheKey(String bvid, int cid) => '$bvid:$cid';
+
+  BilibiliPreparedPlayback? _takeWarmPlayback(
+    String itemId, {
+    int? qualityId,
+  }) {
+    final warm = _warmPlaybacks[itemId];
+    if (warm == null) return null;
+    if (qualityId != null && warm.selectedQuality.id != qualityId) {
+      return null;
+    }
+    _warmPlaybacks.remove(itemId);
+    return warm;
+  }
+
+  void _bindCachePolicy(BilibiliPreparedPlayback playback, String itemId) {
+    final session = _sessionForPlayback(playback);
+    session?.setCachingEnabled(_cachePolicyByItem[itemId] ?? true);
+  }
+
+  _GatewaySession? _sessionForPlayback(BilibiliPreparedPlayback playback) {
+    final segments = playback.videoUri.pathSegments;
+    if (segments.length < 3 || segments.first != 'session') return null;
+    return _sessions[segments[1]];
+  }
+
+  /// Pull the DASH init+sidx bytes so the next skip's first Range is a
+  /// connection reuse, not a TLS handshake to bilivideo.com.
+  Future<void> _warmCdnConnections(BilibiliPreparedPlayback playback) async {
+    final session = _sessionForPlayback(playback);
+    if (session == null || session.isClosed) return;
+    await Future.wait<void>([
+      _warmCdnTrack(session, session.selectedAudio),
+      _warmCdnTrack(session, session.selectedVideo),
+    ]);
+  }
+
+  Future<void> _warmCdnTrack(
+    _GatewaySession session,
+    StreamItem track,
+  ) async {
+    final uri = () {
+      for (final candidate in <String>[track.baseUrl, ...track.backupUrls]) {
+        final parsed = Uri.tryParse(candidate);
+        if (parsed != null && _isAllowedMediaUri(parsed)) return parsed;
+      }
+      return null;
+    }();
+    if (uri == null) return;
+    try {
+      final request = await session.mediaClient.getUrl(uri);
+      request.headers.set(HttpHeaders.userAgentHeader, _userAgent);
+      request.headers.set(HttpHeaders.refererHeader, _referer);
+      request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
+      request.headers.set(
+        HttpHeaders.rangeHeader,
+        'bytes=0-${_warmRangeEnd(track)}',
+      );
+      final response = await request.close().timeout(
+        const Duration(seconds: 4),
+      );
+      await response.drain<void>().timeout(const Duration(seconds: 4));
+    } catch (_) {}
+  }
+
+  int _warmRangeEnd(StreamItem track) {
+    final match = RegExp(r'-(\d+)\s*$').firstMatch(track.indexRange);
+    if (match != null) {
+      final end = int.tryParse(match.group(1)!);
+      if (end != null && end > 0) return end;
+    }
+    return 4095;
+  }
+
+  /// Bilibili CDN URLs stay valid well past [_refreshAge]. Reusing a fresh
+  /// playurl avoids a blocking API round-trip when re-opening the same card.
+  Future<BilibiliStreamInfo> _playUrlFor(
+    String bvid,
+    int cid, {
+    bool forceRefresh = false,
+  }) async {
+    final key = _playUrlCacheKey(bvid, cid);
+    if (!forceRefresh) {
+      final cached = _playUrlCache[key];
+      if (cached != null &&
+          DateTime.now().difference(cached.obtainedAt) < _refreshAge) {
+        return cached.info;
+      }
+    }
+    final info = await apiService.fetchPlayUrl(bvid, cid);
+    _playUrlCache[key] = (info: info, obtainedAt: DateTime.now());
+    return info;
   }
 
   double? _displayAspectRatioFor(BilibiliStreamInfo info) {
@@ -537,6 +877,20 @@ class BilibiliStreamingService extends ChangeNotifier {
     }
   }
 
+  /// True when this card already has readable track bytes that the loopback
+  /// gateway can serve after a process restart without hitting the CDN.
+  Future<bool> hasReusableTrackCache(String itemId) async {
+    final dir = await _resolveCacheDirectory();
+    final itemDir = Directory(p.join(dir.path, _safeName(itemId)));
+    if (!await itemDir.exists()) return false;
+    await for (final entity in itemDir.list(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = p.basename(entity.path);
+      if (name.endsWith('.track') || name.endsWith('.seg')) return true;
+    }
+    return false;
+  }
+
   /// Returns only the cache owned by one library card.
   ///
   /// The item id is the ownership boundary. The Bilibili URL, title and
@@ -779,6 +1133,7 @@ class BilibiliStreamingService extends ChangeNotifier {
     if (sessions.isEmpty) return;
     for (final session in sessions) {
       _sessions.remove(session.token);
+      _resetGatewayTransferMeter(session.itemId);
       session.close();
     }
     await Future.wait<void>([
@@ -796,6 +1151,11 @@ class BilibiliStreamingService extends ChangeNotifier {
     _server = null;
     _serverFuture = null;
     await _releaseSessions(_sessions.values.toList(growable: false));
+    _warmPlaybacks.clear();
+    _warmPrepareFutures.clear();
+    final sharedClient = _sharedMediaClient;
+    _sharedMediaClient = null;
+    sharedClient?.close(force: true);
     if (server != null) await server.close(force: true);
   }
 
@@ -861,31 +1221,38 @@ class BilibiliStreamingService extends ChangeNotifier {
     required int fallbackDurationMs,
     int? requestedQualityId,
     HttpClient? mediaClient,
+    BilibiliStreamInfo? streamInfo,
+    bool forcePlayUrlRefresh = false,
   }) async {
-    final streamInfo = await apiService.fetchPlayUrl(source.bvid!, source.cid!);
-    if (streamInfo.videoStreams.isEmpty || streamInfo.audioStreams.isEmpty) {
+    final resolvedStreamInfo =
+        streamInfo ??
+        await _playUrlFor(
+          source.bvid!,
+          source.cid!,
+          forceRefresh: forcePlayUrlRefresh,
+        );
+    if (resolvedStreamInfo.videoStreams.isEmpty ||
+        resolvedStreamInfo.audioStreams.isEmpty) {
       throw StateError('当前账号没有可播放的 Bilibili 音视频轨道');
     }
-    final video = _selectVideo(streamInfo, requestedQualityId);
+    final video = _selectVideo(resolvedStreamInfo, requestedQualityId);
     final compatibleAudio =
-        streamInfo.audioStreams.where(_hasAllowedMediaUri).toList()..sort((
-          a,
-          b,
-        ) {
-          // AAC is the cross-platform baseline. Prefer it over Dolby/FLAC when
-          // multiple Bilibili audio classes are returned, then choose bitrate.
-          int codecRank(StreamItem item) {
-            final codec = item.codecs.toLowerCase();
-            if (codec.startsWith('mp4a')) return 0;
-            if (codec.contains('opus')) return 1;
-            if (codec.contains('ec-3') || codec.contains('eac3')) return 2;
-            if (codec.contains('flac')) return 3;
-            return 4;
-          }
+        resolvedStreamInfo.audioStreams.where(_hasAllowedMediaUri).toList()
+          ..sort((a, b) {
+            // AAC is the cross-platform baseline. Prefer it over Dolby/FLAC when
+            // multiple Bilibili audio classes are returned, then choose bitrate.
+            int codecRank(StreamItem item) {
+              final codec = item.codecs.toLowerCase();
+              if (codec.startsWith('mp4a')) return 0;
+              if (codec.contains('opus')) return 1;
+              if (codec.contains('ec-3') || codec.contains('eac3')) return 2;
+              if (codec.contains('flac')) return 3;
+              return 4;
+            }
 
-          final codec = codecRank(a).compareTo(codecRank(b));
-          return codec != 0 ? codec : b.bandwidth.compareTo(a.bandwidth);
-        });
+            final codec = codecRank(a).compareTo(codecRank(b));
+            return codec != 0 ? codec : b.bandwidth.compareTo(a.bandwidth);
+          });
     final audio = compatibleAudio.isEmpty ? null : compatibleAudio.first;
     if (audio == null) throw StateError('Bilibili 未返回可用音轨');
     return _GatewaySession(
@@ -893,12 +1260,12 @@ class BilibiliStreamingService extends ChangeNotifier {
       itemId: itemId,
       source: source,
       obtainedAt: DateTime.now(),
-      streamInfo: streamInfo,
+      streamInfo: resolvedStreamInfo,
       selectedVideo: video,
       selectedAudio: audio,
-      mediaClient: mediaClient ?? _createMediaClient(),
-      durationMs: streamInfo.durationMs > 0
-          ? streamInfo.durationMs
+      mediaClient: mediaClient ?? _sharedMediaClientForSessions(),
+      durationMs: resolvedStreamInfo.durationMs > 0
+          ? resolvedStreamInfo.durationMs
           : fallbackDurationMs,
     );
   }
@@ -1046,6 +1413,10 @@ class BilibiliStreamingService extends ChangeNotifier {
     _GatewaySession session, {
     required bool video,
   }) async {
+    if (await _tryServeCachedTrack(downstream, session, video: video)) {
+      return;
+    }
+
     var track = video ? session.selectedVideo : session.selectedAudio;
     HttpClientResponse? upstream;
     for (var attempt = 0; attempt < 2; attempt++) {
@@ -1092,6 +1463,13 @@ class BilibiliStreamingService extends ChangeNotifier {
     IOSink? sink;
     var cacheDisabled = false;
     Future<void>? closeCacheFuture;
+    final cachedRange = _byteRangeFromContentRange(
+      upstream.headers.value(HttpHeaders.contentRangeHeader),
+      fallbackStart: _parseByteRange(
+        downstream.headers.value(HttpHeaders.rangeHeader),
+      )?.start,
+      contentLength: upstream.headers.contentLength,
+    );
 
     Future<void> closeCache({required bool delete}) {
       cacheDisabled = true;
@@ -1111,6 +1489,23 @@ class BilibiliStreamingService extends ChangeNotifier {
           try {
             if (await file.exists()) await file.delete();
           } catch (_) {}
+          return;
+        }
+        final range = cachedRange;
+        if (range == null) return;
+        try {
+          await _commitTrackCacheSegment(
+            session,
+            video: video,
+            start: range.start,
+            endExclusive: range.endExclusive,
+            totalBytes: range.totalBytes,
+            tempFile: file,
+          );
+        } catch (_) {
+          try {
+            if (await file.exists()) await file.delete();
+          } catch (_) {}
         }
       }();
     }
@@ -1119,12 +1514,14 @@ class BilibiliStreamingService extends ChangeNotifier {
 
     if (session.isCachingEnabled &&
         (upstream.statusCode == HttpStatus.ok ||
-            upstream.statusCode == HttpStatus.partialContent)) {
+            upstream.statusCode == HttpStatus.partialContent) &&
+        cachedRange != null) {
       try {
-        cacheFile = await _allocateCacheFile(
+        cacheFile = await _allocateTrackCacheTempFile(
           session,
           video: video,
-          range: downstream.headers.value(HttpHeaders.rangeHeader),
+          start: cachedRange.start,
+          endExclusive: cachedRange.endExclusive,
         );
         sink = cacheFile.openWrite();
         _activeCacheFiles.add(p.normalize(cacheFile.path));
@@ -1137,6 +1534,7 @@ class BilibiliStreamingService extends ChangeNotifier {
       await for (final bytes in upstream) {
         downstream.response.add(bytes);
         if (!cacheDisabled) sink?.add(bytes);
+        _recordGatewayTransfer(session.itemId, bytes.length);
       }
     } finally {
       session.unregisterCacheWriter(disableCacheWriter);
@@ -1190,6 +1588,7 @@ class BilibiliStreamingService extends ChangeNotifier {
       fallbackDurationMs: session.durationMs,
       requestedQualityId: session.selectedVideo.id,
       mediaClient: session.mediaClient,
+      forcePlayUrlRefresh: true,
     );
     session
       ..obtainedAt = refreshed.obtainedAt
@@ -1222,21 +1621,333 @@ class BilibiliStreamingService extends ChangeNotifier {
     return dir;
   }
 
-  Future<File> _allocateCacheFile(
+  Future<File> _allocateTrackCacheTempFile(
     _GatewaySession session, {
     required bool video,
-    String? range,
+    required int start,
+    required int endExclusive,
   }) async {
-    final root = await _resolveCacheDirectory();
-    final itemDir = Directory(p.join(root.path, _safeName(session.itemId)));
-    if (!await itemDir.exists()) await itemDir.create(recursive: true);
-    final normalizedRange = _safeName(range ?? 'full');
+    final itemDir = await _itemCacheDirectory(session.itemId);
     return File(
       p.join(
         itemDir.path,
-        '${video ? 'video' : 'audio'}_${normalizedRange}_${_cacheSequence++}.cache',
+        '${_trackCachePrefix(session, video: video)}_$start-$endExclusive.seg.tmp',
       ),
     );
+  }
+
+  Future<Directory> _itemCacheDirectory(String itemId) async {
+    final root = await _resolveCacheDirectory();
+    final itemDir = Directory(p.join(root.path, _safeName(itemId)));
+    if (!await itemDir.exists()) await itemDir.create(recursive: true);
+    return itemDir;
+  }
+
+  String _trackCachePrefix(_GatewaySession session, {required bool video}) {
+    final track = video ? session.selectedVideo : session.selectedAudio;
+    return '${video ? 'video' : 'audio'}_${track.id}';
+  }
+
+  Future<void> _commitTrackCacheSegment(
+    _GatewaySession session, {
+    required bool video,
+    required int start,
+    required int endExclusive,
+    int? totalBytes,
+    required File tempFile,
+  }) async {
+    final prefix = _trackCachePrefix(session, video: video);
+    await _runCacheOp('${session.itemId}:$prefix', () async {
+      if (!await tempFile.exists()) return;
+      final length = await tempFile.length();
+      if (length <= 0 || length != endExclusive - start) {
+        await tempFile.delete();
+        return;
+      }
+      final itemDir = await _itemCacheDirectory(session.itemId);
+      final store = await _openTrackCacheStore(itemDir, prefix);
+      await _writeBytesIntoTrackFile(
+        store.file,
+        start: start,
+        source: tempFile,
+      );
+      await tempFile.delete();
+      store.index.addRange(start, endExclusive, totalBytes: totalBytes);
+      await _persistTrackCacheIndex(store);
+    });
+  }
+
+  /// Serves a Range from the sparse track file when the merged interval map
+  /// covers it. Exact filename matches are not required, so a restarted
+  /// libmpv that asks for a different window can still hit disk.
+  ///
+  /// The cache IO lock only covers index lookup. Holding it while copying the
+  /// HTTP body serialized the next seek behind whatever readahead Range was
+  /// already streaming — even a fully cached timestamp then waited seconds.
+  Future<bool> _tryServeCachedTrack(
+    HttpRequest downstream,
+    _GatewaySession session, {
+    required bool video,
+  }) async {
+    final requested = _parseByteRange(
+      downstream.headers.value(HttpHeaders.rangeHeader),
+    );
+    final prefix = _trackCachePrefix(session, video: video);
+    final plan = await _runCacheOp('${session.itemId}:$prefix', () async {
+      final itemDir = await _itemCacheDirectory(session.itemId);
+      final store = await _openTrackCacheStore(itemDir, prefix);
+      if (store.index.dirty) await _persistTrackCacheIndex(store);
+      if (!await store.file.exists()) return null;
+
+      int sliceStart;
+      int sliceEndInclusive;
+      var status = HttpStatus.partialContent;
+      if (requested == null) {
+        if (!store.index.isComplete || store.index.totalBytes == null) {
+          return null;
+        }
+        sliceStart = 0;
+        sliceEndInclusive = store.index.totalBytes! - 1;
+        status = HttpStatus.ok;
+      } else {
+        sliceStart = requested.start;
+        if (requested.endInclusive == null) {
+          final contiguousEnd = store.index.contiguousEndExclusive(sliceStart);
+          if (contiguousEnd == null || contiguousEnd <= sliceStart) {
+            return null;
+          }
+          sliceEndInclusive = contiguousEnd - 1;
+        } else {
+          sliceEndInclusive = requested.endInclusive!;
+          if (!store.index.covers(sliceStart, sliceEndInclusive + 1)) {
+            // libmpv often asks for a window larger than any one cached
+            // slice. Serve the contiguous prefix so a fully-watched file
+            // still seeks from disk instead of waiting on CDN.
+            final contiguousEnd = store.index.contiguousEndExclusive(
+              sliceStart,
+            );
+            if (contiguousEnd == null || contiguousEnd <= sliceStart) {
+              return null;
+            }
+            sliceEndInclusive = contiguousEnd - 1;
+            if (sliceEndInclusive > requested.endInclusive!) {
+              sliceEndInclusive = requested.endInclusive!;
+            }
+          }
+        }
+      }
+      if (sliceStart < 0 || sliceStart > sliceEndInclusive) return null;
+      final sliceLength = sliceEndInclusive - sliceStart + 1;
+      final fileLength = await store.file.length();
+      if (fileLength < sliceStart + sliceLength) return null;
+      return _CachedTrackServePlan(
+        file: store.file,
+        sliceStart: sliceStart,
+        sliceLength: sliceLength,
+        status: status,
+        video: video,
+        totalBytes: store.index.totalBytes,
+      );
+    });
+    if (plan == null) return false;
+
+    final sliceEndInclusive = plan.sliceEndInclusive;
+    downstream.response.statusCode = plan.status;
+    downstream.response.headers.contentType = ContentType(
+      plan.video ? 'video' : 'audio',
+      'mp4',
+    );
+    downstream.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+    final total = plan.totalBytes;
+    if (plan.status == HttpStatus.partialContent) {
+      downstream.response.headers.set(
+        HttpHeaders.contentRangeHeader,
+        total != null && total > sliceEndInclusive
+            ? 'bytes ${plan.sliceStart}-$sliceEndInclusive/$total'
+            : 'bytes ${plan.sliceStart}-$sliceEndInclusive/*',
+      );
+    }
+    downstream.response.contentLength = plan.sliceLength;
+    if (downstream.method == 'HEAD') {
+      await downstream.response.close();
+      return true;
+    }
+    final raf = await plan.file.open();
+    try {
+      await raf.setPosition(plan.sliceStart);
+      var remaining = plan.sliceLength;
+      while (remaining > 0) {
+        final chunkSize = remaining < 64 * 1024 ? remaining : 64 * 1024;
+        final chunk = await raf.read(chunkSize);
+        if (chunk.isEmpty) break;
+        downstream.response.add(chunk);
+        remaining -= chunk.length;
+      }
+    } finally {
+      await raf.close();
+    }
+    await downstream.response.close();
+    return true;
+  }
+
+  /// Parses `Range: bytes=start-end` / `bytes=start-`. Open-ended ranges leave
+  /// [endInclusive] null so any covering segment that contains [start] matches.
+  ({int start, int? endInclusive})? _parseByteRange(String? header) {
+    if (header == null || header.isEmpty) return null;
+    final match = RegExp(r'^bytes=(\d+)-(\d*)$').firstMatch(header.trim());
+    if (match == null) return null;
+    final start = int.parse(match.group(1)!);
+    final endText = match.group(2)!;
+    return (
+      start: start,
+      endInclusive: endText.isEmpty ? null : int.parse(endText),
+    );
+  }
+
+  /// Maps a CDN 206 Content-Range, or a 200 with known length, onto a cache
+  /// slice `[start, endExclusive)`. Incomplete headers are not cached.
+  ({int start, int endExclusive, int? totalBytes})? _byteRangeFromContentRange(
+    String? contentRange, {
+    int? fallbackStart,
+    int contentLength = -1,
+  }) {
+    if (contentRange != null && contentRange.isNotEmpty) {
+      final match = RegExp(
+        r'bytes\s+(\d+)-(\d+)/(\d+|\*)',
+      ).firstMatch(contentRange);
+      if (match != null) {
+        final start = int.parse(match.group(1)!);
+        final endInclusive = int.parse(match.group(2)!);
+        if (endInclusive < start) return null;
+        final totalText = match.group(3)!;
+        return (
+          start: start,
+          endExclusive: endInclusive + 1,
+          totalBytes: totalText == '*' ? null : int.parse(totalText),
+        );
+      }
+    }
+    if (contentLength > 0) {
+      final start = fallbackStart ?? 0;
+      return (
+        start: start,
+        endExclusive: start + contentLength,
+        totalBytes: fallbackStart == null ? contentLength : null,
+      );
+    }
+    return null;
+  }
+
+  Future<({File file, File indexFile, _TrackCacheIndex index})>
+  _openTrackCacheStore(Directory itemDir, String prefix) async {
+    await _ingestLegacySegFiles(itemDir, prefix);
+    final file = File(p.join(itemDir.path, '$prefix.track'));
+    final indexFile = File(p.join(itemDir.path, '$prefix.track.json'));
+    return (
+      file: file,
+      indexFile: indexFile,
+      index: await _readTrackCacheIndex(indexFile),
+    );
+  }
+
+  Future<_TrackCacheIndex> _readTrackCacheIndex(File indexFile) async {
+    if (!await indexFile.exists()) return _TrackCacheIndex();
+    try {
+      final decoded = jsonDecode(await indexFile.readAsString());
+      if (decoded is Map<String, dynamic>) {
+        return _TrackCacheIndex.fromJson(decoded);
+      }
+      if (decoded is Map) {
+        return _TrackCacheIndex.fromJson(Map<String, dynamic>.from(decoded));
+      }
+    } catch (_) {}
+    return _TrackCacheIndex();
+  }
+
+  Future<void> _persistTrackCacheIndex(
+    ({File file, File indexFile, _TrackCacheIndex index}) store,
+  ) async {
+    if (!store.index.dirty) return;
+    await store.indexFile.writeAsString(
+      jsonEncode(store.index.toJson()),
+      flush: true,
+    );
+    store.index.dirty = false;
+  }
+
+  /// Fold leftover per-Range `.seg` dumps into the sparse track file so a
+  /// later, differently aligned libmpv Range can still be served.
+  Future<void> _ingestLegacySegFiles(Directory itemDir, String prefix) async {
+    if (!await itemDir.exists()) return;
+    final indexFile = File(p.join(itemDir.path, '$prefix.track.json'));
+    final trackFile = File(p.join(itemDir.path, '$prefix.track'));
+    var index = await _readTrackCacheIndex(indexFile);
+    var changed = false;
+    await for (final entity in itemDir.list(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = p.basename(entity.path);
+      final match = RegExp(
+        '^${RegExp.escape(prefix)}_(\\d+)-(\\d+)\\.seg\$',
+      ).firstMatch(name);
+      if (match == null) continue;
+      final start = int.parse(match.group(1)!);
+      final endExclusive = int.parse(match.group(2)!);
+      if (!index.covers(start, endExclusive)) {
+        await _writeBytesIntoTrackFile(
+          trackFile,
+          start: start,
+          source: entity,
+        );
+        index.addRange(start, endExclusive);
+      }
+      try {
+        await entity.delete();
+      } catch (_) {}
+      changed = true;
+    }
+    if (changed) {
+      index.dirty = true;
+      await indexFile.writeAsString(jsonEncode(index.toJson()), flush: true);
+    }
+  }
+
+  Future<void> _writeBytesIntoTrackFile(
+    File trackFile, {
+    required int start,
+    required File source,
+  }) async {
+    final length = await source.length();
+    if (length <= 0) return;
+    final endExclusive = start + length;
+    final raf = await trackFile.open(mode: FileMode.append);
+    try {
+      if (await raf.length() < endExclusive) {
+        await raf.truncate(endExclusive);
+      }
+      await raf.setPosition(start);
+      final src = await source.open();
+      try {
+        var remaining = length;
+        while (remaining > 0) {
+          final chunkSize = remaining < 64 * 1024 ? remaining : 64 * 1024;
+          final chunk = await src.read(chunkSize);
+          if (chunk.isEmpty) break;
+          await raf.writeFrom(chunk);
+          remaining -= chunk.length;
+        }
+      } finally {
+        await src.close();
+      }
+    } finally {
+      await raf.close();
+    }
+  }
+
+  Future<T> _runCacheOp<T>(String key, Future<T> Function() op) {
+    final previous = _cacheIoLocks[key] ?? Future<void>.value();
+    final run = previous.catchError((_) {}).then((_) => op());
+    _cacheIoLocks[key] = run.then((_) {}, onError: (_) {});
+    return run;
   }
 
   void _pruneSessions() {
@@ -1250,8 +1961,14 @@ class BilibiliStreamingService extends ChangeNotifier {
     }
   }
 
-  HttpClient _createMediaClient() =>
-      HttpClient()..connectionTimeout = const Duration(seconds: 10);
+  HttpClient _sharedMediaClientForSessions() {
+    return _sharedMediaClient ??= _createMediaClient();
+  }
+
+  HttpClient _createMediaClient() => HttpClient()
+    ..connectionTimeout = const Duration(seconds: 8)
+    ..idleTimeout = const Duration(seconds: 60)
+    ..maxConnectionsPerHost = 8;
 
   String _safeName(String input) => _safeNameStatic(input);
 
@@ -1270,6 +1987,28 @@ class BilibiliStreamingService extends ChangeNotifier {
   String _xml(String input) => const HtmlEscape(
     HtmlEscapeMode.element,
   ).convert(input).replaceAll('"', '&quot;');
+}
+
+/// Disk slice to copy to a gateway client. Built under the cache IO lock,
+/// then streamed without holding that lock.
+class _CachedTrackServePlan {
+  const _CachedTrackServePlan({
+    required this.file,
+    required this.sliceStart,
+    required this.sliceLength,
+    required this.status,
+    required this.video,
+    this.totalBytes,
+  });
+
+  final File file;
+  final int sliceStart;
+  final int sliceLength;
+  final int status;
+  final bool video;
+  final int? totalBytes;
+
+  int get sliceEndInclusive => sliceStart + sliceLength - 1;
 }
 
 class _GatewaySession {
@@ -1349,6 +2088,7 @@ class _GatewaySession {
   void close() {
     if (_closed) return;
     _closed = true;
-    mediaClient.close(force: true);
+    // The shared CDN client outlives a single episode so the next skip can
+    // reuse TLS. Only close a client that this session uniquely owns.
   }
 }

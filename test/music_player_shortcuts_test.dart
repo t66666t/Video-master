@@ -119,7 +119,7 @@ void main() {
     final initialVolume = mediaPlayback.volume;
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
     await tester.pump();
-    expect(mediaPlayback.volume, (initialVolume - 0.1).clamp(0.0, 1.0));
+    expect(mediaPlayback.volume, (initialVolume - 0.05).clamp(0.0, 1.0));
     await mediaPlayback.setVolume(initialVolume);
 
     // Keep the providers mounted for the frame in which MusicPlayerScreen is

@@ -13,6 +13,7 @@ import 'package:video_player_platform_interface/video_player_platform_interface.
 import 'pitch_preserving_audio_pipeline.dart';
 import 'local_playback_backend_policy.dart';
 import '../services/settings_service.dart';
+import '../services/subtitle_hop_seek_policy.dart';
 
 class NativeVideoPlayerMediaKit {
   static const Set<String> _audioOnlyExtensions = <String>{
@@ -52,6 +53,27 @@ class NativeVideoPlayerMediaKit {
   static const String externalAudioSourceHeader =
       'x-fluent-player-external-audio-source';
 
+  /// Quality hand-off creates a second Player that immediately seeks away from
+  /// t=0. Skip the conservative 2s cache-pause-initial so the warm decoder
+  /// does not sit idle while the visible stream keeps playing.
+  static const String fastStreamStartHeader =
+      'x-fluent-player-fast-stream-start';
+
+  /// Mini card / notification: the loopback audio URL is the primary media.
+  /// Skip video-track discovery so audio can start without waiting on video.
+  static const String audioPrimaryStreamHeader =
+      'x-fluent-player-audio-primary';
+
+  /// Same split stream as the playback page, but start with [VideoTrack.no]
+  /// so Mini/notification does not decode video. Re-enabling the track later
+  /// keeps the Player and clock — no recreate+seek on page entry.
+  static const String deferVideoStreamHeader =
+      'x-fluent-player-defer-video';
+
+  /// Open libmpv already parked at this timestamp (milliseconds). Avoids an
+  /// extra Range seek after initialize when resuming or handing off quality.
+  static const String startPositionMsHeader = 'x-fluent-player-start-ms';
+
   static bool get supportsHardwareVideoDecodingControl =>
       UniversalPlatform.isAndroid ||
       UniversalPlatform.isIOS ||
@@ -83,6 +105,12 @@ class NativeVideoPlayerMediaKit {
     return _NativeMediaKitVideoPlayer.registeredInstance?._positionStreamFor(
       playerId,
     );
+  }
+
+  /// libmpv `time-pos`, not video_player's Dart cache. The cache can echo a
+  /// `start=` header after the post-open video-track select has reset decode.
+  static Duration? timePosFor(int playerId) {
+    return _NativeMediaKitVideoPlayer.registeredInstance?._timePosFor(playerId);
   }
 
   /// Returns each rate after libmpv has accepted it. Frame-driven overlays use
@@ -123,6 +151,52 @@ class NativeVideoPlayerMediaKit {
         false;
   }
 
+  /// Split Bilibili streams deselect video with [VideoTrack.no]. Re-selecting
+  /// that elementary stream makes libmpv decode from the start of the file,
+  /// while the Player clock and external audio keep running. Seek back unless
+  /// the clock is already at zero (a genuine start).
+  ///
+  /// A live Mini/notification clock still needs this seek for A/V sync, but
+  /// the seek itself must not use cache-pause — that is the audible hitch.
+  @visibleForTesting
+  static bool shouldSeekAfterExternalVideoTrackEnable({
+    required String previousTrackId,
+    required String nextTrackId,
+    required Duration clockPosition,
+  }) {
+    if (previousTrackId == nextTrackId) return false;
+    return clockPosition > Duration.zero;
+  }
+
+  /// A live Mini clock must not be seeked when `vid` joins in place. A cold
+  /// restore can still drop `time-pos` back to the file start; only that
+  /// collapse should be repaired, otherwise audio hitches on page entry.
+  @visibleForTesting
+  static bool shouldRepairClockAfterExternalVideoTrackEnable({
+    required Duration clockBefore,
+    required Duration clockAfter,
+  }) {
+    if (clockBefore <= Duration.zero) return false;
+    return clockAfter + const Duration(milliseconds: 400) < clockBefore &&
+        clockAfter <= const Duration(milliseconds: 450);
+  }
+
+  /// `setVideoTrack` can reset the reported `time-pos` toward zero while the
+  /// external audio clock keeps running. Prefer wall-clock interpolation of
+  /// the pre-switch sample over that stale report.
+  @visibleForTesting
+  static Duration liveClockAfterVideoTrackEnable({
+    required Duration clockBefore,
+    required Duration elapsed,
+    required Duration clockAfter,
+  }) {
+    final predicted = clockBefore + elapsed;
+    if (clockAfter + const Duration(milliseconds: 400) < clockBefore) {
+      return predicted;
+    }
+    return clockAfter >= predicted ? clockAfter : predicted;
+  }
+
   /// Selects or deselects the primary video track of a split Bilibili stream.
   /// The external audio track and the Player clock remain untouched, allowing
   /// mobile background playback to stop consuming video bytes without an
@@ -131,19 +205,45 @@ class NativeVideoPlayerMediaKit {
   static Future<bool> setExternalVideoTrackEnabledFor(
     int playerId, {
     required bool enabled,
+    bool keepPlaying = false,
   }) async {
     return await _NativeMediaKitVideoPlayer.registeredInstance
-            ?._setExternalVideoTrackEnabledFor(playerId, enabled: enabled) ??
+            ?._setExternalVideoTrackEnabledFor(
+              playerId,
+              enabled: enabled,
+              keepPlaying: keepPlaying,
+            ) ??
         false;
   }
 
   /// Completes only after the native media clock has demonstrably started or
   /// the demuxer has buffered beyond the requested position. Unlike a texture
-  /// frame, this remains a valid readiness signal while Android is backgrounded.
+  /// frame, this remains a valid readiness signal while no playback page is
+  /// mounted (Mini card, notification, desktop background audio).
   static Future<bool>? playbackReadyFor(int playerId) {
     return _NativeMediaKitVideoPlayer.registeredInstance?._playbackReadyFor(
       playerId,
     );
+  }
+
+  /// Mini-card / notification play must not wait for `buffering` to go false.
+  /// Split Bilibili streams often keep that flag true for the whole session
+  /// (cache-pause, readahead). A running clock or a filled demuxer window is
+  /// enough to treat audio-only playback as started. Windows often reports
+  /// neither `playing` nor buffer ahead; Mini chrome then uses play intent.
+  @visibleForTesting
+  static bool isBackgroundPlaybackClockReady({
+    required bool playing,
+    required bool completed,
+    required bool positionAdvanced,
+    required bool bufferedAhead,
+  }) {
+    if (completed) return false;
+    // cache-pause leaves `playing` false while packets are already in the
+    // demuxer. Waiting for the Dart isPlaying flag made Mini/notification
+    // skips look dead on a gigabit link.
+    if (bufferedAhead) return true;
+    return playing && positionAdvanced;
   }
 
   /// Reopens the same media on Android with software video decoding while
@@ -162,6 +262,21 @@ class NativeVideoPlayerMediaKit {
   static void cancelPendingRateChange(int playerId) {
     _NativeMediaKitVideoPlayer.registeredInstance?._cancelPendingRateChange(
       playerId,
+    );
+  }
+
+  /// Installs libmpv seek/cache properties for the next [VideoPlayerController.seekTo].
+  ///
+  /// Sentence hops on split Bilibili streams use keyframe seeks and a short
+  /// cache-pause so the clock is not held for [SubtitleHopSeekPolicy.streamingCachePauseWaitSeconds].
+  /// Precise seeks restore the conservative streaming defaults.
+  static Future<void> prepareSeekStyleFor(
+    int playerId, {
+    required StreamingSeekStyle style,
+  }) async {
+    await _NativeMediaKitVideoPlayer.registeredInstance?._prepareSeekStyle(
+      playerId,
+      style: style,
     );
   }
 
@@ -291,6 +406,7 @@ class NativeVideoPlayerMediaKit {
         .replaceFirst(RegExp(r'[?#].*$'), '')
         .replaceAll('\\', '/')
         .toLowerCase();
+    if (normalized.endsWith('/audio')) return true;
     return _audioOnlyExtensions.any(normalized.endsWith);
   }
 
@@ -367,6 +483,8 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
   final _resizeEpochs = HashMap<int, int>();
   final _frameDropModes = HashMap<int, String>();
   final _decoderFallbackStates = HashMap<int, _DecoderFallbackState>();
+  final _streamingBufferPlayers = HashSet<int>();
+  final _streamingSeekStyles = HashMap<int, StreamingSeekStyle>();
 
   static void registerWith() {
     final previous = registeredInstance;
@@ -392,6 +510,10 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
 
   Stream<Duration>? _positionStreamFor(int textureId) {
     return _players[textureId]?.stream.position;
+  }
+
+  Duration? _timePosFor(int textureId) {
+    return _players[textureId]?.state.position;
   }
 
   Stream<double>? _rateStreamFor(int textureId) {
@@ -513,10 +635,12 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
             30;
         final bufferedAhead =
             state.buffer.inMilliseconds > state.position.inMilliseconds + 30;
-        if (state.playing &&
-            !state.completed &&
-            !state.buffering &&
-            (positionAdvanced || bufferedAhead)) {
+        if (NativeVideoPlayerMediaKit.isBackgroundPlaybackClockReady(
+          playing: state.playing,
+          completed: state.completed,
+          positionAdvanced: positionAdvanced,
+          bufferedAhead: bufferedAhead,
+        )) {
           return true;
         }
         await Future<void>.delayed(const Duration(milliseconds: 40));
@@ -528,6 +652,7 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
   Future<bool> _setExternalVideoTrackEnabledFor(
     int textureId, {
     required bool enabled,
+    bool keepPlaying = false,
   }) async {
     final player = _players[textureId];
     final state = _decoderFallbackStates[textureId];
@@ -548,14 +673,68 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
           final shouldEnable = _externalVideoTrackDesired[textureId] ?? true;
           if (shouldEnable) {
             state!.externalVideoTrackSuspended = false;
+            final previousTrack = player.state.track.video;
+            final resumePosition = player.state.position;
+            // player.state.playing can drop during setVideoTrack. Trust the
+            // session intent so a background→foreground re-enable cannot pause
+            // a stream the user is already listening to.
+            final resumePlaying = player.state.playing || keepPlaying;
             final target =
                 _suspendedExternalVideoTracks.remove(textureId) ??
                 NativeVideoPlayerMediaKit.firstUsableVideoTrack(
                   player.state.tracks,
                 ) ??
                 VideoTrack.auto();
-            if (player.state.track.video.id != target.id) {
+            if (previousTrack.id == target.id) return;
+            // Keep the clock running. A global seek after setVideoTrack
+            // flushes the AO — that is the Mini/notification "audio hiccup".
+            // hr-seek lets the newly selected video demuxer join the current
+            // time-pos without moving the shared clock.
+            if (resumePlaying) {
+              await _prepareVideoTrackJoinPreservingAudio(player);
+              final platform = player.platform;
+              if (platform is NativePlayer) {
+                // setVideoTrack waits on the video demuxer and can stall the
+                // AO. Setting `vid` without waiting keeps audio running.
+                await platform.setProperty(
+                  'vid',
+                  target.id,
+                  waitForInitialization: false,
+                );
+              } else {
+                await player.setVideoTrack(target);
+              }
+              // Join-in-place must not seek. A cold restore can still collapse
+              // time-pos to t=0; repair only that reset.
+              if (NativeVideoPlayerMediaKit.shouldRepairClockAfterExternalVideoTrackEnable(
+                clockBefore: resumePosition,
+                clockAfter: player.state.position,
+              )) {
+                await player.seek(resumePosition);
+              }
+            } else {
               await player.setVideoTrack(target);
+            }
+            if (!resumePlaying &&
+                NativeVideoPlayerMediaKit.shouldSeekAfterExternalVideoTrackEnable(
+                  previousTrackId: previousTrack.id,
+                  nextTrackId: target.id,
+                  clockPosition: resumePosition,
+                )) {
+              await player.seek(resumePosition);
+            }
+            if (resumePlaying) {
+              if (!player.state.playing) await player.play();
+            } else {
+              // A paused seek does not ask the decoder for a replacement
+              // frame. Play briefly so the still image is not left black.
+              await player.play();
+              await Future<void>.delayed(const Duration(milliseconds: 80));
+              if (_players[textureId] == player &&
+                  (_externalVideoTrackDesired[textureId] ?? true) &&
+                  !keepPlaying) {
+                await player.pause();
+              }
             }
             return;
           }
@@ -583,6 +762,41 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     }
     return _players[textureId] == player &&
         _externalVideoTrackDesired[textureId] == enabled;
+  }
+
+  /// Prime libmpv so re-selecting a split video track does not pause the AO.
+  /// Default cache-pause=yes waits for the video GOP and silences audio —
+  /// that is the Mini/notification "audio hiccup" on both Windows and Android.
+  Future<void> _prepareVideoTrackJoinPreservingAudio(Player player) async {
+    final platform = player.platform;
+    if (platform is! NativePlayer) return;
+    await Future.wait<void>([
+      platform.setProperty(
+        'cache-pause',
+        'no',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'cache-pause-initial',
+        'no',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'cache-pause-wait',
+        '0',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'hr-seek',
+        'yes',
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'hr-seek-framedrop',
+        'yes',
+        waitForInitialization: false,
+      ),
+    ]);
   }
 
   Future<bool> _recoverVideoOutputFor(int textureId) async {
@@ -711,6 +925,8 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     _outputVideoSizes.remove(textureId);
     _resizeEpochs.remove(textureId);
     _frameDropModes.remove(textureId);
+    _streamingBufferPlayers.remove(textureId);
+    _streamingSeekStyles.remove(textureId);
   }
 
   @override
@@ -757,6 +973,25 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
       final externalAudioUri = httpHeaders.remove(
         NativeVideoPlayerMediaKit.externalAudioSourceHeader,
       );
+      final fastStreamStart =
+          httpHeaders.remove(NativeVideoPlayerMediaKit.fastStreamStartHeader) ==
+          '1';
+      final audioPrimary =
+          httpHeaders.remove(
+            NativeVideoPlayerMediaKit.audioPrimaryStreamHeader,
+          ) ==
+          '1';
+      final deferVideo =
+          httpHeaders.remove(
+            NativeVideoPlayerMediaKit.deferVideoStreamHeader,
+          ) ==
+          '1';
+      final startMs = int.tryParse(
+        httpHeaders.remove(
+              NativeVideoPlayerMediaKit.startPositionMsHeader,
+            ) ??
+            '',
+      );
 
       switch (dataSource.sourceType) {
         case DataSourceType.asset:
@@ -778,9 +1013,9 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
           break;
       }
 
-      final knownAudioOnly = NativeVideoPlayerMediaKit.isKnownAudioOnlyResource(
-        resource,
-      );
+      final knownAudioOnly =
+          audioPrimary ||
+          NativeVideoPlayerMediaKit.isKnownAudioOnlyResource(resource);
       final createVideoOutput =
           NativeVideoPlayerMediaKit.shouldCreateVideoOutput(
             resource: resource,
@@ -807,6 +1042,10 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
         videoOutputDeferred: videoOutputDeferred,
       );
       _decoderFallbackStates[textureId] = decoderFallbackState;
+      if (deferVideo) {
+        decoderFallbackState.externalVideoTrackSuspended = true;
+        _externalVideoTrackDesired[textureId] = false;
+      }
       _initialize(textureId);
 
       // VideoController initialization is deliberately asynchronous and the
@@ -825,14 +1064,35 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
       // is inaudible while paused, but still needlessly rebuilds the native graph.
       await PitchPreservingAudioPipeline.configure(player);
       await _configureHighResolutionPlayback(player);
-      if (externalAudioUri != null) {
-        await _configureStreamingBuffer(player);
+      if (externalAudioUri != null || audioPrimary) {
+        await _configureStreamingBuffer(
+          player,
+          textureId,
+          fastStart: fastStreamStart || audioPrimary || deferVideo,
+          audioOnly: audioPrimary || knownAudioOnly,
+        );
+      }
+      if (startMs != null && startMs > 0) {
+        final platform = player.platform;
+        if (platform is NativePlayer) {
+          // Open already parked at the resume point so initialize does not
+          // fetch t=0 and then immediately throw that work away with a seek.
+          await platform.setProperty(
+            'start',
+            (startMs / 1000).toStringAsFixed(3),
+            waitForInitialization: false,
+          );
+        }
       }
       await _openMediaWithExternalAudio(
         player,
         media,
         externalAudioUri: externalAudioUri,
         knownAudioOnly: knownAudioOnly,
+        startWithoutVideo: audioPrimary || deferVideo,
+        startPosition: startMs != null && startMs > 0
+            ? Duration(milliseconds: startMs)
+            : Duration.zero,
       );
       await _disableSubtitleOutput(player);
       if (knownAudioOnly) {
@@ -949,6 +1209,35 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     return _players[textureId]?.seek(position);
   }
 
+  Future<void> _prepareSeekStyle(
+    int textureId, {
+    required StreamingSeekStyle style,
+  }) async {
+    if (!_streamingBufferPlayers.contains(textureId)) return;
+    final player = _players[textureId];
+    final platform = player?.platform;
+    if (platform is! NativePlayer) return;
+    if (_streamingSeekStyles[textureId] == style) return;
+    await Future.wait<void>([
+      platform.setProperty(
+        'hr-seek',
+        SubtitleHopSeekPolicy.hrSeekFor(style),
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'cache-pause-wait',
+        SubtitleHopSeekPolicy.cachePauseWaitSecondsFor(style),
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'cache-pause-initial',
+        'no',
+        waitForInitialization: false,
+      ),
+    ]);
+    _streamingSeekStyles[textureId] = style;
+  }
+
   @override
   Future<void> setPlaybackSpeed(int textureId, double speed) {
     final delegatedTextureId = _delegatedTextureIds[textureId];
@@ -1063,7 +1352,10 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
 
   @override
   Future<void> setMixWithOthers(bool mixWithOthers) {
-    if (UniversalPlatform.isAndroid) {
+    // Android ExoPlayer and iOS AVAudioSession both live on the stock
+    // video_player plugin. Forwarding keeps mix/exclusive in sync even when
+    // the visible player is actually media_kit.
+    if (UniversalPlatform.isAndroid || UniversalPlatform.isIOS) {
       return _platformFallback.setMixWithOthers(mixWithOthers);
     }
     return Future<void>.value();
@@ -1408,8 +1700,13 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     Media media, {
     required String? externalAudioUri,
     required bool knownAudioOnly,
+    bool startWithoutVideo = false,
+    Duration startPosition = Duration.zero,
   }) async {
-    if (!knownAudioOnly) {
+    final audioOnly = knownAudioOnly || startWithoutVideo;
+    if (audioOnly) {
+      await player.setVideoTrack(VideoTrack.no());
+    } else {
       // A Bilibili DASH video URL is video-only. Explicitly selecting video
       // before load keeps libmpv from deciding that the file has no selected
       // streams and unloading it before the external audio-add command runs.
@@ -1418,18 +1715,28 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
 
     await player.open(media, play: false);
 
-    final selectedPrimaryVideoTrack =
-        !knownAudioOnly &&
-            externalAudioUri != null &&
-            externalAudioUri.isNotEmpty
-        ? await _waitForPrimaryVideoTrack(player)
-        : null;
+    // Attach audio immediately. Waiting for the video track first made Mini
+    // card / notification play sit on a silent spinner while video init
+    // downloaded — audio is a fraction of that size.
     await _attachExternalAudio(player, externalAudioUri);
-    if (selectedPrimaryVideoTrack != null) {
-      // audio-add mutates libmpv's track list. Select the already-discovered
-      // main video by its concrete id so automatic selection cannot settle on
-      // `no` (or on artwork exposed by the external audio container).
-      await player.setVideoTrack(selectedPrimaryVideoTrack);
+    if (audioOnly) {
+      if (player.state.track.video.id != 'no') {
+        await player.setVideoTrack(VideoTrack.no());
+      }
+      if (startPosition > Duration.zero) {
+        await player.seek(startPosition);
+      }
+      return;
+    }
+
+    // audio-add mutates libmpv's track list. Re-select the main video so
+    // automatic selection cannot settle on `no` or album art.
+    final selectedPrimaryVideoTrack = await _waitForPrimaryVideoTrack(player);
+    await player.setVideoTrack(selectedPrimaryVideoTrack);
+    // Selecting the elementary video stream restarts decode at t=0 and wipes
+    // mpv's `start=` offset. Re-park before Flutter initialize() returns.
+    if (startPosition > Duration.zero) {
+      await player.seek(startPosition);
     }
   }
 
@@ -1439,51 +1746,76 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
     );
     if (current != null) return current;
 
-    final tracks = await player.stream.tracks
-        .firstWhere(
-          (tracks) =>
-              NativeVideoPlayerMediaKit.firstUsableVideoTrack(tracks) != null,
-        )
-        .timeout(
-          const Duration(seconds: 20),
-          onTimeout: () => throw TimeoutException(
-            'Timed out waiting for the primary video track before attaching '
-            'external audio.',
-          ),
-        );
-    return NativeVideoPlayerMediaKit.firstUsableVideoTrack(tracks)!;
+    try {
+      final tracks = await player.stream.tracks
+          .firstWhere(
+            (tracks) =>
+                NativeVideoPlayerMediaKit.firstUsableVideoTrack(tracks) !=
+                null,
+          )
+          .timeout(const Duration(milliseconds: 400));
+      return NativeVideoPlayerMediaKit.firstUsableVideoTrack(tracks) ??
+          VideoTrack.auto();
+    } catch (_) {
+      // Audio is already attached. Falling back to auto unblocks initialize
+      // instead of sitting on a spinner for a video track list.
+      return VideoTrack.auto();
+    }
   }
 
-  Future<void> _configureStreamingBuffer(Player player) async {
+  Future<void> _configureStreamingBuffer(
+    Player player,
+    int textureId, {
+    bool fastStart = false,
+    bool audioOnly = false,
+  }) async {
     final platform = player.platform;
     if (platform is! NativePlayer) return;
-    final maxForwardBytes =
-        UniversalPlatform.isAndroid || UniversalPlatform.isIOS
-        ? 32 * 1024 * 1024
-        : 64 * 1024 * 1024;
-    final maxBackBytes = UniversalPlatform.isAndroid || UniversalPlatform.isIOS
-        ? 8 * 1024 * 1024
-        : 16 * 1024 * 1024;
+    final isMobile =
+        UniversalPlatform.isAndroid || UniversalPlatform.isIOS;
+    final isDesktop = UniversalPlatform.isWindows ||
+        UniversalPlatform.isMacOS ||
+        UniversalPlatform.isLinux;
+    // Audio-only Mini/notification sessions are ~128 kbps. Huge video
+    // readahead would keep buffering true and stall the play button.
+    // ExoPlayer/Bilibili start with a few seconds, then refill — gigabit
+    // makes a 128MB start window pure latency.
+    final maxForwardBytes = audioOnly
+        ? 2 * 1024 * 1024
+        : (isMobile
+            ? 16 * 1024 * 1024
+            : (isDesktop ? 32 * 1024 * 1024 : 24 * 1024 * 1024));
+    final maxBackBytes = audioOnly
+        ? 1 * 1024 * 1024
+        : (isMobile
+            ? 8 * 1024 * 1024
+            : (isDesktop ? 12 * 1024 * 1024 : 8 * 1024 * 1024));
+    final cacheSecs = audioOnly ? '6' : (isDesktop ? '16' : '12');
+    final readaheadSecs = audioOnly ? '4' : (isDesktop ? '12' : '8');
+    final skipInitialPause = fastStart || audioOnly;
+    // Local loopback fMP4 does not need a long lavf probe. Waiting here made
+    // Windows report a bursty fake speed while initialize sat idle.
+    final analyzeDuration = audioOnly ? '0.1' : (isDesktop ? '0.25' : '0.4');
+    final probeSize = audioOnly ? '65536' : (isDesktop ? '262144' : '524288');
     await Future.wait<void>([
       platform.setProperty('cache', 'yes', waitForInitialization: false),
-      // Let libmpv accumulate a stable initial/rebuffer window while its clock
-      // is paused. Without this, a split Bilibili stream can expose a few
-      // decoded audio packets, underrun, and audibly repeat that tiny region.
       platform.setProperty('cache-pause', 'yes', waitForInitialization: false),
       platform.setProperty(
         'cache-pause-initial',
-        'yes',
+        skipInitialPause ? 'no' : 'yes',
         waitForInitialization: false,
       ),
       platform.setProperty(
         'cache-pause-wait',
-        '2',
+        skipInitialPause
+            ? SubtitleHopSeekPolicy.streamingScrubCachePauseWaitSeconds
+            : SubtitleHopSeekPolicy.streamingCachePauseWaitSeconds,
         waitForInitialization: false,
       ),
-      platform.setProperty('cache-secs', '30', waitForInitialization: false),
+      platform.setProperty('cache-secs', cacheSecs, waitForInitialization: false),
       platform.setProperty(
         'demuxer-readahead-secs',
-        '30',
+        readaheadSecs,
         waitForInitialization: false,
       ),
       platform.setProperty(
@@ -1496,7 +1828,23 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
         '$maxBackBytes',
         waitForInitialization: false,
       ),
+      platform.setProperty(
+        'demuxer-lavf-analyzeduration',
+        analyzeDuration,
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'demuxer-lavf-probesize',
+        probeSize,
+        waitForInitialization: false,
+      ),
+      platform.setProperty(
+        'force-seekable',
+        'yes',
+        waitForInitialization: false,
+      ),
     ]);
+    _streamingBufferPlayers.add(textureId);
   }
 
   Future<void> _configureHighResolutionPlayback(Player player) async {

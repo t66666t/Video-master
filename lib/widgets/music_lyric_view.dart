@@ -1,5 +1,3 @@
-import '../services/subtitle_debug_session.dart';
-import 'subtitle_overlay.dart';
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -285,7 +283,6 @@ class MusicLyricViewState extends State<MusicLyricView>
   @override
   void initState() {
     super.initState();
-    SubtitleDebugSession.instance.addListener(_scheduleLayoutRelocate);
     _resetWindowsLineKeys();
     _precomputeSecondaryTexts();
 
@@ -1041,7 +1038,6 @@ class MusicLyricViewState extends State<MusicLyricView>
 
   @override
   void dispose() {
-    SubtitleDebugSession.instance.removeListener(_scheduleLayoutRelocate);
     _disposed = true;
     _resumeTimer?.cancel();
     _programmaticScrollResetTimer?.cancel();
@@ -1096,10 +1092,7 @@ class MusicLyricViewState extends State<MusicLyricView>
   }
 
   @override
-  Widget build(BuildContext context) => ListenableBuilder(
-    listenable: SubtitleDebugSession.instance,
-    builder: (context, _) => _build(context),
-  );
+  Widget build(BuildContext context) => _build(context);
 
   Widget _build(BuildContext context) {
     final screenHeight = MediaQuery.of(context).size.height;
@@ -1407,13 +1400,20 @@ class MusicLyricViewState extends State<MusicLyricView>
       mainText = lines[0];
       translatedText = lines.sublist(1).join('\n');
     }
-    final preset = SubtitleDebugSession.instance.preset;
     final mainIsChinese = _isChineseText(mainText);
     final translationIsChinese = _isChineseText(translatedText);
 
     // 优化：对静态行使用 Opacity，对动态行使用 AnimatedOpacity
     // 静态行：距离当前行 > 2，透明度不变，不需要动画
     final isStaticLine = offset.abs() > 2 && !isHovered;
+
+    // Scale the press plate with the primary lyric size. A fixed 20px radius
+    // matches tablet type (~40px) but reads as a capsule next to phone lyrics.
+    final pressRadius = (engFontSize * 0.50).clamp(10.0, 20.0);
+    final pressInsetH = (engFontSize * 0.30).clamp(7.0, 12.0);
+    final pressInsetV = (engFontSize * 0.20).clamp(5.0, 8.0);
+    final pressShadowBlur = (engFontSize * 0.45).clamp(10.0, 18.0);
+    final pressShadowDy = (engFontSize * 0.175).clamp(4.0, 7.0);
 
     // 构建歌词内容（复用）
     Widget lyricContent = Container(
@@ -1423,10 +1423,10 @@ class MusicLyricViewState extends State<MusicLyricView>
         clipBehavior: Clip.none,
         children: [
           Positioned(
-            left: -12,
-            right: -12,
-            top: -8,
-            bottom: -8,
+            left: -pressInsetH,
+            right: -pressInsetH,
+            top: -pressInsetV,
+            bottom: -pressInsetV,
             child: IgnorePointer(
               child: AnimatedScale(
                 scale: isPressed ? 1.0 : 0.985,
@@ -1449,15 +1449,15 @@ class MusicLyricViewState extends State<MusicLyricView>
                           Colors.white.withValues(alpha: 0.14),
                         ],
                       ),
-                      borderRadius: BorderRadius.circular(20),
+                      borderRadius: BorderRadius.circular(pressRadius),
                       border: Border.all(
                         color: Colors.white.withValues(alpha: 0.10),
                       ),
                       boxShadow: [
                         BoxShadow(
                           color: Colors.black.withValues(alpha: 0.14),
-                          blurRadius: 18,
-                          offset: const Offset(0, 7),
+                          blurRadius: pressShadowBlur,
+                          offset: Offset(0, pressShadowDy),
                         ),
                       ],
                     ),
@@ -1466,79 +1466,69 @@ class MusicLyricViewState extends State<MusicLyricView>
               ),
             ),
           ),
-          if (preset != null)
-            SubtitlePresetContent(
-              entry: SubtitleOverlayEntry(
-                text: mainText,
-                secondaryText: translatedText,
-              ),
-              preset: preset,
-              referenceHeight: preset.referenceHeight(
-                MediaQuery.sizeOf(context),
-              ),
-            )
-          else
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
-                MusicTextOpticalAlignment(
-                  applyCjkRaise: mainIsChinese,
-                  fontSize: engFontSize,
-                  child: Text(
-                    mainText,
-                    textAlign: TextAlign.left,
-                    softWrap: true,
-                    maxLines: null,
-                    style: TextStyle(
-                      fontFamily: mainIsChinese
-                          ? _fontFamilyZh
-                          : _fontFamilyEng,
-                      fontSize: engFontSize,
-                      fontWeight: mainIsChinese
-                          ? FontWeight.w600
-                          : FontWeight.w800,
-                      color: Colors.white,
-                      height: 1.3,
-                      letterSpacing: -0.5,
-                      leadingDistribution: mainIsChinese
-                          ? TextLeadingDistribution.even
-                          : null,
-                    ),
+          // Keep Apple Music lyric fonts even when a global video subtitle
+          // preset is active; that mode must not restyle this screen.
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // === 原文（自动检测语言，中文用思源黑体，其他用 Inter）— 主导视觉 ===
+              MusicTextOpticalAlignment(
+                applyCjkRaise: mainIsChinese,
+                fontSize: engFontSize,
+                child: Text(
+                  mainText,
+                  textAlign: TextAlign.left,
+                  softWrap: true,
+                  maxLines: null,
+                  style: TextStyle(
+                    fontFamily: mainIsChinese
+                        ? _fontFamilyZh
+                        : _fontFamilyEng,
+                    fontSize: engFontSize,
+                    fontWeight: mainIsChinese
+                        ? FontWeight.w600
+                        : FontWeight.w800,
+                    color: Colors.white,
+                    height: 1.3,
+                    letterSpacing: -0.5,
+                    leadingDistribution: mainIsChinese
+                        ? TextLeadingDistribution.even
+                        : null,
                   ),
                 ),
+              ),
 
-                if (translatedText.isNotEmpty)
-                  Padding(
-                    padding: EdgeInsets.only(top: engZhGap),
-                    child: MusicTextOpticalAlignment(
-                      applyCjkRaise: translationIsChinese,
-                      fontSize: zhFontSize,
-                      child: Text(
-                        translatedText,
-                        textAlign: TextAlign.left,
-                        softWrap: true,
-                        maxLines: null,
-                        style: TextStyle(
-                          fontFamily: _fontFamilyZh,
-                          fontSize: zhFontSize,
-                          fontWeight: translationIsChinese
-                              ? FontWeight.w600
-                              : FontWeight.w800,
-                          color: Colors.white.withValues(
-                            alpha: highlight ? 0.70 : 0.50,
-                          ),
-                          height: 1.5,
-                          leadingDistribution: translationIsChinese
-                              ? TextLeadingDistribution.even
-                              : null,
+              if (translatedText.isNotEmpty)
+                Padding(
+                  padding: EdgeInsets.only(top: engZhGap),
+                  child: MusicTextOpticalAlignment(
+                    applyCjkRaise: translationIsChinese,
+                    fontSize: zhFontSize,
+                    child: Text(
+                      translatedText,
+                      textAlign: TextAlign.left,
+                      softWrap: true,
+                      maxLines: null,
+                      style: TextStyle(
+                        fontFamily: _fontFamilyZh,
+                        fontSize: zhFontSize,
+                        fontWeight: translationIsChinese
+                            ? FontWeight.w600
+                            : FontWeight.w800,
+                        color: Colors.white.withValues(
+                          alpha: highlight ? 0.70 : 0.50,
                         ),
+                        height: 1.5,
+                        leadingDistribution: translationIsChinese
+                            ? TextLeadingDistribution.even
+                            : null,
                       ),
                     ),
                   ),
-              ],
-            ),
+                ),
+            ],
+          ),
         ],
       ),
     );

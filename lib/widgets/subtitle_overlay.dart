@@ -373,6 +373,33 @@ class _AnimatedSubtitlePositionState
   }
 }
 
+/// Calibrated against visible glyph bounds in the bundled font files, in em.
+/// A stable script/font correction avoids baseline jitter between sentences;
+/// measuring each subtitle's ink would jump on punctuation and descenders.
+/// CJK in Latin-only families uses the explicitly bundled Noto Sans fallback.
+/// Keep these values independent of background opacity and export resolution.
+///
+/// Latin must not be calibrated to the full ink box of a sample with
+/// descenders (`g`/`y`/`p`). That pulls the x-height and cap-height band
+/// too high, and on wrapped lines the whole block sits against the top of
+/// the plate. English values therefore center the cap/x-height body; CJK
+/// ideographs still use the fuller glyph-box correction.
+double subtitlePresetOpticalOffsetEm(String font, String text) {
+  final hasCjk = RegExp(
+    r'[\u2E80-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]',
+  ).hasMatch(text);
+  if (hasCjk) return font == 'Noto Serif CJK SC' ? -.104 : -.068;
+  return switch (font) {
+    'Noto Sans SC' => -.058,
+    'Noto Serif CJK SC' => -.050,
+    'Inter' => -.012,
+    'Roboto' => 0,
+    'Comic Relief' => 0,
+    'Brawler' => -.008,
+    _ => 0,
+  };
+}
+
 /// Shared by playback, lyric rows, preset previews and precise export.
 class SubtitlePresetContent extends StatelessWidget {
   final SubtitleOverlayEntry entry;
@@ -395,6 +422,10 @@ class SubtitlePresetContent extends StatelessWidget {
           style: preset.styleFor(),
           referenceHeight: referenceHeight,
           fontFamilyFallback: const ['Noto Sans SC'],
+          opticalOffsetEm: subtitlePresetOpticalOffsetEm(
+            preset.primaryFont,
+            entry.text,
+          ),
           contentPadding: EdgeInsets.symmetric(
             horizontal: 12,
             vertical: preset.backgroundPadding,
@@ -408,6 +439,10 @@ class SubtitlePresetContent extends StatelessWidget {
           style: preset.styleFor(secondary: true),
           referenceHeight: referenceHeight,
           fontFamilyFallback: const ['Noto Sans SC'],
+          opticalOffsetEm: subtitlePresetOpticalOffsetEm(
+            preset.secondaryFont,
+            entry.secondaryText!,
+          ),
           contentPadding: EdgeInsets.symmetric(
             horizontal: 12,
             vertical: preset.backgroundPadding,
@@ -441,6 +476,10 @@ class SubtitleOverlay extends StatelessWidget {
   final SubtitleStyle style;
   final List<String>? fontFamilyFallback;
   final EdgeInsets contentPadding;
+
+  /// Optical correction moves fill, outline and shadow together within the
+  /// unchanged line box. It must scale with the resolved font size.
+  final double opticalOffsetEm;
   final double? referenceHeight;
   final VoidCallback? onLongPress;
   final bool isDragging;
@@ -455,6 +494,7 @@ class SubtitleOverlay extends StatelessWidget {
     this.image,
     this.style = const SubtitleStyle(),
     this.fontFamilyFallback,
+    this.opticalOffsetEm = 0,
     this.contentPadding = const EdgeInsets.symmetric(
       horizontal: 12,
       vertical: 6,
@@ -532,26 +572,32 @@ class SubtitleOverlay extends StatelessWidget {
                           )
                         : null,
                   ),
-                  child: effectiveStyle.hasBorder
-                      ? Stack(
-                          children: [
-                            _buildContent(
-                              displayText,
-                              effectiveStyle,
-                              isStroke: true,
-                            ),
-                            _buildContent(
-                              displayText,
-                              effectiveStyle,
-                              isStroke: false,
-                            ),
-                          ],
-                        )
-                      : _buildContent(
-                          displayText,
-                          effectiveStyle,
-                          isStroke: false,
-                        ),
+                  child: Transform.translate(
+                    offset: Offset(
+                      0,
+                      opticalOffsetEm * effectiveStyle.fontSize,
+                    ),
+                    child: effectiveStyle.hasBorder
+                        ? Stack(
+                            children: [
+                              _buildContent(
+                                displayText,
+                                effectiveStyle,
+                                isStroke: true,
+                              ),
+                              _buildContent(
+                                displayText,
+                                effectiveStyle,
+                                isStroke: false,
+                              ),
+                            ],
+                          )
+                        : _buildContent(
+                            displayText,
+                            effectiveStyle,
+                            isStroke: false,
+                          ),
+                  ),
                 ),
         );
 

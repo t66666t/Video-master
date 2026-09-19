@@ -29,7 +29,12 @@ import 'services/video_compose_manager.dart';
 import 'services/ocr_subtitle_manager.dart';
 import 'services/system_media_session_service.dart';
 import 'utils/app_toast.dart';
+import 'utils/app_localizations.dart';
+import 'utils/first_open_ui_warmup.dart';
+import 'utils/tooltip_hover_policy.dart';
+import 'widgets/incoming_share_listener.dart';
 import 'widgets/library_persistence_notification_bridge.dart';
+import 'widgets/tooltip_interaction_guard.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -321,6 +326,8 @@ class _StartupSurface extends StatelessWidget {
     return MaterialApp(
       title: 'Fluent Player',
       debugShowCheckedModeBanner: false,
+      localizationsDelegates: appLocalizationDelegates,
+      supportedLocales: appSupportedLocales,
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: const Color(0xFF121212),
@@ -674,6 +681,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
           child: MaterialApp(
             title: 'Fluent_Player',
             debugShowCheckedModeBanner: false,
+            localizationsDelegates: appLocalizationDelegates,
+            supportedLocales: appSupportedLocales,
             navigatorKey: AppToast.navigatorKey,
             navigatorObservers: [
               AppToast.observer,
@@ -681,8 +690,14 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               PlaybackNavigationService.instance.observer,
             ],
             builder: (context, child) {
-              return LibraryPersistenceNotificationBridge(
-                child: child ?? const SizedBox.shrink(),
+              return TooltipInteractionGuard(
+                child: IncomingShareListener(
+                  child: LibraryPersistenceNotificationBridge(
+                    child: FirstOpenUiWarmupHost(
+                      child: child ?? const SizedBox.shrink(),
+                    ),
+                  ),
+                ),
               );
             },
             theme: ThemeData(
@@ -745,6 +760,9 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 surface: Color(0xFF121212),
               ),
               useMaterial3: true,
+              tooltipTheme: const TooltipThemeData(
+                waitDuration: kAppTooltipWaitDuration,
+              ),
               appBarTheme: const AppBarTheme(
                 backgroundColor: Color(0xFF1E1E1E),
                 elevation: 0,
@@ -773,6 +791,7 @@ Future<void> _restorePlaybackState({
   required PlaylistManager playlistManager,
   required LibraryService library,
 }) async {
+  String? previewItemId;
   try {
     // 从 ProgressTracker 恢复播放状态快照
     final snapshot = await progressTracker.restorePlaybackState();
@@ -811,13 +830,20 @@ Future<void> _restorePlaybackState({
     }
     final position = Duration(milliseconds: positionMs);
 
-    // 播放媒体，但立即暂停（不自动播放）
-    // 强制 autoPlay: false，确保启动时不自动播放，无论上次退出时状态如何
-    await mediaPlaybackService.play(
-      videoItem,
-      startPosition: position,
-      autoPlay: false,
-    );
+    // Publish thumbnail/title/progress immediately so Mini playback card does
+    // not wait for Bilibili playurl or native initialize.
+    previewItemId = videoItem.id;
+    mediaPlaybackService.publishRestoredSessionPreview(videoItem, position);
+
+    if (MediaPlaybackService.shouldPrepareNativePlayerOnRestore(videoItem)) {
+      // Local files can warm a paused controller. Online Bilibili Mini chrome
+      // only needs library metadata; playurl waits until the user presses play.
+      await mediaPlaybackService.play(
+        videoItem,
+        startPosition: position,
+        autoPlay: false,
+      );
+    }
     await SystemMediaSessionService.instance.refreshNow(
       ensureNotificationVisible: true,
     );
@@ -825,6 +851,8 @@ Future<void> _restorePlaybackState({
     debugPrint('成功恢复播放状态: ${videoItem.title} at ${position.inSeconds}s');
   } catch (e) {
     debugPrint('恢复播放状态失败: $e');
+    // Drop a dangling loading preview so Mini card does not stay forever.
+    await mediaPlaybackService.cancelPendingPlay(expectedItemId: previewItemId);
     // 静默处理错误，不影响应用启动
   }
 }

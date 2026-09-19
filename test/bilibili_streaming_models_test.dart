@@ -64,6 +64,16 @@ class _FakeBilibiliApiService extends BilibiliApiService {
   }
 }
 
+class _CountingFakeBilibiliApiService extends _FakeBilibiliApiService {
+  int fetchPlayUrlCalls = 0;
+
+  @override
+  Future<BilibiliStreamInfo> fetchPlayUrl(String bvid, int cid) async {
+    fetchPlayUrlCalls++;
+    return super.fetchPlayUrl(bvid, cid);
+  }
+}
+
 class _BackupOnlyQualityApiService extends BilibiliApiService {
   @override
   Future<Map<String, dynamic>?> fetchVideoShot(String bvid, int cid) async =>
@@ -286,6 +296,37 @@ void main() {
     expect(preferences.getInt('bilibili_stream_preferred_quality'), 64);
   });
 
+  test('prepare reuses a fresh playurl instead of fetching again', () async {
+    SharedPreferences.setMockInitialValues({});
+    final api = _CountingFakeBilibiliApiService();
+    final service = BilibiliStreamingService(api);
+    addTearDown(service.shutdown);
+    final item = _streamItem('cached-playurl');
+
+    await service.prepare(item);
+    await service.prepare(item);
+
+    expect(api.fetchPlayUrlCalls, 1);
+  });
+
+  test('prefetch warms a session that prepare consumes without a second playurl',
+      () async {
+    SharedPreferences.setMockInitialValues({});
+    final api = _CountingFakeBilibiliApiService();
+    final service = BilibiliStreamingService(api);
+    addTearDown(service.shutdown);
+    final item = _streamItem('warm-neighbor');
+
+    await service.prefetch(item);
+    expect(api.fetchPlayUrlCalls, 1);
+    expect(service.activePlaybackSessionCount, 1);
+
+    final prepared = await service.prepare(item);
+    expect(prepared.audioUri.path, contains('/audio'));
+    expect(api.fetchPlayUrlCalls, 1);
+    expect(service.activePlaybackSessionCount, 1);
+  });
+
   test(
     'missing preferred quality falls back to the highest lower quality',
     () async {
@@ -319,13 +360,16 @@ void main() {
       (index) => index % 251,
     );
     final audioBytes = List<int>.generate(2048, (index) => (index * 3) % 251);
+    var videoRangeGets = 0;
     final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final upstreamTask = () async {
       await for (final request in upstream) {
-        final source = request.uri.path.contains('audio')
-            ? audioBytes
-            : videoBytes;
+        final isAudio = request.uri.path.contains('audio');
+        final source = isAudio ? audioBytes : videoBytes;
         final range = request.headers.value(HttpHeaders.rangeHeader);
+        if (!isAudio && request.method == 'GET' && range != null) {
+          videoRangeGets++;
+        }
         var start = 0;
         var end = source.length - 1;
         if (range != null) {
@@ -427,8 +471,34 @@ void main() {
     expect(payload, videoBytes.sublist(100, 300));
 
     final cache = await service.inspectCache();
-    expect(cache.bytes, payload.length);
-    expect(cache.fileCount, 1);
+    expect(cache.bytes, greaterThanOrEqualTo(payload.length));
+    expect(cache.fileCount, greaterThanOrEqualTo(1));
+    expect(videoRangeGets, 1);
+
+    // A later, differently aligned Range must still be served from the merged
+    // track file. Exact `bytes=100-299` filenames cannot survive libmpv restart.
+    final overlapRequest = await client.getUrl(prepared.videoUri);
+    overlapRequest.headers.set(HttpHeaders.rangeHeader, 'bytes=150-250');
+    final overlapResponse = await overlapRequest.close();
+    final overlapPayload = await overlapResponse.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    expect(overlapResponse.statusCode, HttpStatus.partialContent);
+    expect(overlapPayload, videoBytes.sublist(150, 251));
+    expect(videoRangeGets, 1);
+
+    // A second identical Range must be answered from disk, not CDN.
+    final cachedRangeRequest = await client.getUrl(prepared.videoUri);
+    cachedRangeRequest.headers.set(HttpHeaders.rangeHeader, 'bytes=100-299');
+    final cachedRangeResponse = await cachedRangeRequest.close();
+    final cachedPayload = await cachedRangeResponse.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    expect(cachedRangeResponse.statusCode, HttpStatus.partialContent);
+    expect(cachedPayload, videoBytes.sublist(100, 300));
+    expect(videoRangeGets, 1);
 
     final activeResponse = await (await client.getUrl(
       prepared.videoUri,
@@ -456,5 +526,91 @@ void main() {
     expect(afterClearResponse.statusCode, HttpStatus.partialContent);
     expect(afterClearPayload, videoBytes.sublist(400, 600));
     expect((await service.inspectCache()).bytes, 0);
+  });
+
+  test('gateway track cache survives a new service instance', () async {
+    final videoBytes = List<int>.generate(64 * 1024, (index) => index % 251);
+    var videoRangeGets = 0;
+    final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final upstreamTask = () async {
+      await for (final request in upstream) {
+        final range = request.headers.value(HttpHeaders.rangeHeader);
+        if (request.method == 'GET' && range != null) videoRangeGets++;
+        var start = 0;
+        var end = videoBytes.length - 1;
+        if (range != null) {
+          final match = RegExp(r'^bytes=(\d+)-(\d*)$').firstMatch(range);
+          if (match != null) {
+            start = int.parse(match.group(1)!);
+            if (match.group(2)!.isNotEmpty) {
+              end = int.parse(match.group(2)!);
+            }
+            end = end.clamp(start, videoBytes.length - 1);
+            request.response.statusCode = HttpStatus.partialContent;
+            request.response.headers.set(
+              HttpHeaders.contentRangeHeader,
+              'bytes $start-$end/${videoBytes.length}',
+            );
+          }
+        }
+        final selected = videoBytes.sublist(start, end + 1);
+        request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+        request.response.contentLength = selected.length;
+        if (request.method != 'HEAD') request.response.add(selected);
+        await request.response.close();
+      }
+    }();
+    addTearDown(() async {
+      await upstream.close(force: true);
+      await upstreamTask;
+    });
+
+    final tempCache = await Directory.systemTemp.createTemp(
+      'bilibili-stream-restart-',
+    );
+    addTearDown(() => tempCache.delete(recursive: true));
+    final origin = Uri(
+      scheme: 'http',
+      host: InternetAddress.loopbackIPv4.address,
+      port: upstream.port,
+    );
+    final item = _streamItem('restart-cache-item');
+
+    final first = BilibiliStreamingService(
+      _FakeBilibiliApiService(mediaOrigin: origin),
+      mediaUriValidator: (uri) => uri.host == origin.host,
+      cacheDirectory: tempCache,
+    );
+    final prepared = await first.prepare(item);
+    final client = HttpClient();
+    addTearDown(() => client.close(force: true));
+    final warm = await client.getUrl(prepared.videoUri);
+    warm.headers.set(HttpHeaders.rangeHeader, 'bytes=32-1023');
+    final warmResponse = await warm.close();
+    expect(await warmResponse.fold<List<int>>(<int>[], (b, c) => b..addAll(c)),
+        videoBytes.sublist(32, 1024));
+    expect(videoRangeGets, 1);
+    await first.shutdown();
+
+    // Closing the app drops in-memory sessions. Disk intervals must still
+    // answer a restarted player's differently aligned Range.
+    final restarted = BilibiliStreamingService(
+      _FakeBilibiliApiService(mediaOrigin: origin),
+      mediaUriValidator: (uri) => uri.host == origin.host,
+      cacheDirectory: tempCache,
+    );
+    addTearDown(restarted.shutdown);
+    expect(await restarted.hasReusableTrackCache(item.id), isTrue);
+    final preparedAgain = await restarted.prepare(item);
+    final replay = await client.getUrl(preparedAgain.videoUri);
+    replay.headers.set(HttpHeaders.rangeHeader, 'bytes=100-500');
+    final replayResponse = await replay.close();
+    final replayPayload = await replayResponse.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    expect(replayResponse.statusCode, HttpStatus.partialContent);
+    expect(replayPayload, videoBytes.sublist(100, 501));
+    expect(videoRangeGets, 1);
   });
 }

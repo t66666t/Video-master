@@ -49,6 +49,10 @@ import UIKit
 
   func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
     shareEventSink = events
+    if !pendingSharedItems.isEmpty {
+      events(pendingSharedItems)
+      pendingSharedItems.removeAll()
+    }
     return nil
   }
 
@@ -136,7 +140,9 @@ import UIKit
   }
 
   private func handleIncomingUrls(_ urls: [URL]) -> Bool {
-    let supportedUrls = urls.filter { isMediaPath($0.path) || isArchivePath($0.path) }
+    let supportedUrls = urls.filter {
+      isFluentPackPath($0.path) || isMediaPath($0.path) || isArchivePath($0.path)
+    }
     if supportedUrls.isEmpty {
       return false
     }
@@ -173,12 +179,30 @@ import UIKit
     return archiveSuffixes.contains { lower.hasSuffix($0) }
   }
 
+  private func isFluentPackPath(_ path: String) -> Bool {
+    return path.lowercased().hasSuffix(".fluentpack")
+  }
+
   private func makeIncomingItem(_ url: URL) -> Any? {
-    let isArchive = isArchivePath(url.path)
-    guard isArchive || isMediaPath(url.path) else { return nil }
-    let cacheDirectoryName = isArchive ? "picked_archives" : "incoming_media"
+    let isFluentPack = isFluentPackPath(url.path)
+    let isArchive = !isFluentPack && isArchivePath(url.path)
+    guard isFluentPack || isArchive || isMediaPath(url.path) else { return nil }
+    let cacheDirectoryName = isFluentPack
+      ? "picked_fluentpacks"
+      : (isArchive ? "picked_archives" : "incoming_media")
     guard let path = copyIncomingFileToCache(url, directoryName: cacheDirectoryName) else {
       return nil
+    }
+    if isFluentPack {
+      let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+      let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+      return [
+        "kind": "fluentpack",
+        "displayName": url.lastPathComponent,
+        "sizeBytes": size,
+        "path": path,
+        "ownedTemporaryCopy": true,
+      ] as [String: Any]
     }
     if !isArchive {
       return path

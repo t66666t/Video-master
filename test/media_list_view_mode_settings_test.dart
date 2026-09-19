@@ -34,16 +34,16 @@ void main() {
     expect(settings.mediaListCoverOffset, -0.35);
   });
 
-  test('媒体列表每行数量支持 1-15 并在越界时钳制', () async {
+  test('媒体列表每行数量支持 1-20 并在越界时钳制', () async {
     final settings = SettingsService();
     settings.resetForTest();
     await settings.init();
 
-    await settings.updateSetting('mediaListCrossAxisCount', 15);
-    expect(settings.mediaListCrossAxisCount, 15);
+    await settings.updateSetting('mediaListCrossAxisCount', 20);
+    expect(settings.mediaListCrossAxisCount, 20);
 
     await settings.updateSetting('mediaListCrossAxisCount', 99);
-    expect(settings.mediaListCrossAxisCount, 15);
+    expect(settings.mediaListCrossAxisCount, 20);
 
     await settings.updateSetting('mediaListCrossAxisCount', 0);
     expect(settings.mediaListCrossAxisCount, 1);
@@ -100,12 +100,12 @@ void main() {
     settings.resetForTest();
     await settings.init();
 
-    expect(settings.mediaListCrossAxisCount, 15);
+    expect(settings.mediaListCrossAxisCount, 20);
     expect(settings.structuredImportSortField, 'fileName');
     expect(settings.structuredImportSortDirection, 'ascending');
 
     final prefs = await SharedPreferences.getInstance();
-    expect(prefs.getInt('mediaListCrossAxisCount'), 15);
+    expect(prefs.getInt('mediaListCrossAxisCount'), 20);
     expect(prefs.getString('structuredImportSortField'), 'fileName');
     expect(prefs.getString('structuredImportSortDirection'), 'ascending');
   });

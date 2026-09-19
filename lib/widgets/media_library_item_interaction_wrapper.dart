@@ -6,8 +6,9 @@ import 'custom_drag.dart';
 import 'folder_drop_target.dart';
 
 /// Uses movement-gated desktop dragging while preserving long-press dragging
-/// on touch-first mobile platforms. A stationary desktop press therefore stays
-/// a click, regardless of how long the mouse button is held.
+/// on touch-first mobile platforms. On desktop, a short still press stays a
+/// click; holding past [delay] enters selection without treating the release
+/// as another tap.
 class MediaLibraryAdaptiveDraggable<T extends Object> extends StatelessWidget {
   const MediaLibraryAdaptiveDraggable({
     super.key,

@@ -7,6 +7,8 @@ import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
+import 'package:video_player_platform_interface/video_player_platform_interface.dart'
+    show VideoPlayerPlatform;
 import '../models/video_item.dart';
 import '../models/media_source_ref.dart';
 import '../models/managed_subtitle_asset.dart';
@@ -30,6 +32,7 @@ import '../services/bilibili/bilibili_streaming_service.dart';
 import '../services/task_subtitle_storage_service.dart';
 import '../services/subtitle_timeline_resolver.dart';
 import '../services/subtitle_discovery_service.dart';
+import '../services/subtitle_hop_seek_policy.dart';
 import '../utils/pgs_parser.dart';
 import '../utils/subtitle_converter.dart';
 import '../utils/subtitle_parser.dart';
@@ -77,6 +80,79 @@ enum PlaybackState {
   error, // 错误
 }
 
+/// Mini playback chrome only needs item metadata (thumbnail, title, duration,
+/// saved progress). Waiting for [PlaybackState.playing]/[PlaybackState.paused]
+/// hides it for the entire Bilibili playurl/initialize window on launch.
+bool isMiniPlaybackCardVisible({
+  required VideoItem? currentItem,
+  required PlaybackState state,
+}) {
+  if (currentItem == null) return false;
+  switch (state) {
+    case PlaybackState.playing:
+    case PlaybackState.paused:
+    case PlaybackState.loading:
+      return true;
+    case PlaybackState.idle:
+    case PlaybackState.error:
+      return false;
+  }
+}
+
+/// Split Bilibili streams can briefly report byte-zero after a track toggle or
+/// CDN reconnect, while the audio clock and subtitle timeline keep running.
+/// Treat that sample as a glitch rather than a real restart.
+bool shouldResyncBilibiliClockFromZero({
+  required bool isOnlineBilibiliStream,
+  required Duration expectedPosition,
+  required Duration nativeSample,
+  required DateTime now,
+  DateTime? lastResyncAt,
+  bool hopSeekInFlight = false,
+  String? lastSeekSource,
+  DateTime? lastHopSeekAt,
+  Duration duration = Duration.zero,
+}) {
+  if (!isOnlineBilibiliStream) return false;
+  if (SubtitleHopSeekPolicy.shouldSuppressZeroClockResync(
+    hopSeekInFlight: hopSeekInFlight,
+    lastSeekSource: lastSeekSource,
+    now: now,
+    lastHopSeekAt: lastHopSeekAt,
+  )) {
+    return false;
+  }
+  // EOS on split fMP4 often reports t=0. Seeking that sample back to the
+  // last clock would loop the last GOP and never fire auto-play-next.
+  if (PlaybackBehaviorPolicy.hasReachedPlaybackEnd(
+    position: expectedPosition,
+    duration: duration,
+  )) {
+    return false;
+  }
+  if (expectedPosition < const Duration(seconds: 2)) return false;
+  if (nativeSample > const Duration(milliseconds: 500)) return false;
+  if (expectedPosition - nativeSample < const Duration(seconds: 2)) {
+    return false;
+  }
+  if (lastResyncAt != null &&
+      now.difference(lastResyncAt) < const Duration(seconds: 2)) {
+    return false;
+  }
+  return true;
+}
+
+/// Fresh t=0 starts are already there. A non-zero resume cannot trust the
+/// Dart sample: `start=` is wiped when the video track is selected after open.
+bool shouldSkipRedundantInitialSeek({
+  required Duration target,
+  required Duration actual,
+  int toleranceMs = 450,
+}) {
+  if (target.inMilliseconds > toleranceMs) return false;
+  return actual.inMilliseconds.abs() <= toleranceMs;
+}
+
 /// 媒体播放服务 - 管理全局播放状态
 class MediaPlaybackService extends ChangeNotifier {
   static const String _globalMutePrefsKey = 'globalMute';
@@ -118,9 +194,27 @@ class MediaPlaybackService extends ChangeNotifier {
   MaterializedMediaLease? _currentMaterializedPlaybackLease;
   int _streamQualitySwitchRequestId = 0;
   bool _controllerCreatedWithoutVisiblePlaybackPage = false;
+  /// Mini/notification opened the loopback audio URL instead of video+audio.
+  bool _bilibiliAudioPrimaryPlayer = false;
   Future<bool>? _visibleVideoOutputRecovery;
   bool? _requestedBilibiliVideoTrackEnabled;
   int _bilibiliVideoTrackPolicyRevision = 0;
+  Future<void>? _bilibiliVideoTrackPolicyFuture;
+  bool _coveringUntilVisibleVideoFrame = false;
+  double _bilibiliGatewayBytesPerSecond = 0;
+  bool _bilibiliStreamingListenerAttached = false;
+  bool _controllerIsBuffering = false;
+  /// Seek's Dart Future can complete while libmpv is still cache-paused.
+  /// Keep the Bilibili spinner up until the clock actually moves again.
+  bool _seekHoldOverlay = false;
+  /// True from the native seek until the clock ticks, including the delay
+  /// before the spinner is allowed to appear.
+  bool _seekHoldPending = false;
+  Timer? _seekHoldOverlayTimer;
+  /// Native sample used as the post-seek baseline. Overlay clears only after
+  /// this clock ticks — `isPlaying && !isBuffering` is not enough.
+  Duration? _seekHoldLandedNative;
+  int _visibleVideoFrameEpoch = 0;
 
   // 字幕相关
   List<SubtitleItem> _subtitles = [];
@@ -167,12 +261,17 @@ class MediaPlaybackService extends ChangeNotifier {
 
   Timer? _seekPersistTimer;
   Timer? _seekVerificationTimer;
+  Timer? _hopSeekDispatchTimer;
+  Duration? _pendingHopSeekPosition;
+  String? _pendingHopSeekSource;
   int _seekRequestId = 0;
   int? _pendingSeekRequestId;
   bool _preservePlayingStateAfterSeek = false;
   bool _initialPositionSeekInFlight = false;
   Duration? _initialPositionGuardTarget;
   DateTime? _initialPositionGuardUntil;
+  DateTime? _bilibiliZeroResyncAt;
+  DateTime? _lastHopSeekAt;
   bool? _lastControllerIsPlaying;
   Timer? _externalSeekResetTimer;
   int _externalSubtitleSeekAccumulator = 0;
@@ -234,6 +333,7 @@ class MediaPlaybackService extends ChangeNotifier {
   );
   static const Duration _controllerSeekTimeout = Duration(seconds: 2);
   static const Duration _controllerInitializeTimeout = Duration(seconds: 20);
+  static const Duration _backgroundClockReadyTimeout = Duration(seconds: 4);
   static const Duration _mobileControllerReleaseTimeout = Duration(seconds: 8);
   static const Duration _firstVideoFrameTimeout = Duration(seconds: 12);
   // One retry is enough for genuinely transient switch failures (e.g. a
@@ -302,7 +402,6 @@ class MediaPlaybackService extends ChangeNotifier {
     final controller = _controller;
     final isActiveOnlineStream =
         !kIsWeb &&
-        (Platform.isAndroid || Platform.isIOS) &&
         item?.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
         _currentBilibiliPlayback != null &&
         controller != null &&
@@ -312,40 +411,254 @@ class MediaPlaybackService extends ChangeNotifier {
       _bilibiliVideoTrackPolicyRevision++;
       return;
     }
+    // Audio-primary Mini/notification players have no video stream. Enabling
+    // the track here cannot produce frames and would race page promotion.
+    if (_bilibiliAudioPrimaryPlayer) {
+      _requestedBilibiliVideoTrackEnabled = false;
+      return;
+    }
 
-    // Only a visible full playback page consumes video frames. Keep the exact
+    // Only a mounted playback page consumes video frames. Keep the exact
     // same Player, external audio track and clock everywhere else, but deselect
     // Bilibili's video track so libmpv stops requesting video bytes.
-    final shouldEnableVideo =
-        _isAppInForeground && _playbackPageOwners.isNotEmpty;
+    // App backgrounding must not deselect the track while that page is still
+    // owned: the re-enable/seek cycle is the black flash on foreground entry.
+    final shouldEnableVideo = shouldEnableBilibiliVideoTrack(
+      hasPlaybackPageOwner: _playbackPageOwners.isNotEmpty,
+      backgroundAudioOnly: SettingsService().bilibiliBackgroundAudioOnly,
+    );
     if (_requestedBilibiliVideoTrackEnabled == shouldEnableVideo) return;
+    final enabling =
+        shouldEnableVideo && _requestedBilibiliVideoTrackEnabled != true;
     _requestedBilibiliVideoTrackEnabled = shouldEnableVideo;
     final revision = ++_bilibiliVideoTrackPolicyRevision;
     final itemId = item!.id;
-    unawaited(
-      NativeVideoPlayerMediaKit.setExternalVideoTrackEnabledFor(
-        // ignore: invalid_use_of_visible_for_testing_member
-        controller.playerId,
-        enabled: shouldEnableVideo,
-      ).then((applied) {
-        if (revision != _bilibiliVideoTrackPolicyRevision ||
-            _currentItem?.id != itemId ||
-            !identical(_controller, controller)) {
-          return;
+    // Re-selecting the video track can briefly report byte-zero while the
+    // native decoder seeks back to the audio clock. Keep the service timeline
+    // (and therefore subtitles) at the real position during that window.
+    if (shouldEnableVideo && _position > Duration.zero) {
+      _armInitialPositionGuard(_position);
+    }
+    if (enabling && _playbackPageOwners.isNotEmpty) {
+      _beginCoveringUntilVisibleVideoFrame();
+    }
+    final command =
+        NativeVideoPlayerMediaKit.setExternalVideoTrackEnabledFor(
+          // ignore: invalid_use_of_visible_for_testing_member
+          controller.playerId,
+          enabled: shouldEnableVideo,
+          keepPlaying: _session.desiredPlaying,
+        ).then((applied) {
+          if (revision != _bilibiliVideoTrackPolicyRevision ||
+              _currentItem?.id != itemId ||
+              !identical(_controller, controller)) {
+            return;
+          }
+          if (!applied) {
+            _requestedBilibiliVideoTrackEnabled = null;
+            return;
+          }
+          if (shouldEnableVideo) {
+            _endCoveringUntilVisibleVideoFrame(immediate: true);
+          }
+        });
+    _bilibiliVideoTrackPolicyFuture = command;
+    unawaited(command);
+  }
+
+  /// Split Bilibili video stays selected unless the user opted into
+  /// background audio-only. Foreground state is not part of this: backgrounding
+  /// the app with the page still open used to deselect the track and paint
+  /// black on return.
+  @visibleForTesting
+  static bool shouldEnableBilibiliVideoTrack({
+    required bool hasPlaybackPageOwner,
+    required bool backgroundAudioOnly,
+  }) {
+    return !backgroundAudioOnly || hasPlaybackPageOwner;
+  }
+
+  /// Mini/notification opens must not drop the video elementary stream unless
+  /// background audio-only is on. Keeping video selected means a later page
+  /// mount joins the live decoder instead of re-enabling `vid`.
+  @visibleForTesting
+  static bool shouldDeferBilibiliVideoOnOpen({
+    required bool hasVisiblePlaybackPage,
+    required bool backgroundAudioOnly,
+  }) {
+    return backgroundAudioOnly && !hasVisiblePlaybackPage;
+  }
+
+  /// A missing Flutter texture must not pause a clock that is already
+  /// running. That park is the "this Bilibili card will not start; the next
+  /// episode works" failure: first-frame wait times out while audio is live.
+  @visibleForTesting
+  static bool shouldParkWhenVisibleVideoFrameMissing({
+    required bool nativeClockPlaying,
+  }) {
+    return !nativeClockPlaying;
+  }
+
+  bool get isCoveringUntilVisibleVideoFrame => _coveringUntilVisibleVideoFrame;
+
+  void _beginCoveringUntilVisibleVideoFrame() {
+    _coveringUntilVisibleVideoFrame = true;
+    final epoch = ++_visibleVideoFrameEpoch;
+    notifyListeners();
+    // Safety: never leave the thumbnail glued on if a frame callback is lost.
+    Future<void>.delayed(const Duration(milliseconds: 8000), () {
+      if (epoch != _visibleVideoFrameEpoch) return;
+      _endCoveringUntilVisibleVideoFrame(immediate: true);
+    });
+  }
+
+  void _endCoveringUntilVisibleVideoFrame({bool immediate = false}) {
+    if (!_coveringUntilVisibleVideoFrame) return;
+    if (immediate) {
+      _coveringUntilVisibleVideoFrame = false;
+      _visibleVideoFrameEpoch++;
+      notifyListeners();
+      return;
+    }
+    final epoch = _visibleVideoFrameEpoch;
+    Future<void>.delayed(const Duration(milliseconds: 80), () {
+      if (epoch != _visibleVideoFrameEpoch) return;
+      if (!_coveringUntilVisibleVideoFrame) return;
+      _coveringUntilVisibleVideoFrame = false;
+      notifyListeners();
+    });
+  }
+
+  Future<void> _awaitBilibiliVideoTrackPolicy() async {
+    _syncBilibiliVideoTrackPolicy();
+    final pending = _bilibiliVideoTrackPolicyFuture;
+    if (pending != null) await pending;
+  }
+
+  /// Short hops (arrow keys, sentence skip) usually land inside this window.
+  /// Showing a spinner on every keypress is the flash the user called noisy.
+  @visibleForTesting
+  static const Duration bilibiliSeekHoldOverlayDelay = Duration(
+    milliseconds: 350,
+  );
+
+  void _armSeekHoldOverlay() {
+    _seekHoldPending = true;
+    _seekHoldLandedNative = null;
+    _seekHoldOverlayTimer?.cancel();
+    if (_seekHoldOverlay) {
+      // Already visible from a longer stall; keep it until the new target
+      // starts moving instead of hiding and flashing it again.
+      _seekHoldOverlayTimer = Timer(const Duration(seconds: 15), () {
+        _clearSeekHoldOverlay();
+      });
+      return;
+    }
+    _seekHoldOverlayTimer = Timer(bilibiliSeekHoldOverlayDelay, () {
+      if (!_seekHoldPending || _seekHoldOverlay) return;
+      _seekHoldOverlay = true;
+      _seekHoldOverlayTimer = Timer(const Duration(seconds: 15), () {
+        _clearSeekHoldOverlay();
+      });
+      notifyListeners();
+    });
+  }
+
+  void _clearSeekHoldOverlay() {
+    _seekHoldPending = false;
+    _seekHoldOverlayTimer?.cancel();
+    _seekHoldOverlayTimer = null;
+    _seekHoldLandedNative = null;
+    if (!_seekHoldOverlay) return;
+    _seekHoldOverlay = false;
+    final controller = _controller;
+    if (controller != null) {
+      try {
+        if (controller.value.isInitialized) {
+          _resetPlaybackTimeline(_position, running: _shouldTimelineRun());
         }
-        if (!applied) _requestedBilibiliVideoTrackEnabled = null;
-      }),
+      } catch (_) {}
+    }
+    notifyListeners();
+  }
+
+  /// libmpv reports seekTo as complete and often keeps isPlaying=true while
+  /// cache-pause / GOP decode still freeze the picture. The spinner stays
+  /// until the native clock lands near the target and then actually ticks.
+  void _syncSeekHoldOverlayFromNative(Duration nativePosition) {
+    if (!_seekHoldPending && !_seekHoldOverlay) return;
+    final target = _lastRequestedSeekPosition ?? _position;
+    final nearTarget =
+        (nativePosition - target).inMilliseconds.abs() <= 450;
+    if (_seekHoldLandedNative == null) {
+      if (nearTarget) {
+        _seekHoldLandedNative = nativePosition;
+      }
+      return;
+    }
+    if ((nativePosition - _seekHoldLandedNative!).inMilliseconds.abs() >= 80) {
+      _clearSeekHoldOverlay();
+    }
+  }
+
+  /// Mini-card / notification resume: the Dart isPlaying flag lags cache-pause.
+  /// The native clock (or a filled demuxer window) is the real start signal.
+  Future<bool> _awaitBackgroundClockStarted(
+    VideoPlayerController controller, {
+    required int playRequestId,
+    required String itemId,
+  }) async {
+    final ready = NativeVideoPlayerMediaKit.playbackReadyFor(
+      // ignore: invalid_use_of_visible_for_testing_member
+      controller.playerId,
     );
+    if (ready == null) return controller.value.isPlaying;
+    try {
+      final started = await ready.timeout(
+        _backgroundClockReadyTimeout,
+        onTimeout: () => false,
+      );
+      if (!_isCurrentPlayRequest(
+        playRequestId,
+        itemId,
+        controller: controller,
+      )) {
+        return false;
+      }
+      return started || controller.value.isPlaying;
+    } catch (_) {
+      return controller.value.isPlaying;
+    }
+  }
+
+  void _coverUntilNextVisibleVideoFrame() {
+    if (_currentItem?.sourceRef?.kind != MediaSourceKind.bilibiliStream ||
+        _currentItem?.type != MediaType.video) {
+      return;
+    }
+    final controller = _controller;
+    // Video is already selected and producing frames. Covering here would
+    // glue the poster over a live picture on Mini/notification page entry.
+    if (_requestedBilibiliVideoTrackEnabled == true &&
+        controller != null &&
+        _controllerHasRequiredVideoOutput(_currentItem!, controller)) {
+      return;
+    }
+    _beginCoveringUntilVisibleVideoFrame();
   }
 
   /// Registers whether a full playback page is currently visible. The owner
   /// token is the State object, so portrait/landscape hand-offs can overlap
   /// without one page accidentally disabling the other page's cache policy.
   void setPlaybackPageVisible(Object owner, bool visible) {
+    final hadPage = _playbackPageOwners.isNotEmpty;
     if (visible) {
       _playbackPageOwners.add(owner);
     } else {
       _playbackPageOwners.remove(owner);
+    }
+    if (visible && !hadPage && _playbackPageOwners.isNotEmpty) {
+      _coverUntilNextVisibleVideoFrame();
     }
     _syncBilibiliCachePolicy();
   }
@@ -355,6 +668,14 @@ class MediaPlaybackService extends ChangeNotifier {
 
   @visibleForTesting
   bool get hasVisiblePlaybackPageForTest => _hasVisiblePlaybackPage;
+
+  /// True when a real playback page, not just [owner], is currently registered.
+  bool hasPlaybackPageOwnerOtherThan(Object owner) {
+    for (final candidate in _playbackPageOwners) {
+      if (!identical(candidate, owner)) return true;
+    }
+    return false;
+  }
 
   /// Registers the mini playback card independently from the full page.
   void setMiniPlaybackCardVisible(Object owner, bool visible) {
@@ -384,6 +705,63 @@ class MediaPlaybackService extends ChangeNotifier {
       // Keep background playback capability enabled and handle the
       // "leave app then pause" policy ourselves so toggles apply immediately.
       allowBackgroundPlayback: true,
+    );
+  }
+
+  /// Android ExoPlayer stores [VideoPlayerOptions.mixWithOthers] per player.
+  /// Recreate local platform players so a live toggle actually changes audio
+  /// focus. media_kit sessions follow [AudioSession] and do not need this.
+  @visibleForTesting
+  static bool shouldReloadPlayerForConcurrentPlayback({
+    required bool isAndroid,
+    required DataSourceType sourceType,
+    required String? resource,
+  }) {
+    if (!isAndroid || sourceType != DataSourceType.file || resource == null) {
+      return false;
+    }
+    return !LocalPlaybackBackendPolicy.isWideCodecBackendPreferred(resource);
+  }
+
+  /// Pushes the mix/exclusive flag to the platform player, then rebuilds an
+  /// Android ExoPlayer if one is currently active.
+  Future<void> applyConcurrentPlaybackSetting() async {
+    final allowConcurrentPlayback = SettingsService().allowConcurrentPlayback;
+    try {
+      await VideoPlayerPlatform.instance.setMixWithOthers(
+        allowConcurrentPlayback,
+      );
+    } catch (error) {
+      _logPlaybackEvent(
+        'mixWithOthers apply failed',
+        data: <String, Object?>{'error': error.toString()},
+      );
+    }
+
+    final item = _currentItem;
+    final controller = _controller;
+    if (item == null || controller == null) {
+      return;
+    }
+    if (_state == PlaybackState.loading || _state == PlaybackState.idle) {
+      return;
+    }
+    if (!shouldReloadPlayerForConcurrentPlayback(
+      isAndroid: !kIsWeb && Platform.isAndroid,
+      sourceType: DataSourceType.file,
+      resource: item.path,
+    )) {
+      return;
+    }
+
+    final position = _position;
+    final autoPlay = _state == PlaybackState.playing || _session.desiredPlaying;
+    await _disposePreloadedController(awaitCompletion: true);
+    await play(
+      item,
+      startPosition: position,
+      autoPlay: autoPlay,
+      forceRecreate: true,
     );
   }
 
@@ -484,51 +862,51 @@ class MediaPlaybackService extends ChangeNotifier {
         ? Duration.zero
         : requestedPosition;
     final duration = controller.value.duration;
-    if (duration > Duration.zero && target >= duration) {
-      target = Duration.zero;
-    }
 
     try {
-      // A new controller must be paused before both the zero seek and a
-      // resumed seek. This is intentionally done even when the backend says it
-      // is already paused, because it clears an implicit network-probe play.
       await controller.pause();
     } catch (_) {}
 
+    final metadataDuration = Duration(
+      milliseconds: _currentItem?.durationMs ?? 0,
+    );
+    final trustedDuration = PlaybackBehaviorPolicy.trustedDurationForResume(
+      nativeDuration: duration,
+      metadataDuration: metadataDuration,
+      savedPosition: target,
+    );
+    if (trustedDuration > Duration.zero && target >= trustedDuration) {
+      target = Duration.zero;
+    }
+
     Duration actual = await _readNativeControllerPosition(controller);
-    for (var attempt = 0; attempt < 3; attempt++) {
-      try {
-        await controller.seekTo(target).timeout(_controllerSeekTimeout);
-      } catch (_) {
-        break;
-      }
-
-      // Verify against the native player rather than controller.value. Flutter
-      // value notifications can be suspended in the background; treating that
-      // stale value as a failed seek caused notification episode changes to
-      // issue the same seek repeatedly and replay the target fragment.
-      await Future<void>.delayed(const Duration(milliseconds: 60));
-      actual = await _readNativeControllerPosition(controller);
-      if ((actual.inMilliseconds - target.inMilliseconds).abs() <=
-          _seekVerificationToleranceMs) {
-        _position = target;
-        break;
-      }
-    }
-
-    actual = await _readNativeControllerPosition(controller);
-    final accepted =
-        (actual.inMilliseconds - target.inMilliseconds).abs() <=
-        _seekVerificationToleranceMs;
-    if (accepted) {
-      _position = target;
-      _armInitialPositionGuard(target);
-    } else {
-      // Never persist a requested position that the native backend rejected.
-      // The next open will then resume from the actual confirmed position.
-      _position = actual;
+    // Only a genuine t=0 start can skip. Dart `position` may echo the start=
+    // header after initialize even though post-open video-track selection
+    // put libmpv back at the file start.
+    if (shouldSkipRedundantInitialSeek(
+      target: target,
+      actual: actual,
+      toleranceMs: _seekVerificationToleranceMs,
+    )) {
+      _position = Duration.zero;
       _clearInitialPositionGuard();
+      _bufferedPosition = _readBufferedPosition(controller);
+      return;
     }
+
+    try {
+      await NativeVideoPlayerMediaKit.prepareSeekStyleFor(
+        // ignore: invalid_use_of_visible_for_testing_member
+        controller.playerId,
+        style: StreamingSeekStyle.scrub,
+      );
+    } catch (_) {}
+
+    try {
+      await controller.seekTo(target).timeout(_controllerSeekTimeout);
+    } catch (_) {}
+    _position = target;
+    _armInitialPositionGuard(target);
     try {
       // Seeking must finish in a paused state. autoPlay is applied explicitly
       // by the caller after this method returns.
@@ -537,6 +915,29 @@ class MediaPlaybackService extends ChangeNotifier {
       }
     } catch (_) {}
     _bufferedPosition = _readBufferedPosition(controller);
+  }
+
+  Future<void> _confirmInitialResumePosition({
+    required VideoPlayerController controller,
+    required Duration target,
+    required bool allowPause,
+  }) async {
+    if (target.inMilliseconds <= _seekVerificationToleranceMs) return;
+    if (!controller.value.isInitialized) return;
+    final actual = await _readNativeControllerPosition(controller);
+    if ((actual - target).inMilliseconds.abs() <=
+        _seekVerificationToleranceMs) {
+      _position = target;
+      _armInitialPositionGuard(target);
+      return;
+    }
+    // Before the clock starts, pause+seek is fine. After play(), a service
+    // seek keeps audio moving instead of repeating the paused initialize path.
+    if (allowPause) {
+      await _seekInitialPosition(controller, target);
+      return;
+    }
+    await seekTo(target, source: 'play_resume_repair');
   }
 
   void _trackMobileControllerRelease(Future<void> release) {
@@ -611,8 +1012,9 @@ class MediaPlaybackService extends ChangeNotifier {
     _nativePresentationPlaybackSpeed = controller.value.playbackSpeed;
     if (positionStream != null) {
       _nativePositionSubscription = positionStream.listen((nativePosition) {
-        if (!identical(_controller, controller) ||
-            _pendingSeekRequestId != null) {
+        if (!identical(_controller, controller)) return;
+        _syncSeekHoldOverlayFromNative(nativePosition);
+        if (_pendingSeekRequestId != null) {
           return;
         }
         if (_shouldIgnoreInitialPositionSample(nativePosition)) return;
@@ -667,15 +1069,18 @@ class MediaPlaybackService extends ChangeNotifier {
     _setAppForegroundState(isForeground);
     sleepTimer.checkNow();
 
+    final bool leftForeground =
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached ||
+        (state == AppLifecycleState.paused &&
+            previousState != AppLifecycleState.hidden);
     final bool shouldPauseForBackground =
-        !kIsWeb &&
-        (Platform.isAndroid || Platform.isIOS) &&
-        SettingsService().pausePlaybackWhenAppBackgrounded &&
-        _state == PlaybackState.playing &&
-        (state == AppLifecycleState.hidden ||
-            state == AppLifecycleState.detached ||
-            (state == AppLifecycleState.paused &&
-                previousState != AppLifecycleState.hidden));
+        leftForeground &&
+        PlaybackBehaviorPolicy.shouldPauseWhenAppBackgrounded(
+          enabled: SettingsService().pausePlaybackWhenAppBackgrounded,
+          isMobilePlatform: !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+          transportPlaying: isTransportPlaying,
+        );
 
     if (shouldPauseForBackground) {
       unawaited(pause());
@@ -734,7 +1139,10 @@ class MediaPlaybackService extends ChangeNotifier {
     }
     if (isForeground && _playbackPageOwners.isNotEmpty) {
       final item = _currentItem;
-      if (item != null) unawaited(ensureVisibleVideoOutput(item.id));
+      if (item != null) {
+        _coverUntilNextVisibleVideoFrame();
+        unawaited(ensureVisibleVideoOutput(item.id));
+      }
     }
   }
 
@@ -772,6 +1180,79 @@ class MediaPlaybackService extends ChangeNotifier {
   Duration get duration => _duration;
   Duration get bufferedPosition => _bufferedPosition;
   bool get isPlaying => _state == PlaybackState.playing;
+
+  /// Mini / notification chrome follows the last play/pause intent. Windows
+  /// Bilibili Mini can emit audio while `_state` is still loading and Dart
+  /// `isPlaying` stays false under cache-pause.
+  bool get isTransportPlaying =>
+      _session.desiredPlaying &&
+      _state != PlaybackState.error &&
+      _state != PlaybackState.idle;
+
+  /// Mini/notification page entry must not call [resume] just because Dart
+  /// `isPlaying` is false. Windows cache-pause leaves that flag false while
+  /// audio is already running; resume() used to pause+seek and hitch the AO.
+  @visibleForTesting
+  static bool shouldResumeOnPageAdopt({
+    required bool desiredPlaying,
+    required PlaybackState state,
+  }) {
+    return desiredPlaying && state == PlaybackState.paused;
+  }
+
+  /// Pause only a session that is actually supposed to be paused. Do not infer
+  /// from Dart isPlaying alone — a live Mini clock can disagree with it.
+  @visibleForTesting
+  static bool shouldPauseOnPageAdopt({
+    required bool desiredPlaying,
+    required PlaybackState state,
+    required bool controllerPlaying,
+  }) {
+    if (desiredPlaying || state == PlaybackState.loading) return false;
+    return state == PlaybackState.playing || controllerPlaying;
+  }
+
+  /// Resume point for a new native session.
+  ///
+  /// An explicit [startPosition] always wins, including [Duration.zero]
+  /// (completed-item restart). Otherwise keep a restored/live same-item
+  /// clock — restart Mini chrome publishes snapshot progress before
+  /// `lastPositionMs` is on disk — then library progress.
+  @visibleForTesting
+  static Duration resolvePlayStartPosition({
+    required Duration? startPosition,
+    required String? currentItemId,
+    required String itemId,
+    required Duration currentPosition,
+    Duration? trackedProgress,
+    required int lastPositionMs,
+  }) {
+    if (startPosition != null) return startPosition;
+    if (currentItemId == itemId && currentPosition > Duration.zero) {
+      return currentPosition;
+    }
+    if (trackedProgress != null && trackedProgress > Duration.zero) {
+      return trackedProgress;
+    }
+    if (lastPositionMs > 0) {
+      return Duration(milliseconds: lastPositionMs);
+    }
+    return Duration.zero;
+  }
+
+  /// Pass the live/restored clock into [play] only when it is actually a
+  /// resume point. `Duration.zero` must stay null so library progress can
+  /// fill in after a process restart.
+  @visibleForTesting
+  static Duration? startPositionForCurrentSession({
+    required String? currentItemId,
+    required String itemId,
+    required Duration currentPosition,
+  }) {
+    if (currentItemId != itemId) return null;
+    return currentPosition > Duration.zero ? currentPosition : null;
+  }
+
   bool get desiredPlaying => _session.desiredPlaying;
   PlaybackSessionSnapshot get session => _session;
   int get sessionGeneration => _session.generation;
@@ -785,12 +1266,110 @@ class MediaPlaybackService extends ChangeNotifier {
   bool get isCurrentItemOnlineBilibiliStream =>
       isCurrentItemBilibiliStream && _currentBilibiliPlayback != null;
 
+  /// Online Bilibili card, including the prepare window before playurl commits.
+  bool get isCurrentItemStreamingBilibiliCard =>
+      isCurrentItemBilibiliStream &&
+      _selectedStreamQuality?.isLocalMaterialized != true;
+
+  /// Rolling gateway throughput for the active online Bilibili item.
+  double get bilibiliGatewayBytesPerSecond => _bilibiliGatewayBytesPerSecond;
+
+  /// Human-readable transfer rate for loading / buffering overlays.
+  String? get bilibiliGatewaySpeedLabel =>
+      formatTransferSpeedLabel(_bilibiliGatewayBytesPerSecond);
+
+  /// Whether the Bilibili-style buffering overlay should be visible.
+  bool get isBilibiliBufferingOverlayVisible =>
+      shouldShowBilibiliBufferingOverlay(
+        isStreamingCard: isCurrentItemStreamingBilibiliCard,
+        state: _state,
+        coveringUntilFrame: _coveringUntilVisibleVideoFrame,
+        controllerBuffering: _controllerIsBuffering,
+        controllerPlaying: _controller?.value.isPlaying ?? false,
+        seekHold: _seekHoldOverlay,
+      );
+
+  /// Readahead while the clock is already running is not a stall. Showing a
+  /// spinner for the whole 60s/128MB desktop window made gigabit loads look
+  /// stuck at a fake 40 MB/s. Dart `seekTo` in-flight is also not a stall:
+  /// arrow-key hops set that flag on every tap and would flash the spinner.
+  @visibleForTesting
+  static bool shouldShowBilibiliBufferingOverlay({
+    required bool isStreamingCard,
+    required PlaybackState state,
+    required bool coveringUntilFrame,
+    required bool controllerBuffering,
+    bool controllerPlaying = true,
+    bool seekHold = false,
+  }) {
+    if (!isStreamingCard) return false;
+    // Mini→page keeps a poster over the texture while video catches the
+    // audio clock. A spinner on top of live audio is the hard-cut feel,
+    // even when `_state` is still loading because Dart isPlaying lagged.
+    if (coveringUntilFrame) return false;
+    if (state == PlaybackState.loading) return true;
+    if (seekHold) return true;
+    if (!controllerBuffering) return false;
+    if (state != PlaybackState.playing) return true;
+    return !controllerPlaying;
+  }
+
+  /// Fallback status line when throughput has not been measured yet.
+  String get bilibiliBufferingStatusText {
+    if (_state == PlaybackState.loading) return '正在连接...';
+    if (_seekHoldOverlay || _pendingSeekRequestId != null) return '正在跳转...';
+    return '缓冲中...';
+  }
+
+  @visibleForTesting
+  static String? formatTransferSpeedLabel(double bytesPerSecond) {
+    if (!bytesPerSecond.isFinite || bytesPerSecond <= 0) return null;
+    if (bytesPerSecond >= 1024 * 1024) {
+      return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+    }
+    if (bytesPerSecond >= 1024) {
+      return '${(bytesPerSecond / 1024).toStringAsFixed(1)} KB/s';
+    }
+    return '${bytesPerSecond.round()} B/s';
+  }
+
+  /// Clock for floating subtitles and the sidebar highlight.
+  ///
+  /// Playback pages used to read [VideoPlayerController] directly. Online
+  /// Bilibili hops keep reporting the pre-hop native sample long enough for
+  /// that highlight to flash backward, then catch up. Keep the optimistic
+  /// hop target until native has actually landed.
+  Duration positionForSubtitleOverlay(Duration nativePosition) {
+    final source = _lastSeekSource;
+    if (!SubtitleHopSeekPolicy.shouldHoldSubtitleClockOnHop(
+      lastSeekSource: source,
+      now: DateTime.now(),
+      lastHopSeekAt: _lastHopSeekAt,
+      nativePosition: nativePosition,
+      hopTarget: _lastRequestedSeekPosition ?? _position,
+      hopSeekInFlight:
+          (_hopSeekDispatchTimer?.isActive ?? false) ||
+          (_pendingSeekRequestId != null &&
+              SubtitleHopSeekPolicy.isHopSeekSource(source ?? '')),
+    )) {
+      return nativePosition;
+    }
+    return _position < Duration.zero ? Duration.zero : _position;
+  }
+
+  /// Mini card can render from [currentItem] metadata without waiting for the
+  /// native controller. Loading/paused restored bookmarks are visible immediately.
+  bool get shouldShowMiniPlaybackCard =>
+      isMiniPlaybackCardVisible(currentItem: _currentItem, state: _state);
+
   /// Whether the active native controller is safe for a playback page to
   /// mount, even while the session is still waiting for its first video frame.
   ///
   /// `loading` describes playback readiness, not controller availability. A
   /// visible media_kit output may need to be mounted before its first rendered
   /// frame can arrive, so pages must not use the state alone as a mount gate.
+  /// Mini/notification Bilibili is audio-first and may not have a Flutter
+  /// texture yet; mounting that same Player avoids play() reopening the stream.
   bool get hasMountableController {
     final controller = _controller;
     final item = _currentItem;
@@ -801,7 +1380,8 @@ class MediaPlaybackService extends ChangeNotifier {
         _session.isControllerMountable &&
         controller.value.isInitialized &&
         !controller.value.hasError &&
-        _controllerHasRequiredVideoOutput(item, controller);
+        (_controllerHasRequiredVideoOutput(item, controller) ||
+            item.sourceRef?.kind == MediaSourceKind.bilibiliStream);
   }
 
   bool canMountControllerFor(
@@ -817,7 +1397,28 @@ class MediaPlaybackService extends ChangeNotifier {
         _session.isControllerMountable &&
         candidate.value.isInitialized &&
         !candidate.value.hasError &&
-        _controllerHasRequiredVideoOutput(_currentItem!, candidate);
+        (_controllerHasRequiredVideoOutput(_currentItem!, candidate) ||
+            _currentItem!.sourceRef?.kind == MediaSourceKind.bilibiliStream);
+  }
+
+  /// True when the service already owns an initialized controller for [itemId]
+  /// and only needs Bilibili video-track re-enable or visible video-output
+  /// recovery before a page can mount. Calling [play] here would reopen the
+  /// stream and stall on a second prepare cycle.
+  bool shouldDeferPlayForActiveSession(String itemId) {
+    if (_currentItem?.id != itemId || hasMountableController) return false;
+    if (_state == PlaybackState.loading ||
+        _state == PlaybackState.idle ||
+        _state == PlaybackState.error) {
+      return false;
+    }
+    final controller = _controller;
+    if (controller == null) return false;
+    try {
+      return controller.value.isInitialized && !controller.value.hasError;
+    } catch (_) {
+      return false;
+    }
   }
 
   bool _controllerHasRequiredVideoOutput(
@@ -842,6 +1443,40 @@ class MediaPlaybackService extends ChangeNotifier {
       hasVideoOutput: false,
     );
     return generation;
+  }
+
+  /// Publishes thumbnail/title/duration/progress before native prepare starts.
+  /// Restore uses this so Mini playback card can appear from local metadata.
+  /// A live session is left untouched.
+  void publishRestoredSessionPreview(VideoItem item, Duration position) {
+    if (_currentItem != null || _controller != null) return;
+    final loadingDuration = Duration(
+      milliseconds: item.durationMs > 0 ? item.durationMs : 0,
+    );
+    final loadingPosition =
+        PlaybackBehaviorPolicy.normalizeEpisodeStartPosition(
+          savedPosition: position < Duration.zero ? Duration.zero : position,
+          duration: loadingDuration,
+        );
+    _currentItem = item;
+    _isSourceMissing = false;
+    _position = loadingPosition;
+    _duration = loadingDuration;
+    _bufferedPosition = Duration.zero;
+    _resetPlaybackTimeline(loadingPosition, running: false);
+    // Paused, not loading: the Mini card is a restored bookmark. Fetching
+    // playurl here would delay chrome that only needs local metadata.
+    _state = PlaybackState.paused;
+    _beginPlaybackSession(item, desiredPlaying: false);
+    _syncWakelockWithState();
+    notifyListeners();
+  }
+
+  /// Online Bilibili restore only needs library metadata for Mini chrome.
+  /// Native prepare / playurl waits until the user actually presses play.
+  @visibleForTesting
+  static bool shouldPrepareNativePlayerOnRestore(VideoItem item) {
+    return item.sourceRef?.kind != MediaSourceKind.bilibiliStream;
   }
 
   void _transitionPlaybackSession(
@@ -983,20 +1618,26 @@ class MediaPlaybackService extends ChangeNotifier {
     return isVideo && hasVisiblePlaybackPage;
   }
 
-  /// True only for an Android video player intentionally created headless in
-  /// the background. Normal foreground controllers must never be rebuilt while
-  /// a route transition is waiting for its first frame.
+  /// True when the current player has no video the page can mount: either an
+  /// Android headless session, or a Bilibili Mini/notification audio-primary
+  /// session that must be promoted to video+audio.
   bool needsVisibleVideoOutputRecovery(String itemId) {
     final item = _currentItem;
     final controller = _controller;
-    if (kIsWeb ||
-        !Platform.isAndroid ||
-        item == null ||
+    if (item == null ||
         item.id != itemId ||
-        item.type != MediaType.video ||
-        !_controllerCreatedWithoutVisiblePlaybackPage ||
         controller == null ||
         !controller.value.isInitialized) {
+      return false;
+    }
+    if (_bilibiliAudioPrimaryPlayer &&
+        item.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+      return true;
+    }
+    if (kIsWeb ||
+        !Platform.isAndroid ||
+        item.type != MediaType.video ||
+        !_controllerCreatedWithoutVisiblePlaybackPage) {
       return false;
     }
     return NativeVideoPlayerMediaKit.hasVideoOutputFor(
@@ -1008,18 +1649,17 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// Readiness probe that never fails the surrounding play request.
   ///
-  /// A notification-controlled background switch must not be torn down and
-  /// retried just because its native clock start was not observed in time:
-  /// retrying reopened the source up to three times and left the notification
-  /// stuck on loading. Instead, an unconfirmed transport is parked paused at
-  /// the seek target and reported as [_PlaybackReadinessResult.degraded], and
-  /// an explicit play command (notification, mini player, page) resumes it.
+  /// Mini/notification must not be parked paused just because Dart `isPlaying`
+  /// never flipped (Windows cache-pause). An unconfirmed background clock is
+  /// treated as started so the play button and AO stay in agreement.
   Future<_PlaybackReadinessResult> _awaitPlaybackReadinessResult({
     required VideoItem item,
     required VideoPlayerController controller,
     required int playRequestId,
   }) async {
-    if (!_hasVisiblePlaybackPage) {
+    // Audio-primary Mini sessions have no video frames. Waiting for first-frame
+    // here parked the clock for 12s when a playback page opened mid-load.
+    if (!_hasVisiblePlaybackPage || _bilibiliAudioPrimaryPlayer) {
       final playbackReady = NativeVideoPlayerMediaKit.playbackReadyFor(
         // ignore: invalid_use_of_visible_for_testing_member
         controller.playerId,
@@ -1028,41 +1668,76 @@ class MediaPlaybackService extends ChangeNotifier {
         return _PlaybackReadinessResult.confirmed;
       }
       final ready = await playbackReady.timeout(
-        _controllerInitializeTimeout,
-        onTimeout: () => false,
+        const Duration(milliseconds: 400),
+        onTimeout: () => true,
       );
-      if (!ready &&
-          _isCurrentPlayRequest(
-            playRequestId,
-            item.id,
-            controller: controller,
-          )) {
+      if (controller.value.hasError) {
+        return _PlaybackReadinessResult.degraded;
+      }
+      // Windows split-stream Mini keeps Dart isPlaying false under
+      // cache-pause. Timing out used to park paused over a live AO, so the
+      // play button never flipped. Audio already started; treat as confirmed.
+      if (!ready) {
         _logPlaybackEvent(
-          'background playback clock did not start in time; '
-          'parking session as paused at the seek target',
+          'background playback clock unconfirmed; keeping play intent',
           data: <String, Object?>{
             'itemId': item.id,
             'positionMs': _position.inMilliseconds,
           },
         );
-        try {
-          if (controller.value.isPlaying) await controller.pause();
-        } catch (_) {}
-        return _PlaybackReadinessResult.degraded;
       }
       return _PlaybackReadinessResult.confirmed;
     }
     if (item.type != MediaType.video) {
       return _PlaybackReadinessResult.confirmed;
     }
+    // Re-selecting a split Bilibili video track is asynchronous. Waiting for
+    // a Flutter texture before that command finishes times out, then parks a
+    // session whose audio is already running.
+    if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+      await _awaitBilibiliVideoTrackPolicy();
+      if (!_isCurrentPlayRequest(
+        playRequestId,
+        item.id,
+        controller: controller,
+      )) {
+        return _PlaybackReadinessResult.confirmed;
+      }
+      // Mini→page promotion holds a visibility owner before VideoPlayer is
+      // mounted. Blocking on first-frame here froze the page for 12s.
+      _beginCoveringUntilVisibleVideoFrame();
+      final firstFrame = NativeVideoPlayerMediaKit.firstFrameRenderedFor(
+        // ignore: invalid_use_of_visible_for_testing_member
+        controller.playerId,
+      );
+      if (firstFrame == null) {
+        _endCoveringUntilVisibleVideoFrame();
+      } else {
+        final coverEpoch = _visibleVideoFrameEpoch;
+        unawaited(() async {
+          try {
+            await firstFrame.timeout(_firstVideoFrameTimeout);
+          } catch (_) {}
+          if (coverEpoch == _visibleVideoFrameEpoch) {
+            _endCoveringUntilVisibleVideoFrame(immediate: true);
+          }
+        }());
+      }
+      return _PlaybackReadinessResult.confirmed;
+    }
+    _beginCoveringUntilVisibleVideoFrame();
     final firstFrame = NativeVideoPlayerMediaKit.firstFrameRenderedFor(
       // ignore: invalid_use_of_visible_for_testing_member
       controller.playerId,
     );
-    if (firstFrame == null) return _PlaybackReadinessResult.confirmed;
+    if (firstFrame == null) {
+      _endCoveringUntilVisibleVideoFrame();
+      return _PlaybackReadinessResult.confirmed;
+    }
 
     try {
       await firstFrame.timeout(_firstVideoFrameTimeout);
+      _endCoveringUntilVisibleVideoFrame(immediate: true);
       return _PlaybackReadinessResult.confirmed;
     } on TimeoutException {
       if (!_isCurrentPlayRequest(
@@ -1070,6 +1745,7 @@ class MediaPlaybackService extends ChangeNotifier {
         item.id,
         controller: controller,
       )) {
+        _endCoveringUntilVisibleVideoFrame(immediate: true);
         return _PlaybackReadinessResult.confirmed;
       }
       _logPlaybackEvent(
@@ -1082,32 +1758,49 @@ class MediaPlaybackService extends ChangeNotifier {
       // ignore: invalid_use_of_visible_for_testing_member
       controller.playerId,
     ).timeout(_controllerInitializeTimeout, onTimeout: () => false);
-    if (!recovered) {
-      // Foreground decoder produced no frame. Degrade to a paused session at
-      // the target position instead of entering the error state: the mounted
-      // page keeps its controls, and a manual play retries the transport
-      // without reopening the media source.
+    if (recovered) {
+      await firstFrame.timeout(_firstVideoFrameTimeout);
+      _endCoveringUntilVisibleVideoFrame(immediate: true);
+      return _PlaybackReadinessResult.confirmed;
+    }
+
+    final nativeClockPlaying = controller.value.isPlaying;
+    if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream ||
+        !shouldParkWhenVisibleVideoFrameMissing(
+          nativeClockPlaying: nativeClockPlaying,
+        )) {
+      // Audio is already running, or this is a Mini→page promotion whose
+      // VideoPlayer has not mounted yet. Parking froze the playback page.
       _logPlaybackEvent(
-        'video decoder produced no frame; parking session as paused',
+        'video decoder produced no frame; keeping running session',
         data: <String, Object?>{'itemId': item.id},
       );
-      try {
-        if (controller.value.isPlaying) await controller.pause();
-      } catch (_) {}
-      return _PlaybackReadinessResult.degraded;
+      _endCoveringUntilVisibleVideoFrame();
+      return _PlaybackReadinessResult.confirmed;
     }
-    await firstFrame.timeout(_firstVideoFrameTimeout);
-    return _PlaybackReadinessResult.confirmed;
+    _logPlaybackEvent(
+      'video decoder produced no frame; parking session as paused',
+      data: <String, Object?>{'itemId': item.id},
+    );
+    try {
+      if (controller.value.isPlaying) await controller.pause();
+    } catch (_) {}
+    _endCoveringUntilVisibleVideoFrame(immediate: true);
+    return _PlaybackReadinessResult.degraded;
   }
 
   void _primeDeferredVideoOutput(
     VideoItem item,
     VideoPlayerController controller,
   ) {
-    // Split Bilibili streams deliberately stay audio-only until an actual
-    // playback page becomes visible. Local files never reach this branch.
+    // Split Bilibili stays audio-only off-page only when the user opted into
+    // background data saving. Otherwise keep decoding video so Mini/notification
+    // can open the playback page on the live picture.
     if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
-        !_hasVisiblePlaybackPage) {
+        shouldDeferBilibiliVideoOnOpen(
+          hasVisiblePlaybackPage: _hasVisiblePlaybackPage,
+          backgroundAudioOnly: SettingsService().bilibiliBackgroundAudioOnly,
+        )) {
       return;
     }
     if (!needsVisibleVideoOutputRecovery(item.id)) return;
@@ -1174,12 +1867,16 @@ class MediaPlaybackService extends ChangeNotifier {
             data: <String, Object?>{'itemId': item.id, 'playerId': playerId},
           );
           var attached = false;
-          for (var attempt = 0; attempt < 2 && !attached; attempt++) {
-            attached = await NativeVideoPlayerMediaKit.attachVideoOutputFor(
-              playerId,
-            );
-            if (!attached && attempt == 0) {
-              await Future<void>.delayed(const Duration(milliseconds: 100));
+          // Audio-primary players have no video stream to attach a texture to.
+          // Promote by reopening video+audio at the same clock below.
+          if (!_bilibiliAudioPrimaryPlayer) {
+            for (var attempt = 0; attempt < 2 && !attached; attempt++) {
+              attached = await NativeVideoPlayerMediaKit.attachVideoOutputFor(
+                playerId,
+              );
+              if (!attached && attempt == 0) {
+                await Future<void>.delayed(const Duration(milliseconds: 100));
+              }
             }
           }
           if (_currentItem?.id != item.id ||
@@ -1188,6 +1885,7 @@ class MediaPlaybackService extends ChangeNotifier {
           }
           if (attached && !controller.value.hasError) {
             _controllerCreatedWithoutVisiblePlaybackPage = false;
+            _endCoveringUntilVisibleVideoFrame(immediate: true);
             _transitionPlaybackSession(
               _session.generation,
               _state == PlaybackState.loading
@@ -1246,6 +1944,7 @@ class MediaPlaybackService extends ChangeNotifier {
             item,
             startPosition: resumePosition,
             autoPlay: desiredPlaying,
+            forceRecreate: _bilibiliAudioPrimaryPlayer,
           );
           return _currentItem?.id == item.id &&
               _controller != null &&
@@ -1330,7 +2029,9 @@ class MediaPlaybackService extends ChangeNotifier {
     _libraryService = libraryService;
     _embeddedSubtitleService = embeddedSubtitleService;
     _bilibiliStreamingService = bilibiliStreamingService;
+    _attachBilibiliStreamingListener();
     _attachPlaybackMaterializedListener();
+    _attachSettingsListener();
     await _restorePersistedMuteState(notify: false);
     await sleepTimer.initialize(
       playbackListenable: this,
@@ -1348,6 +2049,60 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   bool _playbackMaterializedListenerAttached = false;
+  bool _settingsListenerAttached = false;
+  bool? _lastBilibiliBackgroundAudioOnly;
+
+  void _attachSettingsListener() {
+    if (_settingsListenerAttached) return;
+    _settingsListenerAttached = true;
+    final settings = SettingsService();
+    _lastBilibiliBackgroundAudioOnly = settings.bilibiliBackgroundAudioOnly;
+    settings.addListener(_onPlaybackSettingsChanged);
+  }
+
+  void _onPlaybackSettingsChanged() {
+    final enabled = SettingsService().bilibiliBackgroundAudioOnly;
+    if (_lastBilibiliBackgroundAudioOnly == enabled) return;
+    _lastBilibiliBackgroundAudioOnly = enabled;
+    // Re-apply vid now so toggling the switch does not wait for the next
+    // page/Mini visibility change. Enabling video while Mini is live keeps
+    // the clock; the page can then mount the already-selected track.
+    _syncBilibiliVideoTrackPolicy();
+    if (enabled) return;
+    final item = _currentItem;
+    final controller = _controller;
+    if (item == null || controller == null) return;
+    _primeDeferredVideoOutput(item, controller);
+  }
+
+  void _detachSettingsListener() {
+    if (!_settingsListenerAttached) return;
+    _settingsListenerAttached = false;
+    SettingsService().removeListener(_onPlaybackSettingsChanged);
+  }
+
+  void _attachBilibiliStreamingListener() {
+    if (_bilibiliStreamingListenerAttached) return;
+    final streaming = _bilibiliStreamingService;
+    if (streaming == null) return;
+    _bilibiliStreamingListenerAttached = true;
+    streaming.addListener(_onBilibiliGatewayTransferRateChanged);
+  }
+
+  void _onBilibiliGatewayTransferRateChanged() {
+    final itemId = _currentItem?.id;
+    if (itemId == null || !isCurrentItemStreamingBilibiliCard) return;
+    _syncBilibiliGatewaySpeed(notify: true);
+  }
+
+  void _syncBilibiliGatewaySpeed({required bool notify}) {
+    final itemId = _currentItem?.id;
+    if (itemId == null || !isCurrentItemStreamingBilibiliCard) return;
+    final speed = _bilibiliStreamingService!.gatewayBytesPerSecondFor(itemId);
+    if (speed == _bilibiliGatewayBytesPerSecond) return;
+    _bilibiliGatewayBytesPerSecond = speed;
+    if (notify) notifyListeners();
+  }
 
   /// 合成/OCR 下载的素材在后台补齐为可直接播放的文件时，把当前正在在线
   /// 播放的同卡片会话切换到“本地素材”档，实现“下载好即离线复用”。
@@ -1461,7 +2216,11 @@ class MediaPlaybackService extends ChangeNotifier {
         return true;
       }
 
-      warmController = _createBilibiliStreamController(preparedPlayback);
+      warmController = _createBilibiliStreamController(
+        preparedPlayback,
+        fastStart: true,
+        startPosition: _streamQualityHandoffPosition(),
+      );
       try {
         await warmController.initialize();
       } catch (error) {
@@ -1639,16 +2398,52 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   VideoPlayerController _createBilibiliStreamController(
-    BilibiliPreparedPlayback playback,
-  ) {
+    BilibiliPreparedPlayback playback, {
+    bool fastStart = false,
+    bool audioPrimary = false,
+    bool deferVideo = false,
+    Duration? startPosition,
+  }) {
+    if (audioPrimary) {
+      return VideoPlayerController.networkUrl(
+        playback.audioUri,
+        httpHeaders: <String, String>{
+          NativeVideoPlayerMediaKit.audioPrimaryStreamHeader: '1',
+          NativeVideoPlayerMediaKit.fastStreamStartHeader: '1',
+        },
+        videoPlayerOptions: buildVideoPlayerOptions(),
+      );
+    }
+    final startMs = startPosition?.inMilliseconds ?? 0;
     return VideoPlayerController.networkUrl(
       playback.videoUri,
       httpHeaders: <String, String>{
         NativeVideoPlayerMediaKit.externalAudioSourceHeader: playback.audioUri
             .toString(),
+        if (fastStart) NativeVideoPlayerMediaKit.fastStreamStartHeader: '1',
+        if (deferVideo) NativeVideoPlayerMediaKit.deferVideoStreamHeader: '1',
+        if (startMs > 0)
+          NativeVideoPlayerMediaKit.startPositionMsHeader: '$startMs',
       },
       videoPlayerOptions: buildVideoPlayerOptions(),
     );
+  }
+
+  /// Desktop Bilibili always skips the 2s cache-pause-initial. Gigabit Windows
+  /// was waiting on that guard while the overlay reported a bursty false speed.
+  bool _shouldFastStartBilibiliOnThisPlatform() {
+    if (kIsWeb) return false;
+    return Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+  }
+
+  Future<bool> _shouldFastStartCachedBilibiliStream(VideoItem item) async {
+    final streaming = _bilibiliStreamingService;
+    if (streaming == null) return false;
+    try {
+      return await streaming.hasReusableTrackCache(item.id);
+    } catch (_) {
+      return false;
+    }
   }
 
   bool _isCurrentStreamQualitySwitch(
@@ -1725,6 +2520,7 @@ class MediaPlaybackService extends ChangeNotifier {
   }) async {
     final normalSpeed = _playbackSpeed;
     var appliedSpeed = controller.value.playbackSpeed;
+    var usedCatchUpSpeed = false;
     final deadline = DateTime.now().add(_streamQualityPhaseLockTimeout);
 
     Future<void> setCandidateSpeed(double speed) async {
@@ -1757,10 +2553,14 @@ class MediaPlaybackService extends ChangeNotifier {
         if (deltaMs.abs() <= _streamQualityHandoffToleranceMs) {
           await setCandidateSpeed(normalSpeed);
           if (!controller.value.isPlaying) await controller.play();
+          // Catch-up speed can overshoot; confirm one sample after restoring
+          // the user rate. An already-locked candidate does not need that extra
+          // wait — it is the bulk of the "seamless but slow" quality switch.
+          if (!usedCatchUpSpeed) {
+            return positions[1];
+          }
+          usedCatchUpSpeed = false;
 
-          // Confirm one more presentation interval at normal speed. No seek is
-          // allowed after this confirmation, so the decoded texture remains
-          // valid when Flutter mounts it.
           await Future<void>.delayed(_streamQualityPhaseLockSampleDelay);
           if (controller.value.isBuffering) continue;
           final confirmation = await Future.wait<Duration>(<Future<Duration>>[
@@ -1786,6 +2586,7 @@ class MediaPlaybackService extends ChangeNotifier {
           if (!controller.value.isPlaying) await controller.play();
           final catchUp = ((-deltaMs) / 300).clamp(0.5, 1.5).toDouble();
           await setCandidateSpeed(normalSpeed + catchUp);
+          usedCatchUpSpeed = true;
         }
 
         await Future<void>.delayed(_streamQualityPhaseLockSampleDelay);
@@ -1843,6 +2644,9 @@ class MediaPlaybackService extends ChangeNotifier {
     VideoPlayerController controller,
   ) async {
     try {
+      // ignore: invalid_use_of_visible_for_testing_member
+      final native = NativeVideoPlayerMediaKit.timePosFor(controller.playerId);
+      if (native != null) return native;
       return await controller.position ?? controller.value.position;
     } catch (_) {
       return controller.value.position;
@@ -1975,6 +2779,7 @@ class MediaPlaybackService extends ChangeNotifier {
       desiredPlaying: shouldPlay,
     );
     _currentBilibiliPlayback = preparedPlayback;
+    _bilibiliAudioPrimaryPlayer = false;
     _currentMaterializedPlaybackLease = null;
     _isSourceMissing = false;
     _streamQualities = List.unmodifiable([
@@ -2883,12 +3688,24 @@ class MediaPlaybackService extends ChangeNotifier {
       desiredPlaying: autoPlay,
     );
     _activePlayInvocationGeneration = sessionGeneration;
+    // Restored Bilibili Mini has no controller and stays paused until play().
+    // Mark loading before the first await so the playback page does not fire a
+    // second play() without startPosition and reopen at t=0.
+    if (forceRecreate || !_controllerIsReusableForItem(item)) {
+      _state = PlaybackState.loading;
+      notifyListeners();
+    } else if (autoPlay) {
+      // Mini chrome follows desiredPlaying. Publish the tap immediately so the
+      // play button does not sit on a triangle while playurl/initialize run.
+      notifyListeners();
+    }
     bool shouldPlayNow() => _session.generation == sessionGeneration
         ? _session.desiredPlaying
         : autoPlay;
     _seekRequestId++;
     _pendingSeekRequestId = null;
     _clearInitialPositionGuard();
+    _cancelHopSeekDispatch();
     _seekVerificationTimer?.cancel();
     _seekVerificationTimer = null;
     VideoPlayerController? requestController;
@@ -3052,6 +3869,17 @@ class MediaPlaybackService extends ChangeNotifier {
           running: shouldPlayNow() && controller.value.isPlaying,
         );
 
+        if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+          await _awaitBilibiliVideoTrackPolicy();
+          if (!_isCurrentPlayRequest(
+            playRequestId,
+            item.id,
+            controller: controller,
+          )) {
+            return;
+          }
+        }
+
         if (shouldPlayNow()) {
           _state = PlaybackState.playing;
           _syncWakelockWithState();
@@ -3064,6 +3892,36 @@ class MediaPlaybackService extends ChangeNotifier {
               item.id,
               controller: controller,
             )) {
+              return;
+            }
+          }
+          if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
+              !controller.value.isPlaying) {
+            final clockStarted = await _awaitBackgroundClockStarted(
+              controller,
+              playRequestId: playRequestId,
+              itemId: item.id,
+            );
+            if (!_isCurrentPlayRequest(
+              playRequestId,
+              item.id,
+              controller: controller,
+            )) {
+              return;
+            }
+            if (!clockStarted &&
+                !controller.value.isPlaying &&
+                shouldPlayNow()) {
+              _logPlaybackEvent(
+                'reused Bilibili controller did not start; recreating stream',
+                data: <String, Object?>{'itemId': item.id},
+              );
+              await play(
+                item,
+                autoPlay: true,
+                startPosition: _position,
+                forceRecreate: true,
+              );
               return;
             }
           }
@@ -3116,6 +3974,7 @@ class MediaPlaybackService extends ChangeNotifier {
           return;
         }
         _refreshSubtitlesForCurrentItem(item);
+        _prefetchNeighborBilibiliStreams();
         return;
       }
 
@@ -3173,10 +4032,14 @@ class MediaPlaybackService extends ChangeNotifier {
       // previous controller may remain alive while the new one initializes,
       // so leaving these fields untouched would briefly render the previous
       // item's progress on the new current-item card.
-      var loadingPosition =
-          startPosition ??
-          _progressTracker?.getProgress(item.id) ??
-          Duration(milliseconds: item.lastPositionMs);
+      var loadingPosition = resolvePlayStartPosition(
+        startPosition: startPosition,
+        currentItemId: _currentItem?.id,
+        itemId: item.id,
+        currentPosition: _position,
+        trackedProgress: _progressTracker?.getProgress(item.id),
+        lastPositionMs: item.lastPositionMs,
+      );
       final loadingDuration = Duration(
         milliseconds: item.durationMs > 0 ? item.durationMs : 0,
       );
@@ -3191,7 +4054,12 @@ class MediaPlaybackService extends ChangeNotifier {
       _duration = loadingDuration;
       _bufferedPosition = Duration.zero;
       _resetPlaybackTimeline(loadingPosition, running: false);
-      _state = PlaybackState.loading;
+      // A page-exit / background pause can land while playurl is still in
+      // flight. Do not stomp that paused intent with loading chrome.
+      if (!(_session.generation == sessionGeneration &&
+          !_session.desiredPlaying)) {
+        _state = PlaybackState.loading;
+      }
       _transitionPlaybackSession(
         sessionGeneration,
         PlaybackSessionPhase.preparingSource,
@@ -3384,6 +4252,7 @@ class MediaPlaybackService extends ChangeNotifier {
           return;
         }
         _refreshSubtitlesForCurrentItem(item);
+        _prefetchNeighborBilibiliStreams();
         _logPlaybackEvent(
           'play via preloaded controller',
           data: {'itemId': item.id, 'autoPlay': autoPlay},
@@ -3519,13 +4388,43 @@ class MediaPlaybackService extends ChangeNotifier {
         _streamDisplayAspectRatio = null;
         _currentBilibiliPlayback = null;
       }
-      final controller = isBilibiliStream
+      // Readable `.seg` cache means loopback can fill the demuxer immediately.
+      // Skip the conservative 2s cache-pause-initial used for cold CDN opens.
+      var bilibiliFastStart = false;
+      var bilibiliDeferVideo = false;
+      if (isBilibiliStream &&
+          requestMaterializedLease == null &&
+          preparedStream != null) {
+        // Same Player as the playback page. Background audio-only deselects
+        // video after open; otherwise Mini/notification keep decoding video so
+        // a later page entry mounts the live picture without re-enabling vid.
+        bilibiliDeferVideo = shouldDeferBilibiliVideoOnOpen(
+          hasVisiblePlaybackPage: _hasVisiblePlaybackPage,
+          backgroundAudioOnly: SettingsService().bilibiliBackgroundAudioOnly,
+        );
+        bilibiliFastStart =
+            bilibiliDeferVideo ||
+            _shouldFastStartBilibiliOnThisPlatform() ||
+            await _shouldFastStartCachedBilibiliStream(item);
+        if (!_isCurrentPlayRequest(playRequestId, item.id)) {
+          await requestMaterializedLease?.release();
+          requestMaterializedLease = null;
+          await releaseRequestBilibiliPlayback();
+          return;
+        }
+      }
+      var controller = isBilibiliStream
           ? requestMaterializedLease != null
                 ? VideoPlayerController.file(
                     File(requestMaterializedLease.requiredVideoPath),
                     videoPlayerOptions: buildVideoPlayerOptions(),
                   )
-                : _createBilibiliStreamController(preparedStream!)
+                : _createBilibiliStreamController(
+                    preparedStream!,
+                    fastStart: bilibiliFastStart,
+                    deferVideo: bilibiliDeferVideo,
+                    startPosition: loadingPosition,
+                  )
           : VideoPlayerController.file(
               playbackFile!,
               videoPlayerOptions: buildVideoPlayerOptions(),
@@ -3577,6 +4476,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
       _controller = controller;
       _serviceOwnsController = true;
+      _bilibiliAudioPrimaryPlayer = false;
       if (preparedStream != null) {
         _currentBilibiliPlayback = preparedStream;
         requestBilibiliPlayback = null;
@@ -3610,10 +4510,18 @@ class MediaPlaybackService extends ChangeNotifier {
         return;
       }
 
-      _duration = controller.value.duration;
+      _duration = PlaybackBehaviorPolicy.trustedDurationForResume(
+        nativeDuration: controller.value.duration,
+        metadataDuration: loadingDuration,
+        savedPosition: loadingPosition,
+      );
       _bufferedPosition = _readBufferedPosition(controller);
-      if (_progressTracker != null && _duration > Duration.zero) {
-        await _progressTracker!.saveDurationImmediately(item.id, _duration);
+      final nativeDuration = controller.value.duration;
+      if (_progressTracker != null &&
+          nativeDuration > Duration.zero &&
+          (item.durationMs <= 0 ||
+              nativeDuration.inMilliseconds >= item.durationMs ~/ 2)) {
+        await _progressTracker!.saveDurationImmediately(item.id, nativeDuration);
         if (!_isCurrentPlayRequest(
           playRequestId,
           item.id,
@@ -3645,7 +4553,11 @@ class MediaPlaybackService extends ChangeNotifier {
       final normalizedInitialPosition =
           PlaybackBehaviorPolicy.normalizeEpisodeStartPosition(
             savedPosition: initialPosition,
-            duration: _duration,
+            duration: PlaybackBehaviorPolicy.trustedDurationForResume(
+              nativeDuration: controller.value.duration,
+              metadataDuration: loadingDuration,
+              savedPosition: initialPosition,
+            ),
           );
       if (normalizedInitialPosition != initialPosition) {
         _logPlaybackEvent(
@@ -3680,16 +4592,50 @@ class MediaPlaybackService extends ChangeNotifier {
       controller.addListener(_onControllerUpdate);
       _lastControllerIsPlaying = controller.value.isPlaying;
       if (shouldPlayNow()) {
-        // 乐观更新：立即设置状态为播放中
-
-        // 启动进度追踪定时器
-
-        // 开始播放
-        // Mounting the visible VideoPlayer can be part of the native render
-        // path. Publish the initialized, positioned controller before waiting
-        // for first-frame readiness to avoid a circular loading wait.
+        // 乐观更新：立即设置状态为播放中。Windows Mini 在 cache-pause 下
+        // Dart isPlaying 会一直为 false；若等到 readiness 才切状态，按钮会
+        // 一直显示播放箭头，而音频其实已经开始了。
+        _state = PlaybackState.playing;
+        _syncWakelockWithState();
+        _startProgressTracking();
         notifyListeners();
+        // Mini card / notification play has no page owner. Drop the video
+        // track before the clock starts so Windows does not pull video bytes.
+        if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+          await _awaitBilibiliVideoTrackPolicy();
+          if (!_isCurrentPlayRequest(
+            playRequestId,
+            item.id,
+            controller: controller,
+          )) {
+            return;
+          }
+          await _confirmInitialResumePosition(
+            controller: controller,
+            target: initialPosition,
+            allowPause: true,
+          );
+          if (!_isCurrentPlayRequest(
+            playRequestId,
+            item.id,
+            controller: controller,
+          )) {
+            return;
+          }
+        }
         await controller.play();
+        if (!_isCurrentPlayRequest(
+          playRequestId,
+          item.id,
+          controller: controller,
+        )) {
+          return;
+        }
+        await _confirmInitialResumePosition(
+          controller: controller,
+          target: initialPosition,
+          allowPause: false,
+        );
         if (!_isCurrentPlayRequest(
           playRequestId,
           item.id,
@@ -3808,6 +4754,7 @@ class MediaPlaybackService extends ChangeNotifier {
       notifyListeners();
 
       _refreshSubtitlesForCurrentItem(item);
+      _prefetchNeighborBilibiliStreams();
     } catch (e) {
       await releaseEarlyBilibiliSource();
       await requestMaterializedLease?.release();
@@ -3917,6 +4864,7 @@ class MediaPlaybackService extends ChangeNotifier {
     _hasPlaybackCompleted = false;
     _seekPersistTimer?.cancel();
     _seekPersistTimer = null;
+    _cancelHopSeekDispatch();
     _seekVerificationTimer?.cancel();
     _seekVerificationTimer = null;
     _stopProgressTracking();
@@ -4002,22 +4950,26 @@ class MediaPlaybackService extends ChangeNotifier {
     }
     if (_activePlayInvocationGeneration == _session.generation) {
       _setDesiredPlaying(false);
-      // Publish the intent before awaiting the native transport. Android can
-      // keep pause() pending while a newly selected source is still preparing;
-      // delaying this notification leaves the media card showing the wrong
-      // button and makes a second tap look as though it was ignored.
+      // Bilibili Windows/cache-pause leaves Dart isPlaying false while audio
+      // is running. Pause the native transport unconditionally; play() then
+      // observes desiredPlaying=false and finishes paused.
+      if (_state == PlaybackState.playing || _state == PlaybackState.loading) {
+        _state = PlaybackState.paused;
+        _setPlaybackTimelineRunning(false);
+        _syncWakelockWithState();
+        _stopProgressTracking();
+      }
       notifyListeners();
       final loadingController = _controller;
-      if (_currentItem?.id == _session.itemId &&
-          loadingController != null &&
-          loadingController.value.isPlaying) {
+      if (_currentItem?.id == _session.itemId && loadingController != null) {
         try {
           await loadingController.pause();
         } catch (_) {}
       }
+      unawaited(_saveCurrentProgress(immediate: true));
       return;
     }
-    if (_state != PlaybackState.playing) return;
+    if (_state != PlaybackState.playing && !isTransportPlaying) return;
     final controller = _controller;
     final itemId = _currentItem?.id;
     if (controller == null || itemId == null) return;
@@ -4122,6 +5074,12 @@ class MediaPlaybackService extends ChangeNotifier {
       await play(currentItem, autoPlay: true, startPosition: _position);
       return;
     }
+    if (currentItem != null &&
+        _controller == null &&
+        (_state == PlaybackState.paused || _state == PlaybackState.loading)) {
+      await play(currentItem, autoPlay: true, startPosition: _position);
+      return;
+    }
     if (_hasPlaybackCompleted && currentItem != null) {
       _logPlaybackEvent(
         'resume requested after completion',
@@ -4136,10 +5094,13 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
 
-    if (_state != PlaybackState.paused || currentItem == null) return;
+    if (currentItem == null || _state == PlaybackState.idle) return;
     final controller = _controller;
     final itemId = _currentItem?.id;
-    if (controller == null || itemId == null) return;
+    if (controller == null || itemId == null) {
+      await play(currentItem, autoPlay: true, startPosition: _position);
+      return;
+    }
     final requestId = ++_playRequestId;
     _seekRequestId++;
     _pendingSeekRequestId = null;
@@ -4154,13 +5115,19 @@ class MediaPlaybackService extends ChangeNotifier {
           'positionMs': _position.inMilliseconds,
         },
       );
-      // 乐观更新：立即设置状态为播放中
+      // Windows Mini can sit in loading while the AO is paused, or in playing
+      // while Dart isPlaying stays false. Do not require `_state == paused`.
+      final wasPaused = _state == PlaybackState.paused;
+      final wasAlreadyPlaying = _state == PlaybackState.playing;
       _state = PlaybackState.playing;
       _syncWakelockWithState();
       notifyListeners();
 
-      // 重新启动进度追踪定时器
-      if (currentItem.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
+      // _seekInitialPosition pauses first. Only realign a session that was
+      // actually paused; doing it over a live Mini/notification clock is the
+      // audible hitch on page entry.
+      if (wasPaused &&
+          currentItem.sourceRef?.kind == MediaSourceKind.bilibiliStream &&
           controller.value.isInitialized &&
           (controller.value.position.inMilliseconds - _position.inMilliseconds)
                   .abs() >
@@ -4172,6 +5139,18 @@ class MediaPlaybackService extends ChangeNotifier {
       }
 
       _startProgressTracking();
+
+      // Mini card play is audio-only. Apply that before starting the clock so
+      // a Windows resume cannot begin pulling the video track. Skip when the
+      // session was already playing: a page-entry repair must not re-enable
+      // and seek the video demuxer over live audio.
+      if (!wasAlreadyPlaying &&
+          currentItem.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+        await _awaitBilibiliVideoTrackPolicy();
+        if (!_isCurrentPlayRequest(requestId, itemId, controller: controller)) {
+          return;
+        }
+      }
 
       await controller.play();
       if (!_isCurrentPlayRequest(requestId, itemId, controller: controller)) {
@@ -4191,6 +5170,7 @@ class MediaPlaybackService extends ChangeNotifier {
       if (!_isCurrentPlayRequest(requestId, itemId, controller: controller)) {
         return;
       }
+      notifyListeners();
     } catch (e) {
       debugPrint('MediaPlaybackService: 继续播放失败 $e');
     }
@@ -4323,7 +5303,9 @@ class MediaPlaybackService extends ChangeNotifier {
     final stopRequestId = ++_playRequestId;
     _seekRequestId++;
     _pendingSeekRequestId = null;
+    _clearSeekHoldOverlay();
     _preservePlayingStateAfterSeek = false;
+    _cancelHopSeekDispatch();
     _clearInitialPositionGuard();
     _hasPlaybackCompleted = false;
     _logPlaybackEvent(
@@ -4372,6 +5354,7 @@ class MediaPlaybackService extends ChangeNotifier {
     _selectedStreamQuality = null;
     _streamDisplayAspectRatio = null;
     _currentBilibiliPlayback = null;
+    _bilibiliAudioPrimaryPlayer = false;
     _syncWakelockWithState();
     clearSubtitleState();
     _currentItem = null;
@@ -4394,8 +5377,122 @@ class MediaPlaybackService extends ChangeNotifier {
     notifyListeners();
   }
 
+  void _cancelHopSeekDispatch() {
+    _hopSeekDispatchTimer?.cancel();
+    _hopSeekDispatchTimer = null;
+    _pendingHopSeekPosition = null;
+    _pendingHopSeekSource = null;
+  }
+
+  Duration _clampSeekPosition(
+    VideoPlayerController controller,
+    Duration position,
+  ) {
+    final controllerDuration = controller.value.duration;
+    if (controllerDuration > Duration.zero && controllerDuration != _duration) {
+      _duration = controllerDuration;
+    }
+    if (_duration > Duration.zero) {
+      return Duration(
+        milliseconds: position.inMilliseconds
+            .clamp(0, _duration.inMilliseconds)
+            .toInt(),
+      );
+    }
+    return position.inMilliseconds < 0 ? Duration.zero : position;
+  }
+
+  /// UI and subtitle highlight jump immediately; native work can lag or coalesce.
+  void _applyOptimisticSeek(
+    Duration clampedPosition, {
+    required String source,
+  }) {
+    // A manual seek supersedes the bounded startup guard. Otherwise a stale
+    // native sample from the previous startup could hide the user's target.
+    _clearInitialPositionGuard();
+    // A slow ALAC seek can publish samples from the old position before
+    // libmpv reaches the new timestamp. All progress surfaces share this
+    // service, so keep those stale samples from snapping every UI back.
+    _armInitialPositionGuard(clampedPosition, protectZero: true);
+
+    _lastSeekSource = source;
+    _lastRequestedSeekPosition = clampedPosition;
+    _lastSeekRequestedAt = DateTime.now();
+    if (SubtitleHopSeekPolicy.isHopSeekSource(source)) {
+      _lastHopSeekAt = _lastSeekRequestedAt;
+    }
+    _logPlaybackEvent(
+      'seek requested',
+      data: <String, Object?>{
+        'itemId': _currentItem?.id,
+        'source': source,
+        'targetMs': clampedPosition.inMilliseconds,
+        'durationMs': _duration.inMilliseconds,
+        'online': isCurrentItemOnlineBilibiliStream,
+      },
+    );
+
+    final requestId = ++_seekRequestId;
+    _pendingSeekRequestId = requestId;
+    final seeksToPlaybackEnd =
+        _duration > Duration.zero &&
+        _hasReachedPlaybackEnd(clampedPosition, _duration);
+    _preservePlayingStateAfterSeek =
+        !seeksToPlaybackEnd &&
+        (_preservePlayingStateAfterSeek || _state == PlaybackState.playing);
+
+    _position = clampedPosition;
+    // Freeze the interpolator until the native clock actually ticks again.
+    // Leaving it running made the bar crawl while the picture was still frozen.
+    _resetPlaybackTimeline(_position, running: false);
+    notifyListeners();
+  }
+
   /// 跳转到指定位置
   Future<void> seekTo(Duration position, {String source = 'ui'}) async {
+    final controller = _controller;
+    final itemId = _currentItem?.id;
+    if (controller == null ||
+        itemId == null ||
+        !controller.value.isInitialized) {
+      return;
+    }
+
+    final hop = SubtitleHopSeekPolicy.isHopSeekSource(source);
+    if (!hop) {
+      _cancelHopSeekDispatch();
+    }
+
+    final clampedPosition = _clampSeekPosition(controller, position);
+    _applyOptimisticSeek(clampedPosition, source: source);
+
+    final delay = SubtitleHopSeekPolicy.nativeDispatchDelay(
+      isOnlineBilibiliStream: isCurrentItemOnlineBilibiliStream,
+      source: source,
+    );
+    if (hop && delay > Duration.zero) {
+      _pendingHopSeekPosition = clampedPosition;
+      _pendingHopSeekSource = source;
+      _hopSeekDispatchTimer?.cancel();
+      _hopSeekDispatchTimer = Timer(delay, () {
+        final target = _pendingHopSeekPosition;
+        final hopSource = _pendingHopSeekSource ?? source;
+        _pendingHopSeekPosition = null;
+        _pendingHopSeekSource = null;
+        _hopSeekDispatchTimer = null;
+        if (target == null) return;
+        unawaited(_runNativeSeek(target, source: hopSource));
+      });
+      return;
+    }
+
+    await _runNativeSeek(clampedPosition, source: source);
+  }
+
+  Future<void> _runNativeSeek(
+    Duration clampedPosition, {
+    required String source,
+  }) async {
     final controller = _controller;
     final itemId = _currentItem?.id;
     final playRequestId = _playRequestId;
@@ -4405,165 +5502,152 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
 
-    // A manual seek supersedes the bounded startup guard. Otherwise a stale
-    // native sample from the previous startup could hide the user's target.
-    _clearInitialPositionGuard();
+    final requestId = _seekRequestId;
+    _pendingSeekRequestId = requestId;
+    if (isCurrentItemStreamingBilibiliCard) {
+      _armSeekHoldOverlay();
+    }
+    final awaitAck = SubtitleHopSeekPolicy.shouldAwaitNativeSeekAck(
+      isOnlineBilibiliStream: isCurrentItemOnlineBilibiliStream,
+      source: source,
+    );
+    final seekStyle = _bilibiliAudioPrimaryPlayer
+        ? StreamingSeekStyle.hop
+        : SubtitleHopSeekPolicy.streamingSeekStyleFor(
+            isOnlineBilibiliStream: isCurrentItemOnlineBilibiliStream,
+            source: source,
+          );
 
-    var requestId = -1;
-    try {
-      final controllerDuration = controller.value.duration;
-      if (controllerDuration > Duration.zero &&
-          controllerDuration != _duration) {
-        _duration = controllerDuration;
-      }
-
-      final clampedPosition = _duration > Duration.zero
-          ? Duration(
-              milliseconds: position.inMilliseconds
-                  .clamp(0, _duration.inMilliseconds)
-                  .toInt(),
-            )
-          : (position.inMilliseconds < 0 ? Duration.zero : position);
-
-      // A slow ALAC seek can publish samples from the old position before
-      // libmpv reaches the new timestamp. All progress surfaces share this
-      // service, so keep those stale samples from snapping every UI back.
-      _armInitialPositionGuard(clampedPosition, protectZero: true);
-
-      _lastSeekSource = source;
-      _lastRequestedSeekPosition = clampedPosition;
-      _lastSeekRequestedAt = DateTime.now();
-      _logPlaybackEvent(
-        'seek requested',
-        data: <String, Object?>{
-          'itemId': _currentItem?.id,
-          'source': source,
-          'targetMs': clampedPosition.inMilliseconds,
-          'durationMs': _duration.inMilliseconds,
-        },
-      );
-
-      requestId = ++_seekRequestId;
-      _pendingSeekRequestId = requestId;
-      final seeksToPlaybackEnd =
-          _duration > Duration.zero &&
-          _hasReachedPlaybackEnd(clampedPosition, _duration);
-      _preservePlayingStateAfterSeek =
-          !seeksToPlaybackEnd &&
-          (_preservePlayingStateAfterSeek || _state == PlaybackState.playing);
-
-      _position = clampedPosition;
-      // 立即更新插值基线，让 UI 在 seek 后立刻跳到目标位置
-      _resetPlaybackTimeline(
-        _position,
-        running: _state == PlaybackState.playing,
-      );
-      notifyListeners();
-
-      await controller.seekTo(clampedPosition).timeout(_controllerSeekTimeout);
-      if (requestId != _seekRequestId ||
-          playRequestId != _playRequestId ||
-          !_isCurrentControllerSession(controller, itemId)) {
-        return;
-      }
-
-      // VideoPlayerController has acknowledged this exact target. Its native
-      // position sampler can still lag briefly, so a bounded direct verifier
-      // below owns any later correction.
-      final actualPosition = clampedPosition;
-      if (actualPosition != _position) {
-        _position = actualPosition;
-        // 校正插值基线，确保插值时钟从实际位置继续推进
-        _resetPlaybackTimeline(
-          _position,
-          running: _state == PlaybackState.playing,
+    Future<void> dispatch() async {
+      try {
+        if (isCurrentItemStreamingBilibiliCard) {
+          notifyListeners();
+        }
+        await NativeVideoPlayerMediaKit.prepareSeekStyleFor(
+          controller.playerId,
+          style: seekStyle,
         );
-        notifyListeners();
-      }
-      if (_pendingSeekRequestId == requestId) {
-        _pendingSeekRequestId = null;
-      }
-      _logPlaybackEvent(
-        'seek applied',
-        data: <String, Object?>{
-          'source': source,
-          'actualMs': actualPosition.inMilliseconds,
-          'deltaMs':
-              (actualPosition.inMilliseconds - clampedPosition.inMilliseconds)
-                  .abs(),
-        },
-      );
-      _bufferedPosition = _readBufferedPosition(controller);
-      _scheduleSeekVerification(
-        expectedPosition: clampedPosition,
-        source: source,
-        controller: controller,
-        itemId: itemId,
-        requestId: requestId,
-      );
-
-      _seekPersistTimer?.cancel();
-      _seekPersistTimer = Timer(const Duration(milliseconds: 500), () {
-        if (playRequestId != _playRequestId ||
+        if (requestId != _seekRequestId ||
+            playRequestId != _playRequestId ||
             !_isCurrentControllerSession(controller, itemId)) {
           return;
         }
-        _saveCurrentProgress(immediate: true).catchError((e) {
-          debugPrint('MediaPlaybackService: 保存进度失败 $e');
-        });
-        _savePlaybackStateSnapshot().catchError((e) {
-          debugPrint('MediaPlaybackService: 保存播放状态快照失败 $e');
-        });
-      });
 
-      notifyListeners();
-    } catch (e) {
-      if (_pendingSeekRequestId == requestId) {
-        _pendingSeekRequestId = null;
-      }
-      final isCurrentSession =
-          playRequestId == _playRequestId &&
-          _isCurrentControllerSession(controller, itemId);
-      if (isCurrentSession && controller.value.isInitialized) {
-        final controllerDuration = controller.value.duration;
-        if (controllerDuration > Duration.zero) {
-          _duration = controllerDuration;
+        await controller
+            .seekTo(clampedPosition)
+            .timeout(_controllerSeekTimeout);
+        if (requestId != _seekRequestId ||
+            playRequestId != _playRequestId ||
+            !_isCurrentControllerSession(controller, itemId)) {
+          return;
         }
-        _bufferedPosition = _readBufferedPosition(controller);
 
-        if (e is TimeoutException) {
-          // Some native audio backends finish a precise seek after their Dart
-          // completion callback stalls. Stop blocking position samples now,
-          // then let the bounded verifier reconcile the eventual result.
-          final expectedPosition = _lastRequestedSeekPosition ?? _position;
-          _armInitialPositionGuard(expectedPosition, protectZero: true);
-          _scheduleSeekVerification(
-            expectedPosition: expectedPosition,
-            source: '$source-timeout',
-            controller: controller,
-            itemId: itemId,
-            requestId: requestId,
-          );
-        } else {
-          _clearInitialPositionGuard();
-          _position = controller.value.position;
+        // VideoPlayerController has acknowledged this exact target. Its native
+        // position sampler can still lag briefly, so a bounded direct verifier
+        // below owns any later correction.
+        final actualPosition = clampedPosition;
+        if (actualPosition != _position) {
+          _position = actualPosition;
+          // 校正插值基线，确保插值时钟从实际位置继续推进
           _resetPlaybackTimeline(
             _position,
-            running: _state == PlaybackState.playing,
+            running: _shouldTimelineRun(),
           );
+          notifyListeners();
         }
+        if (_pendingSeekRequestId == requestId) {
+          _pendingSeekRequestId = null;
+        }
+        _logPlaybackEvent(
+          'seek applied',
+          data: <String, Object?>{
+            'source': source,
+            'actualMs': actualPosition.inMilliseconds,
+            'deltaMs':
+                (actualPosition.inMilliseconds - clampedPosition.inMilliseconds)
+                    .abs(),
+            'seekStyle': seekStyle.name,
+          },
+        );
+        _syncBilibiliGatewaySpeed(notify: isCurrentItemStreamingBilibiliCard);
+        _bufferedPosition = _readBufferedPosition(controller);
+        _scheduleSeekVerification(
+          expectedPosition: clampedPosition,
+          source: source,
+          controller: controller,
+          itemId: itemId,
+          requestId: requestId,
+        );
+
+        _seekPersistTimer?.cancel();
+        _seekPersistTimer = Timer(const Duration(milliseconds: 500), () {
+          if (playRequestId != _playRequestId ||
+              !_isCurrentControllerSession(controller, itemId)) {
+            return;
+          }
+          _saveCurrentProgress(immediate: true).catchError((e) {
+            debugPrint('MediaPlaybackService: 保存进度失败 $e');
+          });
+          _savePlaybackStateSnapshot().catchError((e) {
+            debugPrint('MediaPlaybackService: 保存播放状态快照失败 $e');
+          });
+        });
+
         notifyListeners();
-      }
-      debugPrint('MediaPlaybackService: 跳转失败 $e');
-    } finally {
-      // Always release the sampling gate owned by this request. In
-      // particular, a stale controller/session return or a native Future that
-      // times out must never leave all future progress updates suppressed.
-      if (_pendingSeekRequestId == requestId) {
-        _pendingSeekRequestId = null;
-        notifyListeners();
+      } catch (e) {
+        if (_pendingSeekRequestId == requestId) {
+          _pendingSeekRequestId = null;
+        }
+        final isCurrentSession =
+            playRequestId == _playRequestId &&
+            _isCurrentControllerSession(controller, itemId);
+        if (isCurrentSession && controller.value.isInitialized) {
+          final controllerDuration = controller.value.duration;
+          if (controllerDuration > Duration.zero) {
+            _duration = controllerDuration;
+          }
+          _bufferedPosition = _readBufferedPosition(controller);
+
+          if (e is TimeoutException) {
+            // Some native audio backends finish a precise seek after their Dart
+            // completion callback stalls. Stop blocking position samples now,
+            // then let the bounded verifier reconcile the eventual result.
+            final expectedPosition = _lastRequestedSeekPosition ?? _position;
+            _armInitialPositionGuard(expectedPosition, protectZero: true);
+            _scheduleSeekVerification(
+              expectedPosition: expectedPosition,
+              source: '$source-timeout',
+              controller: controller,
+              itemId: itemId,
+              requestId: requestId,
+            );
+          } else {
+            _clearInitialPositionGuard();
+            _position = controller.value.position;
+            _resetPlaybackTimeline(
+              _position,
+              running: _shouldTimelineRun(),
+            );
+          }
+          notifyListeners();
+        }
+        debugPrint('MediaPlaybackService: 跳转失败 $e');
+      } finally {
+        // Always release the sampling gate owned by this request. In
+        // particular, a stale controller/session return or a native Future that
+        // times out must never leave all future progress updates suppressed.
+        if (_pendingSeekRequestId == requestId) {
+          _pendingSeekRequestId = null;
+          notifyListeners();
+        }
       }
     }
+
+    if (awaitAck) {
+      await dispatch();
+      return;
+    }
+    unawaited(dispatch());
   }
 
   /// 设置音量
@@ -4735,12 +5819,18 @@ class MediaPlaybackService extends ChangeNotifier {
     Duration? startPosition,
     bool forceFromStart = false,
   }) async {
-    await _saveCurrentProgress(immediate: true);
+    // Disk I/O must not delay a notification skip. ExoPlayer/Bilibili also
+    // persist progress off the media-switch critical path.
+    unawaited(_saveCurrentProgress(immediate: true));
 
-    var frozenStartPosition =
-        startPosition ??
-        _progressTracker?.getProgress(item.id) ??
-        Duration(milliseconds: item.lastPositionMs);
+    var frozenStartPosition = resolvePlayStartPosition(
+      startPosition: startPosition,
+      currentItemId: _currentItem?.id,
+      itemId: item.id,
+      currentPosition: _position,
+      trackedProgress: _progressTracker?.getProgress(item.id),
+      lastPositionMs: item.lastPositionMs,
+    );
     final metadataDuration = Duration(
       milliseconds: item.durationMs > 0 ? item.durationMs : 0,
     );
@@ -4930,6 +6020,15 @@ class MediaPlaybackService extends ChangeNotifier {
     // 检查播放完成
     final position = _controller!.value.position;
     final controllerIsPlaying = _controller!.value.isPlaying;
+    final controllerIsBuffering = _controller!.value.isBuffering;
+    if (controllerIsBuffering != _controllerIsBuffering) {
+      _controllerIsBuffering = controllerIsBuffering;
+      if (isCurrentItemStreamingBilibiliCard) {
+        _syncBilibiliGatewaySpeed(notify: false);
+        notifyListeners();
+      }
+    }
+    _syncSeekHoldOverlayFromNative(position);
     final wasControllerPlaying =
         _lastControllerIsPlaying ?? controllerIsPlaying;
     final controllerPlaybackSpeed = _controller!.value.playbackSpeed;
@@ -5228,8 +6327,15 @@ class MediaPlaybackService extends ChangeNotifier {
 
       final confirmedPosition = completedController.value.position;
       final confirmedDuration = completedController.value.duration;
-      if (completedController.value.isPlaying ||
-          !_hasReachedPlaybackEnd(confirmedPosition, confirmedDuration)) {
+      if (!PlaybackBehaviorPolicy.isConfirmedPlaybackCompletion(
+        servicePosition: _position,
+        serviceDuration: _duration,
+        nativePosition: confirmedPosition,
+        nativeDuration: confirmedDuration,
+        nativePlaying: completedController.value.isPlaying,
+        isOnlineBilibiliStream:
+            _currentItem?.sourceRef?.kind == MediaSourceKind.bilibiliStream,
+      )) {
         _logPlaybackEvent(
           'ignored unconfirmed playback completion',
           data: <String, Object?>{
@@ -5243,8 +6349,13 @@ class MediaPlaybackService extends ChangeNotifier {
       }
 
       _preservePlayingStateAfterSeek = false;
-      _position = confirmedPosition;
-      _duration = confirmedDuration;
+      if (PlaybackBehaviorPolicy.hasReachedPlaybackEnd(
+        position: confirmedPosition,
+        duration: confirmedDuration,
+      )) {
+        _position = confirmedPosition;
+        _duration = confirmedDuration;
+      }
       _bufferedPosition = _readBufferedPosition(completedController);
 
       // 先保存当前进度（在末尾的位置）
@@ -5318,11 +6429,10 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   bool _hasReachedPlaybackEnd(Duration position, Duration duration) {
-    if (duration <= Duration.zero) {
-      return false;
-    }
-    const completionTolerance = Duration(milliseconds: 200);
-    return position + completionTolerance >= duration;
+    return PlaybackBehaviorPolicy.hasReachedPlaybackEnd(
+      position: position,
+      duration: duration,
+    );
   }
 
   /// 启动进度追踪定时器
@@ -5429,6 +6539,9 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   bool _shouldTimelineRun() {
+    if (_seekHoldPending || _seekHoldOverlay) {
+      return false;
+    }
     final controller = _controller;
     return _state == PlaybackState.playing &&
         controller != null &&
@@ -5515,6 +6628,24 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
 
+    if (shouldResyncBilibiliClockFromZero(
+      isOnlineBilibiliStream: isCurrentItemOnlineBilibiliStream,
+      expectedPosition: _position,
+      nativeSample: newPosition,
+      now: DateTime.now(),
+      lastResyncAt: _bilibiliZeroResyncAt,
+      hopSeekInFlight:
+          _pendingSeekRequestId != null ||
+          (_hopSeekDispatchTimer?.isActive ?? false),
+      lastSeekSource: _lastSeekSource,
+      lastHopSeekAt: _lastHopSeekAt,
+      duration: _duration,
+    )) {
+      _bilibiliZeroResyncAt = DateTime.now();
+      unawaited(seekTo(_position, source: 'bilibili_zero_resync'));
+      return;
+    }
+
     // 只有当位置或时长发生变化时才通知监听器
     if (newPosition != _position ||
         newDuration != _duration ||
@@ -5577,6 +6708,21 @@ class MediaPlaybackService extends ChangeNotifier {
 
   // _updateNotificationProgress 已移除，改用事件驱动
 
+  /// Spotify/YouTube/Bilibili prefetch the adjacent episode's playurl so a
+  /// notification skip is a player open, not an API round-trip.
+  void _prefetchNeighborBilibiliStreams() {
+    final streaming = _bilibiliStreamingService;
+    if (streaming == null) return;
+    final neighbors = <VideoItem>[
+      if (nextPlayableItem != null) nextPlayableItem!,
+      if (previousPlayableItem != null) previousPlayableItem!,
+    ].where((item) => item.sourceRef?.kind == MediaSourceKind.bilibiliStream);
+    streaming.retainWarmPlaybacks({for (final item in neighbors) item.id});
+    for (final item in neighbors) {
+      unawaited(streaming.prefetch(item));
+    }
+  }
+
   /// 预加载播放列表中的下一个视频控制器
   void _maybePreloadNextVideo() {
     // 低端设备可通过设置关闭预加载
@@ -5587,7 +6733,14 @@ class MediaPlaybackService extends ChangeNotifier {
 
     final nextItem = nextPlayableItem;
     if (nextItem == null) return;
-    if (nextItem.sourceRef?.kind == MediaSourceKind.bilibiliStream) return;
+    if (nextItem.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
+      // Online Bilibili is playurl + CDN TLS, not a second native Player.
+      // A speculative Player would compete with the current stream for Range
+      // bandwidth; warming playurl is the ExoPlayer / Bilibili pattern.
+      final streaming = _bilibiliStreamingService;
+      if (streaming != null) unawaited(streaming.prefetch(nextItem));
+      return;
+    }
 
     // 如果预加载的已经是目标 item，跳过
     if (_preloadedItemId == nextItem.id && _preloadedController != null) return;
@@ -5757,6 +6910,7 @@ class MediaPlaybackService extends ChangeNotifier {
     final bilibiliPlayback = _currentBilibiliPlayback;
     _currentMaterializedPlaybackLease = null;
     _currentBilibiliPlayback = null;
+    _bilibiliAudioPrimaryPlayer = false;
     _requestedBilibiliVideoTrackEnabled = null;
     _bilibiliVideoTrackPolicyRevision++;
     if (controller != null) {
@@ -5853,12 +7007,14 @@ class MediaPlaybackService extends ChangeNotifier {
   @override
   void dispose() {
     unawaited(persistCurrentProgress());
+    _detachSettingsListener();
     _playbackPageOwners.clear();
     _miniPlaybackCardOwners.clear();
     _mediaNotificationVisible = false;
     _syncBilibiliCachePolicy();
     _seekPersistTimer?.cancel();
     _seekPersistTimer = null;
+    _cancelHopSeekDispatch();
     _seekVerificationTimer?.cancel();
     _seekVerificationTimer = null;
     _stopBackgroundMediaSync();
@@ -6034,6 +7190,21 @@ class MediaPlaybackService extends ChangeNotifier {
         // Wait for the follow-up read instead of issuing a duplicate seek into
         // the same decoder while it is still re-anchoring its audio clock.
         return false;
+      }
+
+      // Keyframe hops are allowed to land on the previous IDR. Rewriting the
+      // service clock to that sample makes subtitle highlight bounce backward.
+      if (!SubtitleHopSeekPolicy.shouldRewritePositionOnSeekDrift(source)) {
+        _logPlaybackEvent(
+          'seek verification hop drift ignored',
+          data: <String, Object?>{
+            'source': source,
+            'expectedMs': expectedPosition.inMilliseconds,
+            'actualMs': actualPosition.inMilliseconds,
+            'deltaMs': deltaMs,
+          },
+        );
+        return true;
       }
 
       // The second direct read is authoritative: if the native backend still

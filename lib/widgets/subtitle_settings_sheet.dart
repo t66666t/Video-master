@@ -1,5 +1,6 @@
 import '../services/subtitle_debug_session.dart';
 import 'subtitle_debug_panel.dart';
+import 'subtitle_preset_chrome.dart';
 import 'package:flutter/material.dart';
 import 'landscape_sidebar_layout.dart';
 import 'package:provider/provider.dart';
@@ -97,51 +98,80 @@ class SubtitleSettingsSheet extends StatelessWidget {
     if (presetSession.catalogVisible) {
       return Material(
         color: const Color(0xFF1E1E1E),
-        child: Column(
-          children: [
-            SafeArea(
-              bottom: false,
-              child: Row(
-                children: [
-                  if (onBack != null)
-                    IconButton(
-                      onPressed: onBack,
-                      icon: const Icon(Icons.arrow_back, color: Colors.white),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final chrome = SubtitlePresetChrome.of(constraints);
+            return Column(
+              children: [
+                SafeArea(
+                  bottom: false,
+                  child: Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      chrome.pad,
+                      4,
+                      2,
+                      2,
                     ),
-                  const Expanded(
-                    child: Padding(
-                      padding: EdgeInsets.all(12),
-                      child: Text(
-                        '字幕排版',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w600,
-                        ),
+                    child: SizedBox(
+                      height: chrome.rowHeight,
+                      child: Row(
+                        children: [
+                          if (onBack != null)
+                            SubtitlePresetIconButton(
+                              tooltip: '返回',
+                              icon: Icons.arrow_back,
+                              size: chrome.iconButton,
+                              iconSize: chrome.iconSize,
+                              color: Colors.white,
+                              onPressed: onBack,
+                            ),
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.only(left: 4, right: 6),
+                              child: FittedBox(
+                                fit: BoxFit.scaleDown,
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  '字幕排版',
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: chrome.titleSize,
+                                    height: 1.1,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (!isAudio && !hideGhostModeToggle)
+                            Consumer<SettingsService>(
+                              builder: (context, settings, _) =>
+                                  SubtitleGhostModeToggle(
+                                    enabled: settings.isGhostModeEnabled,
+                                    onChanged: (value) => settings
+                                        .updateSetting(
+                                          'isGhostModeEnabled',
+                                          value,
+                                        ),
+                                    onHelp: () =>
+                                        _showGhostModeHelp(context),
+                                    label: chrome.ghostLabel,
+                                    fontSize: chrome.captionSize,
+                                    markSize: chrome.isPhone ? 12 : 13,
+                                    helpIconSize: chrome.iconSize - 2,
+                                    helpButtonSize: chrome.iconButton - 4,
+                                  ),
+                            ),
+                        ],
                       ),
                     ),
                   ),
-                  IconButton(
-                    onPressed: onClose,
-                    icon: const Icon(Icons.close, color: Colors.white),
-                  ),
-                ],
-              ),
-            ),
-            if (!isAudio && !hideGhostModeToggle)
-              Consumer<SettingsService>(
-                builder: (context, settings, _) => SwitchListTile(
-                  dense: true,
-                  title: const Text(
-                    '幽灵模式',
-                    style: TextStyle(color: Colors.white, fontSize: 13),
-                  ),
-                  value: settings.isGhostModeEnabled,
-                  onChanged: (value) =>
-                      settings.updateSetting('isGhostModeEnabled', value),
                 ),
-              ),
-            const Expanded(child: SubtitleDebugPanel()),
-          ],
+                const Expanded(child: SubtitleDebugPanel()),
+              ],
+            );
+          },
         ),
       );
     }
@@ -166,8 +196,7 @@ class SubtitleSettingsSheet extends StatelessWidget {
     final headerTopRowHeight = isSmallScreen ? 28.0 : 32.0;
     final headerBottomRowHeight = isSmallScreen ? 20.0 : 24.0;
     final headerRowGap = isSmallScreen ? 0.0 : 2.0;
-    final bool showBottomRow =
-        showAudioSyncRow || (!isAudio && !hideGhostModeToggle);
+    final bool showBottomRow = showAudioSyncRow;
     final headerHeight =
         headerTopRowHeight +
         (showBottomRow ? (headerBottomRowHeight + headerRowGap) : 0.0) +
@@ -232,17 +261,40 @@ class SubtitleSettingsSheet extends StatelessWidget {
                             ),
                           if (onBack != null) const SizedBox(width: 4),
                           Expanded(
-                            child: Text(
-                              isAudio ? "音频字幕样式" : "视频字幕样式",
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: headerTitleFontSize,
-                                fontWeight: FontWeight.w600,
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                isAudio ? "音频字幕样式" : "视频字幕样式",
+                                maxLines: 1,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: headerTitleFontSize,
+                                  fontWeight: FontWeight.w600,
+                                  height: 1.1,
+                                ),
                               ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
                             ),
                           ),
+                          if (!isAudio && !hideGhostModeToggle)
+                            Consumer<SettingsService>(
+                              builder: (context, settings, _) =>
+                                  SubtitleGhostModeToggle(
+                                    enabled: settings.isGhostModeEnabled,
+                                    onChanged: (value) =>
+                                        settings.updateSetting(
+                                          'isGhostModeEnabled',
+                                          value,
+                                        ),
+                                    onHelp: () =>
+                                        _showGhostModeHelp(context),
+                                    label: isSmallScreen ? '幽灵' : '幽灵模式',
+                                    fontSize: isSmallScreen ? 10 : 11,
+                                    markSize: isSmallScreen ? 12 : 13,
+                                    helpIconSize: headerIconSize - 2,
+                                    helpButtonSize: headerButtonSize - 6,
+                                  ),
+                            ),
                           IconButton(
                             icon: Icon(
                               Icons.close,
@@ -290,59 +342,6 @@ class SubtitleSettingsSheet extends StatelessWidget {
                           ],
                         ),
                       ),
-                    if (!isAudio && !hideGhostModeToggle)
-                      Consumer<SettingsService>(
-                        builder: (context, settings, child) {
-                          final titleIndent = onBack != null
-                              ? (headerButtonSize + 4.0)
-                              : 0.0;
-                          final ghostLabel = isSmallScreen ? "幽灵" : "幽灵模式";
-                          return SizedBox(
-                            height: headerBottomRowHeight,
-                            child: Row(
-                              children: [
-                                if (titleIndent > 0)
-                                  SizedBox(width: titleIndent),
-                                Text(
-                                  ghostLabel,
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: isSmallScreen ? 11 : 12,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Transform.scale(
-                                  scale: isSmallScreen ? 0.66 : 0.85,
-                                  alignment: Alignment.centerLeft,
-                                  child: Switch(
-                                    value: settings.isGhostModeEnabled,
-                                    onChanged: (val) => settings.updateSetting(
-                                      'isGhostModeEnabled',
-                                      val,
-                                    ),
-                                    activeThumbColor: Colors.blueAccent,
-                                  ),
-                                ),
-                                IconButton(
-                                  icon: Icon(
-                                    Icons.help_outline,
-                                    color: Colors.white70,
-                                    size: headerIconSize,
-                                  ),
-                                  onPressed: () => _showGhostModeHelp(context),
-                                  tooltip: "幽灵模式说明",
-                                  padding: EdgeInsets.zero,
-                                  constraints: BoxConstraints.tightFor(
-                                    width: headerButtonSize,
-                                    height: headerButtonSize,
-                                  ),
-                                  splashRadius: headerButtonSize / 2,
-                                ),
-                              ],
-                            ),
-                          );
-                        },
-                      ),
                   ],
                 ),
               ),
@@ -358,10 +357,15 @@ class SubtitleSettingsSheet extends StatelessWidget {
               ),
               children: [
                 if (presetSession.enabled)
-                  TextButton.icon(
-                    onPressed: presetSession.openCatalog,
-                    icon: const Icon(Icons.auto_awesome),
-                    label: const Text('选择字幕预设'),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: SubtitlePresetTextAction(
+                      onPressed: presetSession.openCatalog,
+                      icon: Icons.auto_awesome,
+                      label: '选择字幕预设',
+                      fontSize: titleFontSize,
+                      height: isSmallScreen ? 26 : 28,
+                    ),
                   ),
                 if (SubtitleDebugSession.instance.preset == null) ...[
                   // 1. Layout Settings (Size & Spacing) - 仅影响当前方向

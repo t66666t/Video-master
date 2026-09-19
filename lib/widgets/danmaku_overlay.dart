@@ -29,9 +29,10 @@ class DanmakuOverlay extends StatefulWidget {
   final double opacity;
   final double fontScale;
 
-  /// User-selected motion multiplier in media time. Playback speed must not
-  /// be multiplied here: [position] is the shared presentation clock and
-  /// already advances at the rate accepted by the native player.
+  /// Media-time motion multiplier. Playback speed must not be multiplied here:
+  /// [position] already advances at the native rate. Callers that treat a
+  /// locked playback rate as 1x must divide the slider speed by that rate
+  /// before passing it in.
   final double speed;
   final String? fontFamily;
   final int fontWeight;
@@ -96,7 +97,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay> {
         oldWidget.fontWeight != widget.fontWeight ||
         oldWidget.outlineType != widget.outlineType ||
         oldWidget.playerHeight != widget.playerHeight ||
-        oldWidget.speed != widget.speed) {
+        (oldWidget.speed - widget.speed).abs() >= 0.001) {
       _invalidatePrefetchProgress();
       _schedulePrefetch();
     }
@@ -502,7 +503,7 @@ class _DanmakuPainter extends CustomPainter {
     return oldDelegate.document != document ||
         oldDelegate.displayArea != displayArea ||
         oldDelegate.opacity != opacity ||
-        oldDelegate.speed != speed ||
+        (oldDelegate.speed - speed).abs() >= 0.001 ||
         oldDelegate.requestedFontSize != requestedFontSize;
   }
 }

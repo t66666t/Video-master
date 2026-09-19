@@ -33,12 +33,10 @@ void main() {
     expect(readiness, isNot(contains('throw TimeoutException')));
     expect(
       readiness,
-      contains('background playback clock did not start in time'),
+      contains('background playback clock unconfirmed; keeping play intent'),
     );
-    expect(readiness, contains('parking session as paused at the seek target'));
-    // Degraded sessions pause the transport instead of leaving an
-    // unconfirmed "playing" state behind.
-    expect(readiness, contains('await controller.pause()'));
+    expect(readiness, isNot(contains('parking session as paused at the seek target')));
+    expect(readiness, contains('onTimeout: () => true'));
   });
 
   test(
@@ -107,7 +105,7 @@ void main() {
   });
 
   test(
-    'navigation waits for visible-output recovery before opening the page',
+    'navigation opens the playback page without waiting for video recovery',
     () {
       final source = read('lib/services/playback_navigation_service.dart');
       final open = method(
@@ -115,22 +113,18 @@ void main() {
         'Future<void> openCurrentPlaybackSession(',
         'Future<void> _waitForPresentableSession(',
       );
-      // After the presentable wait times out, the recovery (attach or guarded
-      // reopen) must finish before navigation, so the page mounts a working
-      // controller instead of falling back to a full media reload.
+      // Mini→page must push immediately. Waiting for video attach/enable
+      // froze the user on Mini while audio played under a black texture.
+      expect(open, contains('_openPlaybackInternal(item)'));
       expect(
-        open.indexOf('_waitForPresentableSession(playbackService, item.id)'),
-        greaterThanOrEqualTo(0),
+        open,
+        contains('unawaited(playbackService.ensureVisibleVideoOutput(item.id))'),
       );
       expect(
-        open.indexOf(
-          'playbackService.needsVisibleVideoOutputRecovery(item.id)) {',
-          open.indexOf('_waitForPresentableSession(playbackService, item.id)') +
-              1,
-        ),
-        greaterThan(0),
+        open,
+        isNot(contains('_waitForPresentableSession(playbackService, item.id)')),
       );
-      expect(open, contains('ensureVisibleVideoOutput(item.id)'));
+      expect(open, isNot(contains('.timeout(const Duration(seconds: 25)')));
     },
   );
 
@@ -145,7 +139,7 @@ void main() {
       methodSource,
       contains('_openPlaybackInternal(item, notificationEntry: true)'),
     );
-    expect(methodSource, isNot(contains('ensureVisibleVideoOutput')));
+    expect(methodSource, contains('needsVisibleVideoOutputRecovery'));
     expect(methodSource, isNot(contains('playbackService.play(')));
 
     final mainSource = read('lib/main.dart');
@@ -212,6 +206,10 @@ void main() {
     expect(
       resumeMethod.indexOf('notifyListeners();'),
       lessThan(resumeMethod.indexOf('await loadingController.play();')),
+    );
+    expect(
+      resumeMethod,
+      isNot(contains('Bilibili resume did not start; recreating stream')),
     );
   });
 
@@ -388,6 +386,7 @@ void main() {
     );
     expect(completion, contains('settings.autoPlayOnCompletion'));
     expect(completion, contains('settings.autoPlayOnCompletionFromStart'));
+    expect(completion, contains('isConfirmedPlaybackCompletion('));
     expect(completion, contains('await _playPlaylistItem('));
     expect(completion, isNot(contains('useStableBackgroundLocalPath')));
   });

@@ -2,17 +2,22 @@ import 'subtitle_debug_session.dart';
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
+import '../models/folder_placeholder_style.dart';
+import '../models/subtitle_copy_format.dart';
 import '../models/subtitle_style.dart';
 import '../models/subtitle_output_path_strategy.dart';
 import '../models/danmaku_style.dart';
 import '../models/video_compose_models.dart';
 import '../utils/device_form_factor.dart';
+import '../widgets/media_library_layout_profile.dart';
+import '../widgets/media_list_layout_metrics.dart';
 
 enum PlaybackSpeedLockAction { locked, switched, unlocked }
 
@@ -100,6 +105,9 @@ class SettingsService extends ChangeNotifier {
   double bilibiliDanmakuOpacity = 0.8;
   double bilibiliDanmakuFontScale = 0.8;
   double bilibiliDanmakuSpeed = 1.0;
+  bool bilibiliDanmakuUseLockedSpeedAsBaseline = false;
+  Future<void> _danmakuLockedBaselinePersistTail = Future<void>.value();
+  int _danmakuLockedBaselineWriteId = 0;
   String? bilibiliDanmakuFontFamily;
   int bilibiliDanmakuFontWeight = 600;
   DanmakuOutlineType bilibiliDanmakuOutlineType = DanmakuOutlineType.standard;
@@ -247,12 +255,518 @@ class SettingsService extends ChangeNotifier {
   double mediaListCrossSpacingScale = 0.02;
   double mediaListTitleScale = 0.042;
   double mediaListCoverOffset = 0.0;
+  FolderPlaceholderSettings folderPlaceholderSettings =
+      FolderPlaceholderSettings.defaults;
+
+  MediaCardStyleSettings homeCardStyleFor(Size size) {
+    return _cardStyleFor(
+      size: size,
+      columnsPortraitKey: 'homeGridCrossAxisCountPortrait',
+      columnsLandscapeKey: 'homeGridCrossAxisCountLandscape',
+      columnsLegacyKey: 'homeGridCrossAxisCount',
+      columnsLegacy: homeGridCrossAxisCount,
+      titlePortraitKey: 'homeCardTitleFontSizePortrait',
+      titleLandscapeKey: 'homeCardTitleFontSizeLandscape',
+      titleLegacyKey: 'homeCardTitleFontSize',
+      titleLegacy: homeCardTitleFontSize,
+      aspectPortraitKey: 'homeCardAspectRatioPortrait',
+      aspectLandscapeKey: 'homeCardAspectRatioLandscape',
+      aspectLegacyKey: 'homeCardAspectRatio',
+      aspectLegacy: homeCardAspectRatio,
+      crossSpacingPortraitKey: 'homeCardCrossSpacingScalePortrait',
+      crossSpacingLandscapeKey: 'homeCardCrossSpacingScaleLandscape',
+      mainSpacingPortraitKey: 'homeCardMainSpacingScalePortrait',
+      mainSpacingLandscapeKey: 'homeCardMainSpacingScaleLandscape',
+    );
+  }
+
+  /// Folder pages used to keep a separate card profile. They now follow the
+  /// home layout so upgrades drop the old per-folder look instead of keeping
+  /// two independent grids.
+  MediaCardStyleSettings collectionCardStyleFor(Size size) {
+    return homeCardStyleFor(size);
+  }
+
+  MediaListStyleSettings listStyleFor(Size size) {
+    final slot = MediaLibraryLayoutDefaults.slotFor(size);
+    return MediaListStyleSettings(
+      crossAxisCount: _resolveColumns(
+        size: size,
+        slot: slot,
+        portraitKey: 'mediaListCrossAxisCountPortrait',
+        landscapeKey: 'mediaListCrossAxisCountLandscape',
+        legacyKey: 'mediaListCrossAxisCount',
+        legacy: mediaListCrossAxisCount,
+        fallback: () =>
+            MediaLibraryLayoutDefaults.defaultListCrossAxisCount(size),
+      ),
+      titleScale:
+          _resolveDouble(
+            slot: slot,
+            portraitKey: 'mediaListTitleScalePortrait',
+            landscapeKey: 'mediaListTitleScaleLandscape',
+            legacyKey: 'mediaListTitleScale',
+            legacy: mediaListTitleScale,
+            inheritLegacyOnPortrait: true,
+            fallback: mediaListTitleScale,
+          ).clamp(
+            MediaListLayoutMetrics.minTitleSetting,
+            MediaListLayoutMetrics.maxTitleSetting,
+          ),
+      heightScale:
+          _resolveDouble(
+            slot: slot,
+            portraitKey: 'mediaListItemHeightScalePortrait',
+            landscapeKey: 'mediaListItemHeightScaleLandscape',
+            legacyKey: 'mediaListItemHeightScale',
+            legacy: mediaListItemHeightScale,
+            inheritLegacyOnPortrait: true,
+            fallback: mediaListItemHeightScale,
+          ).clamp(
+            MediaListLayoutMetrics.minHeightSetting,
+            MediaListLayoutMetrics.maxHeightSetting,
+          ),
+      crossSpacingScale: _resolveSpacing(
+        slot: slot,
+        portraitKey: 'mediaListCrossSpacingScalePortrait',
+        landscapeKey: 'mediaListCrossSpacingScaleLandscape',
+      ),
+      mainSpacingScale: _resolveSpacing(
+        slot: slot,
+        portraitKey: 'mediaListMainSpacingScalePortrait',
+        landscapeKey: 'mediaListMainSpacingScaleLandscape',
+      ),
+      showThumbnail: _resolveBool(
+        slot: slot,
+        portraitKey: 'mediaListShowThumbnailPortrait',
+        landscapeKey: 'mediaListShowThumbnailLandscape',
+        legacy: mediaListShowThumbnail,
+      ),
+      showIndex: _resolveBool(
+        slot: slot,
+        portraitKey: 'mediaListShowIndexPortrait',
+        landscapeKey: 'mediaListShowIndexLandscape',
+        legacy: mediaListShowIndex,
+      ),
+    );
+  }
+
+  Future<void> updateHomeCardStyleFor(
+    Size size, {
+    int? crossAxisCount,
+    double? titleScale,
+    double? heightScale,
+    double? crossSpacingScale,
+    double? mainSpacingScale,
+  }) {
+    return _updateCardStyleFor(
+      size: size,
+      crossAxisCount: crossAxisCount,
+      titleScale: titleScale,
+      heightScale: heightScale,
+      crossSpacingScale: crossSpacingScale,
+      mainSpacingScale: mainSpacingScale,
+      columnsPortraitKey: 'homeGridCrossAxisCountPortrait',
+      columnsLandscapeKey: 'homeGridCrossAxisCountLandscape',
+      columnsLegacyKey: 'homeGridCrossAxisCount',
+      titlePortraitKey: 'homeCardTitleFontSizePortrait',
+      titleLandscapeKey: 'homeCardTitleFontSizeLandscape',
+      titleLegacyKey: 'homeCardTitleFontSize',
+      aspectPortraitKey: 'homeCardAspectRatioPortrait',
+      aspectLandscapeKey: 'homeCardAspectRatioLandscape',
+      aspectLegacyKey: 'homeCardAspectRatio',
+      crossSpacingPortraitKey: 'homeCardCrossSpacingScalePortrait',
+      crossSpacingLandscapeKey: 'homeCardCrossSpacingScaleLandscape',
+      mainSpacingPortraitKey: 'homeCardMainSpacingScalePortrait',
+      mainSpacingLandscapeKey: 'homeCardMainSpacingScaleLandscape',
+      applyLegacyColumns: (value) => homeGridCrossAxisCount = value,
+      applyLegacyTitle: (value) => homeCardTitleFontSize = value,
+      applyLegacyAspect: (value) => homeCardAspectRatio = value,
+    );
+  }
+
+  Future<void> updateCollectionCardStyleFor(
+    Size size, {
+    int? crossAxisCount,
+    double? titleScale,
+    double? heightScale,
+    double? crossSpacingScale,
+    double? mainSpacingScale,
+  }) {
+    return updateHomeCardStyleFor(
+      size,
+      crossAxisCount: crossAxisCount,
+      titleScale: titleScale,
+      heightScale: heightScale,
+      crossSpacingScale: crossSpacingScale,
+      mainSpacingScale: mainSpacingScale,
+    );
+  }
+
+  Future<void> updateListStyleFor(
+    Size size, {
+    int? crossAxisCount,
+    double? titleScale,
+    double? heightScale,
+    double? crossSpacingScale,
+    double? mainSpacingScale,
+    bool? showThumbnail,
+    bool? showIndex,
+  }) async {
+    final landscape = MediaLibraryLayoutDefaults.isLandscape(size);
+    if (crossAxisCount != null) {
+      final columns = MediaLibraryLayoutDefaults.clampColumns(crossAxisCount);
+      await _writeSlotInt(
+        landscape
+            ? 'mediaListCrossAxisCountLandscape'
+            : 'mediaListCrossAxisCountPortrait',
+        columns,
+      );
+      if (landscape) {
+        mediaListCrossAxisCount = columns;
+        await _prefs.setInt('mediaListCrossAxisCount', columns);
+      }
+    }
+    if (titleScale != null) {
+      final value = titleScale.clamp(
+        MediaListLayoutMetrics.minTitleSetting,
+        MediaListLayoutMetrics.maxTitleSetting,
+      );
+      await _writeSlotDouble(
+        landscape
+            ? 'mediaListTitleScaleLandscape'
+            : 'mediaListTitleScalePortrait',
+        value,
+      );
+      if (landscape) {
+        mediaListTitleScale = value;
+        await _prefs.setDouble('mediaListTitleScale', value);
+      }
+    }
+    if (heightScale != null) {
+      final value = heightScale.clamp(
+        MediaListLayoutMetrics.minHeightSetting,
+        MediaListLayoutMetrics.maxHeightSetting,
+      );
+      await _writeSlotDouble(
+        landscape
+            ? 'mediaListItemHeightScaleLandscape'
+            : 'mediaListItemHeightScalePortrait',
+        value,
+      );
+      if (landscape) {
+        mediaListItemHeightScale = value;
+        await _prefs.setDouble('mediaListItemHeightScale', value);
+      }
+    }
+    if (crossSpacingScale != null) {
+      await _writeSlotDouble(
+        landscape
+            ? 'mediaListCrossSpacingScaleLandscape'
+            : 'mediaListCrossSpacingScalePortrait',
+        MediaLibraryLayoutDefaults.clampSpacing(crossSpacingScale),
+      );
+    }
+    if (mainSpacingScale != null) {
+      await _writeSlotDouble(
+        landscape
+            ? 'mediaListMainSpacingScaleLandscape'
+            : 'mediaListMainSpacingScalePortrait',
+        MediaLibraryLayoutDefaults.clampSpacing(mainSpacingScale),
+      );
+    }
+    if (showThumbnail != null) {
+      await _writeSlotBool(
+        landscape
+            ? 'mediaListShowThumbnailLandscape'
+            : 'mediaListShowThumbnailPortrait',
+        showThumbnail,
+      );
+      if (landscape) {
+        mediaListShowThumbnail = showThumbnail;
+        await _prefs.setBool('mediaListShowThumbnail', showThumbnail);
+      }
+    }
+    if (showIndex != null) {
+      await _writeSlotBool(
+        landscape
+            ? 'mediaListShowIndexLandscape'
+            : 'mediaListShowIndexPortrait',
+        showIndex,
+      );
+      if (landscape) {
+        mediaListShowIndex = showIndex;
+        await _prefs.setBool('mediaListShowIndex', showIndex);
+      }
+    }
+    notifyListeners();
+  }
+
+  MediaCardStyleSettings _cardStyleFor({
+    required Size size,
+    required String columnsPortraitKey,
+    required String columnsLandscapeKey,
+    required String columnsLegacyKey,
+    required int columnsLegacy,
+    required String titlePortraitKey,
+    required String titleLandscapeKey,
+    required String titleLegacyKey,
+    required double titleLegacy,
+    required String aspectPortraitKey,
+    required String aspectLandscapeKey,
+    required String aspectLegacyKey,
+    required double aspectLegacy,
+    required String crossSpacingPortraitKey,
+    required String crossSpacingLandscapeKey,
+    required String mainSpacingPortraitKey,
+    required String mainSpacingLandscapeKey,
+  }) {
+    final slot = MediaLibraryLayoutDefaults.slotFor(size);
+    final aspect = _resolveDouble(
+      slot: slot,
+      portraitKey: aspectPortraitKey,
+      landscapeKey: aspectLandscapeKey,
+      legacyKey: aspectLegacyKey,
+      legacy: aspectLegacy,
+      inheritLegacyOnPortrait: true,
+      fallback: 1.0 / MediaLibraryLayoutDefaults.defaultHeightScale,
+    );
+    return MediaCardStyleSettings(
+      crossAxisCount: _resolveColumns(
+        size: size,
+        slot: slot,
+        portraitKey: columnsPortraitKey,
+        landscapeKey: columnsLandscapeKey,
+        legacyKey: columnsLegacyKey,
+        legacy: columnsLegacy,
+        fallback: () =>
+            MediaLibraryLayoutDefaults.defaultCardCrossAxisCount(size),
+      ),
+      titleScale: MediaLibraryLayoutDefaults.normalizeTitleScale(
+        _resolveDouble(
+          slot: slot,
+          portraitKey: titlePortraitKey,
+          landscapeKey: titleLandscapeKey,
+          legacyKey: titleLegacyKey,
+          legacy: titleLegacy,
+          inheritLegacyOnPortrait: true,
+          fallback: MediaLibraryLayoutDefaults.defaultTitleScale,
+        ),
+      ),
+      heightScale: MediaLibraryLayoutDefaults.clampHeight(
+        1.0 / math.max(0.1, aspect),
+      ),
+      crossSpacingScale: _resolveSpacing(
+        slot: slot,
+        portraitKey: crossSpacingPortraitKey,
+        landscapeKey: crossSpacingLandscapeKey,
+      ),
+      mainSpacingScale: _resolveSpacing(
+        slot: slot,
+        portraitKey: mainSpacingPortraitKey,
+        landscapeKey: mainSpacingLandscapeKey,
+      ),
+    );
+  }
+
+  Future<void> _updateCardStyleFor({
+    required Size size,
+    int? crossAxisCount,
+    double? titleScale,
+    double? heightScale,
+    double? crossSpacingScale,
+    double? mainSpacingScale,
+    required String columnsPortraitKey,
+    required String columnsLandscapeKey,
+    required String columnsLegacyKey,
+    required String titlePortraitKey,
+    required String titleLandscapeKey,
+    required String titleLegacyKey,
+    required String aspectPortraitKey,
+    required String aspectLandscapeKey,
+    required String aspectLegacyKey,
+    required String crossSpacingPortraitKey,
+    required String crossSpacingLandscapeKey,
+    required String mainSpacingPortraitKey,
+    required String mainSpacingLandscapeKey,
+    required void Function(int value) applyLegacyColumns,
+    required void Function(double value) applyLegacyTitle,
+    required void Function(double value) applyLegacyAspect,
+  }) async {
+    final landscape = MediaLibraryLayoutDefaults.isLandscape(size);
+    if (crossAxisCount != null) {
+      final columns = MediaLibraryLayoutDefaults.clampColumns(crossAxisCount);
+      await _writeSlotInt(
+        landscape ? columnsLandscapeKey : columnsPortraitKey,
+        columns,
+      );
+      if (landscape) {
+        applyLegacyColumns(columns);
+        await _prefs.setInt(columnsLegacyKey, columns);
+      }
+    }
+    if (titleScale != null) {
+      final value = MediaLibraryLayoutDefaults.normalizeTitleScale(titleScale);
+      await _writeSlotDouble(
+        landscape ? titleLandscapeKey : titlePortraitKey,
+        value,
+      );
+      // Keep the unsuffixed key as the landscape/migration value only, so a
+      // portrait tweak cannot rewrite the other orientation.
+      if (landscape) {
+        applyLegacyTitle(value);
+        await _prefs.setDouble(titleLegacyKey, value);
+      }
+    }
+    if (heightScale != null) {
+      final aspect = 1.0 / MediaLibraryLayoutDefaults.clampHeight(heightScale);
+      await _writeSlotDouble(
+        landscape ? aspectLandscapeKey : aspectPortraitKey,
+        aspect,
+      );
+      if (landscape) {
+        applyLegacyAspect(aspect);
+        await _prefs.setDouble(aspectLegacyKey, aspect);
+      }
+    }
+    if (crossSpacingScale != null) {
+      await _writeSlotDouble(
+        landscape ? crossSpacingLandscapeKey : crossSpacingPortraitKey,
+        MediaLibraryLayoutDefaults.clampSpacing(crossSpacingScale),
+      );
+    }
+    if (mainSpacingScale != null) {
+      await _writeSlotDouble(
+        landscape ? mainSpacingLandscapeKey : mainSpacingPortraitKey,
+        MediaLibraryLayoutDefaults.clampSpacing(mainSpacingScale),
+      );
+    }
+    notifyListeners();
+  }
+
+  int _resolveColumns({
+    required Size size,
+    required MediaLibraryOrientationSlot slot,
+    required String portraitKey,
+    required String landscapeKey,
+    required String legacyKey,
+    required int legacy,
+    required int Function() fallback,
+  }) {
+    final stored = _slotInt(
+      slot == MediaLibraryOrientationSlot.landscape
+          ? landscapeKey
+          : portraitKey,
+    );
+    if (stored != null) {
+      return MediaLibraryLayoutDefaults.clampColumns(stored);
+    }
+    // A persisted unsuffixed key was almost certainly set in landscape; keep
+    // it there and let portrait fall through to the size-class default.
+    if (slot == MediaLibraryOrientationSlot.landscape && _hasPref(legacyKey)) {
+      return MediaLibraryLayoutDefaults.clampColumns(legacy);
+    }
+    return fallback();
+  }
+
+  double _resolveDouble({
+    required MediaLibraryOrientationSlot slot,
+    required String portraitKey,
+    required String landscapeKey,
+    required String legacyKey,
+    required double legacy,
+    required bool inheritLegacyOnPortrait,
+    required double fallback,
+  }) {
+    final stored = _slotDouble(
+      slot == MediaLibraryOrientationSlot.landscape
+          ? landscapeKey
+          : portraitKey,
+    );
+    if (stored != null) return stored;
+    final useLegacy =
+        _hasPref(legacyKey) &&
+        (slot == MediaLibraryOrientationSlot.landscape ||
+            inheritLegacyOnPortrait);
+    return useLegacy ? legacy : fallback;
+  }
+
+  double _resolveSpacing({
+    required MediaLibraryOrientationSlot slot,
+    required String portraitKey,
+    required String landscapeKey,
+  }) {
+    final stored = _slotDouble(
+      slot == MediaLibraryOrientationSlot.landscape
+          ? landscapeKey
+          : portraitKey,
+    );
+    return MediaLibraryLayoutDefaults.clampSpacing(
+      stored ?? MediaLibraryLayoutDefaults.defaultSpacingScale,
+    );
+  }
+
+  bool _resolveBool({
+    required MediaLibraryOrientationSlot slot,
+    required String portraitKey,
+    required String landscapeKey,
+    required bool legacy,
+  }) {
+    final stored = _slotBool(
+      slot == MediaLibraryOrientationSlot.landscape
+          ? landscapeKey
+          : portraitKey,
+    );
+    return stored ?? legacy;
+  }
+
+  bool _hasPref(String key) {
+    if (!_initialized) return false;
+    return _prefs.containsKey(key);
+  }
+
+  int? _slotInt(String key) {
+    if (!_hasPref(key)) return null;
+    return _prefs.getInt(key);
+  }
+
+  double? _slotDouble(String key) {
+    if (!_hasPref(key)) return null;
+    return _prefs.getDouble(key);
+  }
+
+  bool? _slotBool(String key) {
+    if (!_hasPref(key)) return null;
+    return _prefs.getBool(key);
+  }
+
+  Future<void> _writeSlotInt(String key, int value) {
+    return _prefs.setInt(key, value);
+  }
+
+  Future<void> _writeSlotDouble(String key, double value) {
+    return _prefs.setDouble(key, value);
+  }
+
+  Future<void> _writeSlotBool(String key, bool value) {
+    return _prefs.setBool(key, value);
+  }
 
   /// Whether newly imported media is copied into app-managed storage.
   ///
   /// This is intentionally opt-in. Import operations snapshot the value when
   /// they start so a multi-file import can never end up with mixed semantics.
   bool copyImportedMediaToPrivateStorage = false;
+
+  /// When true, opening a video from search uses the search listing as the
+  /// playback queue. Default is false so next/previous stay in the original
+  /// folder order and do not jump across unrelated series.
+  bool useSearchResultsAsPlaybackQueue = false;
+
+  /// When true, Mini/notification Bilibili sessions drop the video track and
+  /// only fetch audio. Default is false so background playback keeps downloading
+  /// video+audio and a later page entry can mount the live picture.
+  bool bilibiliBackgroundAudioOnly = false;
   String structuredImportSortField = 'fileName';
   String structuredImportSortDirection = 'ascending';
 
@@ -275,8 +789,16 @@ class SettingsService extends ChangeNotifier {
   // Global paragraph size used by the subtitle sidebar article view.
   int subtitleArticleSentencesPerParagraph = 4;
 
+  // Article view uses paragraphs by default. When disabled, subtitles flow as
+  // one continuous article while retaining the saved paragraph size.
+  bool subtitleArticleParagraphModeEnabled = true;
+
   // New: Subtitle Sidebar View Mode (0: List, 1: Article)
   int subtitleViewMode = 0;
+
+  /// How subtitle-sidebar selections are joined when copied. Display layout
+  /// is unchanged; only clipboard output follows this format.
+  SubtitleCopyFormat subtitleCopyFormat = SubtitleCopyFormat.defaults;
 
   bool isLandscapeSubtitleSidebarVisible = true;
 
@@ -609,6 +1131,12 @@ class SettingsService extends ChangeNotifier {
             value.clamp(kDanmakuSpeedMin, kDanmakuSpeedMax).toDouble(),
         apply: (service, value) => service.bilibiliDanmakuSpeed = value,
       ),
+      _boolSetting(
+        key: 'bilibiliDanmakuUseLockedSpeedAsBaseline',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.bilibiliDanmakuUseLockedSpeedAsBaseline = value,
+      ),
       _stringSetting(
         key: 'bilibiliDanmakuFontFamily',
         defaultValue: '',
@@ -870,13 +1398,13 @@ class SettingsService extends ChangeNotifier {
       _intSetting(
         key: 'homeGridCrossAxisCount',
         defaultValue: 4,
-        normalize: (value) => value.clamp(1, 15),
+        normalize: (value) => MediaLibraryLayoutDefaults.clampColumns(value),
         apply: (service, value) => service.homeGridCrossAxisCount = value,
       ),
       _intSetting(
         key: 'videoCardCrossAxisCount',
         defaultValue: 4,
-        normalize: (value) => value.clamp(1, 15),
+        normalize: (value) => MediaLibraryLayoutDefaults.clampColumns(value),
         apply: (service, value) => service.videoCardCrossAxisCount = value,
       ),
       _doubleSetting(
@@ -905,10 +1433,18 @@ class SettingsService extends ChangeNotifier {
         normalize: (value) => value.clamp(0, 1),
         apply: (service, value) => service.mediaLibraryViewMode = value,
       ),
+      _stringSetting(
+        key: 'folderPlaceholderSettings',
+        defaultValue: FolderPlaceholderSettings.defaults.toJsonString(),
+        normalize: (value) =>
+            FolderPlaceholderSettings.fromJsonString(value).toJsonString(),
+        apply: (service, value) => service.folderPlaceholderSettings =
+            FolderPlaceholderSettings.fromJsonString(value),
+      ),
       _intSetting(
         key: 'mediaListCrossAxisCount',
         defaultValue: 1,
-        normalize: (value) => value.clamp(1, 15),
+        normalize: (value) => MediaLibraryLayoutDefaults.clampColumns(value),
         apply: (service, value) => service.mediaListCrossAxisCount = value,
       ),
       _boolSetting(
@@ -930,13 +1466,15 @@ class SettingsService extends ChangeNotifier {
       _doubleSetting(
         key: 'mediaListMainSpacingScale',
         defaultValue: 0.012,
-        normalize: (value) => value.clamp(0.0, 0.04),
+        normalize: (value) =>
+            MediaLibraryLayoutDefaults.clampSpacing(value.clamp(0.0, 0.45)),
         apply: (service, value) => service.mediaListMainSpacingScale = value,
       ),
       _doubleSetting(
         key: 'mediaListCrossSpacingScale',
         defaultValue: 0.02,
-        normalize: (value) => value.clamp(0.0, 0.05),
+        normalize: (value) =>
+            MediaLibraryLayoutDefaults.clampSpacing(value.clamp(0.0, 0.45)),
         apply: (service, value) => service.mediaListCrossSpacingScale = value,
       ),
       _doubleSetting(
@@ -956,6 +1494,18 @@ class SettingsService extends ChangeNotifier {
         defaultValue: false,
         apply: (service, value) =>
             service.copyImportedMediaToPrivateStorage = value,
+      ),
+      _boolSetting(
+        key: 'useSearchResultsAsPlaybackQueue',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.useSearchResultsAsPlaybackQueue = value,
+      ),
+      _boolSetting(
+        key: 'bilibiliBackgroundAudioOnly',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.bilibiliBackgroundAudioOnly = value,
       ),
       _stringSetting(
         key: 'structuredImportSortField',
@@ -1024,10 +1574,24 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) =>
             service.subtitleArticleSentencesPerParagraph = value,
       ),
+      _boolSetting(
+        key: 'subtitleArticleParagraphModeEnabled',
+        defaultValue: true,
+        apply: (service, value) =>
+            service.subtitleArticleParagraphModeEnabled = value,
+      ),
       _intSetting(
         key: 'subtitleViewMode',
         defaultValue: 0,
         apply: (service, value) => service.subtitleViewMode = value,
+      ),
+      _stringSetting(
+        key: 'subtitleCopyFormat',
+        defaultValue: SubtitleCopyFormat.defaults.toJsonString(),
+        normalize: (value) =>
+            SubtitleCopyFormat.fromJsonString(value).toJsonString(),
+        apply: (service, value) => service.subtitleCopyFormat =
+            SubtitleCopyFormat.fromJsonString(value),
       ),
       _stringSetting(
         key: 'lastSelectedModelType',
@@ -1950,6 +2514,15 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<String>('structuredImportSortField', value);
   }
 
+  Future<void> updateFolderPlaceholderSettings(
+    FolderPlaceholderSettings value,
+  ) {
+    return updateSetting(
+      'folderPlaceholderSettings',
+      value.normalized().toJsonString(),
+    );
+  }
+
   Future<void> saveStructuredImportSortDirection(String value) async {
     await _updateRegisteredSetting<String>(
       'structuredImportSortDirection',
@@ -2005,6 +2578,37 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<double>('bilibiliDanmakuSpeed', value);
   }
 
+  /// Instant in-memory toggle, then persist. Skip no-ops so a repeated tap
+  /// cannot enqueue extra player rebuilds. Writes are serialized against the
+  /// latest memory value so a slower older write cannot resurrect a stale tick.
+  Future<void> saveBilibiliDanmakuUseLockedSpeedAsBaseline(bool value) async {
+    if (bilibiliDanmakuUseLockedSpeedAsBaseline == value) return;
+    bilibiliDanmakuUseLockedSpeedAsBaseline = value;
+    notifyListeners();
+    final writeId = ++_danmakuLockedBaselineWriteId;
+    final pending = _danmakuLockedBaselinePersistTail.then((_) async {
+      if (writeId != _danmakuLockedBaselineWriteId) return;
+      await _prefs.setBool(
+        'bilibiliDanmakuUseLockedSpeedAsBaseline',
+        bilibiliDanmakuUseLockedSpeedAsBaseline,
+      );
+    });
+    _danmakuLockedBaselinePersistTail = pending.catchError((Object _) {});
+    await pending;
+  }
+
+  /// Slider speed after applying the locked-playback baseline, if enabled.
+  ///
+  /// Unlocked leftover [playbackSpeed] values must not leak into this result.
+  double get effectiveBilibiliDanmakuSpeed {
+    return resolveDanmakuSpeedWithLockedPlaybackBaseline(
+      sliderSpeed: bilibiliDanmakuSpeed,
+      useLockedPlaybackAsBaseline: bilibiliDanmakuUseLockedSpeedAsBaseline,
+      isPlaybackSpeedLocked: isPlaybackSpeedLocked,
+      lockedPlaybackSpeed: playbackSpeed,
+    );
+  }
+
   Future<void> saveBilibiliDanmakuFontFamily(String? value) async {
     await _updateRegisteredSetting<String>(
       'bilibiliDanmakuFontFamily',
@@ -2047,6 +2651,12 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<double>(
       'bilibiliDanmakuSpeed',
       1.0,
+      notify: false,
+    );
+    _danmakuLockedBaselineWriteId++;
+    await _updateRegisteredSetting<bool>(
+      'bilibiliDanmakuUseLockedSpeedAsBaseline',
+      false,
       notify: false,
     );
     await _updateRegisteredSetting<String>(
@@ -2668,7 +3278,10 @@ class SettingsService extends ChangeNotifier {
             portraitSidebarLocatePositionPercent,
         'subtitleArticleSentencesPerParagraph':
             subtitleArticleSentencesPerParagraph,
+        'subtitleArticleParagraphModeEnabled':
+            subtitleArticleParagraphModeEnabled,
         'subtitleViewMode': subtitleViewMode,
+        'subtitleCopyFormat': subtitleCopyFormat.toJson(),
       },
       'home': {
         'homeGridCrossAxisCount': homeGridCrossAxisCount,
@@ -2683,7 +3296,10 @@ class SettingsService extends ChangeNotifier {
         'mediaListCrossSpacingScale': mediaListCrossSpacingScale,
         'mediaListTitleScale': mediaListTitleScale,
         'mediaListCoverOffset': mediaListCoverOffset,
+        'folderPlaceholderSettings': folderPlaceholderSettings.toJson(),
         'copyImportedMediaToPrivateStorage': copyImportedMediaToPrivateStorage,
+        'useSearchResultsAsPlaybackQueue': useSearchResultsAsPlaybackQueue,
+        'bilibiliBackgroundAudioOnly': bilibiliBackgroundAudioOnly,
         'structuredImportSortField': structuredImportSortField,
         'structuredImportSortDirection': structuredImportSortDirection,
       },

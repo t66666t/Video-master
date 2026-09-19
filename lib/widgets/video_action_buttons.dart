@@ -20,7 +20,15 @@ import '../services/transcription_manager.dart';
 import '../screens/batch_import_screen.dart';
 import '../screens/bilibili_download_screen.dart';
 import '../screens/batch_subtitle_screen.dart';
+import '../utils/android_hardware_input_bridge.dart';
 import '../utils/app_toast.dart';
+import '../utils/desktop_media_management_shortcuts.dart';
+import '../utils/hardware_keyboard_shortcuts.dart';
+import '../utils/import_sheet_shortcuts.dart';
+import '../utils/incoming_share_signatures.dart';
+import '../utils/page_shortcut_keys.dart';
+import '../features/portable_transfer/portable_transfer_models.dart';
+import '../features/portable_transfer/portable_transfer_navigation.dart';
 
 class VideoActionButtons extends StatefulWidget {
   final String? collectionId;
@@ -44,6 +52,103 @@ class VideoActionButtons extends StatefulWidget {
           '',
         );
     return cleaned.isEmpty ? name : cleaned;
+  }
+
+  static Future<void> showImportMenu(
+    BuildContext context,
+    String? collectionId,
+  ) {
+    return _VideoActionButtonsState.openImportMenu(context, collectionId);
+  }
+
+  static void openCreateCollectionDialog(
+    BuildContext context,
+    String? parentId,
+  ) {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text("新建合集"),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(hintText: "合集名称"),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text("取消"),
+          ),
+          TextButton(
+            onPressed: () {
+              if (controller.text.isNotEmpty) {
+                Provider.of<LibraryService>(
+                  context,
+                  listen: false,
+                ).createCollection(controller.text, parentId);
+                Navigator.pop(dialogContext);
+              }
+            },
+            child: const Text("创建"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static void openBilibiliDownloadPage(
+    BuildContext context, {
+    String? collectionId,
+    bool streamingMode = false,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BilibiliDownloadScreen(
+          targetFolderId: collectionId,
+          initialStreamingMode: streamingMode,
+        ),
+        settings: RouteSettings(
+          name: streamingMode ? '/bilibili_stream_import' : '/bilibili_download',
+        ),
+      ),
+    );
+  }
+
+  static void openYtDlpDownloadPage(BuildContext context) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => const YtDlpDownloadScreen(),
+        settings: const RouteSettings(name: '/yt_dlp_download'),
+      ),
+    );
+  }
+
+  static void openBatchSubtitlePage(
+    BuildContext context, {
+    String? collectionId,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BatchSubtitleScreen(collectionId: collectionId),
+        settings: const RouteSettings(name: '/batch_subtitle'),
+      ),
+    );
+  }
+
+  static void openBatchImportPage(
+    BuildContext context, {
+    String? collectionId,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => BatchImportScreen(folderId: collectionId),
+      ),
+    );
   }
 
   const VideoActionButtons({
@@ -171,6 +276,19 @@ class VideoActionButtons extends StatefulWidget {
       return;
     }
 
+    // FluentPack is handled by the portable-transfer page, not media import.
+    // Nested desktop DropTargets may also see this drop; navigation dedupes.
+    if (await PortableTransferNavigation.handleDroppedPaths(
+      context,
+      normalizedPaths,
+    )) {
+      return;
+    }
+
+    if (!context.mounted) {
+      return;
+    }
+
     final mediaPaths = <String>[];
     final archivePaths = <String>[];
     final folderPaths = <String>[];
@@ -223,18 +341,27 @@ class VideoActionButtons extends StatefulWidget {
     await processImportedFiles(context, mediaPaths, collectionId);
   }
 
+  static int _structuredImportDialogCount = 0;
+  static bool _archiveImportUiBusy = false;
+
   static Future<void> processIncomingSharedItems(
     BuildContext context,
     List<dynamic> items,
-    String? collectionId,
-  ) async {
+    String? collectionId, {
+    bool requireCurrentRoute = true,
+  }) async {
     final mediaPaths = <String>[];
     final archiveSelections = <_ArchiveSelection>[];
+    final fluentPackItems = <Map<dynamic, dynamic>>[];
+    final fluentPackStringPaths = <String>[];
 
     for (final item in items) {
       if (item is String) {
         final path = item.trim();
-        if (path.isNotEmpty) {
+        if (path.isEmpty) continue;
+        if (PortableIncomingClassification.isPackagePath(path)) {
+          fluentPackStringPaths.add(path);
+        } else {
           mediaPaths.add(path);
         }
         continue;
@@ -245,14 +372,54 @@ class VideoActionButtons extends StatefulWidget {
 
       final rawKind = item['kind'];
       final kind = rawKind is String ? rawKind.trim().toLowerCase() : '';
+      final rawPath = item['path'];
+      final path = rawPath is String ? rawPath.trim() : '';
+      if (kind == 'fluentpack' ||
+          PortableIncomingClassification.isPackagePath(path) ||
+          PortableIncomingClassification.isPackagePath(
+            item['displayName']?.toString() ?? '',
+          )) {
+        fluentPackItems.add(item);
+        continue;
+      }
       if (kind == 'archive') {
         archiveSelections.add(_ArchiveSelection.fromNativeMap(item));
         continue;
       }
-      final rawPath = item['path'];
-      if (kind == 'media' && rawPath is String && rawPath.trim().isNotEmpty) {
-        mediaPaths.add(rawPath.trim());
+      if (kind == 'media' && path.isNotEmpty) {
+        mediaPaths.add(path);
       }
+    }
+
+    final hasFluentPack =
+        fluentPackItems.isNotEmpty || fluentPackStringPaths.isNotEmpty;
+    if (hasFluentPack) {
+      if (archiveSelections.isNotEmpty || mediaPaths.isNotEmpty) {
+        if (context.mounted) {
+          _showTopBanner(
+            context,
+            PortableIncomingClassification.shareMixMessage,
+            backgroundColor: const Color(0xFFB00020),
+            autoHideDuration: const Duration(seconds: 3),
+          );
+        }
+        return;
+      }
+      final sources = await _resolveSharedFluentPackSources(
+        fluentPackItems,
+        fluentPackStringPaths,
+      );
+      if (!context.mounted) return;
+      if (sources.isEmpty) {
+        _showTopBanner(
+          context,
+          '无法读取 FluentPack 文件',
+          backgroundColor: const Color(0xFFB00020),
+        );
+        return;
+      }
+      await PortableTransferNavigation.openAndImportPackages(context, sources);
+      return;
     }
 
     if (archiveSelections.isNotEmpty) {
@@ -271,11 +438,73 @@ class VideoActionButtons extends StatefulWidget {
         context,
         archiveSelections.single,
         collectionId,
+        requireCurrentRoute: requireCurrentRoute,
       );
       return;
     }
 
     await processImportedFiles(context, mediaPaths, collectionId);
+  }
+
+  static Future<List<PortableImportSource>> _resolveSharedFluentPackSources(
+    List<Map<dynamic, dynamic>> items,
+    List<String> stringPaths,
+  ) async {
+    final sources = <PortableImportSource>[];
+    final seen = <String>{};
+
+    void addSource(PortableImportSource source) {
+      final key = Platform.isWindows ? source.path.toLowerCase() : source.path;
+      if (source.path.isEmpty || !seen.add(key)) return;
+      sources.add(source);
+    }
+
+    for (final path in stringPaths) {
+      addSource(PortableImportSource.fromPath(path));
+    }
+
+    for (final item in items) {
+      final displayName = item['displayName']?.toString().trim();
+      final rawPath = item['path']?.toString().trim() ?? '';
+      final owned =
+          item['ownedTemporaryCopy'] == true || item['owned'] == true;
+      if (rawPath.isNotEmpty && await File(rawPath).exists()) {
+        addSource(
+          PortableImportSource(
+            path: rawPath,
+            displayName: (displayName != null && displayName.isNotEmpty)
+                ? displayName
+                : p.basename(rawPath),
+            ownedTemporaryCopy: owned,
+          ),
+        );
+        continue;
+      }
+      final uri = item['uri']?.toString().trim() ?? '';
+      if (uri.isEmpty || !Platform.isAndroid) continue;
+      try {
+        final materialized = await _fileManagerChannel.invokeMethod<String>(
+          'materializeFluentPackForImport',
+          {
+            'uri': uri,
+            'displayName': displayName ?? 'package.fluentpack',
+          },
+        );
+        if (materialized == null || materialized.isEmpty) continue;
+        addSource(
+          PortableImportSource(
+            path: materialized,
+            displayName: (displayName != null && displayName.isNotEmpty)
+                ? displayName
+                : p.basename(materialized),
+            ownedTemporaryCopy: true,
+          ),
+        );
+      } catch (error) {
+        debugPrint('materialize FluentPack failed: $error');
+      }
+    }
+    return sources;
   }
 
   static Future<void> processDroppedArchive(
@@ -287,20 +516,45 @@ class VideoActionButtons extends StatefulWidget {
     await _processSelectedArchive(context, selection, collectionId);
   }
 
+  static bool _canPresentStructuredImport(
+    BuildContext context, {
+    required bool requireCurrentRoute,
+  }) {
+    if (!context.mounted) return false;
+    return canPresentIncomingImportUi(
+      requireCurrentRoute: requireCurrentRoute,
+      routeIsCurrent: ModalRoute.of(context)?.isCurrent,
+    );
+  }
+
   static Future<void> _processSelectedArchive(
     BuildContext context,
     _ArchiveSelection selection,
-    String? collectionId,
-  ) async {
-    try {
-      if (!context.mounted) return;
-      if (ModalRoute.of(context)?.isCurrent != true) return;
-
-      if (!context.mounted) {
-        await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
-        return;
+    String? collectionId, {
+    bool requireCurrentRoute = true,
+  }) async {
+    if (!_canPresentStructuredImport(
+      context,
+      requireCurrentRoute: requireCurrentRoute,
+    )) {
+      return;
+    }
+    if (_archiveImportUiBusy || _structuredImportDialogCount > 0) {
+      if (context.mounted) {
+        _showTopBanner(
+          context,
+          '请先完成当前的导入确认，再分享下一个压缩包',
+          backgroundColor: const Color(0xFFB00020),
+        );
       }
-      if (ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
+    _archiveImportUiBusy = true;
+    try {
+      if (!_canPresentStructuredImport(
+        context,
+        requireCurrentRoute: requireCurrentRoute,
+      )) {
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
         return;
       }
@@ -315,7 +569,14 @@ class VideoActionButtons extends StatefulWidget {
         return;
       }
       final summary = await _prepareArchiveSelectionSummary(selection, library);
-      if (!context.mounted || ModalRoute.of(context)?.isCurrent != true) {
+      if (!context.mounted) {
+        await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
+        return;
+      }
+      if (!_canPresentStructuredImport(
+        context,
+        requireCurrentRoute: requireCurrentRoute,
+      )) {
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
         return;
       }
@@ -330,13 +591,18 @@ class VideoActionButtons extends StatefulWidget {
 
       if (action == _StructuredImportDialogAction.preview) {
         await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
-        if (!context.mounted || ModalRoute.of(context)?.isCurrent != true) {
+        if (!context.mounted) return;
+        if (!_canPresentStructuredImport(
+          context,
+          requireCurrentRoute: requireCurrentRoute,
+        )) {
           return;
         }
         _showTopBanner(context, "压缩包预览功能暂未开放");
         return;
       }
 
+      if (!context.mounted) return;
       final settings = Provider.of<SettingsService>(context, listen: false);
       final sortOptions = StructuredImportSortOptions.fromSettings(settings);
       final archivePath = await _ensureArchivePathForImport(selection);
@@ -350,7 +616,12 @@ class VideoActionButtons extends StatefulWidget {
           )
           .whenComplete(toastBridge.dispose);
       if (!context.mounted) return;
-      if (ModalRoute.of(context)?.isCurrent != true) return;
+      if (!_canPresentStructuredImport(
+        context,
+        requireCurrentRoute: requireCurrentRoute,
+      )) {
+        return;
+      }
       _showTopBanner(
         context,
         "压缩包导入完成：新增 ${resultSummary.importedMediaCount} 个媒体，创建 ${resultSummary.createdFolderCount} 个文件夹",
@@ -366,6 +637,8 @@ class VideoActionButtons extends StatefulWidget {
           autoHideDuration: const Duration(seconds: 3),
         );
       }
+    } finally {
+      _archiveImportUiBusy = false;
     }
   }
 
@@ -544,8 +817,14 @@ class VideoActionButtons extends StatefulWidget {
     String sortField = settings.structuredImportSortField;
     String sortDirection = settings.structuredImportSortDirection;
 
-    return showDialog<_StructuredImportDialogAction>(
-      context: context,
+    if (_structuredImportDialogCount > 0) {
+      return _StructuredImportDialogAction.cancel;
+    }
+    _structuredImportDialogCount++;
+    try {
+      return await showDialog<_StructuredImportDialogAction>(
+        context: context,
+        useRootNavigator: true,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setState) {
@@ -694,6 +973,9 @@ class VideoActionButtons extends StatefulWidget {
         );
       },
     );
+    } finally {
+      _structuredImportDialogCount--;
+    }
   }
 
   @override
@@ -704,6 +986,18 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
   Timer? _hiddenCleanupTapResetTimer;
   int _hiddenCleanupTapCount = 0;
   bool _isHiddenCleanupDialogOpen = false;
+
+  String _fabTooltip(
+    String label,
+    DesktopMediaManagementShortcutAction action,
+  ) {
+    if (!supportsNativeHardwareKeyboardShortcuts) return label;
+    return DesktopMediaManagementShortcuts.buildTooltip(label, action);
+  }
+
+  Future<void> importVideos(BuildContext context, String? collectionId) {
+    return VideoActionButtons.showImportMenu(context, collectionId);
+  }
 
   @override
   void dispose() {
@@ -1056,7 +1350,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: "批量字幕生成",
+                            tooltip: _fabTooltip(
+                              "批量字幕生成",
+                              DesktopMediaManagementShortcutAction
+                                  .openBatchSubtitle,
+                            ),
                             backgroundColor: Colors.teal,
                             child: const Icon(
                               Icons.closed_caption,
@@ -1070,7 +1368,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                               context,
                               widget.collectionId,
                             ),
-                            tooltip: "新建合集",
+                            tooltip: _fabTooltip(
+                              "新建合集",
+                              DesktopMediaManagementShortcutAction
+                                  .createCollection,
+                            ),
                             child: const Icon(Icons.create_new_folder),
                           ),
                           const SizedBox(height: 16),
@@ -1078,7 +1380,10 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                             heroTag: "add_video_${widget.collectionId}",
                             onPressed: () =>
                                 importVideos(context, widget.collectionId),
-                            tooltip: "导入视频或音频",
+                            tooltip: _fabTooltip(
+                              "导入视频或音频",
+                              DesktopMediaManagementShortcutAction.importMedia,
+                            ),
                             child: const Icon(Icons.video_call),
                           ),
                           const SizedBox(height: 16),
@@ -1097,7 +1402,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: "B站视频下载",
+                            tooltip: _fabTooltip(
+                              "B站视频下载",
+                              DesktopMediaManagementShortcutAction
+                                  .openBilibiliDownload,
+                            ),
                             backgroundColor: const Color(0xFFFB7299),
                             child: const Icon(Icons.tv, color: Colors.white),
                           ),
@@ -1115,7 +1424,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: "YT-DLP 视频下载",
+                            tooltip: _fabTooltip(
+                              "YT-DLP 视频下载",
+                              DesktopMediaManagementShortcutAction
+                                  .openYtDlpDownload,
+                            ),
                             backgroundColor: const Color(0xFFFF4040),
                             child: const Icon(
                               Icons.ondemand_video,
@@ -1143,7 +1456,11 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                         ),
                                       ),
                                     ),
-                                    tooltip: "批量导入媒体及对应字幕",
+                                    tooltip: _fabTooltip(
+                                      "批量导入媒体及对应字幕",
+                                      DesktopMediaManagementShortcutAction
+                                          .openBatchImport,
+                                    ),
                                     backgroundColor: Colors.deepPurpleAccent,
                                     child: const Icon(
                                       Icons.playlist_add,
@@ -1225,39 +1542,10 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
   }
 
   void showCreateCollectionDialog(BuildContext context, String? parentId) {
-    final controller = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text("新建合集"),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(hintText: "合集名称"),
-          autofocus: true,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("取消"),
-          ),
-          TextButton(
-            onPressed: () {
-              if (controller.text.isNotEmpty) {
-                Provider.of<LibraryService>(
-                  context,
-                  listen: false,
-                ).createCollection(controller.text, parentId);
-                Navigator.pop(context);
-              }
-            },
-            child: const Text("创建"),
-          ),
-        ],
-      ),
-    );
+    VideoActionButtons.openCreateCollectionDialog(context, parentId);
   }
 
-  Future<bool> _requestStoragePermissionIfNeeded(BuildContext context) async {
+  static Future<bool> _requestStoragePermissionIfNeeded(BuildContext context) async {
     if (!Platform.isAndroid) {
       return true;
     }
@@ -1279,78 +1567,151 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     return hasPermission;
   }
 
-  Future<void> importVideos(BuildContext context, String? collectionId) async {
-    final mainContext = context;
-    await showModalBottomSheet(
-      context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (!Platform.isWindows && !Platform.isLinux && !Platform.isMacOS)
-              ListTile(
-                leading: const Icon(Icons.photo_library),
-                title: const Text('从相册导入'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _pickFromGallery(mainContext, collectionId);
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.folder_open),
-              title: const Text('从文件管理导入'),
-              onTap: () {
-                Navigator.pop(context);
-                _pickFromFileManager(mainContext, collectionId);
-              },
-            ),
-            ListTile(
-              leading: const Icon(
-                Icons.live_tv_outlined,
-                color: Color(0xFFFB7299),
-              ),
-              title: const Text('导入 Bilibili 链接（在线播放）'),
-              subtitle: const Text('仅导入播放链接；下载请使用小电视按钮'),
-              onTap: () {
-                Navigator.pop(context);
-                Navigator.push(
-                  mainContext,
-                  MaterialPageRoute(
-                    builder: (_) => BilibiliDownloadScreen(
-                      targetFolderId: collectionId,
-                      initialStreamingMode: true,
-                    ),
-                    settings: const RouteSettings(
-                      name: '/bilibili_stream_import',
-                    ),
-                  ),
-                );
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.archive_outlined),
-              title: const Text('从文件管理导入压缩包'),
-              onTap: () {
-                Navigator.pop(context);
-                _pickArchiveFromFileManager(mainContext, collectionId);
-              },
-            ),
-            if (!Platform.isIOS)
-              ListTile(
-                leading: const Icon(Icons.create_new_folder_outlined),
-                title: const Text('从文件管理导入文件夹'),
-                onTap: () {
-                  Navigator.pop(context);
-                  _pickFolderFromFileManager(mainContext, collectionId);
-                },
-              ),
-          ],
-        ),
-      ),
+  static String sheetTitle(String label, ImportSheetShortcutAction action) {
+    return tooltipWithShortcutKey(
+      label,
+      ImportSheetShortcuts.defaults[action]!,
     );
   }
 
-  Future<void> _pickFromGallery(
+  static Future<void> openImportMenu(
+    BuildContext context,
+    String? collectionId,
+  ) async {
+    final mainContext = context;
+    await showModalBottomSheet(
+      context: context,
+      builder: (sheetContext) {
+        void run(ImportSheetShortcutAction action) {
+          switch (action) {
+            case ImportSheetShortcutAction.close:
+              Navigator.pop(sheetContext);
+              return;
+            case ImportSheetShortcutAction.gallery:
+              if (!ImportSheetShortcuts.isVisible(action)) return;
+              Navigator.pop(sheetContext);
+              _VideoActionButtonsState._pickFromGallery(
+                mainContext,
+                collectionId,
+              );
+              return;
+            case ImportSheetShortcutAction.files:
+              Navigator.pop(sheetContext);
+              _VideoActionButtonsState._pickFromFileManager(
+                mainContext,
+                collectionId,
+              );
+              return;
+            case ImportSheetShortcutAction.bilibiliOnline:
+              Navigator.pop(sheetContext);
+              VideoActionButtons.openBilibiliDownloadPage(
+                mainContext,
+                collectionId: collectionId,
+                streamingMode: true,
+              );
+              return;
+            case ImportSheetShortcutAction.archive:
+              Navigator.pop(sheetContext);
+              _VideoActionButtonsState._pickArchiveFromFileManager(
+                mainContext,
+                collectionId,
+              );
+              return;
+            case ImportSheetShortcutAction.folder:
+              if (!ImportSheetShortcuts.isVisible(action)) return;
+              Navigator.pop(sheetContext);
+              _VideoActionButtonsState._pickFolderFromFileManager(
+                mainContext,
+                collectionId,
+              );
+              return;
+            case ImportSheetShortcutAction.fluentPack:
+              Navigator.pop(sheetContext);
+              unawaited(PortableTransferNavigation.openImportTab(mainContext));
+              return;
+          }
+        }
+
+        return _ImportSheetShortcutHost(
+          onAction: run,
+          child: SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (ImportSheetShortcuts.isVisible(
+                  ImportSheetShortcutAction.gallery,
+                ))
+                  ListTile(
+                    leading: const Icon(Icons.photo_library),
+                    title: Text(
+                      _VideoActionButtonsState.sheetTitle('从相册导入', ImportSheetShortcutAction.gallery),
+                    ),
+                    onTap: () => run(ImportSheetShortcutAction.gallery),
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.folder_open),
+                  title: Text(
+                    _VideoActionButtonsState.sheetTitle('从文件管理导入', ImportSheetShortcutAction.files),
+                  ),
+                  onTap: () => run(ImportSheetShortcutAction.files),
+                ),
+                ListTile(
+                  leading: const Icon(
+                    Icons.live_tv_outlined,
+                    color: Color(0xFFFB7299),
+                  ),
+                  title: Text(
+                    _VideoActionButtonsState.sheetTitle(
+                      '导入 Bilibili 链接（在线播放）',
+                      ImportSheetShortcutAction.bilibiliOnline,
+                    ),
+                  ),
+                  subtitle: const Text('仅导入播放链接；下载请使用小电视按钮'),
+                  onTap: () => run(ImportSheetShortcutAction.bilibiliOnline),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.archive_outlined),
+                  title: Text(
+                    _VideoActionButtonsState.sheetTitle(
+                      '从文件管理导入压缩包',
+                      ImportSheetShortcutAction.archive,
+                    ),
+                  ),
+                  onTap: () => run(ImportSheetShortcutAction.archive),
+                ),
+                if (ImportSheetShortcuts.isVisible(
+                  ImportSheetShortcutAction.folder,
+                ))
+                  ListTile(
+                    leading: const Icon(Icons.create_new_folder_outlined),
+                    title: Text(
+                      _VideoActionButtonsState.sheetTitle(
+                        '从文件管理导入文件夹',
+                        ImportSheetShortcutAction.folder,
+                      ),
+                    ),
+                    onTap: () => run(ImportSheetShortcutAction.folder),
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.south_west_rounded),
+                  title: Text(
+                    _VideoActionButtonsState.sheetTitle(
+                      '从 FluentPack 文件导入',
+                      ImportSheetShortcutAction.fluentPack,
+                    ),
+                  ),
+                  subtitle: const Text('打开导入页，选择 .fluentpack 便携包'),
+                  onTap: () => run(ImportSheetShortcutAction.fluentPack),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  static Future<void> _pickFromGallery(
     BuildContext context,
     String? collectionId,
   ) async {
@@ -1449,7 +1810,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     }
   }
 
-  Future<void> _pickFromFileManager(
+  static Future<void> _pickFromFileManager(
     BuildContext context,
     String? collectionId,
   ) async {
@@ -1526,7 +1887,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     }
   }
 
-  Future<void> _pickArchiveFromFileManager(
+  static Future<void> _pickArchiveFromFileManager(
     BuildContext context,
     String? collectionId,
   ) async {
@@ -1593,7 +1954,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     }
   }
 
-  Future<void> _pickFolderFromFileManager(
+  static Future<void> _pickFolderFromFileManager(
     BuildContext context,
     String? collectionId,
   ) async {
@@ -1845,6 +2206,95 @@ class _ArchiveSelection {
       folderCount: 0,
       mediaFileCount: 0,
       detailsDeferred: true,
+    );
+  }
+}
+
+/// Owns hardware-keyboard listeners for the import bottom sheet so keys still
+/// fire when Focus is lost or an attached phone keyboard bypasses Focus.
+class _ImportSheetShortcutHost extends StatefulWidget {
+  const _ImportSheetShortcutHost({
+    required this.onAction,
+    required this.child,
+  });
+
+  final void Function(ImportSheetShortcutAction action) onAction;
+  final Widget child;
+
+  @override
+  State<_ImportSheetShortcutHost> createState() =>
+      _ImportSheetShortcutHostState();
+}
+
+class _ImportSheetShortcutHostState extends State<_ImportSheetShortcutHost> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'ImportSheetShortcuts');
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
+
+  @override
+  void initState() {
+    super.initState();
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
+  }
+
+  @override
+  void dispose() {
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_focusNode.hasFocus) return false;
+    return _handleKey(event) != KeyEventResult.ignored;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleKey(
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  KeyEventResult _handleKey(
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
+    if (!supportsNativeHardwareKeyboardShortcuts) {
+      return KeyEventResult.ignored;
+    }
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
+      return KeyEventResult.handled;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final bool hasBlockingModifier =
+        hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
+    if (hasBlockingModifier) return KeyEventResult.ignored;
+    final ImportSheetShortcutAction? action =
+        ImportSheetShortcuts.matchAction(event.logicalKey);
+    if (action == null) return KeyEventResult.ignored;
+    widget.onAction(action);
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      focusNode: _focusNode,
+      autofocus: true,
+      onKeyEvent: (node, event) => _handleKey(event),
+      child: widget.child,
     );
   }
 }

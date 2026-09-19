@@ -139,36 +139,106 @@ class PlaybackNavigationService {
       var item = playbackService.currentItem;
       if (item == null) return;
 
-      playbackService.setPlaybackPageVisible(_navigationVisibilityOwner, true);
-      try {
-        if (playbackService.needsVisibleVideoOutputRecovery(item.id)) {
-          unawaited(playbackService.ensureVisibleVideoOutput(item.id));
-        }
-        await _waitForPresentableSession(playbackService, item.id);
-        // The wait above can time out (25s) with the session still lacking a
-        // visible output — e.g. the background attach attempts already failed.
-        // Run the recovery once more and let it finish: it now reopens the
-        // same media at the same position with the same play intent as a last
-        // resort, so the playback page mounts a working controller instead of
-        // falling back to a full media reload after navigation.
-        if (playbackService.currentItem?.id == item.id &&
-            playbackService.needsVisibleVideoOutputRecovery(item.id)) {
-          await playbackService
-              .ensureVisibleVideoOutput(item.id)
-              .timeout(const Duration(seconds: 25), onTimeout: () => false);
-        }
-        item = playbackService.currentItem;
-        if (item == null) return;
-        await _openPlaybackInternal(item);
-        await WidgetsBinding.instance.endOfFrame;
-      } finally {
+      // Keep the warmup owner until a real playback page registers. Dropping
+      // it after one frame used to deselect Bilibili's video track while the
+      // route was still mounting, painting a black texture over a ready stream.
+      _holdPlaybackPageVisibleUntilOwned(
+        playbackService,
+        maxAttempts: 1800,
+      );
+      if (playbackService.controller == null) {
+        // Restored Mini chrome has metadata only. Start prepare now so the
+        // playback page does not wait 25s for a player that was never created.
+        unawaited(
+          playbackService.play(
+            item,
+            autoPlay: resolvePlaybackPageEntryAutoPlay(
+              entryAutoPlay: SettingsService().autoPlayOnPageEntry,
+              isCurrentItem: true,
+              desiredPlaying: playbackService.desiredPlaying,
+            ),
+            startPosition: MediaPlaybackService.startPositionForCurrentSession(
+              currentItemId: playbackService.currentItem?.id,
+              itemId: item.id,
+              currentPosition: playbackService.position,
+            ),
+          ),
+        );
+      }
+      // Do not await video attach/enable. The page should open on the live
+      // audio clock immediately; the texture catches up under the poster.
+      if (playbackService.needsVisibleVideoOutputRecovery(item.id)) {
+        unawaited(playbackService.ensureVisibleVideoOutput(item.id));
+      }
+      item = playbackService.currentItem;
+      if (item == null) return;
+      await _openPlaybackInternal(item);
+    });
+    return _navigationQueue;
+  }
+
+  /// Starts source preparation as soon as a library card is tapped, overlapping
+  /// the page-route animation. Also marks a playback page as imminent so a
+  /// Bilibili split stream keeps its video track selected during initialize.
+  void primeLibraryPlaybackEntry({
+    required MediaPlaybackService playbackService,
+    required VideoItem item,
+    VideoPlayerController? existingController,
+  }) {
+    _holdPlaybackPageVisibleUntilOwned(playbackService);
+
+    if (existingController != null) return;
+    if (playbackService.currentItem?.id == item.id &&
+        playbackService.controller != null) {
+      return;
+    }
+
+    unawaited(
+      playbackService.play(
+        item,
+        autoPlay: resolvePlaybackPageEntryAutoPlay(
+          entryAutoPlay: SettingsService().autoPlayOnPageEntry,
+          isCurrentItem: playbackService.currentItem?.id == item.id,
+          desiredPlaying: playbackService.desiredPlaying,
+        ),
+        startPosition: MediaPlaybackService.startPositionForCurrentSession(
+          currentItemId: playbackService.currentItem?.id,
+          itemId: item.id,
+          currentPosition: playbackService.position,
+        ),
+      ),
+    );
+  }
+
+  /// Keep the warmup owner until a real playback page registers. Dropping it on
+  /// the first frame can deselect Bilibili's video track while the route is
+  /// still mounting, which paints a black texture over an already-ready stream.
+  void _holdPlaybackPageVisibleUntilOwned(
+    MediaPlaybackService playbackService, {
+    int maxAttempts = 12,
+  }) {
+    playbackService.setPlaybackPageVisible(_navigationVisibilityOwner, true);
+    var attempts = 0;
+    void releaseWhenPageOwnsIt() {
+      attempts++;
+      if (playbackService.hasPlaybackPageOwnerOtherThan(
+            _navigationVisibilityOwner,
+          ) ||
+          attempts >= maxAttempts) {
         playbackService.setPlaybackPageVisible(
           _navigationVisibilityOwner,
           false,
         );
+        return;
       }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        releaseWhenPageOwnsIt();
+      });
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      releaseWhenPageOwnsIt();
     });
-    return _navigationQueue;
   }
 
   /// Notification body taps follow the pre-streaming behavior: navigate to
@@ -188,26 +258,15 @@ class PlaybackNavigationService {
       if (item == null) return;
       final warmOnlineVideo = playbackService.isCurrentItemOnlineBilibiliStream;
       if (warmOnlineVideo) {
-        // Resume the split video track as soon as the notification body is
-        // tapped. The portrait route still mounts the same Player and external
-        // audio clock, so foreground entry never performs an audible hand-off.
-        // Materialized Bilibili items and ordinary local files skip this path.
-        playbackService.setPlaybackPageVisible(
-          _navigationVisibilityOwner,
-          true,
+        _holdPlaybackPageVisibleUntilOwned(
+          playbackService,
+          maxAttempts: 1800,
         );
-      }
-      try {
-        await _openPlaybackInternal(item, notificationEntry: true);
-        if (warmOnlineVideo) await WidgetsBinding.instance.endOfFrame;
-      } finally {
-        if (warmOnlineVideo) {
-          playbackService.setPlaybackPageVisible(
-            _navigationVisibilityOwner,
-            false,
-          );
+        if (playbackService.needsVisibleVideoOutputRecovery(item.id)) {
+          unawaited(playbackService.ensureVisibleVideoOutput(item.id));
         }
       }
+      await _openPlaybackInternal(item, notificationEntry: true);
     });
     return _navigationQueue;
   }
@@ -218,10 +277,17 @@ class PlaybackNavigationService {
   ) async {
     bool isPresentable() {
       if (service.currentItem?.id != itemId) return true;
-      return service.canMountControllerFor(itemId) ||
+      if (service.canMountControllerFor(itemId) ||
           service.isSourceMissing ||
           service.state == PlaybackState.error ||
-          service.state == PlaybackState.idle;
+          service.state == PlaybackState.idle) {
+        return true;
+      }
+      // A restored bookmark has item metadata and no native player yet.
+      // Navigate immediately; the page (or the play() started above) prepares.
+      return service.controller == null &&
+          (service.state == PlaybackState.paused ||
+              service.state == PlaybackState.loading);
     }
 
     if (isPresentable()) return;

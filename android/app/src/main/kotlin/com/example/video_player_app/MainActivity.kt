@@ -20,6 +20,8 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import android.webkit.MimeTypeMap
+import android.view.KeyEvent
+import android.view.MotionEvent
 import java.io.File
 import java.io.FileOutputStream
 import java.util.ArrayDeque
@@ -38,6 +40,7 @@ class MainActivity : AudioServiceFragmentActivity() {
     private enum class PickerMode {
         MEDIA,
         ARCHIVE,
+        FLUENT_PACK,
     }
 
     private val YTDLP_BEFORE_DL_MARKER = "__YTDLP_BEFORE_DL__:"
@@ -47,12 +50,12 @@ class MainActivity : AudioServiceFragmentActivity() {
     private val SHARE_EVENT_CHANNEL = "com.example.video_player_app/share_intent_events"
     private val YT_DLP_CHANNEL = "com.example.video_player_app/yt_dlp"
     private val YT_DLP_EVENT_CHANNEL = "com.example.video_player_app/yt_dlp_events"
+    private val HARDWARE_INPUT_CHANNEL = "com.example.video_player_app/hardware_input"
     private val REQUEST_CODE_PICK_FILES = 4101
     private var pendingResult: MethodChannel.Result? = null
     private var pendingPickerMode: PickerMode? = null
-    private var shareEventSink: EventChannel.EventSink? = null
     private var ytDlpEventSink: EventChannel.EventSink? = null
-    private val pendingSharedItems = mutableListOf<Map<String, Any?>>()
+    private var hardwareInputChannel: MethodChannel? = null
     private val mediaExtensions = setOf(
         ".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm", ".wmv", ".3gp", ".m4v", ".ts",
         ".rmvb", ".mpg", ".mpeg", ".f4v", ".m2ts", ".mts", ".vob", ".ogv", ".divx",
@@ -70,9 +73,6 @@ class MainActivity : AudioServiceFragmentActivity() {
         ".tar.xz",
     )
     private val ytDlpTasks = ConcurrentHashMap<String, RunningYtDlpTask>()
-    private val sharedIntentExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "shared-intent-resolver")
-    }
     private var ytDlpWorkerReceiverRegistered = false
     private val ytDlpWorkerReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -83,10 +83,17 @@ class MainActivity : AudioServiceFragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         registerYtDlpWorkerReceiver()
+        // Cached Flutter engines skip configureFlutterEngine on the next
+        // Activity. Still consume a VIEW/SEND that launched this instance.
+        enqueueSharedItemsFromIntent(intent)
     }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        hardwareInputChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            HARDWARE_INPUT_CHANNEL,
+        )
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "openFileManager" -> {
@@ -112,6 +119,25 @@ class MainActivity : AudioServiceFragmentActivity() {
                     pendingResult = result
                     pendingPickerMode = PickerMode.ARCHIVE
                     openSystemFilePicker(listOf("*/*"), false)
+                }
+                "pickFluentPack" -> {
+                    if (pendingResult != null) {
+                        result.error("PICKER_ACTIVE", "File picker is already active", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingResult = result
+                    pendingPickerMode = PickerMode.FLUENT_PACK
+                    // DocumentsUI filters by MIME rather than a private file
+                    // extension. Packages shared by this app use application/zip;
+                    // octet-stream keeps packages copied over USB/cloud visible.
+                    openSystemFilePicker(
+                        listOf(
+                            "application/x-fluent-player-package",
+                            "application/zip",
+                            "application/octet-stream",
+                        ),
+                        false,
+                    )
                 }
                 "materializeArchiveForImport" -> {
                     val uriString = call.argument<String>("uri")
@@ -144,6 +170,31 @@ class MainActivity : AudioServiceFragmentActivity() {
                         }
                     }
                 }
+                "materializeFluentPackForImport" -> {
+                    val uriString = call.argument<String>("uri")
+                    val displayName = call.argument<String>("displayName")
+                    if (uriString.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "missing uri", null)
+                    } else {
+                        thread(name = "fluentpack-materialize") {
+                            try {
+                                val materializedPath = materializeFluentPackForImport(
+                                    uriString,
+                                    displayName,
+                                )
+                                runOnUiThread { result.success(materializedPath) }
+                            } catch (e: Exception) {
+                                runOnUiThread {
+                                    result.error(
+                                        "FLUENTPACK_MATERIALIZE_FAILED",
+                                        e.message ?: "fluentpack materialize failed",
+                                        null,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 else -> result.notImplemented()
             }
         }
@@ -151,8 +202,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getInitialSharedMedia" -> {
-                    result.success(ArrayList(pendingSharedItems))
-                    pendingSharedItems.clear()
+                    result.success(ShareIntentDelivery.takePending())
                 }
                 else -> result.notImplemented()
             }
@@ -161,11 +211,13 @@ class MainActivity : AudioServiceFragmentActivity() {
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_EVENT_CHANNEL).setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    shareEventSink = events
+                    ShareIntentDelivery.setSink(events)
                 }
 
                 override fun onCancel(arguments: Any?) {
-                    shareEventSink = null
+                    // onCancel has no EventSink parameter; null clears the
+                    // current sink so a later Activity cannot keep a dead stream.
+                    ShareIntentDelivery.clearSink(null)
                 }
             }
         )
@@ -297,6 +349,61 @@ class MainActivity : AudioServiceFragmentActivity() {
         enqueueSharedItemsFromIntent(intent)
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The Xiaomi keyboard and some Android desktop modes can deliver keys
+        // to the Activity without Flutter's current FocusNode seeing them.
+        // Forward all ordinary down/up events as a fallback while leaving
+        // Back/Escape entirely under Android's navigation handling.
+        if (
+            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP) &&
+            event.keyCode != KeyEvent.KEYCODE_BACK &&
+            event.keyCode != KeyEvent.KEYCODE_ESCAPE
+        ) {
+            hardwareInputChannel?.invokeMethod(
+                "keyEvent",
+                mapOf(
+                    "keyCode" to event.keyCode,
+                    "scanCode" to event.scanCode,
+                    "unicodeChar" to event.getUnicodeChar(event.metaState),
+                    "characters" to event.characters,
+                    "action" to event.action,
+                    "repeatCount" to event.repeatCount,
+                    "eventTime" to event.eventTime,
+                    "ctrl" to event.isCtrlPressed,
+                    "alt" to event.isAltPressed,
+                    "meta" to event.isMetaPressed,
+                    "shift" to event.isShiftPressed,
+                ),
+            )
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        // Flutter normally receives Android mouse hover directly. Re-send
+        // Activity-level hover as a fallback for vendor touchpads/desktop mode;
+        // Dart gives it a separate pointer id and feeds the normal MouseRegion
+        // pipeline, so button Tooltips work without custom per-button code.
+        when (event.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                val density = resources.displayMetrics.density.coerceAtLeast(1f)
+                hardwareInputChannel?.invokeMethod(
+                    "pointerHover",
+                    mapOf(
+                        "action" to event.actionMasked,
+                        "x" to event.x / density,
+                        "y" to event.y / density,
+                        "eventTime" to event.eventTime,
+                        "deviceId" to event.deviceId,
+                    ),
+                )
+            }
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_CODE_PICK_FILES) return
@@ -307,7 +414,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         if (result == null) return
         if (resultCode != Activity.RESULT_OK || data == null) {
             when (pickerMode) {
-                PickerMode.ARCHIVE -> result.success(null)
+                PickerMode.ARCHIVE, PickerMode.FLUENT_PACK -> result.success(null)
                 else -> result.success(emptyList<String>())
             }
             return
@@ -337,6 +444,28 @@ class MainActivity : AudioServiceFragmentActivity() {
                 }
                 result.success(buildArchiveSelectionPayload(firstUri))
             }
+            PickerMode.FLUENT_PACK -> {
+                val firstUri = uris.firstOrNull()
+                if (firstUri == null) {
+                    result.success(null)
+                    return
+                }
+                try {
+                    if (takeFlags != 0) {
+                        contentResolver.takePersistableUriPermission(firstUri, takeFlags)
+                    }
+                } catch (_: Exception) {
+                }
+                try {
+                    result.success(buildFluentPackSelectionPayload(firstUri))
+                } catch (e: Exception) {
+                    result.error(
+                        "INVALID_FLUENTPACK_SELECTION",
+                        e.message ?: "请选择 .fluentpack 文件",
+                        null,
+                    )
+                }
+            }
             else -> {
                 val paths = mutableListOf<String>()
                 for (uri in uris) {
@@ -360,6 +489,7 @@ class MainActivity : AudioServiceFragmentActivity() {
     }
 
     override fun onDestroy() {
+        hardwareInputChannel = null
         ytDlpTasks.values.forEach { task ->
             task.terminationReason = "cancel"
             sendYtDlpWorkerCommand(YtDlpWorkerService.ACTION_CANCEL, task.taskId)
@@ -369,7 +499,6 @@ class MainActivity : AudioServiceFragmentActivity() {
             runCatching { unregisterReceiver(ytDlpWorkerReceiver) }
             ytDlpWorkerReceiverRegistered = false
         }
-        sharedIntentExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -390,21 +519,31 @@ class MainActivity : AudioServiceFragmentActivity() {
         ) return
 
         val snapshot = Intent(sourceIntent)
-        sharedIntentExecutor.execute {
+        // Consume the VIEW/SEND intent immediately so a later Activity
+        // recreate cannot re-deliver the same share after the dialog was
+        // already shown. The snapshot still has the original extras.
+        consumeDeliveredShareIntent(sourceIntent)
+        ShareIntentDelivery.executor.execute {
             val sharedItems = extractSharedItemsFromIntent(snapshot)
             if (sharedItems.isEmpty()) return@execute
             runOnUiThread {
-                if (isFinishing || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && isDestroyed)) {
-                    return@runOnUiThread
-                }
-                val sink = shareEventSink
-                if (sink != null) {
-                    sink.success(sharedItems)
-                } else {
-                    pendingSharedItems.addAll(sharedItems)
-                }
+                ShareIntentDelivery.deliver(sharedItems)
             }
         }
+    }
+
+    private fun consumeDeliveredShareIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action
+        if (
+            action != Intent.ACTION_SEND &&
+            action != Intent.ACTION_SEND_MULTIPLE &&
+            action != Intent.ACTION_VIEW
+        ) return
+        setIntent(Intent(this, MainActivity::class.java).apply {
+            this.action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        })
     }
 
     private fun registerYtDlpWorkerReceiver() {
@@ -621,7 +760,14 @@ class MainActivity : AudioServiceFragmentActivity() {
 
     private fun resolveSharedImportItem(uri: Uri, typeHint: String?): Map<String, Any?>? {
         return try {
-            if (isLikelyArchive(uri, typeHint)) {
+            // FluentPack is a ZIP container; filename / custom MIME must win
+            // before the generic archive heuristic, or Open-With/Share would
+            // dump it into the structured-archive importer.
+            if (isLikelyFluentPack(uri, typeHint)) {
+                val payload = buildFluentPackSelectionPayload(uri).toMutableMap()
+                payload["kind"] = "fluentpack"
+                payload
+            } else if (isLikelyArchive(uri, typeHint)) {
                 val payload = buildArchiveSelectionPayload(uri).toMutableMap()
                 payload["kind"] = "archive"
                 payload
@@ -677,6 +823,19 @@ class MainActivity : AudioServiceFragmentActivity() {
         return false
     }
 
+    private fun isLikelyFluentPack(uri: Uri, typeHint: String?): Boolean {
+        val packageMime = "application/x-fluent-player-package"
+        val normalizedHint = typeHint?.lowercase(Locale.ROOT)
+        if (normalizedHint == packageMime) return true
+        val resolverType = contentResolver.getType(uri)?.lowercase(Locale.ROOT)
+        if (resolverType == packageMime) return true
+        val displayName = queryDisplayName(uri)
+        if (!displayName.isNullOrEmpty() && isFluentPackPath(displayName)) return true
+        val lastPath = uri.lastPathSegment
+        if (!lastPath.isNullOrEmpty() && isFluentPackPath(lastPath)) return true
+        return false
+    }
+
     private fun isLikelyArchive(uri: Uri, typeHint: String?): Boolean {
         val normalizedHint = typeHint?.lowercase(Locale.ROOT)
         if (!normalizedHint.isNullOrEmpty() && normalizedHint != "*/*") {
@@ -717,6 +876,9 @@ class MainActivity : AudioServiceFragmentActivity() {
         return archiveExtensions.any { lower.endsWith(it) }
     }
 
+    private fun isFluentPackPath(path: String): Boolean =
+        path.lowercase(Locale.ROOT).endsWith(".fluentpack")
+
     private fun queryFileSize(uri: Uri): Long? {
         contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -739,6 +901,27 @@ class MainActivity : AudioServiceFragmentActivity() {
         }
 
         val directPath = resolveToPath(uri)?.takeIf { isArchivePath(it) }
+        return mapOf(
+            "displayName" to displayName,
+            "sizeBytes" to queryFileSize(uri),
+            "path" to directPath,
+            "uri" to if (directPath == null) uri.toString() else null,
+        )
+    }
+
+    private fun buildFluentPackSelectionPayload(uri: Uri): Map<String, Any?> {
+        val rawName = queryDisplayName(uri)
+            ?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment
+            ?: "package.fluentpack"
+        // Share-sheet MIME can identify a package whose display name lacks
+        // the extension. Keep a real extension so Flutter/inspect can accept it.
+        val displayName = when {
+            isFluentPackPath(rawName) -> rawName
+            !rawName.contains('.') -> "$rawName.fluentpack"
+            else -> throw IllegalArgumentException("请选择 .fluentpack 文件")
+        }
+        val directPath = resolveToPath(uri)?.takeIf { isFluentPackPath(it) }
         return mapOf(
             "displayName" to displayName,
             "sizeBytes" to queryFileSize(uri),
@@ -801,6 +984,44 @@ class MainActivity : AudioServiceFragmentActivity() {
             } ?: throw IllegalStateException("无法读取压缩包内容")
             if (partialFile.length() <= 0L || !partialFile.renameTo(outFile)) {
                 throw IllegalStateException("无法保存压缩包临时副本")
+            }
+        } catch (e: Exception) {
+            runCatching { partialFile.delete() }
+            throw e
+        }
+        return outFile.absolutePath
+    }
+
+    private fun materializeFluentPackForImport(uriString: String, displayName: String?): String {
+        val uri = Uri.parse(uriString)
+        val directPath = resolveToPath(uri)?.takeIf { isFluentPackPath(it) }
+        if (!directPath.isNullOrBlank()) return directPath
+
+        val sourceName = displayName ?: queryDisplayName(uri) ?: "package.fluentpack"
+        if (!isFluentPackPath(sourceName)) {
+            throw IllegalArgumentException("请选择 .fluentpack 文件")
+        }
+        val safeName = sourceName
+            .replace(Regex("""[^\u4e00-\u9fa5A-Za-z0-9._-]"""), "_")
+            .takeIf { it.isNotBlank() }
+            ?: "package_${System.currentTimeMillis()}.fluentpack"
+        val packageDir = File(cacheDir, "picked_fluentpacks").apply { mkdirs() }
+        var outFile = File(packageDir, safeName)
+        if (outFile.exists()) {
+            val base = safeName.removeSuffix(".fluentpack")
+            outFile = File(packageDir, "${base}_${System.currentTimeMillis()}.fluentpack")
+        }
+        val partialFile = File(outFile.parentFile, "${outFile.name}.partial")
+        try {
+            if (partialFile.exists()) partialFile.delete()
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(partialFile).use { output ->
+                    input.copyTo(output, bufferSize = 1024 * 1024)
+                    output.fd.sync()
+                }
+            } ?: throw IllegalStateException("无法读取 FluentPack 内容")
+            if (partialFile.length() <= 0L || !partialFile.renameTo(outFile)) {
+                throw IllegalStateException("无法保存 FluentPack 临时副本")
             }
         } catch (e: Exception) {
             runCatching { partialFile.delete() }
@@ -2116,4 +2337,57 @@ class MainActivity : AudioServiceFragmentActivity() {
         val logTail: ArrayDeque<String> = ArrayDeque(),
     )
 
+}
+
+/**
+ * Survives MainActivity recreation while audio_service keeps the Flutter
+ * engine. Pending shares and the event sink used to live on the Activity
+ * instance, so a new Activity could resolve a zip while Dart still queried
+ * the previous instance's empty queue.
+ */
+private object ShareIntentDelivery {
+    private val lock = Any()
+    private val pendingSharedItems = mutableListOf<Map<String, Any?>>()
+    private var shareEventSink: EventChannel.EventSink? = null
+    val executor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "shared-intent-resolver")
+    }
+
+    fun setSink(events: EventChannel.EventSink?) {
+        synchronized(lock) {
+            shareEventSink = events
+            if (events != null && pendingSharedItems.isNotEmpty()) {
+                events.success(ArrayList(pendingSharedItems))
+                pendingSharedItems.clear()
+            }
+        }
+    }
+
+    fun clearSink(events: EventChannel.EventSink?) {
+        synchronized(lock) {
+            if (shareEventSink === events || events == null) {
+                shareEventSink = null
+            }
+        }
+    }
+
+    fun takePending(): ArrayList<Map<String, Any?>> {
+        synchronized(lock) {
+            val copy = ArrayList(pendingSharedItems)
+            pendingSharedItems.clear()
+            return copy
+        }
+    }
+
+    fun deliver(items: List<Map<String, Any?>>) {
+        if (items.isEmpty()) return
+        synchronized(lock) {
+            val sink = shareEventSink
+            if (sink != null) {
+                sink.success(ArrayList(items))
+            } else {
+                pendingSharedItems.addAll(items)
+            }
+        }
+    }
 }

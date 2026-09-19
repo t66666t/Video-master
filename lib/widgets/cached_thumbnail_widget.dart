@@ -240,51 +240,64 @@ class _CachedThumbnailWidgetState extends State<CachedThumbnailWidget> {
       return _buildErrorWidget();
     }
 
-    final placeholder = _buildPlaceholder();
-
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        placeholder,
-        Image(
-          key: ValueKey('image_${widget.videoId}'),
-          image: _imageProvider!,
-          fit: widget.fit,
-          gaplessPlayback: true,
-          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-            if (wasSynchronouslyLoaded) {
-              return child;
-            }
-            return AnimatedOpacity(
-              opacity: frame == null ? 0 : 1,
-              duration: widget.fadeInDuration,
-              curve: widget.fadeInCurve,
-              child: child,
-            );
-          },
-          errorBuilder: (context, error, stackTrace) {
-            debugPrint('图片渲染错误: $error');
-            return _buildErrorWidget();
-          },
-        ),
-      ],
+    // Keep the underlay a solid dark fill. Grid cards used to stack a 50px
+    // translucent movie icon behind the image; after a rotation the new
+    // ResizeImage often has no frame yet, so that icon flashed through as a
+    // rounded white square on the now-tiny thumbnail.
+    return Image(
+      key: ValueKey('image_${widget.videoId}'),
+      image: _imageProvider!,
+      fit: widget.fit,
+      width: double.infinity,
+      height: double.infinity,
+      alignment: Alignment.center,
+      gaplessPlayback: true,
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (wasSynchronouslyLoaded) {
+          return child;
+        }
+        return ColoredBox(
+          color: const Color(0xFF121212),
+          child: AnimatedOpacity(
+            opacity: frame == null ? 0 : 1,
+            duration: widget.fadeInDuration,
+            curve: widget.fadeInCurve,
+            child: child,
+          ),
+        );
+      },
+      errorBuilder: (context, error, stackTrace) {
+        debugPrint('图片渲染错误: $error');
+        return _buildErrorWidget();
+      },
     );
   }
 
   /// 构建错误显示组件
   Widget _buildErrorWidget() {
-    return widget.errorWidget ??
-        Container(
+    final fallback = widget.errorWidget;
+    if (fallback != null) {
+      return fallback;
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final side = constraints.biggest.shortestSide;
+        final iconSize = !side.isFinite || side <= 0
+            ? 18.0
+            : (side * 0.42).clamp(10.0, 32.0);
+        return ColoredBox(
           key: const ValueKey('error'),
-          color: Colors.grey[900],
-          child: const Center(
+          color: const Color(0xFF121212),
+          child: Center(
             child: Icon(
               Icons.broken_image_outlined,
               color: Colors.white38,
-              size: 32,
+              size: iconSize,
             ),
           ),
         );
+      },
+    );
   }
 }
 

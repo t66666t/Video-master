@@ -5,6 +5,8 @@ class VideoCollection {
   String name;
   final int createTime;
   String? thumbnailPath;
+  /// Optional cover text. Null follows the folder name; empty hides text on this folder only.
+  String? coverLabel;
   
   // New: File System Structure
   List<String> childrenIds; // Can contain VideoItem IDs or VideoCollection IDs
@@ -21,6 +23,7 @@ class VideoCollection {
     required this.name,
     required this.createTime,
     this.thumbnailPath,
+    this.coverLabel,
     List<String>? childrenIds,
     this.parentId,
     this.isRecycled = false,
@@ -34,6 +37,7 @@ class VideoCollection {
       'name': name,
       'createTime': createTime,
       'thumbnailPath': thumbnailPath,
+      'coverLabel': coverLabel,
       'childrenIds': childrenIds,
       'parentId': parentId,
       'isRecycled': isRecycled,
@@ -56,6 +60,7 @@ class VideoCollection {
       name: json['name'] as String,
       createTime: json['createTime'] as int,
       thumbnailPath: json['thumbnailPath'] as String?,
+      coverLabel: json['coverLabel'] as String?,
       childrenIds: loadedChildren,
       parentId: json['parentId'] as String?,
       isRecycled: json['isRecycled'] as bool? ?? false,

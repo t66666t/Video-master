@@ -7,6 +7,8 @@ import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:video_player_platform_interface/video_player_platform_interface.dart'
+    show VideoPlayerPlatform;
 
 import '../models/subtitle_model.dart';
 import '../models/video_item.dart';
@@ -106,6 +108,44 @@ Duration calculateSubtitleBoundaryDelay({
   return delay < minimumDelay ? minimumDelay : delay;
 }
 
+/// Matches 网易云 / VLC / 哔哩哔哩 "允许与其他应用同时播放":
+/// mix on iOS via [AVAudioSessionCategoryOptions.mixWithOthers], keep Android
+/// as a music session, and never request exclusive focus while mixing.
+@visibleForTesting
+AudioSessionConfiguration buildConcurrentPlaybackAudioSessionConfiguration({
+  required bool allowConcurrentPlayback,
+}) {
+  return AudioSessionConfiguration.music().copyWith(
+    avAudioSessionCategoryOptions: allowConcurrentPlayback
+        ? AVAudioSessionCategoryOptions.mixWithOthers
+        : AVAudioSessionCategoryOptions.none,
+    androidWillPauseWhenDucked: !allowConcurrentPlayback,
+  );
+}
+
+/// Other media apps must not pause us when the user asked to mix. Phone-call
+/// routing is still handled by the OS even if this callback is ignored.
+@visibleForTesting
+bool shouldPauseForAudioInterruption({
+  required bool allowConcurrentPlayback,
+  required bool interruptionBegan,
+}) {
+  return interruptionBegan && !allowConcurrentPlayback;
+}
+
+@visibleForTesting
+bool shouldResumeAfterAudioInterruption({
+  required bool allowConcurrentPlayback,
+  required bool interruptionBegan,
+  required AudioInterruptionType type,
+  required bool isPaused,
+}) {
+  if (allowConcurrentPlayback || interruptionBegan || !isPaused) {
+    return false;
+  }
+  return type == AudioInterruptionType.pause;
+}
+
 class SystemMediaSessionService {
   SystemMediaSessionService._internal();
 
@@ -138,6 +178,7 @@ class SystemMediaSessionService {
   audio_service.MediaItem? _lastPublishedMediaItem;
   bool? _lastAllowConcurrentPlayback;
   bool? _lastHeadsetControlEnabled;
+  bool? _audioFocusHeld;
   int _publishRevision = 0;
   int _notificationVisibilityPrimeRevision = 0;
   String? _lastVisibleNotificationItemId;
@@ -176,16 +217,23 @@ class SystemMediaSessionService {
     final bool allowConcurrentPlayback =
         _settingsService.allowConcurrentPlayback;
     await session.configure(
-      const AudioSessionConfiguration.music()
-          .copyWith(
-            avAudioSessionCategoryOptions: AVAudioSessionCategoryOptions.none,
-          )
-          .copyWith(
-            avAudioSessionCategoryOptions: allowConcurrentPlayback
-                ? AVAudioSessionCategoryOptions.mixWithOthers
-                : AVAudioSessionCategoryOptions.none,
-          ),
+      buildConcurrentPlaybackAudioSessionConfiguration(
+        allowConcurrentPlayback: allowConcurrentPlayback,
+      ),
     );
+    // video_player (and the media_kit adapter's platform fallback) keeps a
+    // process-wide mix flag. Apply it here so a toggle takes effect before
+    // the next VideoPlayerController is created.
+    try {
+      await VideoPlayerPlatform.instance.setMixWithOthers(
+        allowConcurrentPlayback,
+      );
+    } catch (error) {
+      _logMediaSessionEvent(
+        'mixWithOthers apply failed',
+        data: <String, Object?>{'error': error.toString()},
+      );
+    }
     _logMediaSessionEvent(
       'audio session configured',
       data: <String, Object?>{
@@ -196,6 +244,54 @@ class SystemMediaSessionService {
     );
   }
 
+  /// Exclusive mode holds Android/iOS audio focus only while we intend to
+  /// play. Mix mode always abandons it so other apps can keep their output.
+  Future<void> _syncAudioFocusWithPlayback({
+    required bool desiredPlaying,
+  }) async {
+    if (!isSupportedPlatform) {
+      return;
+    }
+    final bool wantExclusiveFocus =
+        desiredPlaying && !_settingsService.allowConcurrentPlayback;
+    if (_audioFocusHeld == wantExclusiveFocus) {
+      return;
+    }
+    final session = await AudioSession.instance;
+    try {
+      final granted = await session.setActive(wantExclusiveFocus);
+      if (wantExclusiveFocus && !granted) {
+        _logMediaSessionEvent(
+          'audio focus request denied',
+          data: <String, Object?>{'desiredPlaying': desiredPlaying},
+        );
+        return;
+      }
+      _audioFocusHeld = wantExclusiveFocus;
+      _logMediaSessionEvent(
+        'audio focus synced',
+        data: <String, Object?>{
+          'held': wantExclusiveFocus,
+          'allowConcurrentPlayback':
+              _settingsService.allowConcurrentPlayback,
+        },
+      );
+    } catch (error) {
+      _logMediaSessionEvent(
+        'audio focus sync failed',
+        data: <String, Object?>{'error': error.toString()},
+      );
+    }
+  }
+
+  Future<void> _applyConcurrentPlaybackSetting() async {
+    await _configureAudioSession();
+    await _syncAudioFocusWithPlayback(
+      desiredPlaying: _playbackService?.desiredPlaying ?? false,
+    );
+    await _playbackService?.applyConcurrentPlaybackSetting();
+  }
+
   void _handleSettingsChanged() {
     final bool allowConcurrentPlayback =
         _settingsService.allowConcurrentPlayback;
@@ -203,7 +299,8 @@ class SystemMediaSessionService {
         _settingsService.enableHeadsetMediaControls;
     if (_lastAllowConcurrentPlayback != allowConcurrentPlayback) {
       _lastAllowConcurrentPlayback = allowConcurrentPlayback;
-      unawaited(_configureAudioSession());
+      _audioFocusHeld = null;
+      unawaited(_applyConcurrentPlaybackSetting());
     }
     if (_lastHeadsetControlEnabled != headsetControlsEnabled) {
       _lastHeadsetControlEnabled = headsetControlsEnabled;
@@ -244,19 +341,29 @@ class SystemMediaSessionService {
       _interruptionSubscription = session.interruptionEventStream.listen((
         event,
       ) {
+        final allowConcurrentPlayback =
+            _settingsService.allowConcurrentPlayback;
         _logMediaSessionEvent(
           'audio interruption',
           data: <String, Object?>{
             'begin': event.begin,
             'type': event.type.name,
+            'allowConcurrentPlayback': allowConcurrentPlayback,
           },
         );
-        if (event.begin) {
+        if (shouldPauseForAudioInterruption(
+          allowConcurrentPlayback: allowConcurrentPlayback,
+          interruptionBegan: event.begin,
+        )) {
           unawaited(_playbackService?.pause());
           return;
         }
-        if (event.type == AudioInterruptionType.pause &&
-            _playbackService?.state == PlaybackState.paused) {
+        if (shouldResumeAfterAudioInterruption(
+          allowConcurrentPlayback: allowConcurrentPlayback,
+          interruptionBegan: event.begin,
+          type: event.type,
+          isPaused: _playbackService?.state == PlaybackState.paused,
+        )) {
           unawaited(_playbackService?.resume());
         }
       });
@@ -273,6 +380,9 @@ class SystemMediaSessionService {
     _handler?.attach(
       playbackService: playbackService,
       playlistManager: playlistManager,
+    );
+    await _syncAudioFocusWithPlayback(
+      desiredPlaying: playbackService.desiredPlaying,
     );
     _publishQueue();
     await _publishSnapshot(force: true);
@@ -292,6 +402,7 @@ class SystemMediaSessionService {
     _playlistManager?.removeListener(_onPlaylistChanged);
     _playbackService = null;
     _playlistManager = null;
+    _audioFocusHeld = null;
     unawaited(_interruptionSubscription?.cancel());
     _interruptionSubscription = null;
     unawaited(_becomingNoisySubscription?.cancel());
@@ -329,6 +440,9 @@ class SystemMediaSessionService {
       return;
     }
     final snapshot = _buildSnapshot();
+    unawaited(
+      _syncAudioFocusWithPlayback(desiredPlaying: snapshot.desiredPlaying),
+    );
     final shouldPublishImmediately = _shouldPublishImmediately(snapshot);
     if (shouldPublishImmediately) {
       _logMediaSessionEvent(

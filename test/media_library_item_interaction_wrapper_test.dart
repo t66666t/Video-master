@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/widgets/media_library_item_interaction_wrapper.dart';
@@ -39,6 +40,101 @@ void main() {
     expect(taps, 0);
     expect(dragStarts, 1);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端原地长按不会触发卡片 InkWell 点击从而取消选中', (
+    tester,
+  ) async {
+    var selectionMode = false;
+    final selected = <int>{};
+    var dragStarts = 0;
+
+    Widget buildCard() {
+      return MaterialApp(
+        home: StatefulBuilder(
+          builder: (context, setState) {
+            return Center(
+              child: SizedBox(
+                width: 180,
+                height: 80,
+                child: MediaLibraryItemInteractionWrapper(
+                  key: const ValueKey('inkwell-long-press'),
+                  index: 0,
+                  dragDelay: const Duration(milliseconds: 100),
+                  isSelected: selected.contains(0),
+                  selectedCount: selected.length,
+                  onDragStarted: () {
+                    dragStarts++;
+                    setState(() {
+                      selectionMode = true;
+                      selected.add(0);
+                    });
+                  },
+                  onTap: () {
+                    if (!selectionMode) return;
+                    setState(() {
+                      if (selected.contains(0)) {
+                        selected.remove(0);
+                      } else {
+                        selected.add(0);
+                      }
+                    });
+                  },
+                  onReorder: (_, _) {},
+                  child: Material(
+                    child: InkWell(
+                      onTap: () {
+                        if (!selectionMode) return;
+                        setState(() {
+                          if (selected.contains(0)) {
+                            selected.remove(0);
+                          } else {
+                            selected.add(0);
+                          }
+                        });
+                      },
+                      child: Text(selected.contains(0) ? 'selected' : 'idle'),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    await tester.pumpWidget(buildCard());
+    final center = tester.getCenter(
+      find.byKey(const ValueKey('inkwell-long-press')),
+    );
+    final gesture = await tester.startGesture(
+      center,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump(const Duration(milliseconds: 800));
+    await gesture.up();
+    await tester.pump();
+
+    expect(dragStarts, 1);
+    expect(selectionMode, isTrue);
+    expect(selected, {0});
+    expect(find.text('selected'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+
+    // 下一次短按仍应能切换选中，说明抑制只作用于这次长按。
+    final second = await tester.startGesture(
+      center,
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump(const Duration(milliseconds: 40));
+    await second.up();
+    await tester.pump();
+
+    expect(dragStarts, 1);
+    expect(selectionMode, isTrue);
+    expect(selected, isEmpty);
+    expect(find.text('idle'), findsOneWidget);
   });
 
   testWidgets('桌面端快速点击不进入拖拽', (tester) async {
@@ -383,6 +479,47 @@ void main() {
 
     expect(taps, 0);
     expect(dragStarts, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端右击轻微移动不会补偿成左键点击', (tester) async {
+    var taps = 0;
+    var dragStarts = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('secondary-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () => dragStarts++,
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: const ColoredBox(color: Colors.black),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('secondary-source'))),
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await tester.pump(const Duration(milliseconds: 60));
+    await gesture.moveBy(const Offset(5, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 0);
+    expect(dragStarts, 0);
     expect(tester.takeException(), isNull);
   });
 }

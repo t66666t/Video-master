@@ -9,6 +9,7 @@ import 'package:video_player_app/models/subtitle_style.dart';
 import 'package:video_player_app/models/subtitle_model.dart';
 import 'package:video_player_app/services/subtitle_debug_session.dart';
 import 'package:video_player_app/widgets/subtitle_settings_sheet.dart';
+import 'package:video_player_app/widgets/subtitle_preset_chrome.dart';
 import 'package:video_player_app/widgets/subtitle_overlay.dart';
 import 'package:video_player_app/widgets/music_lyric_view.dart';
 
@@ -159,8 +160,13 @@ void main() {
       final state = tester.state<ScrollableState>(
         find.descendant(of: scroll, matching: find.byType(Scrollable)).first,
       );
-      state.position.jumpTo(1800);
+      final target = (state.position.maxScrollExtent * 0.72).clamp(
+        0.0,
+        state.position.maxScrollExtent,
+      );
+      state.position.jumpTo(target);
       await tester.pump();
+      final savedOffset = state.position.pixels;
       await tester.tap(find.text('微调当前预设'));
       await tester.pumpAndSettle();
       expect(find.byType(AlertDialog), findsNothing);
@@ -170,14 +176,14 @@ void main() {
       expect(find.byType(TextFormField), findsOneWidget);
       await tester.tap(find.text('完成'));
       await tester.pumpAndSettle();
-      expect(state.position.pixels, 1800);
+      expect(state.position.pixels, savedOffset);
       await tester.pumpWidget(const SizedBox());
       await tester.pumpWidget(app());
       await tester.pumpAndSettle();
       final restored = tester.state<ScrollableState>(
         find.descendant(of: scroll, matching: find.byType(Scrollable)).first,
       );
-      expect(restored.position.pixels, 1800);
+      expect(restored.position.pixels, savedOffset);
       session.select(subtitleDebugPresets[40]);
       await tester.pump();
       await tester.tap(find.byTooltip('定位当前样式'));
@@ -212,19 +218,20 @@ void main() {
           ),
         ),
       );
-      final toggle = find.byType(Switch);
+      final toggle = find.byKey(SubtitleGhostModeToggle.toggleKey);
       final previous = settings.isGhostModeEnabled;
       await tester.tap(toggle);
       await tester.pumpAndSettle();
       expect(settings.isGhostModeEnabled, !previous);
       session.useOriginal();
       await tester.pumpAndSettle();
-      expect(tester.widget<Switch>(toggle.first).value, !previous);
+      expect(settings.isGhostModeEnabled, !previous);
       await tester.tap(toggle.first);
       await tester.pumpAndSettle();
       session.openCatalog();
       await tester.pumpAndSettle();
-      expect(tester.widget<Switch>(toggle).value, previous);
+      expect(settings.isGhostModeEnabled, previous);
+      expect(find.byType(Switch), findsNothing);
       expect(tester.takeException(), isNull);
     },
   );
@@ -266,7 +273,7 @@ void main() {
       expect(exported, normal);
     },
   );
-  testWidgets('audio lyric rows share the global preset renderer', (
+  testWidgets('audio lyric rows keep music fonts while a video preset is on', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -286,13 +293,130 @@ void main() {
         ),
       ),
     );
-    await tester.pump(const Duration(seconds: 1));
-    expect(find.byType(SubtitlePresetContent), findsOneWidget);
-    session.useOriginal();
-    await tester.pump(const Duration(seconds: 1));
-    expect(find.byType(SubtitlePresetContent), findsNothing);
-    expect(find.text('字幕'), findsOneWidget);
-    await tester.pumpWidget(const SizedBox());
     await tester.pump(const Duration(seconds: 5));
   });
+  testWidgets(
+    'narrow phone sidebar keeps chrome labels visible without a switch row',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(240, 400);
+      addTearDown(tester.view.reset);
+      final settings = SettingsService();
+      settings.resetForTest();
+      await tester.runAsync(() => settings.init());
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SettingsService>.value(
+          value: settings,
+          child: const MediaQuery(
+            data: MediaQueryData(size: Size(240, 400)),
+            child: MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 240,
+                  child: SubtitleSettingsSheet(
+                    style: SubtitleStyle(),
+                    onClose: _noopClose,
+                    onBack: _noopClose,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('字幕排版'), findsOneWidget);
+      expect(find.byTooltip('关闭'), findsNothing);
+      expect(find.text('使用原样式'), findsOneWidget);
+      expect(find.text('微调当前预设'), findsOneWidget);
+      expect(find.text('幽灵'), findsOneWidget);
+      expect(find.byType(Switch), findsNothing);
+      final ghost = tester.getSize(
+        find.byKey(SubtitleGhostModeToggle.toggleKey),
+      );
+      expect(ghost.height, lessThan(32));
+      final locate = tester.getSize(find.byTooltip('定位当前样式'));
+      expect(locate.width, lessThanOrEqualTo(28));
+      final category = tester.getSize(find.byTooltip('选择分类'));
+      expect(category, locate);
+      expect(tester.takeException(), isNull);
+    },
+  );
+  testWidgets(
+    'category button opens chips, filters the grid, and stays open',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(240, 400);
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: SizedBox(width: 240, child: SubtitleDebugPanel()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('清幕标准'), findsWidgets);
+      expect(
+        find.byKey(const ValueKey('subtitle-preset-category-panel')),
+        findsNothing,
+      );
+      await tester.tap(find.byTooltip('选择分类'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('subtitle-preset-category-panel')),
+        findsOneWidget,
+      );
+      expect(find.text('电影宋体'), findsOneWidget);
+      expect(find.text('竖屏方屏'), findsOneWidget);
+      await tester.tap(
+        find.byKey(const ValueKey('subtitle-preset-category-电影宋体')),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('subtitle-preset-category-panel')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(ValueKey('preset-card-${subtitleDebugPresets[6].id}')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(ValueKey('preset-card-${subtitleDebugPresets.first.id}')),
+        findsNothing,
+      );
+      await tester.tap(find.byKey(const ValueKey('subtitle-preset-category-全部')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('subtitle-preset-category-panel')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(ValueKey('preset-card-${subtitleDebugPresets.first.id}')),
+        findsOneWidget,
+      );
+      await tester.tap(find.byTooltip('收起分类'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('subtitle-preset-category-panel')),
+        findsNothing,
+      );
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: SizedBox(width: 480, child: SubtitleDebugPanel()),
+          ),
+        ),
+      );
+      tester.view.physicalSize = const Size(480, 720);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('选择分类'));
+      await tester.pumpAndSettle();
+      expect(find.text('通用黑体'), findsOneWidget);
+      expect(find.text('纪录访谈'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
 }
+
+void _noopClose() {}

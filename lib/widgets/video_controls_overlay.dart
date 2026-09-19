@@ -17,9 +17,13 @@ import '../widgets/subtitle_overlay.dart';
 import '../services/media_playback_service.dart';
 import '../services/bilibili/bilibili_streaming_service.dart';
 import '../services/settings_service.dart';
+import '../services/subtitle_hop_seek_policy.dart';
 import '../services/app_haptics.dart';
 import '../services/video_preview_service.dart';
+import '../utils/android_hardware_input_bridge.dart';
 import '../utils/desktop_player_shortcuts.dart';
+import '../utils/hardware_keyboard_shortcuts.dart';
+import '../utils/player_volume_keyboard.dart';
 import '../models/media_chapter.dart';
 import '../models/bilibili_video_shot.dart';
 import '../utils/app_toast.dart';
@@ -52,6 +56,9 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onOpenDanmakuSettings;
   final VoidCallback? onToggleFullScreen; // New: For desktop full screen toggle
   final ValueChanged<Duration>? onSeekTo;
+
+  /// Double-tap / sentence hops. Falls back to [onSeekTo] when omitted.
+  final ValueChanged<Duration>? onHopSeekTo;
   final Future<void> Function(double speed) onSpeedUpdate;
   final int doubleTapSeekSeconds;
   final bool enableDoubleTapSubtitleSeek;
@@ -101,6 +108,9 @@ class VideoControlsOverlay extends StatefulWidget {
   final bool enableSeekThumbnailPreview;
   final BilibiliVideoShot? bilibiliVideoShot;
   final bool showBufferedProgress;
+  // Immediate chrome intent, not the delayed subtitle-avoidance notifier.
+  final bool initialShowControls;
+  final ValueChanged<bool>? onControlsVisibilityIntent;
 
   const VideoControlsOverlay({
     super.key,
@@ -125,6 +135,7 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onOpenDanmakuSettings,
     this.onToggleFullScreen,
     this.onSeekTo,
+    this.onHopSeekTo,
     required this.onSpeedUpdate,
     this.doubleTapSeekSeconds = 5,
     this.enableDoubleTapSubtitleSeek = true,
@@ -169,6 +180,8 @@ class VideoControlsOverlay extends StatefulWidget {
     this.enableSeekThumbnailPreview = true,
     this.bilibiliVideoShot,
     this.showBufferedProgress = false,
+    this.initialShowControls = true,
+    this.onControlsVisibilityIntent,
   });
 
   @override
@@ -199,8 +212,24 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _showControls = true;
   Timer? _subtitleAvoidanceReleaseTimer;
 
+  bool get controlsVisible => _showControls;
+
+  /// Restore chrome after a route or overlay remount without a tap.
+  void applyControlsVisibilityIntent(bool visible) {
+    if (!mounted || _showControls == visible) return;
+    setState(() {
+      _setShowControls(visible);
+    });
+    if (visible) {
+      _startAutoHideTimer();
+    } else {
+      _cancelAutoHideTimer();
+    }
+  }
+
   void _setShowControls(bool value) {
     _showControls = value;
+    widget.onControlsVisibilityIntent?.call(value);
     _subtitleAvoidanceReleaseTimer?.cancel();
 
     // Showing controls must reserve subtitle space before the fade-in starts.
@@ -279,6 +308,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   // Volume & Brightness
   bool _isAdjustingVolume = false;
   bool _isAdjustingBrightness = false;
+  // Async getVolume/brightness can finish after the swipe already ended.
+  int _verticalAdjustmentSession = 0;
+  bool _verticalAdjustmentGestureActive = false;
   // bool _showVolumeSlider = false; // Removed
   double _currentVolume = 0.0;
   double _currentBrightness = 0.0;
@@ -299,6 +331,25 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       <LogicalKeyboardKey, _KeyboardPressState>{};
   LogicalKeyboardKey? _activeSpeedBoostKey;
   bool _isKeyboardLongPressing = false;
+  KeyEvent? _lastRoutedKeyEvent;
+  KeyEventResult _lastRoutedKeyEventResult = KeyEventResult.ignored;
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
+  DesktopPlayerShortcutAction? _lastDispatchedShortcutAction;
+  DateTime? _lastDispatchedShortcutAt;
+  int _volumeKeyDirection = 0;
+  int _volumeKeySessionSerial = 0;
+  Timer? _volumeHoldStartTimer;
+  Timer? _volumeHoldTickTimer;
+  Timer? _volumeFeedbackHideTimer;
+
+  // Mouse and touch share one overlay. The most recently active device owns
+  // visibility so a touch gesture cannot be interrupted by stale hover.
+  final Set<int> _activeTouchPointers = <int>{};
+  bool _lastPointerInputWasTouch = false;
+  bool _suppressMouseActivity = false;
+  Timer? _mouseActivitySuppressionTimer;
+  Timer? _touchReleaseAutoHideTimer;
 
   Uint8List? _previewImage;
   BilibiliVideoShotFrame? _videoShotFrame;
@@ -328,6 +379,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   // Auto-hide controls timer
   Timer? _autoHideTimer;
   static const Duration _autoHideDelay = Duration(seconds: 3);
+  static const Duration _episodeSwitchMouseSuppression = Duration(
+    milliseconds: 600,
+  );
   bool _isPlaybackSpeedDialogOpen = false;
   bool _isStreamQualityDialogOpen = false;
 
@@ -962,8 +1016,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   @override
   void initState() {
     super.initState();
+    // Episode changes and portrait→landscape handoff unmount this overlay.
+    // Restore the chrome that was showing instead of forcing it back on.
+    _showControls = widget.initialShowControls;
+    widget.onControlsVisibilityIntent?.call(_showControls);
     _publishPlaybackControlsVisibility();
     _effectiveFocusNode.addListener(_handleKeyboardFocusChange);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
     if (Platform.isAndroid) {
       VolumeController.instance.showSystemUI = false;
     }
@@ -976,8 +1036,13 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         _requestKeyboardFocus();
       }
     });
-    // Start auto-hide timer since controls are initially visible
-    _startAutoHideTimer();
+    if (_showControls) {
+      _startAutoHideTimer();
+    } else {
+      // Remounting MouseRegion synthesizes enter/hover while the pointer is
+      // still over the player. That is leftover position, not new activity.
+      _suppressMouseActivityFor(_episodeSwitchMouseSuppression);
+    }
   }
 
   @override
@@ -1008,6 +1073,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _videoShotFrame = null;
       _isProgressDragCanceling = false;
       _progressDragWasCancelled = false;
+      _invalidateVerticalAdjustmentSession();
+      _isAdjustingVolume = false;
+      _isAdjustingBrightness = false;
       // Locked mobile controls still need to disappear after inactivity. Keep
       // the unlock affordance visible briefly, then let the normal timer fade
       // it out; a tap on the player surface will reveal it again.
@@ -1049,6 +1117,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   @override
   void dispose() {
     VideoPreviewService().markInteractionEnded();
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
     _effectiveFocusNode.removeListener(_handleKeyboardFocusChange);
     _resetKeyboardPressState(notify: false, endSpeedBoost: false);
     _focusNode.dispose();
@@ -1060,7 +1132,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _doubleTapFeedbackHideTimer?.cancel();
     _doubleTapFeedbackDismissTimer?.cancel();
     _autoHideTimer?.cancel();
+    _mouseActivitySuppressionTimer?.cancel();
+    _touchReleaseAutoHideTimer?.cancel();
     _subtitleAvoidanceReleaseTimer?.cancel();
+    _stopKeyboardVolumeHold();
+    _volumeFeedbackHideTimer?.cancel();
     _unavailableControllerValue.dispose();
     super.dispose();
   }
@@ -1108,15 +1184,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _onMouseEnter(PointerEnterEvent event) {
+    if (_shouldIgnoreMouseActivity()) return;
+    _lastPointerInputWasTouch = false;
     _showControlsForMouseActivity();
   }
 
   void _onMouseHover(PointerHoverEvent event) {
+    if (_shouldIgnoreMouseActivity()) return;
+    _lastPointerInputWasTouch = false;
     _showControlsForMouseActivity();
   }
 
   void _onMouseExit(PointerExitEvent event) {
     if (widget.isLocked) return;
+    if (_lastPointerInputWasTouch || _activeTouchPointers.isNotEmpty) return;
 
     // Do not leave a stale timer running after the pointer has entered a
     // sidebar (or any other non-player area).
@@ -1126,6 +1207,60 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         _setShowControls(false);
       });
     }
+  }
+
+  bool _isTouchLikePointer(PointerDeviceKind kind) {
+    return kind == PointerDeviceKind.touch ||
+        kind == PointerDeviceKind.stylus ||
+        kind == PointerDeviceKind.invertedStylus;
+  }
+
+  bool _shouldIgnoreMouseActivity() {
+    return _activeTouchPointers.isNotEmpty || _suppressMouseActivity;
+  }
+
+  void _suppressMouseActivityFor(Duration duration) {
+    _suppressMouseActivity = true;
+    _mouseActivitySuppressionTimer?.cancel();
+    _mouseActivitySuppressionTimer = Timer(duration, () {
+      _suppressMouseActivity = false;
+    });
+  }
+
+  void _onPlayerPointerDown(PointerDownEvent event) {
+    _requestKeyboardFocus();
+    if (_isTouchLikePointer(event.kind)) {
+      _activeTouchPointers.add(event.pointer);
+      _lastPointerInputWasTouch = true;
+      _suppressMouseActivityFor(const Duration(milliseconds: 180));
+      _touchReleaseAutoHideTimer?.cancel();
+      _cancelAutoHideTimer();
+    } else if (event.kind == PointerDeviceKind.mouse) {
+      if (_shouldIgnoreMouseActivity()) return;
+      _lastPointerInputWasTouch = false;
+    }
+  }
+
+  void _finishPlayerPointer(PointerEvent event) {
+    if (!_isTouchLikePointer(event.kind)) return;
+    _activeTouchPointers.remove(event.pointer);
+    if (_activeTouchPointers.isNotEmpty) return;
+    _suppressMouseActivityFor(const Duration(milliseconds: 120));
+
+    // Let the single/double-tap recognizer decide visibility first, then put
+    // touch mode back on the normal inactivity timer even after button taps.
+    _touchReleaseAutoHideTimer?.cancel();
+    _touchReleaseAutoHideTimer = Timer(const Duration(milliseconds: 260), () {
+      if (!mounted ||
+          _activeTouchPointers.isNotEmpty ||
+          !_lastPointerInputWasTouch ||
+          !_showControls ||
+          _isDraggingProgress ||
+          _isGestureSeeking) {
+        return;
+      }
+      _startAutoHideTimer();
+    });
   }
 
   FocusNode get _effectiveFocusNode => widget.focusNode ?? _focusNode;
@@ -1153,6 +1288,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     }
     _keyboardPressStates.clear();
     _activeSpeedBoostKey = null;
+    _stopKeyboardVolumeHold();
     if (shouldEndSpeedBoost && endSpeedBoost) {
       _endZoneLongPress();
     }
@@ -1172,10 +1308,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     }
   }
 
-  bool get _supportsDesktopPlayerShortcuts {
-    return !kIsWeb &&
-        !widget.isPreviewMode &&
-        (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+  bool get _supportsPlayerKeyboardShortcuts {
+    return supportsNativeHardwareKeyboardShortcuts;
+  }
+
+  bool get _showsPointerShortcutHints {
+    return !kIsWeb && supportsPlayerPointerHoverOn(defaultTargetPlatform);
   }
 
   bool _isTextInputFocused() {
@@ -1190,11 +1328,29 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     String label,
     DesktopPlayerShortcutAction action,
   ) {
-    if (!_supportsDesktopPlayerShortcuts) return label;
+    final platform = currentNativeTargetPlatform;
+    if (!_showsPointerShortcutHints ||
+        platform == null ||
+        !DesktopPlayerShortcuts.isAvailableOnPlatform(action, platform)) {
+      return label;
+    }
     return DesktopPlayerShortcuts.buildTooltip(label, action);
   }
 
   void _dispatchDesktopShortcut(DesktopPlayerShortcutAction action) {
+    // Toggle actions (sidebar B, episode picker G, mute, subtitles) cancel
+    // themselves if Flutter and the Android Activity bridge both deliver the
+    // same physical press a few milliseconds apart.
+    final DateTime now = DateTime.now();
+    final DateTime? lastAt = _lastDispatchedShortcutAt;
+    if (lastAt != null &&
+        _lastDispatchedShortcutAction == action &&
+        now.difference(lastAt) <
+            AndroidHardwareKeyDeduplicator.duplicateArrivalWindow) {
+      return;
+    }
+    _lastDispatchedShortcutAction = action;
+    _lastDispatchedShortcutAt = now;
     switch (action) {
       case DesktopPlayerShortcutAction.back:
         _startAutoHideTimer();
@@ -1282,12 +1438,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         return;
       case DesktopPlayerShortcutAction.previousEpisode:
         if (widget.onPlayPrevious == null || !widget.hasPrevious) return;
-        _startAutoHideTimer();
         widget.onPlayPrevious!();
         return;
       case DesktopPlayerShortcutAction.nextEpisode:
         if (widget.onPlayNext == null || !widget.hasNext) return;
-        _startAutoHideTimer();
         widget.onPlayNext!();
         return;
       case DesktopPlayerShortcutAction.toggleSubtitles:
@@ -1302,29 +1456,183 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         _startAutoHideTimer();
         unawaited(playbackService.toggleMute());
         return;
+      case DesktopPlayerShortcutAction.volumeUp:
+        unawaited(_handleVolumeKeyDown(1));
+        return;
+      case DesktopPlayerShortcutAction.volumeDown:
+        unawaited(_handleVolumeKeyDown(-1));
+        return;
+      case DesktopPlayerShortcutAction.speedSlower:
+        unawaited(_nudgePlaybackSpeedPreset(slower: true));
+        return;
+      case DesktopPlayerShortcutAction.speedFaster:
+        unawaited(_nudgePlaybackSpeedPreset(slower: false));
+        return;
+      case DesktopPlayerShortcutAction.openChapters:
+        if (widget.onOpenChapters == null || widget.chapters.isEmpty) return;
+        _startAutoHideTimer();
+        widget.onOpenChapters!();
+        return;
+      case DesktopPlayerShortcutAction.toggleLock:
+        _startAutoHideTimer();
+        widget.onToggleLock();
+        return;
+      case DesktopPlayerShortcutAction.toggleDanmaku:
+        if (!widget.showDanmakuControls || widget.onToggleDanmaku == null) {
+          return;
+        }
+        _startAutoHideTimer();
+        widget.onToggleDanmaku!();
+        return;
+      case DesktopPlayerShortcutAction.openDanmakuSettings:
+        if (!widget.showDanmakuControls ||
+            widget.onOpenDanmakuSettings == null) {
+          return;
+        }
+        _startAutoHideTimer();
+        widget.onOpenDanmakuSettings!();
+        return;
+      case DesktopPlayerShortcutAction.openOcrSubtitle:
+        if (widget.onOpenOcrSubtitle == null) return;
+        _startAutoHideTimer();
+        widget.onOpenOcrSubtitle!();
+        return;
+      case DesktopPlayerShortcutAction.openStreamQuality:
+        final playbackService = Provider.of<MediaPlaybackService>(
+          context,
+          listen: false,
+        );
+        if (!playbackService.isCurrentItemBilibiliStream ||
+            playbackService.streamQualities.isEmpty ||
+            playbackService.isSwitchingStreamQuality) {
+          return;
+        }
+        _startAutoHideTimer();
+        unawaited(_showStreamQualityPicker(playbackService, context));
+        return;
+      case DesktopPlayerShortcutAction.resetScreen:
+        if (widget.onResetScreenTransform == null ||
+            widget.showResetScreenButton == false) {
+          return;
+        }
+        _startAutoHideTimer();
+        widget.onResetScreenTransform!();
+        return;
+      case DesktopPlayerShortcutAction.openSleepTimer:
+        if (widget.onOpenSleepTimer == null) return;
+        _startAutoHideTimer();
+        widget.onOpenSleepTimer!();
+        return;
     }
   }
 
+  /// Session-only notch: never writes [SettingsService.setPlaybackSpeedLock].
+  Future<void> _nudgePlaybackSpeedPreset({required bool slower}) async {
+    if (widget.isLongPressing ||
+        _isKeyboardLongPressing ||
+        _activeSpeedBoostKey != null) {
+      return;
+    }
+    final next = nextPlaybackSpeedPreset(
+      _controllerValue.playbackSpeed,
+      direction: slower ? -1 : 1,
+    );
+    if (next == null) return;
+    if (!_showControls) {
+      setState(() => _setShowControls(true));
+    }
+    _startAutoHideTimer();
+    await widget.onSpeedUpdate(next);
+  }
+
   // Handle Key Events
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    return handleKeyEvent(_effectiveFocusNode, event) != KeyEventResult.ignored;
+  }
+
   KeyEventResult handleKeyEvent(FocusNode node, KeyEvent event) {
-    if (!_supportsDesktopPlayerShortcuts) return KeyEventResult.ignored;
+    if (identical(_lastRoutedKeyEvent, event)) {
+      return _lastRoutedKeyEventResult;
+    }
+    _lastRoutedKeyEvent = event;
+    _lastRoutedKeyEventResult = _handleKeyEvent(node, event);
+    return _lastRoutedKeyEventResult;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleKeyEvent(
+      _effectiveFocusNode,
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+      isShiftPressedOverride: message.isShiftPressed,
+    );
+  }
+
+  @visibleForTesting
+  void handleAndroidHardwareKeyEventForTest(AndroidHardwareKeyMessage message) {
+    _handleAndroidHardwareKeyEvent(message);
+  }
+
+  KeyEventResult _handleKeyEvent(
+    FocusNode node,
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+    bool? isShiftPressedOverride,
+  }) {
+    if (!_supportsPlayerKeyboardShortcuts) return KeyEventResult.ignored;
     final ModalRoute<dynamic>? route = ModalRoute.of(context);
     if (route != null && !route.isCurrent) return KeyEventResult.ignored;
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
+      return KeyEventResult.handled;
+    }
     final key = event.logicalKey;
     final bool hasBlockingModifier =
-        HardwareKeyboard.instance.isControlPressed ||
-        HardwareKeyboard.instance.isAltPressed ||
-        HardwareKeyboard.instance.isMetaPressed;
-    final bool isLongPressKey =
-        key == LogicalKeyboardKey.space ||
-        key == LogicalKeyboardKey.arrowRight ||
-        key == LogicalKeyboardKey.arrowLeft ||
-        key == LogicalKeyboardKey.escape;
-    final DesktopPlayerShortcutAction? shortcutAction = hasBlockingModifier
+        hasBlockingModifierOverride ??
+        (HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isAltPressed ||
+            HardwareKeyboard.instance.isMetaPressed);
+    final bool isShiftPressed =
+        isShiftPressedOverride ?? HardwareKeyboard.instance.isShiftPressed;
+    final DesktopPlayerShortcutAction? matchedAction = hasBlockingModifier
         ? null
-        : DesktopPlayerShortcuts.matchAction(key);
+        : DesktopPlayerShortcuts.matchAction(key, shiftPressed: isShiftPressed);
+    final platform = currentNativeTargetPlatform;
+    final DesktopPlayerShortcutAction? shortcutAction =
+        matchedAction != null &&
+            platform != null &&
+            DesktopPlayerShortcuts.isAvailableOnPlatform(
+              matchedAction,
+              platform,
+            )
+        ? matchedAction
+        : null;
+    final bool isVolumeKey =
+        shortcutAction == DesktopPlayerShortcutAction.volumeUp ||
+        shortcutAction == DesktopPlayerShortcutAction.volumeDown;
+    final bool isSpeedNudgeKey =
+        shortcutAction == DesktopPlayerShortcutAction.speedSlower ||
+        shortcutAction == DesktopPlayerShortcutAction.speedFaster;
+    // Shift+arrows own the speed notches; they must not start seek or hold-boost.
+    final bool isTemporarySpeedBoostKey =
+        !isSpeedNudgeKey &&
+        (key == LogicalKeyboardKey.space ||
+            key == LogicalKeyboardKey.arrowRight);
+    final bool isLongPressKey =
+        isTemporarySpeedBoostKey ||
+        (!isSpeedNudgeKey && key == LogicalKeyboardKey.arrowLeft) ||
+        (key == LogicalKeyboardKey.escape &&
+            shortcutAction == DesktopPlayerShortcutAction.back);
 
-    if (!isLongPressKey && shortcutAction == null) {
+    if (!isLongPressKey &&
+        !isVolumeKey &&
+        !isSpeedNudgeKey &&
+        shortcutAction == null) {
       return KeyEventResult.ignored;
     }
 
@@ -1333,16 +1641,68 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       return KeyEventResult.ignored;
     }
 
-    // In locked mode, consume only player-owned keys. System/application
-    // shortcuts with modifiers were returned above and remain available.
-    if (widget.isLocked) return KeyEventResult.handled;
+    // Locked mode still allows unlock (K) and volume; other player keys
+    // are consumed so they cannot leak to the page underneath.
+    if (widget.isLocked) {
+      if (shortcutAction == DesktopPlayerShortcutAction.toggleLock) {
+        if (event is KeyDownEvent) {
+          _dispatchDesktopShortcut(shortcutAction!);
+        }
+        return KeyEventResult.handled;
+      }
+      if (isVolumeKey) {
+        final int direction =
+            shortcutAction == DesktopPlayerShortcutAction.volumeUp ? 1 : -1;
+        if (event is KeyRepeatEvent) return KeyEventResult.handled;
+        if (event is KeyDownEvent) {
+          unawaited(_handleVolumeKeyDown(direction));
+          return KeyEventResult.handled;
+        }
+        if (event is KeyUpEvent) {
+          _handleVolumeKeyUp(direction);
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.handled;
+    }
 
-    // Windows emits repeated key events while a key is held.  A right/left
-    // arrow hold has already been converted to the long-press speed action by
-    // its timer, so treating those repeats as seek requests makes one hold
-    // look like several taps.  Swallow every repeat and wait for the matching
-    // key-up event to end the speed boost.
+    if (isSpeedNudgeKey) {
+      if (event is KeyDownEvent) {
+        _dispatchDesktopShortcut(shortcutAction!);
+      }
+      return KeyEventResult.handled;
+    }
+
+    if (isVolumeKey) {
+      final int direction =
+          shortcutAction == DesktopPlayerShortcutAction.volumeUp ? 1 : -1;
+      if (event is KeyRepeatEvent) {
+        // OS repeats are ignored; hold ticks use a capped timer so volume
+        // cannot jump by tens of percent in a single burst.
+        return KeyEventResult.handled;
+      }
+      if (event is KeyDownEvent) {
+        unawaited(_handleVolumeKeyDown(direction));
+        return KeyEventResult.handled;
+      }
+      if (event is KeyUpEvent) {
+        _handleVolumeKeyUp(direction);
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.handled;
+    }
+
+    // Right-arrow / space holds become a temporary speed boost, so their OS
+    // repeats must not also fire seeks. Left-arrow holds keep seeking backward.
     if (event is KeyRepeatEvent) {
+      if (key == LogicalKeyboardKey.arrowLeft) {
+        final _KeyboardPressState? state = _keyboardPressStates[key];
+        if (state != null) {
+          state.timer?.cancel();
+          state.longPressTriggered = true;
+          _handleArrowTap(isLeft: true);
+        }
+      }
       return KeyEventResult.handled;
     }
 
@@ -1371,6 +1731,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (key == LogicalKeyboardKey.escape) {
         final settings = Provider.of<SettingsService>(context, listen: false);
         if (settings.isFullScreen) widget.onToggleFullScreen?.call();
+        return;
+      }
+      // Left arrow is rewind. Only space and right arrow hold-to-boost.
+      if (key == LogicalKeyboardKey.arrowLeft) {
+        _handleArrowTap(isLeft: true);
         return;
       }
       if (_activeSpeedBoostKey != null || !_startZoneLongPress()) return;
@@ -1404,7 +1769,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _handleArrowTap({required bool isLeft}) {
-    if (Platform.isWindows && !widget.isPreviewMode) {
+    final platform = currentNativeTargetPlatform;
+    if (!widget.isPreviewMode &&
+        platform != null &&
+        DesktopPlayerShortcuts.usesCoordinatedSeekOnPlatform(platform)) {
       final playbackService = Provider.of<MediaPlaybackService>(
         context,
         listen: false,
@@ -1459,9 +1827,165 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       } else {
         _currentBrightness = 1.0;
       }
-      _currentVolume = _controllerValue.volume;
+      final double initialVolume = await _resolveVolumeForAdjustment();
+      if (!mounted) return;
+      _currentVolume = initialVolume;
     } catch (e) {
       debugPrint("Error initializing controls: $e");
+    }
+  }
+
+  bool get _usesSystemVolumeAdjustment =>
+      !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+  /// Same source as the left/right vertical swipe: system volume on phones,
+  /// in-player volume on desktop.
+  Future<double> _resolveVolumeForAdjustment() async {
+    if (_usesSystemVolumeAdjustment) {
+      try {
+        return await VolumeController.instance.getVolume();
+      } catch (_) {
+        return _currentVolume;
+      }
+    }
+    if (!mounted) return _currentVolume;
+    return Provider.of<MediaPlaybackService>(context, listen: false).volume;
+  }
+
+  void _stopKeyboardVolumeHold() {
+    _volumeKeyDirection = 0;
+    _volumeKeySessionSerial++;
+    _volumeHoldStartTimer?.cancel();
+    _volumeHoldTickTimer?.cancel();
+    _volumeHoldStartTimer = null;
+    _volumeHoldTickTimer = null;
+  }
+
+  Future<void> _handleVolumeKeyDown(int direction) async {
+    // Extra KeyDowns for the same held key must not apply another 5% step.
+    if (_volumeKeyDirection == direction) return;
+    _stopKeyboardVolumeHold();
+    _volumeKeyDirection = direction;
+    final int session = ++_volumeKeySessionSerial;
+
+    if (!_isAdjustingVolume) {
+      if (_usesSystemVolumeAdjustment) {
+        _currentVolume = await _resolveVolumeForAdjustment();
+      } else if (mounted) {
+        _currentVolume = Provider.of<MediaPlaybackService>(
+          context,
+          listen: false,
+        ).volume;
+      }
+    }
+    if (!mounted || session != _volumeKeySessionSerial) return;
+
+    _commitVolumeAdjustment(
+      PlayerVolumeKeyboard.applyShortPress(_currentVolume, direction),
+    );
+
+    _volumeHoldStartTimer = Timer(PlayerVolumeKeyboard.holdStartDelay, () {
+      if (!mounted ||
+          session != _volumeKeySessionSerial ||
+          _volumeKeyDirection != direction) {
+        return;
+      }
+      _volumeHoldTickTimer = Timer.periodic(
+        PlayerVolumeKeyboard.holdTickInterval,
+        (_) {
+          if (!mounted ||
+              session != _volumeKeySessionSerial ||
+              _volumeKeyDirection != direction) {
+            return;
+          }
+          _commitVolumeAdjustment(
+            PlayerVolumeKeyboard.applyHoldTick(_currentVolume, direction),
+          );
+        },
+      );
+      _commitVolumeAdjustment(
+        PlayerVolumeKeyboard.applyHoldTick(_currentVolume, direction),
+      );
+    });
+  }
+
+  void _handleVolumeKeyUp(int direction) {
+    if (_volumeKeyDirection != direction) return;
+    _stopKeyboardVolumeHold();
+    _scheduleVolumeFeedbackHide();
+  }
+
+  void _commitVolumeAdjustment(double volume) {
+    final double clamped = volume.clamp(0.0, 1.0);
+    setState(() {
+      _isAdjustingVolume = true;
+      _currentVolume = clamped;
+    });
+
+    if (_usesSystemVolumeAdjustment) {
+      VolumeController.instance.setVolume(clamped);
+    } else {
+      final MediaPlaybackService playbackService =
+          Provider.of<MediaPlaybackService>(context, listen: false);
+      unawaited(_applyPlaybackVolume(playbackService, clamped));
+    }
+
+    _startAutoHideTimer();
+    _scheduleVolumeFeedbackHide();
+  }
+
+  Future<void> _applyPlaybackVolume(
+    MediaPlaybackService playbackService,
+    double volume,
+  ) async {
+    await playbackService.setVolume(volume);
+    // Raising or lowering volume should make sound audible again, matching
+    // YouTube / VLC arrow-key behavior while muted.
+    if (playbackService.isMuted && volume > 0) {
+      await playbackService.toggleMute();
+    }
+  }
+
+  void _scheduleVolumeFeedbackHide([Duration? duration]) {
+    _volumeFeedbackHideTimer?.cancel();
+    _volumeFeedbackHideTimer = Timer(
+      duration ?? PlayerVolumeKeyboard.overlayVisibleDuration,
+      () {
+        if (!mounted) return;
+        if (_volumeKeyDirection != 0) return;
+        if (_verticalAdjustmentGestureActive) return;
+        setState(() {
+          _isAdjustingVolume = false;
+          _isAdjustingBrightness = false;
+        });
+      },
+    );
+  }
+
+  void _invalidateVerticalAdjustmentSession() {
+    _verticalAdjustmentSession++;
+    _verticalAdjustmentGestureActive = false;
+  }
+
+  /// Drop the center HUD even if the swipe never got an onEnd (arena cancel,
+  /// lock, long-press, or a late async volume/brightness read).
+  void _hideVolumeBrightnessOverlay({bool hidePlaybackControls = false}) {
+    _invalidateVerticalAdjustmentSession();
+    if (!mounted) return;
+    if (!_isAdjustingVolume &&
+        !_isAdjustingBrightness &&
+        !hidePlaybackControls) {
+      return;
+    }
+    setState(() {
+      _isAdjustingVolume = false;
+      _isAdjustingBrightness = false;
+      if (hidePlaybackControls) {
+        _setShowControls(false);
+      }
+    });
+    if (hidePlaybackControls) {
+      _cancelAutoHideTimer();
     }
   }
 
@@ -1585,8 +2109,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     return -1;
   }
 
-  void _seekTo(Duration position) {
-    final handler = widget.onSeekTo;
+  void _seekTo(Duration position, {bool hop = false}) {
+    final handler = hop
+        ? (widget.onHopSeekTo ?? widget.onSeekTo)
+        : widget.onSeekTo;
     if (handler != null) {
       handler(position);
       return;
@@ -1871,10 +2397,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (target < Duration.zero) target = Duration.zero;
     if (target > duration) target = duration;
 
-    // Debounce/Throttle Seek to prevent UI lag
+    // Side double-taps are sentence or N-second hops, never slider scrubs.
+    // Online hops get a second coalesce in MediaPlaybackService.
     _seekDebounceTimer?.cancel();
-    _seekDebounceTimer = Timer(const Duration(milliseconds: 30), () {
-      _seekTo(target);
+    _seekDebounceTimer = Timer(SubtitleHopSeekPolicy.overlayHopDebounce, () {
+      _seekTo(target, hop: true);
     });
 
     unawaited(AppHaptics.doubleTapSeek(settings));
@@ -1900,6 +2427,15 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _showLongPressFeedback(localPosition);
   }
 
+  /// Speed-boost is a watch gesture, not chrome interaction.
+  /// A held finger used to cancel auto-hide for the entire press, which left
+  /// the progress bar covering the video while the user was trying to watch.
+  void _dismissPlaybackControlsForWatchGesture() {
+    _cancelAutoHideTimer();
+    if (!_showControls) return;
+    _setShowControls(false);
+  }
+
   void _showLongPressFeedback(Offset localPosition) {
     if (!mounted) return;
     setState(() {
@@ -1919,6 +2455,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       }
       _isAdjustingBrightness = false;
       _isAdjustingVolume = false;
+      _invalidateVerticalAdjustmentSession();
+      _dismissPlaybackControlsForWatchGesture();
     });
   }
 
@@ -2107,49 +2645,66 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
     final dx = details.localPosition.dx;
     final bool isWindows = !kIsWeb && Platform.isWindows;
+    final bool isBrightnessEdge = dx < width * 0.2;
+    final bool isVolumeEdge = dx > width * 0.8;
+    // Center swipes are not volume/brightness. Leave the keyboard/wheel HUD
+    // timer alone or a cancelled vertical recognizer would freeze that card.
+    if (!isBrightnessEdge && !isVolumeEdge) return;
 
-    if (dx < width * 0.2) {
+    _volumeFeedbackHideTimer?.cancel();
+    final int session = ++_verticalAdjustmentSession;
+    _verticalAdjustmentGestureActive = true;
+
+    double startValue;
+    if (isBrightnessEdge) {
       if (Platform.isAndroid || Platform.isIOS) {
         try {
-          _startDragValue = await ScreenBrightness().application;
+          startValue = await ScreenBrightness().application;
         } catch (_) {
-          _startDragValue = 0.5;
+          startValue = 0.5;
         }
-        setState(() {
-          _isAdjustingBrightness = true;
-          _currentBrightness = _startDragValue;
-        });
       } else if (isWindows) {
-        _startDragValue = _currentBrightness;
-        setState(() {
-          _isAdjustingBrightness = true;
-          _currentBrightness = _startDragValue;
-        });
+        startValue = _currentBrightness;
+      } else {
+        _invalidateVerticalAdjustmentSession();
+        return;
       }
-    } else if (dx > width * 0.8) {
-      if (Platform.isAndroid || Platform.isIOS) {
-        try {
-          _startDragValue = await VolumeController.instance.getVolume();
-        } catch (_) {
-          _startDragValue = 0.5;
-        }
-        setState(() {
-          _isAdjustingVolume = true;
-          _currentVolume = _startDragValue;
-        });
-      } else if (isWindows) {
-        _startDragValue = _controllerValue.volume;
-        setState(() {
-          _isAdjustingVolume = true;
-          _currentVolume = _startDragValue;
-        });
+    } else if (_usesSystemVolumeAdjustment) {
+      try {
+        startValue = await VolumeController.instance.getVolume();
+      } catch (_) {
+        startValue = 0.5;
       }
+    } else if (isWindows) {
+      startValue = _controllerValue.volume;
+    } else {
+      _invalidateVerticalAdjustmentSession();
+      return;
     }
 
-    // Reset auto-hide timer during gesture
-    if (_isAdjustingBrightness || _isAdjustingVolume) {
-      _startAutoHideTimer();
+    if (!mounted ||
+        session != _verticalAdjustmentSession ||
+        !_verticalAdjustmentGestureActive) {
+      return;
     }
+    if (widget.isLocked || _shouldBlockPrimaryGestures || _isLongPressActive) {
+      _hideVolumeBrightnessOverlay();
+      return;
+    }
+
+    _startDragValue = startValue;
+    setState(() {
+      if (isBrightnessEdge) {
+        _isAdjustingBrightness = true;
+        _isAdjustingVolume = false;
+        _currentBrightness = _startDragValue;
+      } else {
+        _isAdjustingVolume = true;
+        _isAdjustingBrightness = false;
+        _currentVolume = _startDragValue;
+      }
+    });
+    _startAutoHideTimer();
   }
 
   void _onVerticalDragUpdate(DragUpdateDetails details, double height) {
@@ -2190,19 +2745,18 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _onVerticalDragEnd(DragEndDetails details) {
-    if (_shouldBlockPrimaryGestures) return;
-    setState(() {
-      _isAdjustingBrightness = false;
-      _isAdjustingVolume = false;
-      _setShowControls(false); // Auto hide controls after adjustment
-    });
+    // Always drop the HUD. Blocking chrome after the fact used to skip this
+    // and leave the card on screen.
+    _hideVolumeBrightnessOverlay(
+      hidePlaybackControls: !_shouldBlockPrimaryGestures,
+    );
+  }
 
-    // Cancel auto-hide timer since controls are hidden
-    _cancelAutoHideTimer();
+  void _onVerticalDragCancel() {
+    _hideVolumeBrightnessOverlay();
   }
 
   // 鼠标滚轮调节音量（桌面端）
-  Timer? _wheelVolumeHideTimer;
   void _onPointerSignal(PointerSignalEvent event) {
     if (event is! PointerScrollEvent) return;
     if (_shouldBlockPrimaryGestures) return;
@@ -2214,45 +2768,21 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     debugPrint('[_onPointerSignal] 滚动增量: $scrollDelta');
     if (scrollDelta == 0) return;
 
-    // 获取播放服务
     final playbackService = Provider.of<MediaPlaybackService>(
       context,
       listen: false,
     );
-
-    // 从播放服务获取当前音量，确保音量调整的准确性
     final double currentVolume = playbackService.volume;
     debugPrint('[_onPointerSignal] 当前音量: $currentVolume');
 
-    // 计算音量变化：向上滚动(scrollDelta < 0)增加音量，向下滚动(scrollDelta > 0)减小音量
-    // 步长设为 0.03 (3%) 使调节平滑
+    // Wheel notches stay slightly finer than a key tap so scrolling remains
+    // smooth, while the HUD is the same overlay as swipe / arrow keys.
     final double step = 0.03;
     final double delta = scrollDelta > 0 ? -step : step;
-
     final double newVolume = (currentVolume + delta).clamp(0.0, 1.0);
     debugPrint('[_onPointerSignal] 新音量: $newVolume');
 
-    setState(() {
-      _isAdjustingVolume = true;
-      _currentVolume = newVolume;
-    });
-
-    // 调整播放器音量
-    debugPrint('[_onPointerSignal] 正在设置音量: $_currentVolume');
-    unawaited(playbackService.setVolume(_currentVolume));
-
-    // 启动自动隐藏定时器
-    _startAutoHideTimer();
-
-    // 音量调节视觉反馈延时隐藏
-    _wheelVolumeHideTimer?.cancel();
-    _wheelVolumeHideTimer = Timer(const Duration(milliseconds: 1500), () {
-      if (mounted) {
-        setState(() {
-          _isAdjustingVolume = false;
-        });
-      }
-    });
+    _commitVolumeAdjustment(newVolume);
   }
 
   void _handleSmartTap(double width) {
@@ -2423,11 +2953,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
             ? Alignment.centerLeft
             : Alignment.centerRight;
         final bool isWindows = !kIsWeb && Platform.isWindows;
-        final bool showLockButton =
-            !widget.isPreviewMode &&
-            (kIsWeb ||
-                (defaultTargetPlatform != TargetPlatform.windows &&
-                    defaultTargetPlatform != TargetPlatform.macOS));
+        final bool showLockButton = !widget.isPreviewMode;
         final bool showInteractiveDanmakuControls =
             widget.showDanmakuControls && !widget.isLocked;
         final bool hasResetScreenControl =
@@ -2475,6 +3001,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final bool isDesktop =
             !kIsWeb &&
             (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+        final bool supportsPointerHover =
+            !kIsWeb && supportsPlayerPointerHoverOn(defaultTargetPlatform);
         final List<Widget> topLeading = [
           if (isDesktop)
             IconButton(
@@ -2582,7 +3110,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                   Icons.document_scanner_outlined,
                   color: Colors.white,
                 ),
-                tooltip: 'OCR 字幕',
+                tooltip: _tooltipWithShortcut(
+                  'OCR 字幕',
+                  DesktopPlayerShortcutAction.openOcrSubtitle,
+                ),
                 onPressed: () {
                   _startAutoHideTimer();
                   widget.onOpenOcrSubtitle!();
@@ -2790,6 +3321,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                               _onVerticalDragUpdate(details, height);
                           instance.onEnd = (details) =>
                               _onVerticalDragEnd(details);
+                          instance.onCancel = _onVerticalDragCancel;
                         }),
                     HorizontalDragGestureRecognizer:
                         GestureRecognizerFactoryWithHandlers<
@@ -3014,7 +3546,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                   child: _PlayerSideControlButton(
                     key: const ValueKey('player-side-reset-screen'),
                     extent: sideControlButtonExtent,
-                    tooltip: '还原屏幕',
+                    tooltip: _tooltipWithShortcut(
+                      '还原屏幕',
+                      DesktopPlayerShortcutAction.resetScreen,
+                    ),
                     onPressed: () {
                       widget.onResetScreenTransform?.call();
                       _startAutoHideTimer();
@@ -3052,7 +3587,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                             _PlayerSideControlButton(
                               key: const ValueKey('player-side-lock'),
                               extent: sideControlButtonExtent,
-                              tooltip: widget.isLocked ? '解锁播放器' : '锁定播放器',
+                              tooltip: _tooltipWithShortcut(
+                                widget.isLocked ? '解锁播放器' : '锁定播放器',
+                                DesktopPlayerShortcutAction.toggleLock,
+                              ),
                               highlighted: widget.isLocked,
                               onPressed: () {
                                 _startAutoHideTimer();
@@ -3074,7 +3612,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                             _PlayerSideControlButton(
                               key: const ValueKey('player-side-danmaku-toggle'),
                               extent: sideControlButtonExtent,
-                              tooltip: widget.danmakuEnabled ? '关闭弹幕' : '打开弹幕',
+                              tooltip: _tooltipWithShortcut(
+                                widget.danmakuEnabled ? '关闭弹幕' : '打开弹幕',
+                                DesktopPlayerShortcutAction.toggleDanmaku,
+                              ),
                               highlighted: widget.danmakuEnabled,
                               onPressed: () {
                                 _startAutoHideTimer();
@@ -3093,7 +3634,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                 'player-side-danmaku-settings',
                               ),
                               extent: sideControlButtonExtent,
-                              tooltip: '弹幕设置',
+                              tooltip: _tooltipWithShortcut(
+                                '弹幕设置',
+                                DesktopPlayerShortcutAction.openDanmakuSettings,
+                              ),
                               onPressed: () {
                                 _startAutoHideTimer();
                                 widget.onOpenDanmakuSettings?.call();
@@ -3437,7 +3981,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                           );
                                                           return Tooltip(
                                                             message:
-                                                                chapter.title,
+                                                                _tooltipWithShortcut(
+                                                                  chapter.title,
+                                                                  DesktopPlayerShortcutAction
+                                                                      .openChapters,
+                                                                ),
                                                             child: Material(
                                                               key: const ValueKey(
                                                                 'video-controls-chapter-button',
@@ -3584,7 +4132,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                     behavior: HitTestBehavior
                                                         .translucent,
                                                     onPointerDown:
-                                                        isDesktop &&
+                                                        supportsPointerHover &&
                                                             isInitialized
                                                         ? (event) {
                                                             final progressAreaHeight =
@@ -3745,7 +4293,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 : MouseCursor
                                                                       .defer,
                                                             onEnter:
-                                                                isDesktop &&
+                                                                supportsPointerHover &&
                                                                     isInitialized
                                                                 ? (
                                                                     event,
@@ -3764,7 +4312,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                   )
                                                                 : null,
                                                             onHover:
-                                                                isDesktop &&
+                                                                supportsPointerHover &&
                                                                     isInitialized
                                                                 ? (
                                                                     event,
@@ -3782,7 +4330,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                         progressTextDirection,
                                                                   )
                                                                 : null,
-                                                            onExit: isDesktop
+                                                            onExit:
+                                                                supportsPointerHover
                                                                 ? (_) =>
                                                                       _endProgressHover()
                                                                 : null,
@@ -4487,7 +5036,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                           return const SizedBox.shrink();
                                                         }
                                                         return Tooltip(
-                                                          message: '清晰度',
+                                                          message:
+                                                              _tooltipWithShortcut(
+                                                                '清晰度',
+                                                                DesktopPlayerShortcutAction
+                                                                    .openStreamQuality,
+                                                              ),
                                                           child: InkWell(
                                                             borderRadius:
                                                                 BorderRadius.circular(
@@ -4558,7 +5112,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                             speedButtonContext,
                                                             handleSpeedTap,
                                                           ) => Tooltip(
-                                                            message: '倍速',
+                                                            message:
+                                                                _showsPointerShortcutHints
+                                                                ? '倍速 (${DesktopPlayerShortcuts.shortcutLabel(DesktopPlayerShortcutAction.speedSlower)} / ${DesktopPlayerShortcuts.shortcutLabel(DesktopPlayerShortcutAction.speedFaster)})'
+                                                                : '倍速',
                                                             child: Material(
                                                               color: Colors
                                                                   .transparent,
@@ -4604,9 +5161,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                               ),
                                                                               child: FittedBox(
                                                                                 fit: BoxFit.scaleDown,
-                                                                                child: Text(
-                                                                                  "${speed}x",
-                                                                                  maxLines: 1,
+                                                                                child: PlaybackSpeedText(
+                                                                                  speed: speed,
                                                                                   style: TextStyle(
                                                                                     color: Colors.white,
                                                                                     fontWeight: FontWeight.bold,
@@ -4660,10 +5216,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                   .onOpenSleepTimer!();
                                                             },
                                                             tooltip:
-                                                                timer.isActive
-                                                                ? timer
-                                                                      .statusText
-                                                                : '定时关闭',
+                                                                _tooltipWithShortcut(
+                                                                  timer.isActive
+                                                                      ? timer
+                                                                            .statusText
+                                                                      : '定时关闭',
+                                                                  DesktopPlayerShortcutAction
+                                                                      .openSleepTimer,
+                                                                ),
                                                           );
                                                         },
                                                       ),
@@ -4760,18 +5320,18 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
         // 桌面端：用 Listener 包裹整个播放器区域，捕获鼠标滚轮事件调节音量
         // 必须在 MouseRegion 之前包裹，确保滚轮事件被优先处理
-        if (!kIsWeb &&
-            (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
-          focusChild = Listener(
-            onPointerSignal: _onPointerSignal,
-            behavior: HitTestBehavior.translucent,
-            child: focusChild,
-          );
-        }
+        focusChild = Listener(
+          onPointerDown: _onPlayerPointerDown,
+          onPointerUp: _finishPlayerPointer,
+          onPointerCancel: _finishPlayerPointer,
+          onPointerSignal: supportsPointerHover ? _onPointerSignal : null,
+          behavior: HitTestBehavior.translucent,
+          child: focusChild,
+        );
 
         // Desktop: Wrap with MouseRegion to show controls on mouse movement
         // and hide cursor when controls are hidden for full immersion
-        if (isDesktop) {
+        if (supportsPointerHover) {
           return MouseRegion(
             key: const ValueKey('video-controls-player-mouse-region'),
             onEnter: _onMouseEnter,

@@ -86,6 +86,29 @@ class PlaylistManager extends ChangeNotifier {
     );
   }
 
+  /// Opens a library item into a playback queue.
+  ///
+  /// By default search result pages are locators only, so previous/next follow
+  /// [item]'s original parent folder. [useSearchResultsAsQueue] restores the
+  /// optional behavior of treating the current search listing as the queue.
+  void prepareLibraryPlayback(
+    VideoItem item, {
+    List<VideoItem>? searchItems,
+    bool useSearchResultsAsQueue = false,
+  }) {
+    if (useSearchResultsAsQueue && searchItems != null) {
+      final startIndex = searchItems.indexWhere(
+        (candidate) => candidate.id == item.id,
+      );
+      setPlaylist(
+        searchItems,
+        startIndex: startIndex < 0 ? 0 : startIndex,
+      );
+      return;
+    }
+    loadFolderPlaylist(item.parentId, item.id);
+  }
+
   /// Revalidates source existence and publishes a new queue revision.
   void reloadPlaylist() {
     final library = _libraryService;

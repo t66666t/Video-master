@@ -64,10 +64,10 @@ class SubtitleTimelineResolver {
   /// Returns every cue active at [positionMs], in source order.
   ///
   /// When [extendToNextStart] is enabled, overlapping cues are treated as one
-  /// coverage group. Their original durations remain intact, and only the cue
-  /// that ends last is extended across the real gap before the next group.
-  /// This keeps a short on-screen translation from lingering just because it
-  /// appeared during a much longer narration cue.
+  /// coverage group. Their original durations remain intact. Every cue that
+  /// shares the group's latest original end is extended across the real gap
+  /// before the next group, so duplicate same-end cues stay together while a
+  /// short nested translation does not linger after a longer narration cue.
   /// Prefix maximum end times let the backwards scan stop as soon as no
   /// earlier cue can still be active.
   List<int> activeIndicesAtMs(
@@ -195,31 +195,46 @@ class SubtitleTimelineResolver {
     return List<int>.unmodifiable(result);
   }
 
+  /// Extends coverage only across silent gaps, never by shortening overlaps.
+  ///
+  /// A coverage group is a run of cues whose original intervals union without
+  /// a hole. When the next cue starts after that union, every cue whose
+  /// original end equals the group's latest end is stretched to that start.
   static List<int> _buildGapFilledEndTimes(List<SubtitleItem> subtitles) {
-    final List<int> result = subtitles
-        .map((item) => item.endTime.inMilliseconds)
-        .toList(growable: false);
-    if (subtitles.length < 2) return result;
+    final List<int> originalEnds = List<int>.generate(
+      subtitles.length,
+      (int index) => subtitles[index].endTime.inMilliseconds,
+      growable: false,
+    );
+    final List<int> result = List<int>.from(originalEnds);
+    if (subtitles.length < 2) {
+      return List<int>.unmodifiable(result);
+    }
 
-    int groupLastEndMs = result.first;
-    int groupLastEndOwner = 0;
+    int groupStart = 0;
+    int groupLastEndMs = originalEnds.first;
+    void closeGroup(int groupEndExclusive, int nextStartMs) {
+      for (int index = groupStart; index < groupEndExclusive; index++) {
+        if (originalEnds[index] == groupLastEndMs) {
+          result[index] = nextStartMs;
+        }
+      }
+    }
+
     for (int index = 1; index < subtitles.length; index++) {
       final int startMs = subtitles[index].startTime.inMilliseconds;
-      final int endMs = result[index];
+      final int endMs = originalEnds[index];
       if (startMs <= groupLastEndMs) {
-        if (endMs >= groupLastEndMs) {
+        if (endMs > groupLastEndMs) {
           groupLastEndMs = endMs;
-          groupLastEndOwner = index;
         }
         continue;
       }
 
-      // There is no active subtitle between the previous coverage group and
-      // this cue. Extend only the cue that naturally ended last in that group.
-      result[groupLastEndOwner] = startMs;
+      closeGroup(index, startMs);
+      groupStart = index;
       groupLastEndMs = endMs;
-      groupLastEndOwner = index;
     }
-    return result;
+    return List<int>.unmodifiable(result);
   }
 }

@@ -72,5 +72,148 @@ void main() {
         const Duration(seconds: 30),
       );
     });
+
+    test('keeps progress when reported duration is far shorter than saved', () {
+      expect(
+        PlaybackBehaviorPolicy.normalizeEpisodeStartPosition(
+          savedPosition: const Duration(minutes: 5),
+          duration: const Duration(seconds: 2),
+        ),
+        const Duration(minutes: 5),
+      );
+    });
+
+    test('prefers library duration over a short native probe', () {
+      expect(
+        PlaybackBehaviorPolicy.trustedDurationForResume(
+          nativeDuration: const Duration(seconds: 2),
+          metadataDuration: const Duration(minutes: 20),
+          savedPosition: const Duration(minutes: 5),
+        ),
+        const Duration(minutes: 20),
+      );
+    });
+  });
+
+  group('PlaybackBehaviorPolicy playback-setting rules', () {
+    test('page-exit pause follows the live transport, not Dart isPlaying', () {
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+          autoPauseOnExit: true,
+          explicitExit: true,
+          suppressRouteCleanup: false,
+          transportPlaying: true,
+        ),
+        isTrue,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+          autoPauseOnExit: false,
+          explicitExit: true,
+          suppressRouteCleanup: false,
+          transportPlaying: true,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+          autoPauseOnExit: true,
+          explicitExit: false,
+          suppressRouteCleanup: false,
+          transportPlaying: true,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+          autoPauseOnExit: true,
+          explicitExit: true,
+          suppressRouteCleanup: true,
+          transportPlaying: true,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+          autoPauseOnExit: true,
+          explicitExit: true,
+          suppressRouteCleanup: false,
+          transportPlaying: false,
+        ),
+        isFalse,
+      );
+    });
+
+    test('background pause uses the Bilibili transport intent', () {
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseWhenAppBackgrounded(
+          enabled: true,
+          isMobilePlatform: true,
+          transportPlaying: true,
+        ),
+        isTrue,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseWhenAppBackgrounded(
+          enabled: true,
+          isMobilePlatform: true,
+          transportPlaying: false,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseWhenAppBackgrounded(
+          enabled: true,
+          isMobilePlatform: false,
+          transportPlaying: true,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.shouldPauseWhenAppBackgrounded(
+          enabled: false,
+          isMobilePlatform: true,
+          transportPlaying: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('Bilibili completion trusts the service clock when native lags', () {
+      const duration = Duration(minutes: 4);
+      expect(
+        PlaybackBehaviorPolicy.isConfirmedPlaybackCompletion(
+          servicePosition: duration,
+          serviceDuration: duration,
+          nativePosition: duration - const Duration(seconds: 2),
+          nativeDuration: duration,
+          nativePlaying: false,
+          isOnlineBilibiliStream: true,
+        ),
+        isTrue,
+      );
+      expect(
+        PlaybackBehaviorPolicy.isConfirmedPlaybackCompletion(
+          servicePosition: const Duration(minutes: 2),
+          serviceDuration: duration,
+          nativePosition: const Duration(minutes: 2),
+          nativeDuration: duration,
+          nativePlaying: false,
+          isOnlineBilibiliStream: true,
+        ),
+        isFalse,
+      );
+      expect(
+        PlaybackBehaviorPolicy.isConfirmedPlaybackCompletion(
+          servicePosition: duration,
+          serviceDuration: duration,
+          nativePosition: const Duration(minutes: 2),
+          nativeDuration: duration,
+          nativePlaying: true,
+          isOnlineBilibiliStream: false,
+        ),
+        isFalse,
+      );
+    });
   });
 }

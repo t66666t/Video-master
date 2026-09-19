@@ -80,7 +80,7 @@ void main() {
 
   for (final articleMode in <bool>[false, true]) {
     testWidgets(
-      '${articleMode ? 'article' : 'list'} view animates when seek updates before pointer-up',
+      '${articleMode ? 'article' : 'list'} view animates locate after a confirmed tap',
       (tester) async {
         SharedPreferences.setMockInitialValues({
           'autoScrollSubtitles': true,
@@ -120,8 +120,8 @@ void main() {
                   controller: controller,
                   isCompact: true,
                   onItemTap: (position) {
-                    // Reproduce a fast player callback while the pointer that
-                    // selected the subtitle is still down.
+                    // Seek lands on pointer-up (confirmed click), then the
+                    // player reports the new position in the same callback.
                     controller.value = controller.value.copyWith(
                       position: position,
                     );
@@ -309,6 +309,67 @@ void main() {
       },
     );
   }
+
+  testWidgets('list tap does not locate when auto-follow is off', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'autoScrollSubtitles': false,
+      'subtitleViewMode': 0,
+      'landscapeSidebarLocatePositionPercent': 30,
+    });
+    final settings = SettingsService();
+    settings.resetForTest();
+    await settings.init();
+    await settings.updateSetting('autoScrollSubtitles', false);
+    expect(settings.autoScrollSubtitles, isFalse);
+
+    final controller = VideoPlayerController.networkUrl(
+      Uri.parse('https://example.invalid/no-follow-tap.mp4'),
+    );
+    controller.value = const VideoPlayerValue(
+      duration: Duration(minutes: 2),
+      isInitialized: true,
+      isPlaying: true,
+    );
+    final subtitles = _buildSubtitles(firstStartSeconds: 0);
+    final sidebarKey = GlobalKey<SubtitleSidebarState>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 320,
+            height: 360,
+            child: SubtitleSidebar(
+              key: sidebarKey,
+              subtitles: subtitles,
+              controller: controller,
+              isCompact: true,
+              onItemTap: (position) {
+                controller.value = controller.value.copyWith(position: position);
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await _pumpPostFrameCallbacks(tester);
+
+    final target = find.text('subtitle 4');
+    expect(target, findsOneWidget);
+    final gesture = await tester.startGesture(tester.getCenter(target));
+    await tester.pump(const Duration(milliseconds: 120));
+    await gesture.up();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 240));
+
+    expect(controller.value.position, subtitles[4].startTime);
+    expect(sidebarKey.currentState!.lastTappedLocateScrollIndex, isNull);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.dispose();
+  });
 
   testWidgets('changing video automatically locates the new subtitle content', (
     tester,

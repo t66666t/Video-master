@@ -38,5 +38,43 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Fluent Player Portable Package</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.fluentplayer.portable-package</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.fluentplayer.portable-package</string>
+			<key>UTTypeDescription</key>
+			<string>Fluent Player Portable Package</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.zip-archive</string>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>fluentpack</string>
+				</array>
+				<key>public.mime-type</key>
+				<string>application/x-fluent-player-package</string>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>

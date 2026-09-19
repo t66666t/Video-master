@@ -7,6 +7,7 @@ import 'package:video_player/video_player.dart';
 import 'package:video_player_app/models/subtitle_style.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/utils/android_hardware_input_bridge.dart';
 import 'package:video_player_app/widgets/video_controls_overlay.dart';
 
 void main() {
@@ -96,7 +97,6 @@ void main() {
       addTearDown(controller.dispose);
 
       final playbackService = MediaPlaybackService();
-      addTearDown(playbackService.dispose);
       final controlsVisibility = ValueNotifier<bool>(true);
       addTearDown(controlsVisibility.dispose);
 
@@ -206,4 +206,135 @@ void main() {
       await tester.pump(const Duration(seconds: 20));
     },
   );
+
+  testWidgets('Android hover shows details and yields cleanly to touch', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    await tester.binding.setSurfaceSize(const Size(1000, 700));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    final controller = VideoPlayerController.networkUrl(
+      Uri.parse('https://example.invalid/video.mp4'),
+    );
+    addTearDown(controller.dispose);
+    final controlsVisibility = ValueNotifier<bool>(true);
+    addTearDown(controlsVisibility.dispose);
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<SettingsService>.value(
+            value: SettingsService(),
+          ),
+          ChangeNotifierProvider<MediaPlaybackService>.value(
+            value: MediaPlaybackService(),
+          ),
+        ],
+        child: MaterialApp(
+          home: Scaffold(
+            body: Row(
+              children: [
+                SizedBox(
+                  width: 750,
+                  child: VideoControlsOverlay(
+                    controller: controller,
+                    isLocked: false,
+                    onTogglePlay: () {},
+                    onBackPressed: () {},
+                    onToggleLock: () {},
+                    onSpeedUpdate: (_) async {},
+                    showSubtitles: false,
+                    onToggleSubtitles: () {},
+                    onMoveSubtitles: () {},
+                    isLongPressing: false,
+                    longPressFeedbackText: '',
+                    onLongPressStart: () => true,
+                    onLongPressEnd: () {},
+                    subtitleEntries: const [],
+                    subtitleStyle: const SubtitleStyle(),
+                    subtitleAlignment: Alignment.bottomCenter,
+                    onEnterSubtitleDragMode: () {},
+                    playbackControlsVisibility: controlsVisibility,
+                  ),
+                ),
+                const Expanded(child: ColoredBox(color: Colors.grey)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.byKey(const ValueKey('video-controls-player-mouse-region')),
+      findsOneWidget,
+    );
+
+    // Exercise the Activity-level fallback path used when the vendor input
+    // stack does not forward hover into Flutter by itself.
+    AndroidHardwareInputBridge.dispatchNativeHoverForTesting(<Object?, Object?>{
+      'action': 9,
+      'x': 500.0,
+      'y': 350.0,
+      'eventTime': 10,
+      'deviceId': 91,
+    });
+    await tester.pump();
+    expect(controlsVisibility.value, isTrue);
+
+    final lockButton = find.byKey(const ValueKey('player-side-lock'));
+    final lockTooltipWidget = find.descendant(
+      of: lockButton,
+      matching: find.byType(Tooltip),
+    );
+    final lockTooltip = tester.widget<Tooltip>(lockTooltipWidget).message!;
+    final lockPosition = tester.getCenter(lockButton);
+    AndroidHardwareInputBridge.dispatchNativeHoverForTesting(<Object?, Object?>{
+      'action': 7,
+      'x': lockPosition.dx,
+      'y': lockPosition.dy,
+      'eventTime': 20,
+      'deviceId': 91,
+    });
+    await tester.pump(const Duration(milliseconds: 700));
+    expect(
+      find.text(lockTooltip),
+      findsOneWidget,
+      reason: 'native Android hover must open the existing IconButton tooltip',
+    );
+
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: const Offset(500, 350));
+    await tester.pump();
+    final touch = await tester.createGesture(kind: PointerDeviceKind.touch);
+    await touch.down(const Offset(450, 300));
+    await mouse.moveTo(const Offset(900, 350));
+    expect(
+      controlsVisibility.value,
+      isTrue,
+      reason: 'mouse exit must not hide controls during an active touch',
+    );
+    await touch.cancel();
+
+    // A later genuine mouse move takes ownership back.
+    await tester.pump(const Duration(milliseconds: 130));
+    await mouse.moveTo(const Offset(500, 350));
+    await mouse.moveTo(const Offset(900, 350));
+    await tester.pump(const Duration(milliseconds: 170));
+    expect(controlsVisibility.value, isFalse);
+
+    AndroidHardwareInputBridge.dispatchNativeHoverForTesting(<Object?, Object?>{
+      'action': 10,
+      'x': 900.0,
+      'y': 350.0,
+      'eventTime': 30,
+      'deviceId': 91,
+    });
+    await mouse.removePointer();
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 20));
+    debugDefaultTargetPlatformOverride = null;
+  });
 }

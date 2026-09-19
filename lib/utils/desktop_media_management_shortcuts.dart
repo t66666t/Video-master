@@ -10,6 +10,17 @@ enum DesktopMediaManagementShortcutAction {
   openCardStyle,
   enterSelectionMode,
   toggleSelectAll,
+  openSearch,
+  openLibrarySettings,
+  openSleepTimer,
+  createCollection,
+  importMedia,
+  openBilibiliDownload,
+  openYtDlpDownload,
+  openBatchSubtitle,
+  openBatchImport,
+  moveToParent,
+  exportFluentPack,
 }
 
 class DesktopMediaManagementShortcuts {
@@ -32,6 +43,26 @@ class DesktopMediaManagementShortcuts {
         LogicalKeyboardKey.keyB,
     DesktopMediaManagementShortcutAction.toggleSelectAll:
         LogicalKeyboardKey.keyA,
+    DesktopMediaManagementShortcutAction.openSearch: LogicalKeyboardKey.keyS,
+    DesktopMediaManagementShortcutAction.openLibrarySettings:
+        LogicalKeyboardKey.keyP,
+    DesktopMediaManagementShortcutAction.openSleepTimer:
+        LogicalKeyboardKey.keyZ,
+    DesktopMediaManagementShortcutAction.createCollection:
+        LogicalKeyboardKey.keyN,
+    DesktopMediaManagementShortcutAction.importMedia: LogicalKeyboardKey.keyI,
+    DesktopMediaManagementShortcutAction.openBilibiliDownload:
+        LogicalKeyboardKey.keyD,
+    DesktopMediaManagementShortcutAction.openYtDlpDownload:
+        LogicalKeyboardKey.keyY,
+    DesktopMediaManagementShortcutAction.openBatchSubtitle:
+        LogicalKeyboardKey.keyC,
+    DesktopMediaManagementShortcutAction.openBatchImport:
+        LogicalKeyboardKey.keyM,
+    DesktopMediaManagementShortcutAction.moveToParent: LogicalKeyboardKey.keyU,
+    // Browse: open 导入与导出. Selection: export the current pick.
+    DesktopMediaManagementShortcutAction.exportFluentPack:
+        LogicalKeyboardKey.keyX,
   };
 
   static DesktopMediaManagementShortcutAction? matchAction(
@@ -41,6 +72,31 @@ class DesktopMediaManagementShortcuts {
       if (entry.value == key) return entry.key;
     }
     return null;
+  }
+
+  static bool isAvailableOnPlatform(
+    DesktopMediaManagementShortcutAction action,
+    TargetPlatform platform,
+  ) {
+    switch (platform) {
+      case TargetPlatform.windows:
+      case TargetPlatform.macOS:
+      case TargetPlatform.linux:
+        return true;
+      case TargetPlatform.android:
+        return action !=
+                DesktopMediaManagementShortcutAction.backOrExitSelection &&
+            action != DesktopMediaManagementShortcutAction.toggleFullScreen &&
+            action !=
+                DesktopMediaManagementShortcutAction.openLargeDataDirectory;
+      case TargetPlatform.iOS:
+        return action !=
+                DesktopMediaManagementShortcutAction.toggleFullScreen &&
+            action !=
+                DesktopMediaManagementShortcutAction.openLargeDataDirectory;
+      case TargetPlatform.fuchsia:
+        return false;
+    }
   }
 
   static String shortcutLabel(DesktopMediaManagementShortcutAction action) {

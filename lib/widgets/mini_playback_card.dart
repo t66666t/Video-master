@@ -197,15 +197,12 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
               ),
               child: Material(
                 color: Colors.transparent,
-                child: Tooltip(
-                  message: '打开播放器',
-                  waitDuration: _tooltipWaitDuration,
-                  child: InkWell(
-                    onTap: widget.onTap,
-                    borderRadius: const BorderRadius.vertical(
-                      top: Radius.circular(16.0),
-                    ),
-                    child: Stack(
+                child: InkWell(
+                  onTap: widget.onTap,
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(16.0),
+                  ),
+                  child: Stack(
                       children: [
                         Container(
                           height: dimensions.height.clamp(80.0, 200.0),
@@ -288,7 +285,6 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                       ],
                     ),
                   ),
-                ),
               ),
             );
           },
@@ -307,7 +303,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     return Row(
       children: [
         // 缩略图
-        _buildThumbnail(currentItem, dimensions),
+        _buildThumbnail(currentItem, dimensions, playbackService),
 
         SizedBox(width: dimensions.padding),
 
@@ -323,8 +319,12 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   }
 
   /// 构建缩略图
-  Widget _buildThumbnail(VideoItem item, PlaybackCardDimensions dimensions) {
-    return Container(
+  Widget _buildThumbnail(
+    VideoItem item,
+    PlaybackCardDimensions dimensions,
+    MediaPlaybackService playbackService,
+  ) {
+    final thumbnail = Container(
       width: dimensions.thumbnailSize,
       height: dimensions.thumbnailSize,
       decoration: BoxDecoration(
@@ -344,6 +344,24 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
             ? _buildAudioThumbnail(item, dimensions)
             : _buildVideoThumbnail(item, dimensions),
       ),
+    );
+    if (!playbackService.isBilibiliBufferingOverlayVisible) {
+      return thumbnail;
+    }
+    final spinnerSize = (dimensions.thumbnailSize * 0.42).clamp(16.0, 28.0);
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        thumbnail,
+        SizedBox(
+          width: spinnerSize,
+          height: spinnerSize,
+          child: const CircularProgressIndicator(
+            strokeWidth: 2.4,
+            color: Color(0xFFFB7299),
+          ),
+        ),
+      ],
     );
   }
 
@@ -746,10 +764,12 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
         SizedBox(width: dimensions.padding / 4), // 减小间距
         // 播放/暂停按钮
         _buildActionButton(
-          icon: playbackService.isPlaying ? Icons.pause : Icons.play_arrow,
-          tooltip: playbackService.isPlaying ? '暂停' : '播放',
+          icon: playbackService.isTransportPlaying
+              ? Icons.pause
+              : Icons.play_arrow,
+          tooltip: playbackService.isTransportPlaying ? '暂停' : '播放',
           onPressed: () {
-            if (playbackService.isPlaying) {
+            if (playbackService.isTransportPlaying) {
               playbackService.pause();
             } else {
               playbackService.resume();

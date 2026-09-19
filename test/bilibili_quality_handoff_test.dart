@@ -700,4 +700,25 @@ void main() {
       expect(streaming.activePlaybackSessionCount, 0);
     },
   );
+
+  test('quality switch skips the conservative 2s cache-pause on the warm player', () {
+    final playback = File('lib/services/media_playback_service.dart').readAsStringSync();
+    expect(playback, contains('fastStart: true'));
+    expect(
+      playback,
+      contains('NativeVideoPlayerMediaKit.fastStreamStartHeader'),
+    );
+    // Cold first-play stays conservative unless reusable `.seg` cache exists.
+    expect(playback, contains('_shouldFastStartCachedBilibiliStream(item)'));
+    expect(playback, contains('fastStart: bilibiliFastStart'));
+
+    final kit = File(
+      'lib/platform/windows_video_player_media_kit.dart',
+    ).readAsStringSync();
+    expect(kit, contains("skipInitialPause ? 'no' : 'yes'"));
+    expect(
+      kit,
+      contains('SubtitleHopSeekPolicy.streamingScrubCachePauseWaitSeconds'),
+    );
+  });
 }

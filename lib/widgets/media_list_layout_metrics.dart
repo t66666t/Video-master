@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/widgets.dart';
 
+import 'media_library_layout_profile.dart';
+
 /// Shared proportional layout calculations for the media-library list view.
 ///
 /// Screen size establishes the desired scale. The actual cell dimensions then
@@ -19,6 +21,8 @@ class MediaListLayoutMetrics {
   static const double maxHeightSetting = 0.15;
   static const double minTitleSetting = 0.001;
   static const double maxTitleSetting = 0.065;
+  static const double minSpacingSetting = 0.0;
+  static const double maxSpacingSetting = 0.45;
 
   final double unit;
   final double rowHeight;
@@ -76,36 +80,27 @@ class MediaListLayoutMetrics {
     required double mainSpacingSetting,
     required double crossSpacingSetting,
   }) {
-    final columns = crossAxisCount.clamp(1, 15);
+    final columns = MediaLibraryLayoutDefaults.clampColumns(crossAxisCount);
     final scale = screenScale(screenShortestSide);
-    final outerPadding = math.min(16.0 * scale, availableWidth * 0.08);
-    final mainSpacing = referenceMainSpacing(mainSpacingSetting) * scale;
-    final widthInsidePadding = math.max(
-      0.001,
-      availableWidth - outerPadding * 2,
+    final distribution = MediaLibraryLayoutDefaults.distributeWidth(
+      availableWidth: availableWidth,
+      columns: columns,
+      spacingScale: crossSpacingSetting,
     );
-    final desiredCrossSpacing =
-        referenceCrossSpacing(crossSpacingSetting) * scale;
-    final crossSpacing = columns == 1
-        ? 0.0
-        : math.min(
-            desiredCrossSpacing,
-            widthInsidePadding * 0.9 / (columns - 1),
-          );
-    final usableWidth = math.max(
-      0.001,
-      widthInsidePadding - crossSpacing * math.max(0, columns - 1),
-    );
-    final cellWidth = usableWidth / columns;
     final desiredRowHeight =
         referenceRowHeight(titleSetting, heightSetting) * scale;
 
     return MediaListGridMetrics(
-      rowHeight: math.max(0.001, math.min(desiredRowHeight, cellWidth)),
-      cellWidth: cellWidth,
-      outerPadding: outerPadding,
-      mainSpacing: mainSpacing,
-      crossSpacing: crossSpacing,
+      rowHeight: math.max(
+        0.001,
+        math.min(desiredRowHeight, distribution.cellWidth),
+      ),
+      cellWidth: distribution.cellWidth,
+      outerPadding: distribution.outerPadding,
+      mainSpacing:
+          distribution.cellWidth *
+          MediaLibraryLayoutDefaults.clampSpacing(mainSpacingSetting),
+      crossSpacing: distribution.crossSpacing,
     );
   }
 
@@ -146,6 +141,19 @@ class MediaListLayoutMetrics {
   static double gridSelectionIconSize(double cardWidth) => cardWidth * 0.17;
 
   static double gridSelectionHitPadding(double cardWidth) => cardWidth * 0.11;
+
+  /// Title block padding scales with the card so portrait cells do not keep
+  /// the 10×6 offsets that were designed for ~170px-wide landscape cards.
+  static EdgeInsets cardGridContentPadding(double cardWidth) {
+    return EdgeInsets.symmetric(
+      horizontal: (cardWidth * 0.059).clamp(3.0, 10.0),
+      vertical: (cardWidth * 0.035).clamp(2.0, 6.0),
+    );
+  }
+
+  static double cardGridThumbnailIconSize(double extent) {
+    return (extent * 0.42).clamp(10.0, 50.0);
+  }
 
   static double _normalize(double value, double min, double max) {
     return ((value - min) / (max - min)).clamp(0.0, 1.0);
@@ -223,5 +231,54 @@ class MediaLibraryGridGeometry {
 
     final index = row * crossAxisCount + column;
     return index >= 0 && index < itemCount ? index : null;
+  }
+
+  /// Indices whose cell rect intersects [contentRect], in reading order.
+  List<int> indicesOverlapping(Rect contentRect, int itemCount) {
+    if (itemCount <= 0) return const <int>[];
+    final strideX = itemWidth + horizontalSpacing;
+    final strideY = itemHeight + verticalSpacing;
+    if (strideX <= 0 || strideY <= 0) return const <int>[];
+
+    var minRow = ((contentRect.top - topPadding) / strideY).floor();
+    var maxRow = ((contentRect.bottom - topPadding) / strideY).floor();
+    var minCol = ((contentRect.left - horizontalPadding) / strideX).floor();
+    var maxCol = ((contentRect.right - horizontalPadding) / strideX).floor();
+    if (minRow < 0) minRow = 0;
+    if (minCol < 0) minCol = 0;
+    if (maxCol >= crossAxisCount) maxCol = crossAxisCount - 1;
+
+    final indices = <int>[];
+    for (var row = minRow; row <= maxRow; row++) {
+      for (var col = minCol; col <= maxCol; col++) {
+        final index = row * crossAxisCount + col;
+        if (index < 0 || index >= itemCount) continue;
+        if (rectForIndex(index).overlaps(contentRect)) {
+          indices.add(index);
+        }
+      }
+    }
+    return indices;
+  }
+
+  /// Maps a content-space point onto a grid cell for album-style range drag.
+  ///
+  /// Gaps count as the neighboring cell; points outside the grid clamp to the
+  /// nearest edge item so a finger can leave a card without dropping the range.
+  int? indexForDragSelection(Offset offset, int itemCount) {
+    if (itemCount <= 0) return null;
+    final strideX = itemWidth + horizontalSpacing;
+    final strideY = itemHeight + verticalSpacing;
+    if (strideX <= 0 || strideY <= 0) return null;
+
+    var column = ((offset.dx - horizontalPadding) / strideX).floor();
+    var row = ((offset.dy - topPadding) / strideY).floor();
+    column = column.clamp(0, crossAxisCount - 1);
+    final lastRow = (itemCount - 1) ~/ crossAxisCount;
+    row = row.clamp(0, lastRow);
+    final index = row * crossAxisCount + column;
+    if (index < 0) return 0;
+    if (index >= itemCount) return itemCount - 1;
+    return index;
   }
 }

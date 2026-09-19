@@ -4,16 +4,16 @@ import 'package:video_player_app/utils/desktop_player_shortcuts.dart';
 
 void main() {
   group('DesktopPlayerShortcuts', () {
-    test('every player action has a unique key binding', () {
+    test('every player action has a unique primary key binding', () {
       expect(
         DesktopPlayerShortcuts.defaults.length,
         DesktopPlayerShortcutAction.values.length,
       );
 
-      final keys = DesktopPlayerShortcuts.defaults.values
-          .map((binding) => binding.logicalKey)
+      final identities = DesktopPlayerShortcuts.defaults.values
+          .map((bindings) => (bindings.first.logicalKey, bindings.first.shift))
           .toSet();
-      expect(keys.length, DesktopPlayerShortcutAction.values.length);
+      expect(identities.length, DesktopPlayerShortcutAction.values.length);
     });
 
     test('matches transport and panel shortcuts to their intended actions', () {
@@ -28,7 +28,8 @@ void main() {
         LogicalKeyboardKey.keyE: DesktopPlayerShortcutAction.openSubtitleEditor,
         LogicalKeyboardKey.keyV: DesktopPlayerShortcutAction.openVideoCompose,
         LogicalKeyboardKey.keyT: DesktopPlayerShortcutAction.openSubtitleStyle,
-        LogicalKeyboardKey.keyD: DesktopPlayerShortcutAction.moveSubtitles,
+        LogicalKeyboardKey.keyJ: DesktopPlayerShortcutAction.moveSubtitles,
+        LogicalKeyboardKey.keyD: DesktopPlayerShortcutAction.toggleDanmaku,
         LogicalKeyboardKey.keyB:
             DesktopPlayerShortcutAction.toggleSubtitleSidebar,
         LogicalKeyboardKey.keyF: DesktopPlayerShortcutAction.toggleFullScreen,
@@ -39,6 +40,18 @@ void main() {
         LogicalKeyboardKey.keyN: DesktopPlayerShortcutAction.nextEpisode,
         LogicalKeyboardKey.keyC: DesktopPlayerShortcutAction.toggleSubtitles,
         LogicalKeyboardKey.keyM: DesktopPlayerShortcutAction.toggleMute,
+        LogicalKeyboardKey.arrowUp: DesktopPlayerShortcutAction.volumeUp,
+        LogicalKeyboardKey.arrowDown: DesktopPlayerShortcutAction.volumeDown,
+        LogicalKeyboardKey.keyH: DesktopPlayerShortcutAction.openChapters,
+        LogicalKeyboardKey.keyK: DesktopPlayerShortcutAction.toggleLock,
+        LogicalKeyboardKey.keyX: DesktopPlayerShortcutAction.openDanmakuSettings,
+        LogicalKeyboardKey.keyO: DesktopPlayerShortcutAction.openOcrSubtitle,
+        LogicalKeyboardKey.keyQ: DesktopPlayerShortcutAction.openStreamQuality,
+        LogicalKeyboardKey.keyR: DesktopPlayerShortcutAction.resetScreen,
+        LogicalKeyboardKey.keyZ: DesktopPlayerShortcutAction.openSleepTimer,
+        LogicalKeyboardKey.bracketLeft: DesktopPlayerShortcutAction.speedSlower,
+        LogicalKeyboardKey.bracketRight:
+            DesktopPlayerShortcutAction.speedFaster,
       };
 
       for (final entry in expected.entries) {
@@ -49,8 +62,33 @@ void main() {
         );
       }
       expect(
-        DesktopPlayerShortcuts.matchAction(LogicalKeyboardKey.keyQ),
+        DesktopPlayerShortcuts.matchAction(LogicalKeyboardKey.keyW),
         isNull,
+      );
+      expect(
+        DesktopPlayerShortcuts.matchAction(LogicalKeyboardKey.keyI),
+        isNull,
+      );
+      expect(
+        DesktopPlayerShortcuts.matchAction(
+          LogicalKeyboardKey.arrowLeft,
+          shiftPressed: true,
+        ),
+        DesktopPlayerShortcutAction.speedSlower,
+      );
+      expect(
+        DesktopPlayerShortcuts.matchAction(
+          LogicalKeyboardKey.arrowRight,
+          shiftPressed: true,
+        ),
+        DesktopPlayerShortcutAction.speedFaster,
+      );
+      expect(
+        DesktopPlayerShortcuts.matchAction(
+          LogicalKeyboardKey.space,
+          shiftPressed: true,
+        ),
+        DesktopPlayerShortcutAction.playPause,
       );
     });
 
@@ -68,6 +106,32 @@ void main() {
           DesktopPlayerShortcutAction.back,
         ),
         '返回 (Esc)',
+      );
+      expect(
+        DesktopPlayerShortcuts.buildTooltip(
+          '弹幕',
+          DesktopPlayerShortcutAction.toggleDanmaku,
+        ),
+        '弹幕 (D)',
+      );
+      expect(
+        DesktopPlayerShortcuts.buildTooltip(
+          '移动字幕',
+          DesktopPlayerShortcutAction.moveSubtitles,
+        ),
+        '移动字幕 (J)',
+      );
+      expect(
+        DesktopPlayerShortcuts.shortcutLabel(
+          DesktopPlayerShortcutAction.speedSlower,
+        ),
+        '[',
+      );
+      expect(
+        DesktopPlayerShortcuts.shortcutLabel(
+          DesktopPlayerShortcutAction.speedFaster,
+        ),
+        ']',
       );
     });
   });

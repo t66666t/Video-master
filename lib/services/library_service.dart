@@ -23,6 +23,7 @@ import '../utils/media_library_search_query.dart';
 import '../utils/imported_media_title.dart';
 import '../models/video_item.dart';
 import '../models/managed_subtitle_asset.dart';
+import '../models/media_chapter.dart';
 import 'thumbnail_cache_service.dart';
 import 'audio_playback_compatibility_service.dart';
 import 'settings_service.dart';
@@ -107,12 +108,14 @@ class StructuredImportExecutionResult {
   final int createdFolderCount;
   final int importedMediaCount;
   final int restoredMediaCount;
+  final List<String> importedVideoIds;
 
   const StructuredImportExecutionResult({
     required this.rootCollectionId,
     required this.createdFolderCount,
     required this.importedMediaCount,
     required this.restoredMediaCount,
+    this.importedVideoIds = const <String>[],
   });
 
   int get affectedMediaCount => importedMediaCount + restoredMediaCount;
@@ -666,6 +669,10 @@ class LibraryService extends ChangeNotifier {
   final ValueNotifier<String> importStatus = ValueNotifier("");
   bool _importOperationActive = false;
   bool get hasActiveImport => _importOperationActive;
+
+  /// Overlay-only progress (e.g. clipboard Bilibili cards) that must not
+  /// toggle [isImporting], which would grow the collection title.
+  bool _transientImportProgressActive = false;
 
   bool _initialized = false;
   late Directory _dataRootDir;
@@ -1570,6 +1577,7 @@ class LibraryService extends ChangeNotifier {
     String name,
     String? parentId, {
     String? thumbnailPath,
+    String? coverLabel,
     MediaSourceRef? sourceRef,
   }) async {
     final collection = VideoCollection(
@@ -1578,6 +1586,7 @@ class LibraryService extends ChangeNotifier {
       createTime: DateTime.now().millisecondsSinceEpoch,
       parentId: parentId,
       thumbnailPath: thumbnailPath,
+      coverLabel: coverLabel,
       sourceRef: sourceRef,
     );
 
@@ -1710,11 +1719,106 @@ class LibraryService extends ChangeNotifier {
     });
   }
 
+  /// Imports a trusted, already validated portable-package directory.
+  ///
+  /// Unlike a normal folder import, package media is always moved into the
+  /// app-managed library before the temporary extraction directory is removed.
+  Future<StructuredImportExecutionResult> importPortablePackageDirectory(
+    String folderPath, {
+    required String rootCollectionName,
+    required int mediaEntriesHint,
+    required StructuredImportSortOptions sortOptions,
+  }) {
+    return _runExclusiveImport(() async {
+      final rootDir = Directory(folderPath);
+      if (!await rootDir.exists()) {
+        throw FileSystemException('导入包临时目录不存在', folderPath);
+      }
+      isImporting.value = true;
+      await _setImportProgress(progress: 0.34, status: '正在写入媒体库…');
+      try {
+        return await _importDirectoryTreeIntoLibrary(
+          sourceDir: rootDir,
+          rootCollectionName: rootCollectionName,
+          parentId: null,
+          sortOptions: sortOptions,
+          importLabel: '导出包',
+          moveImportedFilesToLibrary: true,
+          totalMediaEntriesHint: mediaEntriesHint > 0 ? mediaEntriesHint : null,
+          deferPostProcessing: true,
+        );
+      } finally {
+        isImporting.value = false;
+        importProgress.value = 0.0;
+        importStatus.value = '';
+      }
+    });
+  }
+
+  /// Restores portable, path-independent media metadata after package files
+  /// have been moved into this device's private storage.
+  Future<void> applyPortableMediaMetadata(
+    Iterable<String> importedVideoIds,
+    Iterable<Map<String, dynamic>> records,
+  ) async {
+    final byStem = <String, List<Map<String, dynamic>>>{};
+    for (final record in records) {
+      final stem = record['fileStem']?.toString().trim().toLowerCase() ?? '';
+      if (stem.isNotEmpty) {
+        byStem.putIfAbsent(stem, () => <Map<String, dynamic>>[]).add(record);
+      }
+    }
+
+    var changed = false;
+    for (final id in importedVideoIds) {
+      final item = _videos[id];
+      if (item == null) continue;
+      final candidates = byStem[item.title.trim().toLowerCase()];
+      if (candidates == null || candidates.isEmpty) continue;
+      final record = candidates.removeAt(0);
+      item.title = record['title']?.toString() ?? item.title;
+      item.lastPositionMs = (record['lastPositionMs'] as num?)?.toInt() ?? 0;
+      item.showFloatingSubtitles =
+          record['showFloatingSubtitles'] as bool? ??
+          item.showFloatingSubtitles;
+      item.portraitDisplayAspectRatio =
+          (record['portraitDisplayAspectRatio'] as num?)?.toDouble();
+      item.portraitCustomAspectWidth =
+          (record['portraitCustomAspectWidth'] as num?)?.toDouble();
+      item.portraitCustomAspectHeight =
+          (record['portraitCustomAspectHeight'] as num?)?.toDouble();
+      item.hasPortraitAspectPreferenceInitialized =
+          record['hasPortraitAspectPreferenceInitialized'] as bool? ?? false;
+      item.isVideoMirroredH = record['isVideoMirroredH'] as bool? ?? false;
+      item.isVideoMirroredV = record['isVideoMirroredV'] as bool? ?? false;
+      item.sourceRef = MediaSourceRef.fromJsonOrNull(record['sourceRef']);
+      final rawChapters = record['chapters'];
+      if (rawChapters is List) {
+        item.chapters = MediaChapter.normalize(
+          rawChapters.whereType<Map>().map(
+            (chapter) =>
+                MediaChapter.fromJson(Map<String, dynamic>.from(chapter)),
+          ),
+          durationMs: item.durationMs,
+        );
+        item.hasProbedChapters =
+            record['hasProbedChapters'] as bool? ?? item.chapters.isNotEmpty;
+      }
+      item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      changed = true;
+    }
+    if (changed) {
+      await _saveLibrary();
+      notifyListeners();
+    }
+  }
+
   Future<T> _runExclusiveImport<T>(Future<T> Function() operation) async {
     if (_importOperationActive) {
       throw StateError('已有导入任务正在运行，请等待完成后再试');
     }
     _importOperationActive = true;
+    _transientImportProgressActive = false;
     try {
       return await operation();
     } finally {
@@ -1880,6 +1984,7 @@ class LibraryService extends ChangeNotifier {
         createdFolderCount: accumulator.createdFolderCount,
         importedMediaCount: accumulator.importedMediaCount,
         restoredMediaCount: accumulator.restoredMediaCount,
+        importedVideoIds: List<String>.unmodifiable(accumulator.newVideoIds),
       );
     } catch (e) {
       await _cleanupStructuredImportArtifacts(accumulator.newVideoIds);
@@ -2369,6 +2474,34 @@ class LibraryService extends ChangeNotifier {
   }) async {
     importProgress.value = progress;
     importStatus.value = status;
+  }
+
+  /// Drives the top-bar overlay without expanding titles via [isImporting].
+  /// Returns false when an exclusive/local import currently owns the bar.
+  bool reportTransientImportProgress({
+    required double progress,
+    required String status,
+  }) {
+    if (_importOperationActive && !_transientImportProgressActive) {
+      return false;
+    }
+    _transientImportProgressActive = true;
+    importProgress.value = progress.clamp(0.02, 0.99);
+    importStatus.value = status;
+    return true;
+  }
+
+  /// Hides the overlay after a transient import. No-op if local import took over.
+  void clearTransientImportProgress() {
+    if (!_transientImportProgressActive) {
+      return;
+    }
+    _transientImportProgressActive = false;
+    if (_importOperationActive) {
+      return;
+    }
+    importProgress.value = 0.0;
+    importStatus.value = '';
   }
 
   Future<void> _cleanupStructuredImportArtifacts(
@@ -2869,6 +3002,7 @@ class LibraryService extends ChangeNotifier {
       return;
     }
     _importOperationActive = true;
+    _transientImportProgressActive = false;
 
     // Give UI a chance to render the "Started importing" snackbar.
     await Future.delayed(const Duration(milliseconds: 200));
@@ -5361,9 +5495,17 @@ class LibraryService extends ChangeNotifier {
     }
   }
 
-  Future<void> renameItem(String id, String newName) async {
+  Future<void> renameItem(
+    String id,
+    String newName, {
+    String? coverLabel,
+    bool updateCoverLabel = false,
+  }) async {
     if (_collections.containsKey(id)) {
       _collections[id]!.name = newName;
+      if (updateCoverLabel) {
+        _collections[id]!.coverLabel = coverLabel;
+      }
     } else if (_videos.containsKey(id)) {
       _videos[id]!.title = newName;
     }

@@ -10,7 +10,9 @@ import '../services/media_playback_service.dart';
 import '../services/audio_playback_compatibility_service.dart';
 import '../services/music_artwork_backdrop_cache.dart';
 import '../services/settings_service.dart';
+import '../utils/android_hardware_input_bridge.dart';
 import '../utils/desktop_player_shortcuts.dart';
+import '../utils/player_volume_keyboard.dart';
 import '../models/video_item.dart';
 import '../widgets/cached_thumbnail_widget.dart';
 import '../widgets/music_album_cover.dart';
@@ -139,6 +141,8 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   // 用于跟踪 seek 目标位置，避免在 seek 完成前进度条闪烁回旧位置
   double? _seekTargetProgress;
   final FocusNode _focusNode = FocusNode();
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
   late final MediaPlaybackService _positionMediaService;
   bool? _lastSystemUiLandscape;
 
@@ -206,6 +210,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     FocusManager.instance.addEarlyKeyEventHandler(_handleEarlyKeyEvent);
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
 
     // 同步读取上次保存的歌词字号（竖屏 / 横屏分别记忆）。
     // 在首帧之前同步读取，可避免进入页面时先显示默认字号再跳变（闪烁）。
@@ -296,6 +301,9 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
   @override
   void dispose() {
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
     FocusManager.instance.removeEarlyKeyEventHandler(_handleEarlyKeyEvent);
     WidgetsBinding.instance.removeObserver(this);
     _hideControlsTimer?.cancel();
@@ -428,24 +436,49 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   }
 
   /// 处理键盘快捷键事件
-  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleKeyEvent(
+      _focusNode,
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  KeyEventResult _handleKeyEvent(
+    FocusNode node,
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
     if (!mounted || ModalRoute.of(context)?.isCurrent != true) {
       return KeyEventResult.ignored;
+    }
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
+      return KeyEventResult.handled;
     }
 
     final key = event.logicalKey;
     final hasBlockingModifier =
-        HardwareKeyboard.instance.isControlPressed ||
-        HardwareKeyboard.instance.isAltPressed ||
-        HardwareKeyboard.instance.isMetaPressed;
+        hasBlockingModifierOverride ??
+        (HardwareKeyboard.instance.isControlPressed ||
+            HardwareKeyboard.instance.isAltPressed ||
+            HardwareKeyboard.instance.isMetaPressed);
+    final supportsSystemEscapeShortcut = !Platform.isAndroid;
+    final supportsWindowFullScreenShortcut =
+        Platform.isWindows || Platform.isMacOS || Platform.isLinux;
     final isSupportedKey =
         key == LogicalKeyboardKey.space ||
-        key == LogicalKeyboardKey.escape ||
+        (supportsSystemEscapeShortcut && key == LogicalKeyboardKey.escape) ||
         key == LogicalKeyboardKey.arrowLeft ||
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.arrowUp ||
         key == LogicalKeyboardKey.arrowDown ||
-        key == LogicalKeyboardKey.keyF ||
+        (supportsWindowFullScreenShortcut && key == LogicalKeyboardKey.keyF) ||
         key == LogicalKeyboardKey.keyM;
 
     if (!isSupportedKey) return KeyEventResult.ignored;
@@ -505,14 +538,20 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
     // 上箭头：增加音量
     if (key == LogicalKeyboardKey.arrowUp) {
-      final newVolume = (mediaService.volume + 0.1).clamp(0.0, 1.0);
+      final newVolume = PlayerVolumeKeyboard.applyShortPress(
+        mediaService.volume,
+        1,
+      );
       unawaited(mediaService.setVolume(newVolume));
       return KeyEventResult.handled;
     }
 
     // 下箭头：减少音量
     if (key == LogicalKeyboardKey.arrowDown) {
-      final newVolume = (mediaService.volume - 0.1).clamp(0.0, 1.0);
+      final newVolume = PlayerVolumeKeyboard.applyShortPress(
+        mediaService.volume,
+        -1,
+      );
       unawaited(mediaService.setVolume(newVolume));
       return KeyEventResult.handled;
     }

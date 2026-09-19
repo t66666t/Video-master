@@ -19,6 +19,10 @@ import 'package:video_player_app/services/playback_navigation_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/utils/android_hardware_input_bridge.dart';
+import 'package:video_player_app/utils/hardware_keyboard_shortcuts.dart';
+import 'package:video_player_app/utils/link_download_shortcuts.dart';
+import 'package:video_player_app/utils/page_shortcut_keys.dart';
 
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 import 'package:video_player_app/widgets/adaptive_settings_dialog.dart';
@@ -53,6 +57,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   final FocusNode _shortcutFocusNode = FocusNode(
     debugLabel: 'BilibiliDownloadShortcutFocus',
   );
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
   late final AnimationController _keepAwakeBannerController;
   late final Animation<double> _keepAwakeBannerFade;
   late final Animation<double> _keepAwakeBannerSize;
@@ -275,6 +281,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   @override
   void initState() {
     super.initState();
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
     _streamingMode = widget.initialStreamingMode;
     _keepAwakeBannerController = AnimationController(
       vsync: this,
@@ -307,7 +315,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
       cache.maximumSizeBytes = 20 * 1024 * 1024;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (Platform.isWindows && mounted) {
+      if (supportsNativeHardwareKeyboardShortcuts && mounted) {
         _shortcutFocusNode.requestFocus();
       }
     });
@@ -344,14 +352,135 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   }
 
   KeyEventResult _handleEscKeyEvent(KeyEvent event) {
-    if (!Platform.isWindows) return KeyEventResult.ignored;
-    if (event is KeyRepeatEvent) return KeyEventResult.handled;
-    if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.escape) {
-      Navigator.of(context).maybePop();
+    return _handleShortcutKeyEvent(event);
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_shortcutFocusNode.hasFocus) return false;
+    return _handleShortcutKeyEvent(event) != KeyEventResult.ignored;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleShortcutKeyEvent(
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  String _dlTooltip(String label, LinkDownloadShortcutAction action) {
+    return hoverAwareShortcutTooltip(
+      label,
+      LinkDownloadShortcuts.defaults[action]!,
+    );
+  }
+
+  Future<void> _pasteInput() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    if (data?.text == null) return;
+    String currentText = _inputController.text;
+    if (currentText.isNotEmpty && !currentText.endsWith('\n')) {
+      currentText += '\n';
+    }
+    _inputController.text = currentText + data!.text!;
+  }
+
+  KeyEventResult _handleShortcutKeyEvent(
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
+    if (!supportsNativeHardwareKeyboardShortcuts) {
+      return KeyEventResult.ignored;
+    }
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return KeyEventResult.ignored;
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+    final bool hasBlockingModifier =
+        hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
+    if (hasBlockingModifier) return KeyEventResult.ignored;
+    final LinkDownloadShortcutAction? action = LinkDownloadShortcuts.matchAction(
+      event.logicalKey,
+    );
+    final platform = currentNativeTargetPlatform;
+    if (action == null ||
+        platform == null ||
+        !LinkDownloadShortcuts.isAvailableOnPlatform(action, platform)) {
+      return KeyEventResult.ignored;
+    }
+    final bool allowWhileEditing =
+        action == LinkDownloadShortcutAction.parse ||
+        action == LinkDownloadShortcutAction.back;
+    if (isEditableTextFocused() && !allowWhileEditing) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.handled;
+
+    final service = Provider.of<BilibiliDownloadService>(
+      context,
+      listen: false,
+    );
+    switch (action) {
+      case LinkDownloadShortcutAction.back:
+        Navigator.of(context).maybePop();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.toggleMode:
+        service.clearSelection();
+        setState(() => _streamingMode = !_streamingMode);
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.parse:
+        unawaited(_parseVideo(service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.paste:
+        unawaited(_pasteInput());
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.clearInput:
+        _inputController.clear();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.openSettings:
+        unawaited(_showDownloadSettings(service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.login:
+        unawaited(_showCookieDialog(service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.selectAll:
+        service.selectAllForMode(_streamingMode);
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.primaryRun:
+        if (_streamingMode) {
+          unawaited(_exportStreaming(service));
+        } else {
+          service.startDownloadSelected();
+        }
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.pause:
+        if (!_streamingMode) service.pauseSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.importToLibrary:
+        if (!_streamingMode) unawaited(_importToLibrary(service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.exportToLibrary:
+        if (_streamingMode) {
+          unawaited(_exportStreaming(service));
+        } else {
+          unawaited(_importToLibrary(service));
+        }
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.remove:
+        service.removeSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.prioritize:
+      case LinkDownloadShortcutAction.cancel:
+      case LinkDownloadShortcutAction.retry:
+        return KeyEventResult.handled;
+    }
   }
 
   @override
@@ -368,6 +497,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     _keepAwakeBannerController.dispose();
     _taskListScrollController.dispose();
     _shortcutFocusNode.dispose();
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
     _inputController.dispose();
     super.dispose();
   }
@@ -2200,12 +2333,13 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     );
     return Focus(
       focusNode: _shortcutFocusNode,
-      autofocus: Platform.isWindows,
+      autofocus: supportsNativeHardwareKeyboardShortcuts,
       onKeyEvent: (node, event) => _handleEscKeyEvent(event),
       child: Listener(
         behavior: HitTestBehavior.translucent,
         onPointerDown: (_) {
-          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+          if (supportsNativeHardwareKeyboardShortcuts &&
+              !_shortcutFocusNode.hasFocus) {
             _shortcutFocusNode.requestFocus();
           }
         },
@@ -2277,11 +2411,17 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                       service.clearSelection();
                       setState(() => _streamingMode = !_streamingMode);
                     },
-                    child: Text(
-                      _streamingMode ? 'Bilibili 在线导入' : 'BiliBili视频下载',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
+                    child: Tooltip(
+                      message: _dlTooltip(
+                        '双击切换下载 / 在线导入',
+                        LinkDownloadShortcutAction.toggleMode,
+                      ),
+                      child: Text(
+                        _streamingMode ? 'Bilibili 在线导入' : 'BiliBili视频下载',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: isCompactAppBar ? 16 : 18),
+                      ),
                     ),
                   ),
                   backgroundColor: const Color(0xFF1E1E1E),
@@ -2320,7 +2460,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     ),
                     IconButton(
                       icon: Icon(Icons.settings, size: appBarIconSize),
-                      tooltip: _streamingMode ? "解析设置" : "下载设置",
+                      tooltip: _dlTooltip(
+                        _streamingMode ? "解析设置" : "下载设置",
+                        LinkDownloadShortcutAction.openSettings,
+                      ),
                       padding: appBarIconPadding,
                       constraints: appBarIconConstraints,
                       onPressed: () => _showDownloadSettings(service),
@@ -2328,7 +2471,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                     IconButton(
                       icon: Icon(Icons.person, size: appBarIconSize),
                       onPressed: () => _showCookieDialog(service),
-                      tooltip: "登录/Cookie",
+                      tooltip: _dlTooltip(
+                        "登录/Cookie",
+                        LinkDownloadShortcutAction.login,
+                      ),
                       padding: appBarIconPadding,
                       constraints: appBarIconConstraints,
                     ),
@@ -2374,26 +2520,16 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                   color: Colors.white70,
                                   size: actionIconSize,
                                 ),
-                                tooltip: "粘贴",
+                                tooltip: _dlTooltip(
+                                  "粘贴",
+                                  LinkDownloadShortcutAction.paste,
+                                ),
                                 padding: EdgeInsets.all(iconButtonPadding),
                                 constraints: BoxConstraints.tightFor(
                                   width: actionButtonExtent,
                                   height: actionButtonExtent,
                                 ),
-                                onPressed: () async {
-                                  final data = await Clipboard.getData(
-                                    Clipboard.kTextPlain,
-                                  );
-                                  if (data?.text != null) {
-                                    String currentText = _inputController.text;
-                                    if (currentText.isNotEmpty &&
-                                        !currentText.endsWith('\n')) {
-                                      currentText += '\n';
-                                    }
-                                    _inputController.text =
-                                        currentText + data!.text!;
-                                  }
-                                },
+                                onPressed: () => unawaited(_pasteInput()),
                               ),
                               SizedBox(width: actionGap),
                               IconButton(
@@ -2402,7 +2538,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                   color: Colors.white70,
                                   size: actionIconSize,
                                 ),
-                                tooltip: "清空",
+                                tooltip: _dlTooltip(
+                                  "清空",
+                                  LinkDownloadShortcutAction.clearInput,
+                                ),
                                 padding: EdgeInsets.all(iconButtonPadding),
                                 constraints: BoxConstraints.tightFor(
                                   width: actionButtonExtent,
@@ -2475,7 +2614,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
                                               color: Colors.white,
                                             ),
                                           )
-                                        : const Text("解析"),
+                                        : Text(
+                                            _dlTooltip(
+                                              "解析",
+                                              LinkDownloadShortcutAction.parse,
+                                            ),
+                                          ),
                                   );
                                 },
                               ),
@@ -4023,32 +4167,39 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
           children: [
             _buildSelectionAction(
               Icons.select_all,
-              "全选",
+              _dlTooltip("全选", LinkDownloadShortcutAction.selectAll),
               () => service.selectAllForMode(_streamingMode),
               selection,
             ),
             if (_streamingMode)
               _buildBottomAction(
                 Icons.file_upload_outlined,
-                "导出到媒体库",
+                _dlTooltip(
+                  "导出到媒体库",
+                  LinkDownloadShortcutAction.exportToLibrary,
+                ),
                 () => _exportStreaming(service),
               )
             else ...[
               _buildBottomAction(
                 Icons.download,
-                "下载并合并",
+                _dlTooltip("下载并合并", LinkDownloadShortcutAction.primaryRun),
                 service.startDownloadSelected,
               ),
-              _buildBottomAction(Icons.pause, "暂停下载", service.pauseSelected),
+              _buildBottomAction(
+                Icons.pause,
+                _dlTooltip("暂停下载", LinkDownloadShortcutAction.pause),
+                service.pauseSelected,
+              ),
               _buildBottomAction(
                 Icons.file_upload,
-                "导入到媒体库",
+                _dlTooltip("导入到媒体库", LinkDownloadShortcutAction.importToLibrary),
                 () => _importToLibrary(service),
               ),
             ],
             _buildBottomAction(
               Icons.delete,
-              "移除",
+              _dlTooltip("移除", LinkDownloadShortcutAction.remove),
               service.removeSelected,
               isDestructive: true,
             ),

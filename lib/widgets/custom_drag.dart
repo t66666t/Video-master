@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 /// 桌面端拖拽启动阈值（逻辑像素）。
@@ -72,9 +73,12 @@ class DropZone<T extends Object> extends StatelessWidget {
 ///
 /// 其余行为：
 ///  - 平台拖拽的反馈置为透明、拖拽中保持原样，避免点击时出现拖拽残影；
-///  - 拖拽视觉反馈由本组件用 [feedback] 自行绘制；
+///  - 拖拽视觉反馈由本组件用 [feedback] 自行绘制，且仅在真正开始移动后出现，
+///    避免「长按选中」时闪出拖拽残影；
 ///  - 位移未达阈值但发生过轻微移动（0 < 位移 < [threshold]）时，平台手势
-///    已把本次操作判定为非点击，通过 [onTap] 把「点击」语义补回来。
+///    已把本次操作判定为非点击，通过 [onTap] 把「点击」语义补回来；
+///  - 本次按住已经 armed 后，抬起时会在手势竞技场里抢占胜利，避免卡片内部
+///    [InkWell] 把同一次松手再当成点击（否则会把刚选中的卡片立刻取消）。
 class GatedDraggable<T extends Object> extends StatefulWidget {
   const GatedDraggable({
     super.key,
@@ -106,70 +110,109 @@ class GatedDraggable<T extends Object> extends StatefulWidget {
 
 class _GatedDraggableState<T extends Object> extends State<GatedDraggable<T>> {
   Offset? _downPosition;
+  int? _activePointer;
   bool _armed = false;
   Offset _feedbackPosition = Offset.zero;
   OverlayEntry? _feedbackEntry;
   Timer? _longPressTimer;
+  _ArmedTapSuppressor? _tapSuppressor;
 
   @override
   void dispose() {
     _longPressTimer?.cancel();
+    _disposeTapSuppressor();
     _removeFeedback();
     super.dispose();
   }
 
   void _onPointerDown(PointerDownEvent event) {
+    // 右键/中键不参与拖拽门控：否则轻微位移会被补偿成左键点击。
+    if (event.buttons != kPrimaryButton) {
+      return;
+    }
+    _longPressTimer?.cancel();
+    _disposeTapSuppressor();
+    _activePointer = event.pointer;
     _downPosition = event.position;
     _armed = false;
-    _longPressTimer?.cancel();
+
+    // 从 pointer-down 就加入竞技场，才能在抬起时抢在 sweep 之前吞掉 InkWell 点击。
+    // 不能在长按到期时就 accept：那会把原生 Draggable 挤掉，后续拖去排序/移入文件夹会失效。
+    _tapSuppressor = _ArmedTapSuppressor();
+    _tapSuppressor!.addPointer(event);
+
     // 长按选中：按住不动超过 longPressDuration 也进入选择模式。
     _longPressTimer = Timer(widget.longPressDuration, () {
       if (!_armed && _downPosition != null && mounted) {
-        _arm(event.position);
+        _arm(event.position, showFeedback: false);
       }
     });
   }
 
   void _onPointerMove(PointerMoveEvent event) {
+    if (event.pointer != _activePointer) return;
     final down = _downPosition;
     if (down == null) return;
     if (!_armed) {
       final distance = (event.position - down).distance;
       if (distance < widget.threshold) return;
       _longPressTimer?.cancel();
-      _arm(event.position);
+      _arm(event.position, showFeedback: true);
+    } else if (_feedbackEntry == null) {
+      // 先长按选中、再开始移动：这时才出现拖拽残影。
+      _showFeedback(event.position);
     } else {
       _updateFeedback(event.position);
     }
   }
 
-  void _arm(Offset position) {
+  void _arm(Offset position, {required bool showFeedback}) {
+    if (_armed) return;
     _armed = true;
     widget.onDragStarted();
-    _showFeedback(position);
+    if (showFeedback) {
+      _showFeedback(position);
+    }
     if (mounted) setState(() {});
   }
 
   void _onPointerUp(PointerUpEvent event) {
+    if (event.pointer != _activePointer) return;
     _longPressTimer?.cancel();
     final down = _downPosition;
-    if (down != null && !_armed) {
+    final armed = _armed;
+    if (armed) {
+      // Listener.onPointerUp 早于 GestureBinding 的 arena sweep。
+      // 此时 accept 会立刻 reject 掉 InkWell 的 TapGestureRecognizer。
+      _tapSuppressor?.stealTap();
+    }
+    if (down != null && !armed) {
       final distance = (event.position - down).distance;
       if (distance > 0 && distance < widget.threshold) {
         // 轻微移动但未达拖拽阈值：平台已取消 InkWell 点击，这里补一次点击。
         widget.onTap?.call();
       }
     }
+    _disposeTapSuppressor();
     _removeFeedback();
     _downPosition = null;
+    _activePointer = null;
     _armed = false;
   }
 
   void _onPointerCancel(PointerCancelEvent event) {
+    if (event.pointer != _activePointer) return;
     _longPressTimer?.cancel();
+    _disposeTapSuppressor();
     _removeFeedback();
     _downPosition = null;
+    _activePointer = null;
     _armed = false;
+  }
+
+  void _disposeTapSuppressor() {
+    _tapSuppressor?.dispose();
+    _tapSuppressor = null;
   }
 
   void _showFeedback(Offset position) {
@@ -217,4 +260,31 @@ class _GatedDraggableState<T extends Object> extends State<GatedDraggable<T>> {
       ),
     );
   }
+}
+
+/// 只在「本次按住已经 armed」的抬起瞬间抢占竞技场，用来吞掉子级点击。
+///
+/// 不在长按到期或位移过阈值时 accept，以免原生 [Draggable] 被挤出竞技场。
+class _ArmedTapSuppressor extends OneSequenceGestureRecognizer {
+  void stealTap() {
+    resolve(GestureDisposition.accepted);
+  }
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    startTrackingPointer(event.pointer, event.transform);
+  }
+
+  @override
+  void handleEvent(PointerEvent event) {
+    if (event is PointerUpEvent || event is PointerCancelEvent) {
+      stopTrackingPointer(event.pointer);
+    }
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {}
+
+  @override
+  String get debugDescription => 'gated-drag tap suppressor';
 }

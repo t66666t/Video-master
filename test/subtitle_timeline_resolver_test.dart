@@ -107,5 +107,50 @@ void main() {
         1,
       ]);
     });
+
+    test('duplicate same-end cues stay highlighted together across a gap', () {
+      final resolver = SubtitleTimelineResolver(<SubtitleItem>[
+        _subtitle(1, 0, 5000, 'hello'),
+        _subtitle(2, 0, 5000, '你好'),
+        _subtitle(3, 8000, 9000, 'next'),
+      ]);
+
+      expect(resolver.activeIndicesAtMs(2500, extendToNextStart: true), <int>[
+        0,
+        1,
+      ]);
+      expect(resolver.activeIndicesAtMs(6500, extendToNextStart: true), <int>[
+        0,
+        1,
+      ]);
+      expect(resolver.activeIndicesAtMs(8000, extendToNextStart: true), <int>[
+        2,
+      ]);
+    });
+
+    test(
+      'partial overlap keeps the later-ending cue across the following gap',
+      () {
+        final resolver = SubtitleTimelineResolver(<SubtitleItem>[
+          _subtitle(1, 0, 5000, 'first'),
+          _subtitle(2, 4000, 8000, 'second'),
+          _subtitle(3, 10000, 11000, 'third'),
+        ]);
+
+        expect(resolver.activeIndicesAtMs(4500, extendToNextStart: true), <int>[
+          0,
+          1,
+        ]);
+        expect(resolver.activeIndicesAtMs(6000, extendToNextStart: true), <int>[
+          1,
+        ]);
+        expect(resolver.activeIndicesAtMs(9000, extendToNextStart: true), <int>[
+          1,
+        ]);
+        expect(resolver.activeIndicesAtMs(10000, extendToNextStart: true), <int>[
+          2,
+        ]);
+      },
+    );
   });
 }

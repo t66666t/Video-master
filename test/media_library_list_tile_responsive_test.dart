@@ -5,6 +5,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/widgets/media_list_layout_metrics.dart';
+import 'package:video_player_app/widgets/media_library_layout_profile.dart';
 import 'package:video_player_app/widgets/media_library_list_tile.dart';
 
 void main() {
@@ -335,6 +336,12 @@ void main() {
     expect(geometry.indexAt(const Offset(20, 50), 4), isNull);
     expect(geometry.indexAt(const Offset(20, 60), 4), 2);
     expect(geometry.rectForIndex(3), const Rect.fromLTWH(126, 54, 100, 40));
+    expect(geometry.indexForDragSelection(const Offset(120, 10), 4), 0);
+    expect(geometry.indexForDragSelection(const Offset(20, 50), 4), 0);
+    expect(
+      geometry.indicesOverlapping(const Rect.fromLTWH(16, 6, 210, 40), 4),
+      [0, 1],
+    );
   });
 
   test('56 高视觉母版保持紧凑且协调的文字层级和留白', () {
@@ -352,5 +359,62 @@ void main() {
     expect(metrics.horizontalPadding, closeTo(7.89, 0.01));
     expect(metrics.verticalPadding, closeTo(4.51, 0.01));
     expect(metrics.radius, closeTo(10.15, 0.01));
+  });
+
+  test('平板默认横屏 10 列、竖屏 6 列，间距随卡片宽度等比例变化', () {
+    const portrait = Size(800, 1280);
+    const landscape = Size(1280, 800);
+
+    expect(
+      MediaLibraryLayoutDefaults.defaultCardCrossAxisCount(landscape),
+      10,
+    );
+    expect(
+      MediaLibraryLayoutDefaults.defaultCardCrossAxisCount(portrait),
+      6,
+    );
+
+    const style = MediaCardStyleSettings(
+      crossAxisCount: 10,
+      titleScale: 0.104,
+      heightScale: 1.39,
+      crossSpacingScale: 0.12,
+      mainSpacingScale: 0.12,
+    );
+    final landscapeGrid = MediaLibraryLayoutDefaults.cardGrid(
+      screenSize: landscape,
+      style: style,
+    );
+    final portraitGrid = MediaLibraryLayoutDefaults.cardGrid(
+      screenSize: portrait,
+      style: MediaCardStyleSettings(
+        crossAxisCount: 6,
+        titleScale: style.titleScale,
+        heightScale: style.heightScale,
+        crossSpacingScale: style.crossSpacingScale,
+        mainSpacingScale: style.mainSpacingScale,
+      ),
+    );
+
+    expect(
+      landscapeGrid.crossSpacing / landscapeGrid.cellWidth,
+      closeTo(0.12, 1e-9),
+    );
+    expect(
+      portraitGrid.crossSpacing / portraitGrid.cellWidth,
+      closeTo(0.12, 1e-9),
+    );
+    expect(landscapeGrid.cellWidth, closeTo(portraitGrid.cellWidth, 8));
+  });
+
+  test('卡片内边距随宽度等比例缩小', () {
+    final wide = MediaListLayoutMetrics.cardGridContentPadding(170);
+    final narrow = MediaListLayoutMetrics.cardGridContentPadding(60);
+    expect(wide.horizontal, closeTo(20, 0.2));
+    expect(narrow.horizontal, lessThan(wide.horizontal));
+    expect(
+      MediaListLayoutMetrics.cardGridThumbnailIconSize(34),
+      lessThan(50),
+    );
   });
 }

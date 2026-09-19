@@ -133,6 +133,50 @@ void main() {
     await tester.pumpAndSettle();
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('1.0x 倍速文案与 1.25x 占用相同宽度', (tester) async {
+    const style = TextStyle(fontSize: 14, fontWeight: FontWeight.bold);
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Row(
+            children: [
+              PlaybackSpeedText(
+                key: ValueKey('speed-label-1.0'),
+                speed: 1.0,
+                style: style,
+              ),
+              PlaybackSpeedText(
+                key: ValueKey('speed-label-1.25'),
+                speed: 1.25,
+                style: style,
+              ),
+              PlaybackSpeedText(
+                key: ValueKey('speed-label-2.0'),
+                speed: 2.0,
+                style: style,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    final width10 = tester
+        .getSize(find.byKey(const ValueKey('speed-label-1.0')))
+        .width;
+    final width125 = tester
+        .getSize(find.byKey(const ValueKey('speed-label-1.25')))
+        .width;
+    final width20 = tester
+        .getSize(find.byKey(const ValueKey('speed-label-2.0')))
+        .width;
+
+    expect(find.text('1.0x'), findsOneWidget);
+    expect(find.text('1.25x'), findsWidgets);
+    expect(width10, closeTo(width125, 0.001));
+    expect(width20, closeTo(width125, 0.001));
+  });
 }
 
 Checkbox _checkboxForSpeed(WidgetTester tester, double speed) {

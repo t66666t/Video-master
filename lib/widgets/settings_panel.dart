@@ -360,7 +360,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                             ),
                           ),
                           subtitle: const Text(
-                            "开启后尽量与其他应用混音并行播放，关闭后优先独占音频",
+                            "开启后与其他应用同时出声、互不打断；关闭后本应用独占音频，其他应用开播时自动暂停",
                             style: TextStyle(
                               color: Colors.white30,
                               fontSize: 10,
@@ -488,21 +488,8 @@ class _SettingsPanelState extends State<SettingsPanel> {
                     }),
                   ],
                 ),
-                SwitchListTile(
-                  title: const Text(
-                    "显示倍速提示",
-                    style: TextStyle(color: Colors.white70, fontSize: 13),
-                  ),
-                  subtitle: const Text(
-                    "长按快进时显示当前倍速",
-                    style: TextStyle(color: Colors.white30, fontSize: 10),
-                  ),
-                  value: widget.showLongPressSpeedIndicator,
-                  onChanged: widget.onShowLongPressSpeedIndicatorChanged,
-                  activeThumbColor: Colors.blueAccent,
-                  dense: true,
+                _buildShowLongPressSpeedIndicatorTile(
                   contentPadding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.compact,
                 ),
 
                 SizedBox(height: spacingValue),
@@ -741,6 +728,27 @@ class _SettingsPanelState extends State<SettingsPanel> {
     );
   }
 
+  Widget _buildShowLongPressSpeedIndicatorTile({
+    required EdgeInsetsGeometry contentPadding,
+  }) {
+    return SwitchListTile(
+      title: const Text(
+        "显示加速浮层",
+        style: TextStyle(color: Colors.white70, fontSize: 13),
+      ),
+      subtitle: const Text(
+        "长按画面或按住右方向键加速时，在画面上显示当前倍速",
+        style: TextStyle(color: Colors.white30, fontSize: 10),
+      ),
+      value: widget.showLongPressSpeedIndicator,
+      onChanged: widget.onShowLongPressSpeedIndicatorChanged,
+      activeThumbColor: Colors.blueAccent,
+      dense: true,
+      contentPadding: contentPadding,
+      visualDensity: VisualDensity.compact,
+    );
+  }
+
   Widget _buildPlaybackBehaviorSection() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -886,6 +894,9 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 dense: true,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                 visualDensity: VisualDensity.compact,
+              ),
+              _buildShowLongPressSpeedIndicatorTile(
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
               ),
               if (widget.showMobilePlaybackControls)
                 SwitchListTile(

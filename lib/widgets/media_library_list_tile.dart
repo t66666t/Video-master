@@ -7,6 +7,7 @@ import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import '../services/media_playback_service.dart';
 import 'cached_thumbnail_widget.dart';
+import 'folder_placeholder_cover.dart';
 import 'media_list_layout_metrics.dart';
 import 'media_library_locate_button.dart';
 
@@ -22,6 +23,7 @@ class MediaLibraryListTile extends StatelessWidget {
     required this.isSelectionMode,
     required this.onTap,
     required this.titleScale,
+    this.onSecondaryTap,
     this.onSelectionTap,
     this.onSelectionPanStart,
     this.onSelectionPanUpdate,
@@ -43,6 +45,7 @@ class MediaLibraryListTile extends StatelessWidget {
     required this.isSelectionMode,
     required this.onTap,
     required this.titleScale,
+    this.onSecondaryTap,
     this.onSelectionTap,
     this.onSelectionPanStart,
     this.onSelectionPanUpdate,
@@ -62,6 +65,9 @@ class MediaLibraryListTile extends StatelessWidget {
   final bool isSelected;
   final bool isSelectionMode;
   final VoidCallback onTap;
+
+  /// 键鼠右击：进入选择并选中/取消该项，不走左键打开或播放。
+  final VoidCallback? onSecondaryTap;
   final double titleScale;
   final GestureTapCallback? onSelectionTap;
   final GestureDragStartCallback? onSelectionPanStart;
@@ -191,6 +197,7 @@ class MediaLibraryListTile extends StatelessWidget {
           clipBehavior: Clip.antiAlias,
           child: InkWell(
             onTap: onTap,
+            onSecondaryTap: onSecondaryTap,
             hoverColor: Colors.white.withValues(alpha: 0.045),
             splashColor: accent.withValues(alpha: 0.12),
             child: Stack(
@@ -319,16 +326,33 @@ class MediaLibraryListTile extends StatelessWidget {
     double progressThickness, {
     String? indexLabel,
   }) {
-    final placeholderIcon = _isCollection
+    final collection = _collection;
+    final video = _video;
+    final placeholderIcon = collection != null
         ? Icons.folder_rounded
-        : _video!.type == MediaType.audio
+        : video!.type == MediaType.audio
         ? Icons.music_note_rounded
         : Icons.movie_rounded;
-    final placeholderColor = _isCollection ? Colors.blueAccent : Colors.white30;
-    final path = _isCollection
-        ? _collection!.thumbnailPath
-        : _video!.thumbnailPath;
-    final id = _isCollection ? _collection!.id : _video!.id;
+    final placeholderColor = collection != null
+        ? Colors.blueAccent
+        : Colors.white30;
+    final path = collection != null
+        ? collection.thumbnailPath
+        : video!.thumbnailPath;
+    final id = collection != null ? collection.id : video!.id;
+    final folderPlaceholder = collection != null
+        ? FolderPlaceholderCover(
+            folderId: collection.id,
+            folderName: collection.name,
+            coverLabel: collection.coverLabel,
+          )
+        : null;
+    final mediaPlaceholder = Icon(
+      placeholderIcon,
+      color: placeholderColor,
+      size: extent * 0.42,
+    );
+    final fallback = folderPlaceholder ?? mediaPlaceholder;
 
     return Stack(
       fit: StackFit.expand,
@@ -340,22 +364,10 @@ class MediaLibraryListTile extends StatelessWidget {
                   videoId: id,
                   thumbnailPath: path,
                   fit: BoxFit.cover,
-                  placeholder: Icon(
-                    placeholderIcon,
-                    color: placeholderColor,
-                    size: extent * 0.42,
-                  ),
-                  errorWidget: Icon(
-                    placeholderIcon,
-                    color: placeholderColor,
-                    size: extent * 0.42,
-                  ),
+                  placeholder: fallback,
+                  errorWidget: fallback,
                 )
-              : Icon(
-                  placeholderIcon,
-                  color: placeholderColor,
-                  size: extent * 0.42,
-                ),
+              : fallback,
         ),
         if (_video != null) _buildThumbnailProgress(context, progressThickness),
         if (indexLabel != null)

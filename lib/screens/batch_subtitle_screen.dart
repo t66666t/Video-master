@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
@@ -14,7 +15,11 @@ import '../services/transcription_manager.dart';
 import '../services/settings_service.dart';
 import '../services/library_service.dart';
 import '../utils/app_toast.dart';
+import '../utils/android_hardware_input_bridge.dart';
+import '../utils/batch_tool_shortcuts.dart';
+import '../utils/hardware_keyboard_shortcuts.dart';
 import '../utils/media_folder_scanner.dart';
+import '../utils/page_shortcut_keys.dart';
 import '../widgets/internal_video_picker_dialog.dart';
 import '../widgets/task_queue_table.dart';
 
@@ -29,11 +34,111 @@ class BatchSubtitleScreen extends StatefulWidget {
 
 class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
   AppToastHandle? _importToast;
+  final FocusNode _shortcutFocusNode = FocusNode();
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
+
+  @override
+  void initState() {
+    super.initState();
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (supportsNativeHardwareKeyboardShortcuts && mounted) {
+        _shortcutFocusNode.requestFocus();
+      }
+    });
+  }
 
   @override
   void dispose() {
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
+    _shortcutFocusNode.dispose();
     unawaited(_importToast?.dismiss(immediate: true));
     super.dispose();
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_shortcutFocusNode.hasFocus) return false;
+    return _handleShortcutKeyEvent(event) != KeyEventResult.ignored;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleShortcutKeyEvent(
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  String _bsTooltip(String label, BatchSubtitleShortcutAction action) {
+    return hoverAwareShortcutTooltip(
+      label,
+      BatchSubtitleShortcuts.defaults[action]!,
+    );
+  }
+
+  KeyEventResult _handleShortcutKeyEvent(
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
+    if (!supportsNativeHardwareKeyboardShortcuts) {
+      return KeyEventResult.ignored;
+    }
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return KeyEventResult.ignored;
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
+      return KeyEventResult.handled;
+    }
+    if (isEditableTextFocused()) return KeyEventResult.ignored;
+    final bool hasBlockingModifier =
+        hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
+    if (hasBlockingModifier) return KeyEventResult.ignored;
+    final BatchSubtitleShortcutAction? action =
+        BatchSubtitleShortcuts.matchAction(event.logicalKey);
+    final platform = currentNativeTargetPlatform;
+    if (action == null ||
+        platform == null ||
+        !BatchSubtitleShortcuts.isAvailableOnPlatform(action, platform)) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.handled;
+    final manager = context.read<TranscriptionManager>();
+    final settings = context.read<SettingsService>();
+    switch (action) {
+      case BatchSubtitleShortcutAction.back:
+        Navigator.of(context).maybePop();
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.addVideos:
+        _showInternalVideoPicker(context);
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.pickExternal:
+        unawaited(_pickExternalFiles(context));
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.toggleAll:
+        _toggleBatch(manager);
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.toggleAutoRemove:
+        settings.updateBatchSubtitleAutoDelete(
+          !settings.batchSubtitleAutoDelete,
+        );
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.openSettings:
+        _showBatchSettingsSheet(context);
+        return KeyEventResult.handled;
+      case BatchSubtitleShortcutAction.clearCompleted:
+        _clearCompleted(manager);
+        return KeyEventResult.handled;
+    }
   }
 
   void _showImportNotice(
@@ -62,7 +167,11 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
     // capturedThemes 一并继承）统一使用思源黑体。
     return Theme(
       data: _sourceHanSansTheme(context),
-      child: Scaffold(
+      child: Focus(
+        focusNode: _shortcutFocusNode,
+        autofocus: supportsNativeHardwareKeyboardShortcuts,
+        onKeyEvent: (node, event) => _handleShortcutKeyEvent(event),
+        child: Scaffold(
         appBar: AppBar(
           title: const Text('批量字幕生成'),
           centerTitle: metrics.isCompact,
@@ -115,6 +224,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             },
           ),
         ),
+      ),
       ),
     );
   }
@@ -176,7 +286,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             Expanded(
               child: _buildCompactAction(
                 context: context,
-                label: '添加视频',
+                label: _bsTooltip(
+                  '添加视频',
+                  BatchSubtitleShortcutAction.addVideos,
+                ),
                 icon: Icons.add_rounded,
                 color: Theme.of(context).colorScheme.primary,
                 onPressed: () => _showInternalVideoPicker(context),
@@ -186,7 +299,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             Expanded(
               child: _buildCompactAction(
                 context: context,
-                label: manager.canPauseAll ? '暂停全部' : '开始全部',
+                label: _bsTooltip(
+                  manager.canPauseAll ? '暂停全部' : '开始全部',
+                  BatchSubtitleShortcutAction.toggleAll,
+                ),
                 icon: manager.canPauseAll
                     ? Icons.pause_rounded
                     : Icons.play_arrow_rounded,
@@ -205,7 +321,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             Expanded(
               child: _buildCompactAction(
                 context: context,
-                label: settings.batchSubtitleAutoDelete ? '完成后自动移除' : '保留已完成任务',
+                label: _bsTooltip(
+                  settings.batchSubtitleAutoDelete ? '完成后自动移除' : '保留已完成任务',
+                  BatchSubtitleShortcutAction.toggleAutoRemove,
+                ),
                 icon: settings.batchSubtitleAutoDelete
                     ? Icons.auto_delete
                     : Icons.inventory_2_outlined,
@@ -250,23 +369,35 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
       },
       itemBuilder: (context) => [
         if (Platform.isWindows)
-          const PopupMenuItem(
+          PopupMenuItem(
             value: _BatchOverflowAction.pickExternal,
             child: _PopupMenuLabel(
               icon: Icons.folder_open_outlined,
-              label: '选择外部文件',
+              label: _bsTooltip(
+                '选择外部文件',
+                BatchSubtitleShortcutAction.pickExternal,
+              ),
             ),
           ),
         if (metrics.isDesktopPlatform)
-          const PopupMenuItem(
+          PopupMenuItem(
             value: _BatchOverflowAction.settings,
-            child: _PopupMenuLabel(icon: Icons.tune_rounded, label: '外部视频设置'),
+            child: _PopupMenuLabel(
+              icon: Icons.tune_rounded,
+              label: _bsTooltip(
+                '外部视频设置',
+                BatchSubtitleShortcutAction.openSettings,
+              ),
+            ),
           ),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: _BatchOverflowAction.clearCompleted,
           child: _PopupMenuLabel(
             icon: Icons.cleaning_services_outlined,
-            label: '清除已完成',
+            label: _bsTooltip(
+              '清除已完成',
+              BatchSubtitleShortcutAction.clearCompleted,
+            ),
           ),
         ),
         PopupMenuItem(
@@ -322,7 +453,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
           children: [
             _buildActionButton(
               context: context,
-              label: '选择内部视频',
+              label: _bsTooltip(
+                '选择内部视频',
+                BatchSubtitleShortcutAction.addVideos,
+              ),
               icon: Icons.video_library_outlined,
               height: metrics.buttonHeight,
               fontSize: metrics.fontSize,
@@ -331,7 +465,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             if (Platform.isWindows)
               _buildActionButton(
                 context: context,
-                label: '选择外部文件',
+                label: _bsTooltip(
+                  '选择外部文件',
+                  BatchSubtitleShortcutAction.pickExternal,
+                ),
                 icon: Icons.folder_open_outlined,
                 height: metrics.buttonHeight,
                 fontSize: metrics.fontSize,
@@ -339,7 +476,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
               ),
             _buildActionButton(
               context: context,
-              label: manager.canPauseAll ? '暂停全部任务' : '开始全部任务',
+              label: _bsTooltip(
+                manager.canPauseAll ? '暂停全部任务' : '开始全部任务',
+                BatchSubtitleShortcutAction.toggleAll,
+              ),
               icon: manager.canPauseAll
                   ? Icons.pause_rounded
                   : Icons.play_arrow_rounded,
@@ -377,18 +517,24 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         final useSingleRow =
             constraints.maxWidth >= 1440 && metrics.isDesktopPlatform;
         final actions = <Widget>[
-          _buildActionButton(
-            context: context,
-            label: '选择内部视频',
-            icon: Icons.video_library_outlined,
-            height: metrics.buttonHeight,
-            fontSize: metrics.fontSize,
-            onPressed: () => _showInternalVideoPicker(context),
-          ),
-          if (Platform.isWindows)
             _buildActionButton(
               context: context,
-              label: '选择外部文件',
+              label: _bsTooltip(
+                '选择内部视频',
+                BatchSubtitleShortcutAction.addVideos,
+              ),
+              icon: Icons.video_library_outlined,
+              height: metrics.buttonHeight,
+              fontSize: metrics.fontSize,
+              onPressed: () => _showInternalVideoPicker(context),
+            ),
+            if (Platform.isWindows)
+              _buildActionButton(
+                context: context,
+                label: _bsTooltip(
+                  '选择外部文件',
+                  BatchSubtitleShortcutAction.pickExternal,
+                ),
               icon: Icons.folder_open_outlined,
               height: metrics.buttonHeight,
               fontSize: metrics.fontSize,
@@ -396,7 +542,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             ),
           _buildActionButton(
             context: context,
-            label: manager.canPauseAll ? '全部暂停' : '全部开始',
+            label: _bsTooltip(
+              manager.canPauseAll ? '全部暂停' : '全部开始',
+              BatchSubtitleShortcutAction.toggleAll,
+            ),
             icon: manager.canPauseAll
                 ? Icons.pause_rounded
                 : Icons.play_arrow_rounded,
@@ -804,7 +953,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         subtitle: enabled ? '已开启' : '已关闭',
         accent: accent,
         active: enabled,
-        tooltip: enabled ? '点击关闭完成后自动移除' : '点击开启完成后自动移除',
+        tooltip: _bsTooltip(
+          enabled ? '点击关闭完成后自动移除' : '点击开启完成后自动移除',
+          BatchSubtitleShortcutAction.toggleAutoRemove,
+        ),
         trailing: Icon(
           enabled ? Icons.check_circle_rounded : Icons.circle_outlined,
           size: 15,
@@ -836,7 +988,10 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         : '视频同目录';
 
     return PopupMenuButton<SubtitleOutputPathStrategy>(
-      tooltip: '选择外部视频字幕输出位置',
+      tooltip: _bsTooltip(
+        '选择外部视频字幕输出位置',
+        BatchSubtitleShortcutAction.openSettings,
+      ),
       position: PopupMenuPosition.under,
       onSelected: (value) => _changeOutputStrategy(settings, value),
       itemBuilder: (context) => [
@@ -960,9 +1115,15 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         }
       },
       itemBuilder: (context) => [
-        const PopupMenuItem(
+        PopupMenuItem(
           value: _BatchOverflowAction.clearCompleted,
-          child: _PopupMenuLabel(icon: Icons.task_alt_rounded, label: '清除已完成'),
+          child: _PopupMenuLabel(
+            icon: Icons.task_alt_rounded,
+            label: _bsTooltip(
+              '清除已完成',
+              BatchSubtitleShortcutAction.clearCompleted,
+            ),
+          ),
         ),
         PopupMenuItem(
           value: _BatchOverflowAction.clearAll,

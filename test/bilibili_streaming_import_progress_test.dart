@@ -51,6 +51,10 @@ void main() {
 
       expect(service.isStreamingImporting(episode), isTrue);
       expect(episode.downloadSpeed, '正在准备视频信息...');
+      expect(library.importProgress.value, inInclusiveRange(0.02, 0.99));
+      expect(library.isImporting.value, isFalse);
+      expect(service.tasks, contains(task));
+      expect(service.tasks.single.isStreamingImport, isTrue);
 
       final duplicateCount = await service.importParsedStreamingTaskToLibrary(
         library,
@@ -72,6 +76,20 @@ void main() {
       expect(service.isStreamingImporting(episode), isFalse);
       expect(episode.status, DownloadStatus.completed);
       expect(episode.downloadSpeed, '已导出在线播放条目');
+      expect(library.importProgress.value, 0.0);
+      expect(library.importStatus.value, isEmpty);
+      expect(identical(service.tasks.single, task), isTrue);
+
+      // Same BV is still a new parse-page row; only the identical task object
+      // was skipped above.
+      final secondTask = _streamingTask(cid: 303);
+      expect(
+        await service.importParsedStreamingTaskToLibrary(library, secondTask),
+        1,
+      );
+      expect(service.tasks.length, 2);
+      expect(identical(service.tasks.first, secondTask), isTrue);
+      expect(identical(service.tasks.last, task), isTrue);
 
       final failingApi = _ControlledMetadataApi();
       final failingService = BilibiliDownloadService(apiService: failingApi);
@@ -83,6 +101,7 @@ void main() {
         failingTask,
       );
       await failingApi.requestStarted.future;
+      expect(library.importProgress.value, inInclusiveRange(0.02, 0.99));
       failingApi.metadata.completeError(StateError('metadata failed'));
 
       expect(await failingImport, 0);
@@ -90,6 +109,8 @@ void main() {
       expect(failingEpisode.status, DownloadStatus.failed);
       expect(failingEpisode.downloadSpeed, isNull);
       expect(failingEpisode.error, contains('metadata failed'));
+      expect(library.importProgress.value, 0.0);
+      expect(library.importStatus.value, isEmpty);
     },
   );
 }

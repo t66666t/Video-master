@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
@@ -100,4 +102,15 @@ void main() {
       });
     },
   );
+
+  test('Mini and library entry use page-entry auto-play without pausing a live clock', () {
+    final navigation = File(
+      'lib/services/playback_navigation_service.dart',
+    ).readAsStringSync();
+    expect(navigation, contains('resolvePlaybackPageEntryAutoPlay('));
+    expect(
+      navigation,
+      isNot(contains('autoPlay: SettingsService().autoPlayOnPageEntry')),
+    );
+  });
 }

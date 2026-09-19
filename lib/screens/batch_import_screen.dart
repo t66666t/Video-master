@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -18,6 +19,10 @@ import 'package:linked_scroll_controller/linked_scroll_controller.dart';
 import '../models/video_item.dart';
 import '../models/video_item.dart' as vi;
 import '../utils/app_toast.dart';
+import '../utils/android_hardware_input_bridge.dart';
+import '../utils/batch_tool_shortcuts.dart';
+import '../utils/hardware_keyboard_shortcuts.dart';
+import '../utils/page_shortcut_keys.dart';
 
 class BatchImportScreen extends StatefulWidget {
   final String? folderId;
@@ -35,16 +40,20 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
   final FocusNode _shortcutFocusNode = FocusNode(
     debugLabel: 'BatchImportShortcutFocus',
   );
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
 
   @override
   void initState() {
     super.initState();
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
     _controllers = LinkedScrollControllerGroup();
     _videoController = _controllers.addAndGet();
     _subtitleController = _controllers.addAndGet();
     _actionController = _controllers.addAndGet();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (Platform.isWindows && mounted) {
+      if (supportsNativeHardwareKeyboardShortcuts && mounted) {
         _shortcutFocusNode.requestFocus();
       }
     });
@@ -55,19 +64,84 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     _videoController.dispose();
     _subtitleController.dispose();
     _actionController.dispose();
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
     _shortcutFocusNode.dispose();
     super.dispose();
   }
 
   KeyEventResult _handleEscKeyEvent(KeyEvent event) {
-    if (!Platform.isWindows) return KeyEventResult.ignored;
-    if (event is KeyRepeatEvent) return KeyEventResult.handled;
-    if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.escape) {
-      Navigator.of(context).maybePop();
+    return _handleShortcutKeyEvent(event);
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_shortcutFocusNode.hasFocus) return false;
+    return _handleShortcutKeyEvent(event) != KeyEventResult.ignored;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleShortcutKeyEvent(
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  String _biTooltip(String label, BatchImportShortcutAction action) {
+    return hoverAwareShortcutTooltip(
+      label,
+      BatchImportShortcuts.defaults[action]!,
+    );
+  }
+
+  KeyEventResult _handleShortcutKeyEvent(
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
+    if (!supportsNativeHardwareKeyboardShortcuts) {
+      return KeyEventResult.ignored;
+    }
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return KeyEventResult.ignored;
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+    if (isEditableTextFocused()) return KeyEventResult.ignored;
+    final bool hasBlockingModifier =
+        hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
+    if (hasBlockingModifier) return KeyEventResult.ignored;
+    final BatchImportShortcutAction? action = BatchImportShortcuts.matchAction(
+      event.logicalKey,
+    );
+    final platform = currentNativeTargetPlatform;
+    if (action == null ||
+        platform == null ||
+        !BatchImportShortcuts.isAvailableOnPlatform(action, platform)) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.handled;
+    switch (action) {
+      case BatchImportShortcutAction.back:
+        Navigator.of(context).maybePop();
+        return KeyEventResult.handled;
+      case BatchImportShortcutAction.importMedia:
+        unawaited(_pickVideos());
+        return KeyEventResult.handled;
+      case BatchImportShortcutAction.importSubtitles:
+        unawaited(_pickSubtitles());
+        return KeyEventResult.handled;
+      case BatchImportShortcutAction.help:
+        _showHelpDialog();
+        return KeyEventResult.handled;
+    }
   }
 
   Future<void> _pickVideos() async {
@@ -457,12 +531,13 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
 
     return Focus(
       focusNode: _shortcutFocusNode,
-      autofocus: Platform.isWindows,
+      autofocus: supportsNativeHardwareKeyboardShortcuts,
       onKeyEvent: (node, event) => _handleEscKeyEvent(event),
       child: Listener(
         behavior: HitTestBehavior.translucent,
         onPointerDown: (_) {
-          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+          if (supportsNativeHardwareKeyboardShortcuts &&
+              !_shortcutFocusNode.hasFocus) {
             _shortcutFocusNode.requestFocus();
           }
         },
@@ -502,7 +577,12 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                       child: ElevatedButton.icon(
                         onPressed: _pickVideos,
                         icon: const Icon(Icons.video_library),
-                        label: const Text('导入媒体'),
+                        label: Text(
+                          _biTooltip(
+                            '导入媒体',
+                            BatchImportShortcutAction.importMedia,
+                          ),
+                        ),
                         style: ElevatedButton.styleFrom(
                           padding: const EdgeInsets.symmetric(vertical: 16),
                           backgroundColor: Colors.blueAccent,
@@ -515,7 +595,12 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                       child: ElevatedButton.icon(
                         onPressed: _pickSubtitles,
                         icon: const Icon(Icons.subtitles),
-                        label: const Text('导入字幕\n(支持zip)'),
+                        label: Text(
+                          _biTooltip(
+                            '导入字幕 (支持zip)',
+                            BatchImportShortcutAction.importSubtitles,
+                          ),
+                        ),
                         style: ElevatedButton.styleFrom(
                           padding: const EdgeInsets.symmetric(vertical: 16),
                           backgroundColor: Colors.orangeAccent,
@@ -530,7 +615,10 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                         Icons.help_outline,
                         color: Colors.white70,
                       ),
-                      tooltip: "操作说明",
+                      tooltip: _biTooltip(
+                        "操作说明",
+                        BatchImportShortcutAction.help,
+                      ),
                       style: IconButton.styleFrom(
                         backgroundColor: Colors.white10,
                         padding: const EdgeInsets.all(12),

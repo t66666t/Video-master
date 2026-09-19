@@ -2,12 +2,21 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:video_player/video_player.dart';
 import '../services/settings_service.dart';
+import '../services/subtitle_timeline_resolver.dart';
+import '../models/subtitle_copy_format.dart';
 import '../models/subtitle_model.dart';
+import '../utils/subtitle_copy_formatter.dart';
 import '../utils/subtitle_display_resolver.dart';
+import 'subtitle_copy_format_popover.dart';
+import '../features/subtitle_article/article_document.dart';
+import '../features/subtitle_article/article_layout_engine.dart';
+import '../features/subtitle_article/article_layout_model.dart';
+import '../features/subtitle_article/continuous_article_view.dart';
 
 class SubtitleSidebar extends StatefulWidget {
   final List<SubtitleItem> subtitles;
@@ -33,6 +42,9 @@ class SubtitleSidebar extends StatefulWidget {
   final VoidCallback? onOpenSubtitleEditor;
   final bool isCompact;
   final bool isPortrait;
+
+  /// 与画面字幕一致：音频/视频各自使用独立的「连续字幕」设置。
+  final bool isAudio;
   final FocusNode? focusNode; // New
   final bool isVisible;
   final bool showEmbeddedLoadingMessage;
@@ -57,6 +69,7 @@ class SubtitleSidebar extends StatefulWidget {
     this.onOpenSubtitleEditor,
     this.isCompact = false,
     this.isPortrait = false,
+    this.isAudio = false,
     this.focusNode,
     this.isVisible = true,
     this.showEmbeddedLoadingMessage = false,
@@ -76,26 +89,179 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   double _timeColumnRatio = 0.18;
   int _locatePositionPercent = 30;
 
+  /// 最近一次「点击字幕后滚到该句」的目标索引；关闭自动跟随时为 null。
+  @visibleForTesting
+  int? lastTappedLocateScrollIndex;
+
   // 滚动控制器
   final ItemScrollController _itemScrollController = ItemScrollController();
   final ItemPositionsListener _itemPositionsListener =
       ItemPositionsListener.create();
+  final ScrollOffsetController _listScrollOffsetController =
+      ScrollOffsetController();
+  final ScrollOffsetController _articleScrollOffsetController =
+      ScrollOffsetController();
+  final GlobalKey<SelectionAreaState> _textSelectionKey =
+      GlobalKey<SelectionAreaState>();
+  final FocusNode _textSelectionFocusNode = FocusNode(
+    debugLabel: 'SubtitleSidebarTextSelection',
+  );
+  bool _hasTextSelection = false;
+  String _selectedTranscriptText = '';
+  Timer? _touchSelectionEdgeScrollTimer;
+  int? _touchSelectionEdgePointer;
+  bool _selectionViewportCorrectionInFlight = false;
+  ScrollableState? _selectionScrollable;
+  OverlayEntry? _persistentSelectionToolbarEntry;
+  bool _persistentSelectionToolbarInsertScheduled = false;
+  bool _usesPersistentTouchSelectionToolbar = false;
+  Offset? _persistentSelectionToolbarAnchor;
+  TextSelectionToolbarAnchors? _persistentSelectionToolbarAnchors;
+  OverlayEntry? _desktopSelectionToolbarEntry;
+  Offset? _desktopSelectionToolbarAnchor;
+  bool _desktopSelectionToolbarInsertScheduled = false;
+  OverlayEntry? _copyFormatPopoverEntry;
+  Offset? _selectionShieldTapDownPosition;
+  Drag? _selectionPreservingPanDrag;
+
+  // Flutter's tap recognizer intentionally allows normal finger jitter. That
+  // tolerance is too generous for a destructive "dismiss selection" action:
+  // the first few pixels of an intended scroll could otherwise count as a
+  // tap. Keep dismissal much stricter than kTouchSlop.
+  static const double _selectionDismissTapSlop = 3;
+
+  /// Signed pixel delta for edge auto-scroll: negative toward the start.
+  double _touchSelectionEdgeScrollPixels = 0;
+  int _touchSelectionEdgeTickCount = 0;
+
+  /// Pointer currently extending the selection, either the initial long-press
+  /// or a later gesture that has been confirmed by the selection-status scope.
+  int? _selectionGesturePointer;
+  bool _selectionGestureUsesHandle = false;
+  int? _latestDownTouchPointer;
+  final Set<int> _downTouchPointers = <int>{};
+  final Map<int, Offset> _downTouchPointerPositions = <int, Offset>{};
+  bool _selectionHandleBindCheckScheduled = false;
+  SelectableRegionSelectionStatus _selectionRegionStatus =
+      SelectableRegionSelectionStatus.finalized;
+
+  /// Enter/exit hysteresis keeps a jittering finger from flipping between
+  /// "hold still" and "edge scroll" on every move.
+  // Start before the finger reaches the physical screen edge. On gesture-nav
+  // Android devices the last few pixels may belong to the system, so requiring
+  // the handle to cross the viewport boundary makes downward scrolling either
+  // very slow or impossible.
+  static const double _touchSelectionEdgeEnterZone = 56;
+
+  // Hysteresis is deliberately wider than the entry band: once scrolling has
+  // started, small finger movements must not repeatedly stop/restart it.
+  static const double _touchSelectionEdgeExitZone = 72;
+  static const Duration _touchSelectionEdgeScrollInterval = Duration(
+    milliseconds: 16,
+  );
+  static const double _touchSelectionMinPixelsPerTick = 2;
+  static const double _touchSelectionMaxPixelsPerTick = 6.5;
+  static const int _touchSelectionAccelerationDelayTicks = 8;
+  static const int _touchSelectionAccelerationTicks = 64;
 
   // 自动滚动相关
   final ValueNotifier<int> _activeIndexNotifier = ValueNotifier<int>(-1);
   final ValueNotifier<List<int>> _activeIndicesNotifier =
       ValueNotifier<List<int>>(<int>[]);
-  final List<int> _subtitleStartMs = <int>[];
-  final List<int> _subtitleEffectiveEndMs = <int>[];
-  final List<int> _subtitlePrefixMaxEndMs = <int>[];
-  int _indexedMediaDurationMs = -1;
-  int _lastIndexComputeAtMs = 0;
-  int _lastIndexComputePosMs = -1;
+  SubtitleTimelineResolver? _timelineResolver;
+  List<SubtitleItem> _timelineResolverSubtitles = const <SubtitleItem>[];
   Timer? _autoScrollTimer;
   int _activePointerCount = 0;
+  bool _pointerSessionStartedWithTextSelection = false;
   bool _didScrollWhilePointerSession = false;
   int? _pointerDownStartIndex;
   int? _pointerDownSubtitleIndex;
+
+  // ===== 拖拽会话中的「副指针双击跳转」=====
+  // 背景：手指按住不放时自动跟随被抑制，用户可以一边按住一边翻阅上下文。
+  // 本机制允许在这个状态下用另一根手指在某句字幕上快速点两下，立刻把媒体
+  // seek 到该句，但不滚动文稿；文稿的定位统一推迟到所有手指抬起之后。
+  //
+  // 误判防线（缺一不可，详见 [_evaluateDragDoubleTap]）：
+  //   1. 只认触摸设备，鼠标/触控笔走各自既有交互；
+  //   2. 只认落在字幕列表区的指针，顶部工具栏按钮不参与，也不能充当锚点；
+  //   3. 按下瞬间列表区必须已有其他手指按住，单指点击一律走原有逻辑；
+  //   4. 两次轻点必须共享同一根「一直没抬起」的锚定手指，杜绝「全松手后
+  //      换手再点」被误拼成双击；
+  //   5. 两次轻点必须都是干净轻点（位移 < slop 且时长 < 300ms）、命中同一行、
+  //      落点接近、间隔 <= 300ms。
+  /// 当前按在侧边栏内的每根手指的按下快照，key 为 pointer id。
+  final Map<int, _SidebarPointerRecord> _pointerRecords =
+      <int, _SidebarPointerRecord>{};
+
+  /// 落点位于字幕列表区（而非顶部工具栏）的指针 id。
+  final Set<int> _listAreaPointerIds = <int>{};
+
+  /// 列表区 [Listener] 在指针按下瞬间解析出的「pointer id → 字幕行号」。
+  ///
+  /// 行号只能靠几何反查，不能依赖列表内部的任何回调：
+  ///   - onTapDown 不行。列表已经在滚动时，Scrollable 的 [DragGestureRecognizer]
+  ///     会在新手指按下的瞬间直接赢下该指针的手势竞技场，行上的
+  ///     TapGestureRecognizer 被判负，onTapDown 根本不会触发。
+  ///   - 行级 Listener 也不行。拖拽期间 Scrollable 会把整个视口包进
+  ///     `IgnorePointer`（`DragScrollActivity.shouldIgnorePointer == true`），
+  ///     视口内部收不到任何指针事件。
+  /// 而「拖着不松手」恰恰就是这两种屏蔽同时生效的状态，所以只能在视口外面，
+  /// 用 [ItemPositionsListener] 的几何信息自己算落点落在哪一行。
+  final Map<int, int> _pendingRowIndexByPointer = <int, int>{};
+
+  /// 指向当前挂载的 [ScrollablePositionedList]，用于把全局坐标换算成视口比例。
+  final GlobalKey _listViewportKey = GlobalKey();
+
+  /// 文章模式下每个段落的 key，用于把落点进一步定位到段落内的具体某一句。
+  final Map<int, GlobalKey<State<SubtitleArticleChunk>>> _articleChunkKeys =
+      <int, GlobalKey<State<SubtitleArticleChunk>>>{};
+  final GlobalKey<ContinuousArticleViewState> _continuousArticleViewKey =
+      GlobalKey<ContinuousArticleViewState>();
+
+  /// 等待凑成双击的候选轻点；超时/换会话即作废。
+  _SidebarTapRecord? _pendingDragDoubleTap;
+
+  /// 最近一根抬起的副指针记录，只存活到下一个指针事件为止。
+  ///
+  /// 快速轻点时手势竞技场要等抬起事件派发完才裁决，也就是说 onTap
+  /// 会晚于 [_onPointerUpOrCancel]；留着这条记录，才能在那一刻认出
+  /// 「这次点击已经被双击识别器接管了」。
+  _SidebarPointerRecord? _recentlyLiftedSecondaryTap;
+
+  /// 最近一次指针抬起的快照，供 [_isConfirmedSubtitleClick] 在 onTap
+  /// 里核对「这是不是一次短单击」。
+  ///
+  /// Listener 先于手势竞技场收到 PointerUp，所以 onTap 触发时这里一定
+  /// 已经写好。下一根手指按下时清空，避免串到下一次点击。
+  _SidebarPointerRecord? _lastLiftedPointer;
+  int _lastLiftedHeldMs = 0;
+
+  /// 已被双击识别接管、因而必须屏蔽常规 onTap 落地的字幕行号。
+  int? _suppressedRowTapIndex;
+
+  /// 本次按压会话内是否发生过双击 seek；决定松手后是否强制补一次定位。
+  bool _didDoubleTapSeekWhilePointerSession = false;
+
+  /// 单次轻点允许的最长按住时长；超过即视为长按/拖拽，不参与双击。
+  static const int _dragTapMaxDurationMs = 300;
+
+  /// 常规「点某一句就跳转」允许的最长按住时长。
+  ///
+  /// 对齐 [kLongPressTimeout]：超过它就应当进入选字/长按语义，而不是单击。
+  /// 比 [_dragTapMaxDurationMs] 更宽，避免把略慢的单击误杀掉。
+  static const int _rowTapMaxDurationMs = 500;
+
+  /// 两次轻点之间允许的最大间隔（第一次抬起 → 第二次按下），对齐
+  /// Flutter 的 [kDoubleTapTimeout]。
+  static const int _dragDoubleTapIntervalMs = 300;
+
+  /// 单次轻点允许的最大位移，超过即认为手指在滑动而不是点击。
+  static const double _dragTapMaxTravel = kDoubleTapTouchSlop;
+
+  /// 两次轻点落点之间允许的最大距离，用于确认「是同一根手指点的」。
+  /// 比 [kDoubleTapSlop] 更严，配合「同一行」判定进一步压低误判率。
+  static const double _dragDoubleTapSlop = 72.0;
   int? _pendingLocateIndex;
   bool _lastKnownIsPlaying = false;
   int _lastSubtitleOffsetMs = 0;
@@ -138,10 +304,18 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   VideoPlayerValue? get _controllerValue => widget.controller?.value;
 
-  Duration get _playbackPosition =>
-      widget.positionListenable?.value ??
-      _controllerValue?.position ??
-      Duration.zero;
+  /// 高亮/定位用播放器真实位置，与画面字幕 [_updateSubtitle] 保持一致。
+  ///
+  /// [positionListenable] 是每帧插值的平滑时钟，可能略超前 native
+  /// position；若用它判定当前句，文稿高亮会比实际听到的内容提前切换。
+  /// positionListenable 仅在 controller 尚未就绪时作为回退。
+  Duration get _subtitleTimingPosition {
+    final controller = widget.controller;
+    if (controller != null && controller.value.isInitialized) {
+      return controller.value.position;
+    }
+    return widget.positionListenable?.value ?? Duration.zero;
+  }
 
   /// 字幕延迟（subtitleOffset）：正值表示字幕整体延后出现。
   int get _subtitleOffsetMs => SettingsService().subtitleOffset.inMilliseconds;
@@ -150,16 +324,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   /// 定位必须换算到同一条字幕时间轴，否则调整「字幕同步」后两侧会整体
   /// 错开（offset > 0 时高亮比画面字幕提前）。
   int get _subtitleTimelinePositionMs =>
-      _playbackPosition.inMilliseconds - _subtitleOffsetMs;
+      _subtitleTimingPosition.inMilliseconds - _subtitleOffsetMs;
 
   bool get _playbackIsPlaying => _controllerValue?.isPlaying ?? false;
-
-  int get _playbackDurationMs {
-    final value = _controllerValue;
-    return value != null && value.isInitialized
-        ? value.duration.inMilliseconds
-        : -1;
-  }
 
   void _attachPlaybackListeners() {
     widget.controller?.addListener(_updateIndex);
@@ -255,6 +422,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   static const int _minArticleChunkSize = 1;
   static const int _maxArticleChunkSize = 99;
   int _articleChunkSize = 4;
+  bool _articleParagraphModeEnabled = true;
   final ItemScrollController _articleItemScrollController =
       ItemScrollController();
   final ItemPositionsListener _articleItemPositionsListener =
@@ -265,8 +433,28 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   final Map<int, String> _secondaryTextCache = {};
   final Map<int, int> _primaryToSecondaryIndexCache = {};
   final Map<int, int> _secondaryToPrimaryIndexCache = {};
-  final List<String> _displayTextCache = <String>[];
+  final List<String> _selectionTextCache = <String>[];
+  final List<SubtitleCueCopyParts> _cueCopyPartsCache =
+      <SubtitleCueCopyParts>[];
   bool _isBilingualMode = false;
+  int _articleDocumentGeneration = 0;
+  ArticleDocument? _continuousArticleDocument;
+  ArticleLayout? _continuousArticleLayout;
+  ArticleLayoutKey? _continuousArticleLayoutKey;
+  Future<ArticleLayout?>? _continuousArticleLayoutFuture;
+  ArticleLayoutKey? _continuousArticlePendingKey;
+  int _continuousArticleLayoutRequestId = 0;
+
+  bool get _isContinuousArticleMode =>
+      _isArticleMode && !_articleParagraphModeEnabled;
+
+  void _invalidateContinuousArticleLayout() {
+    _continuousArticleLayoutRequestId++;
+    _continuousArticleLayout = null;
+    _continuousArticleLayoutKey = null;
+    _continuousArticleLayoutFuture = null;
+    _continuousArticlePendingKey = null;
+  }
 
   // Cached display subtitles to avoid repeated computation
   late List<SubtitleItem> _cachedDisplaySubtitles;
@@ -335,14 +523,18 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       _minArticleChunkSize,
       _maxArticleChunkSize,
     );
+    _articleParagraphModeEnabled = settings.subtitleArticleParagraphModeEnabled;
     _loadOrientationDisplaySettings();
     _lastKnownIsPlaying = _playbackIsPlaying;
     _lastSubtitleOffsetMs = settings.subtitleOffset.inMilliseconds;
     settings.addListener(_handleSubtitleOffsetChanged);
     _attachPlaybackListeners();
+    GestureBinding.instance.pointerRouter.addGlobalRoute(
+      _handleGlobalSelectionPointerEvent,
+    );
     _invalidateDisplaySubtitlesCache();
     _checkBilingualSync();
-    _rebuildSubtitleIndex();
+    _rebuildTimelineResolver();
   }
 
   @override
@@ -380,6 +572,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   @override
   void didUpdateWidget(SubtitleSidebar oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.isVisible && !widget.isVisible) {
+      _invalidateContinuousArticleLayout();
+    }
     final bool playbackSourceChanged =
         widget.controller != oldWidget.controller ||
         widget.positionListenable != oldWidget.positionListenable;
@@ -397,9 +592,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
     if (widget.subtitles != oldWidget.subtitles ||
         widget.secondarySubtitles != oldWidget.secondarySubtitles) {
+      _clearTextSelection(resumeAutoFollow: false);
       _invalidateDisplaySubtitlesCache();
       _checkBilingualSync();
-      _rebuildSubtitleIndex();
+      _rebuildTimelineResolver();
     }
     if (playbackSourceChanged || subtitleContentBecameAvailable) {
       _scheduleLocateAfterMediaOrSubtitleChange();
@@ -409,8 +605,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
         SettingsService().autoScrollSubtitles) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        _lastIndexComputeAtMs = 0;
-        _lastIndexComputePosMs = -1;
         _updateIndex();
         triggerLocateForAutoFollow();
       });
@@ -451,6 +645,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       final bool autoFollowRepair =
           _playbackIsPlaying && SettingsService().autoScrollSubtitles;
       if (!autoFollowRepair && !_repairRequestPending) return;
+      if (_hasTextSelection) return;
       // 被不透明路由覆盖时列表没有布局，定位会被丢弃，等回到前台重新驱动。
       if (!_isSubtitleSidebarRouteCurrent) return;
       _beginLocateRequest(animated: false, repair: true);
@@ -475,10 +670,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _secondaryToPrimaryIndexCache.addAll(matchResult.secondaryToPrimary);
 
     for (final entry in matchResult.primaryToSecondary.entries) {
-      _secondaryTextCache[entry.key] = widget
-          .secondarySubtitles[entry.value]
-          .text
-          .replaceAll('\n', ' ');
+      _secondaryTextCache[entry.key] = _normalizeTranscriptText(
+        widget.secondarySubtitles[entry.value].text,
+      );
     }
 
     final int minimumMatchCount = widget.subtitles.length <= 2
@@ -489,50 +683,33 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   @override
   void dispose() {
+    GestureBinding.instance.pointerRouter.removeGlobalRoute(
+      _handleGlobalSelectionPointerEvent,
+    );
+    _stopTouchSelectionEdgeScroll();
+    _clearSelectionGesture();
+    _cancelSelectionPreservingPan();
+    _removePersistentSelectionToolbar();
+    _removeDesktopSelectionToolbar();
+    _removeCopyFormatPopover();
+    _continuousArticleLayoutRequestId++;
     _detachPlaybackListeners(widget);
     SettingsService().removeListener(_handleSubtitleOffsetChanged);
     _activeIndexNotifier.dispose();
     _activeIndicesNotifier.dispose();
+    _textSelectionFocusNode.dispose();
     _autoScrollTimer?.cancel();
     super.dispose();
   }
 
-  void _rebuildSubtitleIndex() {
+  void _rebuildTimelineResolver() {
     final subtitles = _displaySubtitles;
-    _indexedMediaDurationMs = _playbackDurationMs;
-    _subtitleStartMs
-      ..clear()
-      ..addAll(subtitles.map((e) => e.startTime.inMilliseconds));
-    _subtitleEffectiveEndMs.clear();
-    _subtitlePrefixMaxEndMs.clear();
-    int prefixMaxEndMs = -1;
-    for (int i = 0; i < subtitles.length; i++) {
-      final SubtitleItem item = subtitles[i];
-      int effectiveEndMs = item.endTime.inMilliseconds;
-      if (i + 1 < subtitles.length) {
-        final int nextStartMs = _subtitleStartMs[i + 1];
-        if (nextStartMs > effectiveEndMs) {
-          effectiveEndMs = nextStartMs;
-        }
-      } else if (_indexedMediaDurationMs > effectiveEndMs) {
-        effectiveEndMs = _indexedMediaDurationMs;
-      }
-      _subtitleEffectiveEndMs.add(effectiveEndMs);
-      if (effectiveEndMs > prefixMaxEndMs) {
-        prefixMaxEndMs = effectiveEndMs;
-      }
-      _subtitlePrefixMaxEndMs.add(prefixMaxEndMs);
-    }
-    _displayTextCache
-      ..clear()
-      ..addAll(
-        List<String>.generate(
-          subtitles.length,
-          _computeDisplayTextForIndex,
-          growable: false,
-        ),
-      );
-    _lastIndexComputePosMs = -1;
+    _timelineResolverSubtitles = subtitles;
+    _timelineResolver = subtitles.isEmpty
+        ? null
+        : SubtitleTimelineResolver(subtitles);
+    _rebuildSelectionTextCache();
+    _rebuildContinuousArticleDocument();
     if (_pendingLocateIndex != null &&
         (_pendingLocateIndex! < 0 ||
             _pendingLocateIndex! >= subtitles.length)) {
@@ -540,27 +717,841 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
   }
 
-  void _ensureSubtitleIndex() {
+  String _normalizeTranscriptText(String text) {
+    return text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  void _rebuildSelectionTextCache() {
     final subtitles = _displaySubtitles;
-    final int durationMs = _playbackDurationMs;
-    if (_subtitleStartMs.length != subtitles.length ||
-        _subtitleEffectiveEndMs.length != subtitles.length ||
-        _subtitlePrefixMaxEndMs.length != subtitles.length ||
-        _indexedMediaDurationMs != durationMs) {
-      _rebuildSubtitleIndex();
+    final parts = List<SubtitleCueCopyParts>.generate(
+      subtitles.length,
+      _computeCueCopyPartsForIndex,
+      growable: false,
+    );
+    _cueCopyPartsCache
+      ..clear()
+      ..addAll(parts);
+    _selectionTextCache
+      ..clear()
+      ..addAll(parts.map(SubtitleCopyFormatter.displayText));
+  }
+
+  bool _hasSelectableTextAfter(int index) {
+    for (int next = index + 1; next < _selectionTextCache.length; next++) {
+      if (_selectionTextCache[next].isNotEmpty) return true;
     }
+    return false;
+  }
+
+  bool get _selectionBlocksAutoFollow =>
+      _hasAnyActivePointer || _hasTextSelection;
+
+  void _handleTextSelectionChanged(SelectedContent? content) {
+    final String nextText = content?.plainText ?? '';
+    final bool hasSelection = nextText.isNotEmpty;
+    final bool textChanged = nextText != _selectedTranscriptText;
+    _selectedTranscriptText = nextText;
+
+    if (hasSelection && !_hasTextSelection) {
+      final int? touchPointer = _activeTouchPointerForSelection();
+      if (touchPointer != null) {
+        _usesPersistentTouchSelectionToolbar = true;
+        _persistentSelectionToolbarAnchor =
+            _downTouchPointerPositions[touchPointer];
+      }
+      setState(() => _hasTextSelection = true);
+      if (_usesPersistentTouchSelectionToolbar) {
+        _schedulePersistentSelectionToolbar();
+      }
+      _cancelPendingAutoScroll();
+      _invalidateLocateRequests();
+      // The long-press pointer is already down; bind the gesture to it.
+      if (_selectionGesturePointer == null) {
+        _selectionGesturePointer = _activeTouchPointerForSelection();
+        _selectionGestureUsesHandle = false;
+      }
+      return;
+    }
+
+    if (hasSelection && textChanged) {
+      _persistentSelectionToolbarEntry?.markNeedsBuild();
+      _copyFormatPopoverEntry?.markNeedsBuild();
+      _tryBindCurrentSelectionHandlePointer();
+      // Keep the existing pointer; the helper only rebinds when Flutter has
+      // confirmed an active selection-changing gesture.
+      return;
+    }
+
+    if (hasSelection == _hasTextSelection) return;
+    setState(() => _hasTextSelection = hasSelection);
+    _removePersistentSelectionToolbar();
+    _removeCopyFormatPopover();
+    _stopTouchSelectionEdgeScroll();
+    _clearSelectionGesture();
+    _resumeAutoFollowAfterSelection();
+  }
+
+  void _resumeAutoFollowAfterSelection() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _hasTextSelection) return;
+      triggerLocateForAutoFollow(animated: true);
+    });
+    _ensureFrameScheduled();
+  }
+
+  void _clearTextSelection({bool resumeAutoFollow = true}) {
+    final bool wasSelected = _hasTextSelection;
+    if (_hasTextSelection && mounted) {
+      setState(() => _hasTextSelection = false);
+    } else {
+      _hasTextSelection = false;
+    }
+    _selectedTranscriptText = '';
+    _cancelSelectionPreservingPan();
+    _removePersistentSelectionToolbar();
+    _removeDesktopSelectionToolbar();
+    _removeCopyFormatPopover();
+    _stopTouchSelectionEdgeScroll();
+    _clearSelectionGesture();
+    _textSelectionKey.currentState?.selectableRegion.clearSelection();
+    _textSelectionFocusNode.unfocus();
+    if (wasSelected && resumeAutoFollow) {
+      _resumeAutoFollowAfterSelection();
+    }
+  }
+
+  /// Clears the sidebar's independent transcript selection region.
+  ///
+  /// Playback pages call this when the user taps outside the sidebar so a
+  /// selection cannot remain stranded after the page-level selection clears.
+  void clearTextSelection() => _clearTextSelection();
+
+  @visibleForTesting
+  String get selectedTranscriptText => _selectedTranscriptText;
+
+  @visibleForTesting
+  bool get hasTextSelection => _hasTextSelection;
+
+  @visibleForTesting
+  bool get isTouchSelectionEdgeScrolling =>
+      _touchSelectionEdgeScrollTimer != null;
+
+  @visibleForTesting
+  bool get isSelectionGestureActive => _selectionGesturePointer != null;
+
+  /// Touch selection follows a text-editor model:
+  ///   1. While the extending pointer stays inside the document, leave the
+  ///      viewport entirely to Flutter's selection gesture.
+  ///   2. When that pointer reaches the top or bottom edge, pixel-scroll in
+  ///      that direction through the list's public relative-offset API.
+  ///   3. After lift, stop the fallback so the user can pan the transcript.
+  ///
+  /// Listen globally because selection handles live in the overlay rather than
+  /// this sidebar's render subtree. Mouse is unchanged.
+  void _handleGlobalSelectionPointerEvent(PointerEvent event) {
+    if (event.kind != PointerDeviceKind.touch &&
+        event.kind != PointerDeviceKind.stylus &&
+        event.kind != PointerDeviceKind.invertedStylus) {
+      return;
+    }
+    if (event is PointerDownEvent) {
+      _downTouchPointers.add(event.pointer);
+      _downTouchPointerPositions[event.pointer] = event.position;
+      _latestDownTouchPointer = event.pointer;
+      return;
+    }
+    if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _downTouchPointers.remove(event.pointer);
+      _downTouchPointerPositions.remove(event.pointer);
+      if (_latestDownTouchPointer == event.pointer) {
+        _latestDownTouchPointer = _downTouchPointers.isEmpty
+            ? null
+            : _downTouchPointers.last;
+      }
+      if (_selectionGesturePointer == event.pointer) {
+        _stopTouchSelectionEdgeScroll();
+        _clearSelectionGesture();
+      } else if (_touchSelectionEdgePointer == event.pointer) {
+        _stopTouchSelectionEdgeScroll();
+      }
+      return;
+    }
+    if (event is! PointerMoveEvent || !_hasTextSelection) return;
+    _downTouchPointerPositions[event.pointer] = event.position;
+
+    // A real mobile handle drag is a second gesture: long-press, lift, then
+    // press one of the handles.  The original long-press pointer has already
+    // been cleared by that point.  Bind the new pointer only after Flutter's
+    // selection overlay confirms that it is dragging a handle, so an ordinary
+    // one-finger transcript pan remains a normal scroll gesture.
+    if (_selectionGesturePointer == null && _isSelectionChangeGestureActive) {
+      _selectionGesturePointer = event.pointer;
+      _selectionGestureUsesHandle = true;
+    }
+    if (_selectionGesturePointer == null) {
+      _scheduleSelectionHandlePointerBindCheck();
+    }
+    if (event.pointer != _selectionGesturePointer) {
+      return;
+    }
+
+    _updateTouchSelectionEdgeForPointer(event.pointer, event.position);
+  }
+
+  void _scheduleSelectionHandlePointerBindCheck() {
+    if (_selectionHandleBindCheckScheduled) return;
+    _selectionHandleBindCheckScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _selectionHandleBindCheckScheduled = false;
+      if (!mounted) return;
+      _tryBindCurrentSelectionHandlePointer();
+    });
+    _ensureFrameScheduled();
+  }
+
+  void _tryBindCurrentSelectionHandlePointer() {
+    if (!_hasTextSelection ||
+        _selectionGesturePointer != null ||
+        !_isSelectionChangeGestureActive) {
+      return;
+    }
+    final int? pointer = _latestDownTouchPointer;
+    if (pointer == null || !_downTouchPointers.contains(pointer)) return;
+    final Offset? position = _downTouchPointerPositions[pointer];
+    if (position == null) return;
+    _selectionGesturePointer = pointer;
+    _selectionGestureUsesHandle = true;
+    _updateTouchSelectionEdgeForPointer(pointer, position);
+  }
+
+  void _updateTouchSelectionEdgeForPointer(int pointer, Offset position) {
+    if (pointer != _selectionGesturePointer) return;
+
+    final RenderObject? object = _listViewportKey.currentContext
+        ?.findRenderObject();
+    if (object is! RenderBox || !object.hasSize || object.size.height <= 0) {
+      return;
+    }
+    final Offset local = object.globalToLocal(position);
+    final bool wasEdgeScrolling = _touchSelectionEdgePointer == pointer;
+    final double edgeZone = wasEdgeScrolling
+        ? _touchSelectionEdgeExitZone
+        : _touchSelectionEdgeEnterZone;
+    final bool horizontallyNearViewport =
+        local.dx >= -_touchSelectionEdgeEnterZone &&
+        local.dx <= object.size.width + _touchSelectionEdgeEnterZone;
+    final double topPenetration = edgeZone - local.dy;
+    final double bottomPenetration = local.dy - (object.size.height - edgeZone);
+
+    double? signedPixels;
+    if (horizontallyNearViewport &&
+        bottomPenetration > 0 &&
+        local.dy > _touchSelectionEdgeEnterZone) {
+      signedPixels = _edgeScrollPixelsForPenetration(
+        local.dy - (object.size.height - _touchSelectionEdgeEnterZone),
+      );
+    } else if (horizontallyNearViewport &&
+        topPenetration > 0 &&
+        local.dy < object.size.height - _touchSelectionEdgeEnterZone) {
+      signedPixels = -_edgeScrollPixelsForPenetration(
+        _touchSelectionEdgeEnterZone - local.dy,
+      );
+    }
+
+    if (signedPixels == null) {
+      if (wasEdgeScrolling) {
+        _stopTouchSelectionEdgeScroll();
+      }
+      return;
+    }
+
+    final int previousDirection = _touchSelectionEdgeScrollPixels.sign.toInt();
+    final int nextDirection = signedPixels.sign.toInt();
+    if (!wasEdgeScrolling || previousDirection != nextDirection) {
+      _touchSelectionEdgeTickCount = 0;
+    }
+    _touchSelectionEdgePointer = pointer;
+    _touchSelectionEdgeScrollPixels = signedPixels;
+    final bool startedTimer = _touchSelectionEdgeScrollTimer == null;
+    _touchSelectionEdgeScrollTimer ??= Timer.periodic(
+      _touchSelectionEdgeScrollInterval,
+      (_) => _tickTouchSelectionEdgeScroll(),
+    );
+    if (startedTimer) {
+      _tickTouchSelectionEdgeScroll();
+    }
+  }
+
+  bool get _isSelectionChangeGestureActive =>
+      _selectionRegionStatus == SelectableRegionSelectionStatus.changing;
+
+  void _handleSelectionRegionStatusChanged(
+    SelectableRegionSelectionStatus status,
+  ) {
+    _selectionRegionStatus = status;
+    if (status == SelectableRegionSelectionStatus.changing) {
+      _tryBindCurrentSelectionHandlePointer();
+    }
+  }
+
+  double _edgeScrollPixelsForPenetration(double penetration) {
+    final double strength = (penetration / _touchSelectionEdgeEnterZone).clamp(
+      0.0,
+      1.0,
+    );
+    return (_touchSelectionMinPixelsPerTick + 1.5 * strength).clamp(
+      _touchSelectionMinPixelsPerTick,
+      _touchSelectionMaxPixelsPerTick,
+    );
+  }
+
+  double get _acceleratedTouchSelectionPixelsPerTick {
+    final double progress =
+        ((_touchSelectionEdgeTickCount -
+                    _touchSelectionAccelerationDelayTicks) /
+                _touchSelectionAccelerationTicks)
+            .clamp(0.0, 1.0);
+    // Smoothstep gives a gentle start and reaches full speed without requiring
+    // any additional travel beyond the phone's physical bottom edge.
+    final double eased = progress * progress * (3 - 2 * progress);
+    final double dwellSpeed =
+        _touchSelectionMinPixelsPerTick +
+        (_touchSelectionMaxPixelsPerTick - _touchSelectionMinPixelsPerTick) *
+            eased;
+    final double requestedSpeed = _touchSelectionEdgeScrollPixels.abs();
+    return requestedSpeed > dwellSpeed ? requestedSpeed : dwellSpeed;
+  }
+
+  void _tickTouchSelectionEdgeScroll() {
+    if (!mounted ||
+        !_hasTextSelection ||
+        _touchSelectionEdgePointer == null ||
+        _selectionGesturePointer == null) {
+      return;
+    }
+    final ScrollableState? scrollable = _selectionScrollable;
+    if (scrollable == null || !scrollable.mounted) return;
+    try {
+      final position = scrollable.position;
+      _touchSelectionEdgeTickCount++;
+      final double direction = _touchSelectionEdgeScrollPixels.sign;
+      final double delta = direction * _acceleratedTouchSelectionPixelsPerTick;
+      final double target = (position.pixels + delta).clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((target - position.pixels).abs() < precisionErrorTolerance) {
+        _stopTouchSelectionEdgeScroll();
+        return;
+      }
+      // Mature document editors keep one stable scroll position and apply
+      // small, velocity-limited deltas every frame. Never re-anchor the list:
+      // doing so makes the viewport race and disposes selection endpoints.
+      position.jumpTo(target);
+    } catch (_) {
+      // The scrollable may detach while switching mode or media.
+    }
+  }
+
+  void _handleSelectionScrollableChanged(ScrollableState scrollable) {
+    if (!mounted) return;
+    _selectionScrollable = scrollable;
+  }
+
+  Widget _keepSelectionNodeAlive(Widget child) {
+    return _SelectionKeepAlive(
+      keepAlive: _hasTextSelection,
+      child: _TranscriptScrollableObserver(
+        onScrollableChanged: _handleSelectionScrollableChanged,
+        child: child,
+      ),
+    );
+  }
+
+  void _clearSelectionGesture() {
+    _selectionGesturePointer = null;
+    _selectionGestureUsesHandle = false;
+  }
+
+  void _stopTouchSelectionEdgeScroll() {
+    _touchSelectionEdgeScrollTimer?.cancel();
+    _touchSelectionEdgeScrollTimer = null;
+    _touchSelectionEdgePointer = null;
+    _touchSelectionEdgeScrollPixels = 0;
+    _touchSelectionEdgeTickCount = 0;
+  }
+
+  Widget _buildTextSelectionContextMenu(
+    BuildContext context,
+    SelectableRegionState selectableRegionState,
+  ) {
+    // Touch uses a toolbar owned by this sidebar instead of Flutter's
+    // endpoint-anchored ContextMenuController. Flutter may tear down and
+    // recreate that toolbar as selection geometry scrolls off-screen; keeping
+    // ours in one stable overlay avoids that invalid-anchor transition.
+    if (_usesPersistentTouchSelectionToolbar) {
+      return const SizedBox.shrink();
+    }
+    // Keep this seam local to the transcript. Future actions such as dictionary
+    // lookup can be added without widening selection to timestamps or controls.
+    return AdaptiveTextSelectionToolbar.selectableRegion(
+      selectableRegionState: selectableRegionState,
+    );
+  }
+
+  void _schedulePersistentSelectionToolbar() {
+    if (_persistentSelectionToolbarEntry != null ||
+        _persistentSelectionToolbarInsertScheduled) {
+      _persistentSelectionToolbarEntry?.markNeedsBuild();
+      return;
+    }
+    _persistentSelectionToolbarInsertScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _persistentSelectionToolbarInsertScheduled = false;
+      if (!mounted ||
+          !_hasTextSelection ||
+          !_usesPersistentTouchSelectionToolbar ||
+          _persistentSelectionToolbarEntry != null) {
+        return;
+      }
+      final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
+      if (overlay == null) return;
+      final entry = OverlayEntry(builder: _buildPersistentSelectionToolbar);
+      _persistentSelectionToolbarEntry = entry;
+      overlay.insert(entry);
+    });
+    _ensureFrameScheduled();
+  }
+
+  Widget _buildPersistentSelectionToolbar(BuildContext context) {
+    if (!mounted ||
+        !_hasTextSelection ||
+        !_usesPersistentTouchSelectionToolbar) {
+      return const SizedBox.shrink();
+    }
+    final SelectionAreaState? selectionArea = _textSelectionKey.currentState;
+    final RenderObject? viewportObject = _listViewportKey.currentContext
+        ?.findRenderObject();
+    if (selectionArea == null ||
+        viewportObject is! RenderBox ||
+        !viewportObject.hasSize) {
+      return const SizedBox.shrink();
+    }
+
+    final Offset topLeft = viewportObject.localToGlobal(Offset.zero);
+    final Rect viewport = topLeft & viewportObject.size;
+    final TextSelectionToolbarAnchors stableAnchors =
+        _persistentSelectionToolbarAnchors ??=
+            _resolvePersistentTouchToolbarAnchors(selectionArea, viewport);
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: stableAnchors,
+      buttonItems: _buildReliableSelectionToolbarItems(forTouch: true),
+    );
+  }
+
+  TextSelectionToolbarAnchors _resolvePersistentTouchToolbarAnchors(
+    SelectionAreaState selectionArea,
+    Rect viewport,
+  ) {
+    TextSelectionToolbarAnchors? nativeAnchors;
+    try {
+      final TextSelectionToolbarAnchors candidate =
+          selectionArea.selectableRegion.contextMenuAnchors;
+      if (_isFiniteOffset(candidate.primaryAnchor) &&
+          (candidate.secondaryAnchor == null ||
+              _isFiniteOffset(candidate.secondaryAnchor!))) {
+        nativeAnchors = candidate;
+      }
+    } catch (_) {
+      // Selection geometry can be between layout passes while virtualized
+      // transcript children are mounting. The touch position is a safe
+      // one-frame fallback and remains stable afterwards.
+    }
+
+    final Offset requested =
+        _persistentSelectionToolbarAnchor ?? viewport.center;
+    final Offset rawAbove =
+        nativeAnchors?.primaryAnchor ?? requested - const Offset(0, 24);
+    final Offset rawBelow =
+        nativeAnchors?.secondaryAnchor ?? requested + const Offset(0, 24);
+    final double horizontalInset = viewport.width < 32 ? 0 : 16;
+    double clampX(double dx) => dx
+        .clamp(
+          viewport.left + horizontalInset,
+          viewport.right - horizontalInset,
+        )
+        .toDouble();
+
+    // Give the toolbar two genuinely different anchors. It is first laid out
+    // above the first selected glyph; if that does not fit, it goes below the
+    // last selected glyph. Using one anchor for both directions is what made
+    // the old toolbar cover the selected word.
+    return TextSelectionToolbarAnchors(
+      primaryAnchor: Offset(clampX(rawAbove.dx), rawAbove.dy - 6),
+      secondaryAnchor: Offset(clampX(rawBelow.dx), rawBelow.dy + 6),
+    );
+  }
+
+  bool _isFiniteOffset(Offset value) => value.dx.isFinite && value.dy.isFinite;
+
+  List<ContextMenuButtonItem> _buildReliableSelectionToolbarItems({
+    required bool forTouch,
+  }) {
+    final List<ContextMenuButtonItem> items = <ContextMenuButtonItem>[];
+    if (_selectedTranscriptText.isNotEmpty) {
+      items.add(
+        ContextMenuButtonItem(
+          type: ContextMenuButtonType.copy,
+          onPressed: () => _copySelectedTranscript(forTouch: forTouch),
+        ),
+      );
+    }
+    items.add(
+      ContextMenuButtonItem(
+        type: ContextMenuButtonType.selectAll,
+        onPressed: () {
+          _textSelectionKey.currentState?.selectableRegion.selectAll(
+            SelectionChangedCause.toolbar,
+          );
+          if (!forTouch) _removeDesktopSelectionToolbar();
+        },
+      ),
+    );
+    if (_selectedTranscriptText.isNotEmpty) {
+      items.add(
+        ContextMenuButtonItem(
+          type: ContextMenuButtonType.custom,
+          label: '格式',
+          onPressed: () => _openCopyFormatPopover(forTouch: forTouch),
+        ),
+      );
+      if (forTouch && defaultTargetPlatform == TargetPlatform.android) {
+        items.add(
+          ContextMenuButtonItem(
+            type: ContextMenuButtonType.share,
+            onPressed: () {
+              final String text = _formattedSelectedTranscriptText();
+              if (text.isEmpty) return;
+              unawaited(
+                SystemChannels.platform.invokeMethod<void>(
+                  'Share.invoke',
+                  text,
+                ),
+              );
+              _removeCopyFormatPopover();
+              clearTextSelection();
+            },
+          ),
+        );
+      }
+    }
+    return items;
+  }
+
+  String _formattedSelectedTranscriptText() {
+    return SubtitleCopyFormatter.format(
+      selectedText: _selectedTranscriptText,
+      cues: List<SubtitleCueCopyParts>.unmodifiable(_cueCopyPartsCache),
+      format: SettingsService().subtitleCopyFormat,
+    );
+  }
+
+  @visibleForTesting
+  String get formattedSelectedTranscriptText =>
+      _formattedSelectedTranscriptText();
+
+  void _copySelectedTranscript({required bool forTouch}) {
+    final String text = _formattedSelectedTranscriptText();
+    if (text.isEmpty) return;
+    unawaited(Clipboard.setData(ClipboardData(text: text)));
+    _removeCopyFormatPopover();
+    if (forTouch &&
+        (defaultTargetPlatform == TargetPlatform.android ||
+            defaultTargetPlatform == TargetPlatform.fuchsia)) {
+      clearTextSelection();
+    } else if (!forTouch) {
+      _removeDesktopSelectionToolbar();
+    }
+  }
+
+  void _persistCopyFormat(SubtitleCopyFormat format) {
+    unawaited(
+      SettingsService().updateSetting(
+        'subtitleCopyFormat',
+        format.toJsonString(),
+      ),
+    );
+  }
+
+  Offset _copyFormatPopoverAnchor({required bool forTouch}) {
+    if (forTouch) {
+      return _persistentSelectionToolbarAnchors?.secondaryAnchor ??
+          _persistentSelectionToolbarAnchor ??
+          Offset.zero;
+    }
+    return _desktopSelectionToolbarAnchor ?? Offset.zero;
+  }
+
+  void _openCopyFormatPopover({required bool forTouch}) {
+    if (!_hasTextSelection || _selectedTranscriptText.isEmpty) return;
+    if (_copyFormatPopoverEntry != null) {
+      _removeCopyFormatPopover();
+      return;
+    }
+    final Offset anchor = _copyFormatPopoverAnchor(forTouch: forTouch);
+    if (!forTouch) {
+      _removeDesktopSelectionToolbar();
+    }
+    if (!mounted ||
+        !_hasTextSelection ||
+        _selectedTranscriptText.isEmpty ||
+        _copyFormatPopoverEntry != null) {
+      return;
+    }
+    final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (overlay == null) return;
+    final OverlayEntry entry = OverlayEntry(
+      builder: (BuildContext context) {
+        if (!mounted ||
+            !_hasTextSelection ||
+            _selectedTranscriptText.isEmpty) {
+          return const SizedBox.shrink();
+        }
+          return SizedBox.expand(
+            child: SubtitleCopyFormatPopover(
+              anchor: anchor,
+              format: SettingsService().subtitleCopyFormat,
+              previewText: _formattedSelectedTranscriptText(),
+              showBilingualOptions: _cueCopyPartsCache.any(
+                (SubtitleCueCopyParts parts) => parts.hasSecondary,
+              ),
+              onFormatChanged: _persistCopyFormat,
+              onCopy: () => _copySelectedTranscript(forTouch: forTouch),
+              onReset: () => _persistCopyFormat(SubtitleCopyFormat.defaults),
+            ),
+          );
+      },
+    );
+    _copyFormatPopoverEntry = entry;
+    overlay.insert(entry);
+  }
+
+  void _removeCopyFormatPopover() {
+    _copyFormatPopoverEntry?.remove();
+    _copyFormatPopoverEntry?.dispose();
+    _copyFormatPopoverEntry = null;
+  }
+
+  void _removePersistentSelectionToolbar() {
+    _persistentSelectionToolbarInsertScheduled = false;
+    _persistentSelectionToolbarEntry?.remove();
+    _persistentSelectionToolbarEntry?.dispose();
+    _persistentSelectionToolbarEntry = null;
+    _usesPersistentTouchSelectionToolbar = false;
+    _persistentSelectionToolbarAnchor = null;
+    _persistentSelectionToolbarAnchors = null;
+  }
+
+  void _showDesktopSelectionToolbar(Offset anchor) {
+    if (!_hasTextSelection || _usesPersistentTouchSelectionToolbar) return;
+    _removeCopyFormatPopover();
+    _desktopSelectionToolbarAnchor = anchor;
+    _hideNativeSelectionToolbars();
+    if (_desktopSelectionToolbarInsertScheduled) return;
+    _desktopSelectionToolbarInsertScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_desktopSelectionToolbarInsertScheduled) return;
+      _desktopSelectionToolbarInsertScheduled = false;
+      if (!mounted ||
+          !_hasTextSelection ||
+          _usesPersistentTouchSelectionToolbar ||
+          _desktopSelectionToolbarAnchor == null) {
+        return;
+      }
+
+      // An ancestor SelectionArea also receives secondary-tap-down before the
+      // gesture arena has chosen the sidebar. It may therefore have opened a
+      // second, selection-less menu containing only "Select all". Run this
+      // after the pointer dispatch has finished, remove every native menu, and
+      // then leave exactly one sidebar-owned menu visible.
+      _hideNativeSelectionToolbars();
+      if (_desktopSelectionToolbarEntry != null) {
+        _desktopSelectionToolbarEntry!.markNeedsBuild();
+        return;
+      }
+      final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
+      if (overlay == null) return;
+      final OverlayEntry entry = OverlayEntry(
+        builder: (BuildContext context) {
+          if (!mounted ||
+              !_hasTextSelection ||
+              _usesPersistentTouchSelectionToolbar ||
+              _desktopSelectionToolbarAnchor == null) {
+            return const SizedBox.shrink();
+          }
+          return AdaptiveTextSelectionToolbar.buttonItems(
+            anchors: TextSelectionToolbarAnchors(
+              primaryAnchor: _desktopSelectionToolbarAnchor!,
+            ),
+            buttonItems: _buildReliableSelectionToolbarItems(forTouch: false),
+          );
+        },
+      );
+      _desktopSelectionToolbarEntry = entry;
+      overlay.insert(entry);
+    });
+    _ensureFrameScheduled();
+  }
+
+  void _hideNativeSelectionToolbars() {
+    _textSelectionKey.currentState?.selectableRegion.hideToolbar();
+    context.visitAncestorElements((Element element) {
+      if (element is StatefulElement) {
+        final State<StatefulWidget> state = element.state;
+        if (state is SelectableRegionState) {
+          state.hideToolbar();
+        } else if (state is SelectionAreaState) {
+          state.selectableRegion.hideToolbar();
+        }
+      }
+      return true;
+    });
+  }
+
+  void _removeDesktopSelectionToolbar() {
+    _desktopSelectionToolbarInsertScheduled = false;
+    _desktopSelectionToolbarEntry?.remove();
+    _desktopSelectionToolbarEntry?.dispose();
+    _desktopSelectionToolbarEntry = null;
+    _desktopSelectionToolbarAnchor = null;
+  }
+
+  void _startSelectionPreservingPan(DragStartDetails details) {
+    _stopTouchSelectionEdgeScroll();
+    _cancelPendingAutoScroll();
+    _removeDesktopSelectionToolbar();
+    _selectionPreservingPanDrag?.cancel();
+    final ScrollableState? scrollable = _selectionScrollable;
+    if (scrollable == null || !scrollable.mounted) return;
+    try {
+      _selectionPreservingPanDrag = scrollable.position.drag(details, () {
+        _selectionPreservingPanDrag = null;
+      });
+    } catch (_) {
+      _selectionPreservingPanDrag = null;
+    }
+  }
+
+  void _updateSelectionPreservingPan(DragUpdateDetails details) {
+    _selectionPreservingPanDrag?.update(details);
+  }
+
+  void _endSelectionPreservingPan(DragEndDetails details) {
+    final Drag? drag = _selectionPreservingPanDrag;
+    _selectionPreservingPanDrag = null;
+    drag?.end(details);
+  }
+
+  void _cancelSelectionPreservingPan() {
+    final Drag? drag = _selectionPreservingPanDrag;
+    _selectionPreservingPanDrag = null;
+    drag?.cancel();
+  }
+
+  Widget _buildSelectionPreservingScrollShield() {
+    return Positioned.fill(
+      child: Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerSignal: (PointerSignalEvent event) {
+          if (event is! PointerScrollEvent) return;
+          final ScrollableState? scrollable = _selectionScrollable;
+          if (scrollable == null || !scrollable.mounted) return;
+          _removeDesktopSelectionToolbar();
+          scrollable.position.pointerScroll(event.scrollDelta.dy);
+        },
+        child: GestureDetector(
+          key: const ValueKey('subtitle-selection-scroll-shield'),
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (TapDownDetails details) {
+            _selectionShieldTapDownPosition = details.globalPosition;
+          },
+          onTapUp: (TapUpDetails details) {
+            final Offset? down = _selectionShieldTapDownPosition;
+            _selectionShieldTapDownPosition = null;
+            if (down == null ||
+                (details.globalPosition - down).distance >
+                    _selectionDismissTapSlop) {
+              return;
+            }
+            clearTextSelection();
+            widget.onClearSelection?.call();
+            widget.focusNode?.requestFocus();
+          },
+          onTapCancel: () => _selectionShieldTapDownPosition = null,
+          onSecondaryTapDown: (TapDownDetails details) {
+            _selectionShieldTapDownPosition = null;
+            _showDesktopSelectionToolbar(details.globalPosition);
+          },
+          onVerticalDragStart: _startSelectionPreservingPan,
+          onVerticalDragUpdate: _updateSelectionPreservingPan,
+          onVerticalDragEnd: _endSelectionPreservingPan,
+          onVerticalDragCancel: _cancelSelectionPreservingPan,
+        ),
+      ),
+    );
+  }
+
+  void _ensureTimelineResolver() {
+    final subtitles = _displaySubtitles;
+    if (_timelineResolverSubtitles != subtitles) {
+      _rebuildTimelineResolver();
+    }
+  }
+
+  List<int> _activeIndicesAtMs(int posMs) {
+    _ensureTimelineResolver();
+    final resolver = _timelineResolver;
+    if (resolver == null || resolver.isEmpty) return const <int>[];
+    // 侧栏高亮是阅读光标：上一句保持点亮直到下一句开始。画面「字幕连续
+    // 显示」只决定悬浮字幕要不要填空隙，不能把这套粘滞高亮关掉。
+    return resolver.activeIndicesAtMs(posMs, extendToNextStart: true);
   }
 
   /// 暂停时播放位置不再变化，调整「字幕同步」不会触发 controller 回调；
   /// 这里主动重算一次高亮，避免侧边栏停留在换算前的索引。
   void _handleSubtitleOffsetChanged() {
-    final int offsetMs = SettingsService().subtitleOffset.inMilliseconds;
+    _copyFormatPopoverEntry?.markNeedsBuild();
+    final settings = SettingsService();
+    final bool nextParagraphMode = settings.subtitleArticleParagraphModeEnabled;
+    if (nextParagraphMode != _articleParagraphModeEnabled && mounted) {
+      _clearTextSelection(resumeAutoFollow: false);
+      setState(() {
+        _articleParagraphModeEnabled = nextParagraphMode;
+        _invalidateContinuousArticleLayout();
+      });
+      _triggerLocateButtonAfterModeSwitch();
+    }
+    final int offsetMs = settings.subtitleOffset.inMilliseconds;
     if (offsetMs == _lastSubtitleOffsetMs) return;
     _lastSubtitleOffsetMs = offsetMs;
     if (!mounted) return;
-    // 绕过位置节流，保证滑块落点立即生效（即使位移小于 80ms）。
-    _lastIndexComputePosMs = -1;
     _updateIndex();
+  }
+
+  void _rebuildContinuousArticleDocument() {
+    _articleDocumentGeneration++;
+    final subtitles = _displaySubtitles;
+    _continuousArticleDocument = ArticleDocument.fromDisplayTexts(
+      generation: _articleDocumentGeneration,
+      displayTexts: _selectionTextCache,
+      sentenceSeparator: ' ',
+      imageSubtitleFlags: List<bool>.generate(
+        subtitles.length,
+        (index) => subtitles[index].imageLoader != null,
+        growable: false,
+      ),
+    );
+    _invalidateContinuousArticleLayout();
   }
 
   bool _isBeforeFirstSubtitleAtMs(int positionMs) {
@@ -591,20 +1582,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _lastKnownIsPlaying = isPlaying;
     final int posMs = _subtitleTimelinePositionMs;
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (!playbackStateChanged && _lastIndexComputePosMs != -1) {
-      final int deltaPos = (posMs - _lastIndexComputePosMs).abs();
-      final int deltaTime = nowMs - _lastIndexComputeAtMs;
-      if (deltaPos < 80 && deltaTime < 80) {
-        return;
-      }
-    }
-    _lastIndexComputePosMs = posMs;
-    _lastIndexComputeAtMs = nowMs;
-
-    final List<int> activeIndices = _findActiveIndicesMs(
-      posMs,
-      continuousSubtitleEnabled: true,
-    );
+    // 高亮必须跟悬浮字幕用同一帧播放位置切句。按 80ms 节流会跨过句界，
+    // 侧栏会比画面晚一拍；解析器查询本身很便宜，不必为省这一点而延迟。
+    final List<int> activeIndices = _activeIndicesAtMs(posMs);
     final bool isBeforeFirstSubtitle = _isBeforeFirstSubtitleAtMs(posMs);
     if (isBeforeFirstSubtitle) {
       _pendingLocateIndex = null;
@@ -686,7 +1666,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
         SettingsService().autoScrollSubtitles &&
         !isInManualLocateAutoFollowCooldown &&
         !suppressAutoScrollForIndex &&
-        !_hasAnyActivePointer) {
+        !_selectionBlocksAutoFollow) {
       _scheduleAutoScroll();
     }
   }
@@ -704,10 +1684,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
     // 调用方传入的是视频时间（用于 seek），先换算到字幕时间轴再定位。
     final int posMs = target.inMilliseconds - _subtitleOffsetMs;
-    final List<int> activeIndices = _findActiveIndicesMs(
-      posMs,
-      continuousSubtitleEnabled: true,
-    );
+    final List<int> activeIndices = _activeIndicesAtMs(posMs);
     if (_isBeforeFirstSubtitleAtMs(posMs)) {
       _cancelPendingAutoScroll();
       _invalidateLocateRequests();
@@ -751,66 +1728,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
   }
 
-  int _getEffectiveEndTimeMs(int index, bool continuousSubtitleEnabled) {
-    final subtitles = _displaySubtitles;
-    final item = subtitles[index];
-    final int actualEndMs = item.endTime.inMilliseconds;
-    if (!continuousSubtitleEnabled) {
-      return actualEndMs;
-    }
-    _ensureSubtitleIndex();
-    if (index >= 0 && index < _subtitleEffectiveEndMs.length) {
-      return _subtitleEffectiveEndMs[index];
-    }
-    return actualEndMs;
-  }
-
-  int _binarySearchLastStartLE(int posMs) {
-    int low = 0;
-    int high = _subtitleStartMs.length - 1;
-    int ans = -1;
-    while (low <= high) {
-      final int mid = (low + high) >> 1;
-      if (_subtitleStartMs[mid] <= posMs) {
-        ans = mid;
-        low = mid + 1;
-      } else {
-        high = mid - 1;
-      }
-    }
-    return ans;
-  }
-
-  List<int> _findActiveIndicesMs(
-    int posMs, {
-    required bool continuousSubtitleEnabled,
-  }) {
-    final subtitles = _displaySubtitles;
-    if (subtitles.isEmpty) return <int>[];
-    _ensureSubtitleIndex();
-    final int candidate = _binarySearchLastStartLE(posMs);
-    if (candidate < 0 || candidate >= subtitles.length) return <int>[];
-    final List<int> indices = <int>[];
-    for (int i = candidate; i >= 0; i--) {
-      if (_subtitleStartMs[i] > posMs) continue;
-      final int endMs = _getEffectiveEndTimeMs(i, continuousSubtitleEnabled);
-      if (posMs < endMs) {
-        indices.add(i);
-      }
-      if (i == 0) {
-        break;
-      }
-      final int prefixMaxEndMs = continuousSubtitleEnabled
-          ? _subtitlePrefixMaxEndMs[i - 1]
-          : _getEffectiveEndTimeMs(i - 1, continuousSubtitleEnabled);
-      if (prefixMaxEndMs <= posMs) {
-        break;
-      }
-    }
-    if (indices.length <= 1) return indices;
-    return indices.reversed.toList(growable: false);
-  }
-
   bool _isSameIndices(List<int> next, List<int> prev) {
     if (next.length != prev.length) return false;
     for (int i = 0; i < next.length; i++) {
@@ -824,11 +1741,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     final int requestId = ++_autoScrollRequestId;
     _autoScrollTimer = Timer(Duration.zero, () {
       if (!mounted) return;
-      if (_hasAnyActivePointer) return;
+      if (_selectionBlocksAutoFollow) return;
       if (!_isSubtitleSidebarRouteCurrent) return;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        if (_hasAnyActivePointer) return;
+        if (_selectionBlocksAutoFollow) return;
         if (requestId != _autoScrollRequestId) return;
         if (!_isSubtitleSidebarRouteCurrent) return;
         _scrollToActiveIndex(isAuto: true);
@@ -840,11 +1757,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   void triggerLocateForAutoFollow({bool animated = false}) {
     if (!mounted) return;
     if (!widget.isVisible || !SettingsService().autoScrollSubtitles) return;
-    if (_hasAnyActivePointer) return;
+    if (_selectionBlocksAutoFollow) return;
     if (_displaySubtitles.isEmpty) return;
     if (!_playbackIsPlaying) return;
     if (!_isSubtitleSidebarRouteCurrent) return;
-    _ensureSubtitleIndex();
+    _ensureTimelineResolver();
     if (_isBeforeFirstSubtitleAtMs(_subtitleTimelinePositionMs)) {
       _locateBeforeFirstSubtitleAtTop();
       return;
@@ -856,7 +1773,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   void _triggerLocateButtonAfterModeSwitch() {
     if (!mounted) return;
     if (!widget.isVisible) return;
-    if (_hasAnyActivePointer) return;
+    if (_selectionBlocksAutoFollow) return;
     if (_displaySubtitles.isEmpty) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -880,10 +1797,26 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     );
     if (nextValue == _articleChunkSize) return;
 
+    _clearTextSelection(resumeAutoFollow: false);
     setState(() => _articleChunkSize = nextValue);
     SettingsService().updateSetting(
       'subtitleArticleSentencesPerParagraph',
       nextValue,
+    );
+    _triggerLocateButtonAfterModeSwitch();
+  }
+
+  void _updateArticleParagraphMode(bool enabled) {
+    if (enabled == _articleParagraphModeEnabled) return;
+    _invalidateLocateRequests();
+    _cancelPendingAutoScroll();
+    setState(() {
+      _articleParagraphModeEnabled = enabled;
+      _invalidateContinuousArticleLayout();
+    });
+    SettingsService().updateSetting(
+      'subtitleArticleParagraphModeEnabled',
+      enabled,
     );
     _triggerLocateButtonAfterModeSwitch();
   }
@@ -922,9 +1855,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (!widget.isVisible) return false;
     // 页面切换完成后的自动定位属于「显式请求」，即便切页瞬间仍有一个活动的指针
     // （例如点击返回键抬起前的那一帧）也应执行定位；此时由调用方传入 ignorePointer=true。
+    if (_hasTextSelection) return false;
     if (!ignorePointer && _hasAnyActivePointer) return false;
     if (_displaySubtitles.isEmpty) return false;
-    _ensureSubtitleIndex();
+    _ensureTimelineResolver();
     // 修复定位必须压过自动跟随：先取消待执行的自动滚动并进入冷却时间，
     // 否则自动跟随的动画会在修复跳转之后落地，把文稿又拖回旧位置。
     _cancelPendingAutoScroll();
@@ -943,6 +1877,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     bool keepVerificationBudget = false,
     bool immediate = false,
   }) {
+    if (_hasTextSelection) return;
     final int requestId = ++_locateRequestId;
     _locateAttempts = 0;
     _locateAnimated = animated;
@@ -984,6 +1919,20 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     return _isArticleMode
         ? _articleItemPositionsListener.itemPositions.value
         : _itemPositionsListener.itemPositions.value;
+  }
+
+  int _articleItemIndexForSubtitle(int subtitleIndex) {
+    if (_isContinuousArticleMode) {
+      return _continuousArticleLayout?.lineForSentence(subtitleIndex) ?? -1;
+    }
+    return subtitleIndex ~/ _articleChunkSize;
+  }
+
+  int get _articleItemCount {
+    if (_isContinuousArticleMode) {
+      return _continuousArticleLayout?.lines.length ?? 0;
+    }
+    return (_displaySubtitles.length / _articleChunkSize).ceil();
   }
 
   /// 列表是否已经产出可用的几何信息。控制器未挂载或没有任何可见行时，
@@ -1029,7 +1978,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       return;
     }
 
-    _ensureSubtitleIndex();
+    _ensureTimelineResolver();
     _applyLocateRequest();
     if (_locateIsRepair) {
       _repairRequestPending = false;
@@ -1039,10 +1988,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   void _applyLocateRequest() {
     final int posMs = _subtitleTimelinePositionMs;
-    final List<int> activeIndices = _findActiveIndicesMs(
-      posMs,
-      continuousSubtitleEnabled: true,
-    );
+    final List<int> activeIndices = _activeIndicesAtMs(posMs);
     if (_isBeforeFirstSubtitleAtMs(posMs)) {
       _locateBeforeFirstSubtitleAtTop();
       return;
@@ -1109,28 +2055,154 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     });
   }
 
+  /// 字幕列表区（不含顶部工具栏）的指针登记。
+  ///
+  /// 命中测试结果自内向外派发，本回调一定早于外层的 [_onPointerDown]，
+  /// 因此 [_onPointerDown] 建记录时可以直接读到这里写下的结果。
+  void _onListAreaPointerDown(PointerDownEvent event) {
+    _listAreaPointerIds.add(event.pointer);
+    final int? rowIndex = _resolveRowIndexAt(event.position);
+    if (rowIndex != null) {
+      _pendingRowIndexByPointer[event.pointer] = rowIndex;
+    }
+  }
+
+  /// 把全局坐标反查成字幕行号；落在行间空隙或列表之外时返回 null。
+  ///
+  /// [ItemPosition] 的 leading/trailing edge 是相对视口主轴长度的比例，所以
+  /// 先把坐标换算进 [_listViewportKey] 对应的视口，再按比例查表。
+  int? _resolveRowIndexAt(Offset globalPosition) {
+    final RenderObject? object = _listViewportKey.currentContext
+        ?.findRenderObject();
+    if (object is! RenderBox || !object.hasSize) return null;
+    final Size size = object.size;
+    if (size.height <= 0) return null;
+    final Offset local = object.globalToLocal(globalPosition);
+    if (!(Offset.zero & size).contains(local)) return null;
+
+    final double fraction = local.dy / size.height;
+    int? targetIndex;
+    for (final ItemPosition position in _currentItemPositions()) {
+      if (fraction >= position.itemLeadingEdge &&
+          fraction < position.itemTrailingEdge) {
+        targetIndex = position.index;
+        break;
+      }
+    }
+    if (targetIndex == null) return null;
+
+    if (!_isArticleMode) {
+      return targetIndex >= 0 && targetIndex < _displaySubtitles.length
+          ? targetIndex
+          : null;
+    }
+    if (_isContinuousArticleMode) {
+      return _continuousArticleViewKey.currentState
+          ?.subtitleIndexAtGlobalPosition(globalPosition, targetIndex);
+    }
+    // 文章模式一个 item 是一整段，还要再问段落自己命中了段内哪一句。
+    final State<SubtitleArticleChunk>? chunkState =
+        _articleChunkKeys[targetIndex]?.currentState;
+    if (chunkState is! _SubtitleArticleChunkState) return null;
+    return chunkState.subtitleIndexAtGlobalPosition(globalPosition);
+  }
+
   void _onPointerDown(PointerDownEvent event) {
     if (_activePointerCount == 0) {
+      _pointerSessionStartedWithTextSelection = _hasTextSelection;
       _didScrollWhilePointerSession = false;
+      _didDoubleTapSeekWhilePointerSession = false;
       _pointerDownStartIndex = _activeIndexNotifier.value;
       _pointerDownSubtitleIndex = null;
+      _pendingDragDoubleTap = null;
+      _suppressedRowTapIndex = null;
     }
+    _recentlyLiftedSecondaryTap = null;
+    _lastLiftedPointer = null;
+    _lastLiftedHeldMs = 0;
     _activePointerCount++;
+    _pointerRecords[event.pointer] = _SidebarPointerRecord(
+      downPosition: event.position,
+      downTimeMs: event.timeStamp.inMilliseconds,
+      kind: event.kind,
+      inListArea: _listAreaPointerIds.contains(event.pointer),
+      anchorPointerIds: _currentListAreaAnchorIds(event.pointer),
+      rowIndex: _pendingRowIndexByPointer.remove(event.pointer),
+    );
     _cancelPendingAutoScroll();
   }
 
+  /// 本指针按下瞬间，列表区内已经按住的其他指针 id。
+  /// 非空即表示它是一次「拖拽会话中的副指针」。
+  Set<int> _currentListAreaAnchorIds(int selfPointer) {
+    return _pointerRecords.keys
+        .where(
+          (int id) => id != selfPointer && _listAreaPointerIds.contains(id),
+        )
+        .toSet();
+  }
+
+  void _onPointerMove(PointerMoveEvent event) {
+    final _SidebarPointerRecord? record = _pointerRecords[event.pointer];
+    if (record == null) return;
+    // 累计「离落点的最远距离」而不是逐帧位移：来回抖动同样会被正确放大，
+    // 避免手指画圈却被当成原地轻点。
+    final double travel = (event.position - record.downPosition).distance;
+    if (travel > record.maxTravel) record.maxTravel = travel;
+  }
+
   void _onPointerUpOrCancel(PointerEvent event) {
+    final _SidebarPointerRecord? record = _pointerRecords.remove(event.pointer);
+    _listAreaPointerIds.remove(event.pointer);
+    // PointerCancel 表示手势被系统/上层接管（来电浮层、返回手势等），
+    // 绝不能当成一次有效轻点。
+    _recentlyLiftedSecondaryTap = null;
+    _pendingRowIndexByPointer.remove(event.pointer);
+    // 先记下这次抬起的位移/时长，再交给随后才会裁决的 onTap 去核对。
+    // PointerCancel 不能当单击：手势被系统接管时绝不能 seek。
+    if (record != null && event is PointerUpEvent) {
+      _lastLiftedPointer = record;
+      _lastLiftedHeldMs = event.timeStamp.inMilliseconds - record.downTimeMs;
+    } else {
+      _lastLiftedPointer = null;
+      _lastLiftedHeldMs = 0;
+    }
+    if (record != null &&
+        event is PointerUpEvent &&
+        _isDragDoubleTapCandidate(record, event)) {
+      // 留给随后才会裁决出的 onTap 认领，见 [_shouldDeferRowTap]。
+      _recentlyLiftedSecondaryTap = record;
+      _evaluateDragDoubleTap(record, event.timeStamp.inMilliseconds);
+    }
     _activePointerCount--;
     if (_activePointerCount < 0) _activePointerCount = 0;
     if (_activePointerCount == 0) {
+      // 兜底清理：极端情况下（如事件在路由切换中丢失）残留的记录会让下一次
+      // 单指点击被误判成副指针，这里按会话边界强制归零。
+      _pointerRecords.clear();
+      _listAreaPointerIds.clear();
+      _pendingRowIndexByPointer.clear();
       final bool shouldAnimateRelocate = _didScrollWhilePointerSession;
+      final bool didDoubleTapSeek = _didDoubleTapSeekWhilePointerSession;
       final int? pointerDownStartIndex = _pointerDownStartIndex;
       final int? tappedSubtitleIndex = _pointerDownSubtitleIndex;
       final int currentIndex = _activeIndexNotifier.value;
       _didScrollWhilePointerSession = false;
+      _didDoubleTapSeekWhilePointerSession = false;
       _pointerDownStartIndex = null;
       _pointerDownSubtitleIndex = null;
-      if (shouldAnimateRelocate && tappedSubtitleIndex == null) {
+      _pendingDragDoubleTap = null;
+      _suppressedRowTapIndex = null;
+      if (didDoubleTapSeek) {
+        // 拖拽期间的双击只做了 seek，定位被刻意推迟到这一刻。
+        // 目标是「此刻的当前句」（媒体可能已经从双击那句继续播了过去），
+        // 由 locateToCurrentSubtitle 按实时播放位置解析，而不是记住双击行号。
+        // 用它而不是 triggerLocateForAutoFollow：双击是显式意图，暂停时也该
+        // 对齐，只保留「自动跟随开关」这一层约束。
+        if (SettingsService().autoScrollSubtitles) {
+          locateToCurrentSubtitle(animated: true);
+        }
+      } else if (shouldAnimateRelocate && tappedSubtitleIndex == null) {
         triggerLocateForAutoFollow(animated: true);
       } else if (tappedSubtitleIndex == null &&
           pointerDownStartIndex != null &&
@@ -1142,13 +2214,163 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
   }
 
+  /// 这次抬起是不是「拖拽会话中副指针的一次干净轻点」。
+  ///
+  ///  - [PointerDeviceKind.touch]：鼠标双击、触控笔在桌面端另有语义；
+  ///  - [_SidebarPointerRecord.inListArea]：点在顶部工具栏上不算；
+  ///  - `anchorPointerIds` 非空：单指点击必须保持原有的「点一下就跳并定位」；
+  ///  - `rowIndex != null`：必须真的命中了某一行字幕；
+  ///  - 干净轻点：位移 <= slop 且时长 <= 300ms，滑动与长按都被排除。
+  bool _isDragDoubleTapCandidate(
+    _SidebarPointerRecord record,
+    PointerUpEvent event,
+  ) {
+    // 关闭自动跟随时，单指点击本来就只 seek 不滚动，没有需要规避的副作用，
+    // 保持原有交互即可，不启用本机制。
+    if (!SettingsService().autoScrollSubtitles) return false;
+    if (record.kind != PointerDeviceKind.touch) return false;
+    if (!record.inListArea) return false;
+    if (record.rowIndex == null) return false;
+    if (record.anchorPointerIds.isEmpty) return false;
+    if (record.maxTravel > _dragTapMaxTravel) return false;
+    final int heldMs = event.timeStamp.inMilliseconds - record.downTimeMs;
+    return heldMs <= _dragTapMaxDurationMs;
+  }
+
+  /// 判定刚抬起的这根手指是否凑成了一次「拖拽中的副指针双击」。
+  ///
+  /// 前置条件已由 [_isDragDoubleTapCandidate] 过滤，这里只补上需要跨两次
+  /// 轻点才能判的部分：同一行、落点接近、间隔 <= 300ms，且两次轻点共享至少
+  /// 一根「从第一次点之前就按着、到现在仍没抬起」的锚定手指。
+  void _evaluateDragDoubleTap(_SidebarPointerRecord record, int upTimeMs) {
+    final int rowIndex = record.rowIndex!;
+    final _SidebarTapRecord? pending = _pendingDragDoubleTap;
+    if (pending != null &&
+        pending.rowIndex == rowIndex &&
+        (record.downPosition - pending.downPosition).distance <=
+            _dragDoubleTapSlop &&
+        (record.downTimeMs - pending.upTimeMs) <= _dragDoubleTapIntervalMs &&
+        // 这一条同时挡掉了「中途全部松手后重新落指」和「另一处的无关连点」。
+        pending.anchorPointerIds.any(
+          (int id) =>
+              record.anchorPointerIds.contains(id) &&
+              _pointerRecords.containsKey(id),
+        )) {
+      _pendingDragDoubleTap = null;
+      _handleDragDoubleTapSeek(rowIndex);
+      return;
+    }
+
+    _pendingDragDoubleTap = _SidebarTapRecord(
+      rowIndex: rowIndex,
+      downPosition: record.downPosition,
+      upTimeMs: upTimeMs,
+      anchorPointerIds: record.anchorPointerIds,
+    );
+  }
+
+  /// 第 [index] 行的常规点击是否应该让位给「拖拽中双击」识别器。
+  ///
+  /// 只有在列表尚未进入滚动状态时，行上的 TapGestureRecognizer 才可能赢下
+  /// 竞技场并触发 onTap（列表一旦在滚动，新指针会被 Scrollable 的
+  /// DragGestureRecognizer 直接判给自己）。所以这里要覆盖两种时序：
+  ///   1. 手指仍按着（副指针还在 [_pointerRecords] 里）；
+  ///   2. 手指刚抬起（快速轻点，竞技场在抬起事件派发完之后才裁决），对应记录
+  ///      暂存在 [_recentlyLiftedSecondaryTap]。
+  bool _shouldDeferRowTap(int index) {
+    if (!SettingsService().autoScrollSubtitles) return false;
+    final _SidebarPointerRecord? lifted = _recentlyLiftedSecondaryTap;
+    if (lifted != null && lifted.rowIndex == index) return true;
+    for (final _SidebarPointerRecord record in _pointerRecords.values) {
+      if (record.kind != PointerDeviceKind.touch) continue;
+      if (record.anchorPointerIds.isEmpty) continue;
+      if (record.rowIndex != index) continue;
+      return true;
+    }
+    return false;
+  }
+
+  /// 拖拽会话中的双击：只把媒体 seek 到该句的时间点，绝不滚动文稿。
+  ///
+  /// 播放/暂停状态交由播放页的 seek 通路原样保持（seekTo 不会 pause/play），
+  /// 因此双击前在播放的，双击后继续播放。
+  void _handleDragDoubleTapSeek(int index) {
+    final subtitles = _displaySubtitles;
+    if (index < 0 || index >= subtitles.length) return;
+
+    final item = subtitles[index];
+    widget.onClearSelection?.call();
+    // 作废在途的自动/修复定位并进入冷却，否则它们会在 seek 之后落地，
+    // 把用户正在浏览的位置拖走——这正是本机制要避免的。
+    _invalidateLocateRequests();
+    _cancelPendingAutoScroll();
+    _markManualLocateAutoFollowCooldown();
+    // 高亮立刻跟到被双击的那一行；加锁是为了扛住 seek 真正生效前的那几帧
+    // 仍在上报旧位置的回调，避免高亮来回闪。
+    _markManualLocateLock(index);
+    _activeIndexNotifier.value = index;
+    final List<int> tappedIndices = <int>[index];
+    if (!_isSameIndices(tappedIndices, _activeIndicesNotifier.value)) {
+      _activeIndicesNotifier.value = tappedIndices;
+    }
+    _didDoubleTapSeekWhilePointerSession = true;
+    // 与常规点击一致：接收方把参数当作视频时间直接 seek，字幕时间需加上
+    // 延迟换算，才能让画面字幕与双击项一致。
+    widget.onItemTap?.call(
+      item.startTime + Duration(milliseconds: _subtitleOffsetMs),
+    );
+    // 手指仍压在屏幕上、文稿又刻意不滚动，缺少视觉位移反馈，用轻微震动补上。
+    HapticFeedback.selectionClick();
+  }
+
+  int? _activeTouchPointerForSelection() {
+    // Only pointers that are still down. Leftover list-area records would
+    // re-bind a later pan as a selection gesture and freeze the viewport.
+    if (_latestDownTouchPointer != null) return _latestDownTouchPointer;
+    if (_downTouchPointers.isNotEmpty) return _downTouchPointers.first;
+    return null;
+  }
+
   bool _handleScrollNotification(ScrollNotification notification) {
+    // A long-press drag inside the text can emit a spurious programmatic
+    // scroll even before reaching an edge. Correct that narrow case. Never
+    // counter-scroll a real selection-handle drag: doing so races the overlay
+    // geometry and was the source of the Android full-screen ErrorWidget.
+    if (_selectionGesturePointer != null &&
+        !_selectionGestureUsesHandle &&
+        _touchSelectionEdgePointer == null &&
+        !_selectionViewportCorrectionInFlight &&
+        notification is ScrollUpdateNotification &&
+        notification.dragDetails == null) {
+      final double delta = notification.scrollDelta ?? 0;
+      if (delta.abs() >= 0.5) {
+        unawaited(_correctInitialSelectionViewportOffset(-delta));
+      }
+    }
     if (_activePointerCount <= 0) return false;
     if (notification is ScrollUpdateNotification ||
         notification is OverscrollNotification) {
       _didScrollWhilePointerSession = true;
     }
     return false;
+  }
+
+  Future<void> _correctInitialSelectionViewportOffset(double offset) async {
+    _selectionViewportCorrectionInFlight = true;
+    final ScrollOffsetController controller = _isArticleMode
+        ? _articleScrollOffsetController
+        : _listScrollOffsetController;
+    try {
+      await controller.animateScroll(
+        offset: offset,
+        duration: const Duration(milliseconds: 1),
+        curve: Curves.linear,
+      );
+    } catch (_) {
+      // The list may detach while switching mode or media.
+    } finally {
+      _selectionViewportCorrectionInFlight = false;
+    }
   }
 
   int _resolveLocateTargetIndex(int currentIndex) {
@@ -1170,16 +2392,16 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   String _getFilteredText(String text, int index) {
-    if (index >= 0 && index < _displayTextCache.length) {
-      return _displayTextCache[index];
+    if (index >= 0 && index < _selectionTextCache.length) {
+      return _selectionTextCache[index];
     }
-    return _computeDisplayTextForIndex(index);
+    return _normalizeTranscriptText(_computeDisplayTextForIndex(index));
   }
 
   String _computeDisplayTextForIndex(int index) {
     final subtitles = _displaySubtitles;
     if (index < 0 || index >= subtitles.length) return '';
-    final String text = subtitles[index].text;
+    final String text = _normalizeTranscriptText(subtitles[index].text);
     if (_usesSecondaryTrackForDisplay) {
       return text;
     }
@@ -1187,7 +2409,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       // Dual Mode
       // If we have valid bilingual match, merge them
       if (_isBilingualMode && _secondaryTextCache.containsKey(index)) {
-        return "$text ${_secondaryTextCache[index]}";
+        final String secondary = _secondaryTextCache[index]!;
+        if (text.isEmpty) return secondary;
+        if (secondary.isEmpty) return text;
+        return '$text $secondary';
       }
       return text;
     }
@@ -1206,44 +2431,132 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
 
     // Fallback to split-by-newline logic (Single File)
-    final lines = text.split('\n');
+    final lines = subtitles[index].text.split(RegExp(r'\r?\n'));
     if (_lineFilterMode == 1) {
-      return lines.isNotEmpty ? lines[0] : '';
+      return lines.isNotEmpty ? _normalizeTranscriptText(lines[0]) : '';
     } else if (_lineFilterMode == 2) {
-      return lines.length > 1 ? lines[1] : '';
+      return lines.length > 1 ? _normalizeTranscriptText(lines[1]) : '';
     }
     return text;
   }
 
-  void _handleSubtitleTapDown(int index) {
+  /// Structured primary/secondary text for copy formatting.
+  ///
+  /// Mirrors [_computeDisplayTextForIndex] so the joined display string stays
+  /// identical to the SelectionArea `plainText`, while still exposing the
+  /// bilingual boundary that a flattened copy cannot recover.
+  SubtitleCueCopyParts _computeCueCopyPartsForIndex(int index) {
+    final subtitles = _displaySubtitles;
+    if (index < 0 || index >= subtitles.length) {
+      return SubtitleCueCopyParts.empty;
+    }
+    final SubtitleItem item = subtitles[index];
+    final String text = _normalizeTranscriptText(item.text);
+    SubtitleCueCopyParts parts;
+    if (_usesSecondaryTrackForDisplay) {
+      parts = SubtitleCueCopyParts(primary: text, secondary: '');
+    } else if (_lineFilterMode == 0) {
+      if (_isBilingualMode && _secondaryTextCache.containsKey(index)) {
+        parts = SubtitleCueCopyParts(
+          primary: text,
+          secondary: _secondaryTextCache[index]!,
+        );
+      } else {
+        parts = SubtitleCueCopyParts(primary: text, secondary: '');
+      }
+    } else if (widget.secondarySubtitles.isNotEmpty) {
+      if (_lineFilterMode == 1) {
+        parts = SubtitleCueCopyParts(primary: text, secondary: '');
+      } else {
+        parts = SubtitleCueCopyParts(
+          primary: _secondaryTextCache[index] ?? '',
+          secondary: '',
+        );
+      }
+    } else {
+      final List<String> lines = item.text.split(RegExp(r'\r?\n'));
+      if (_lineFilterMode == 1) {
+        parts = SubtitleCueCopyParts(
+          primary: lines.isNotEmpty ? _normalizeTranscriptText(lines[0]) : '',
+          secondary: '',
+        );
+      } else {
+        parts = SubtitleCueCopyParts(
+          primary: lines.length > 1 ? _normalizeTranscriptText(lines[1]) : '',
+          secondary: '',
+        );
+      }
+    }
+    if (parts.isEmpty && item.imageLoader != null) {
+      return const SubtitleCueCopyParts(primary: '[图片字幕]', secondary: '');
+    }
+    return parts;
+  }
+
+  /// 这次 onTap 是不是「确认的短单击」，只有这时才允许 seek。
+  ///
+  /// 过去把 seek 放在 onTapDown：TapGestureRecognizer 按住约 100ms
+  /// （[kPressTimeout]）就会触发，于是长按、按住再滑、鼠标拖选用字都会先跳转。
+  /// 现在只在手势竞技场确认这是一次 tap 之后，再拿 Listener 记下的时长/位移
+  /// 做一次核对：
+  ///   - 副指针 / 已交给双击识别器的轻点：不 seek；
+  ///   - 按住超过 [_rowTapMaxDurationMs]：长按/选字，不 seek；
+  ///   - 位移超过设备对应 slop：滑动浏览或拖选用字，不 seek。
+  bool _isConfirmedSubtitleClick(int index) {
+    if (_shouldDeferRowTap(index)) return false;
+    if (_suppressedRowTapIndex == index) return false;
+    final _SidebarPointerRecord? lifted = _lastLiftedPointer;
+    if (lifted == null) {
+      // Listener 没看到这次抬起时，仍信任手势竞技场判出的 onTap。
+      return true;
+    }
+    if (lifted.anchorPointerIds.isNotEmpty) return false;
+    if (_lastLiftedHeldMs >= _rowTapMaxDurationMs) return false;
+    if (lifted.maxTravel > _rowTapMaxTravelFor(lifted.kind)) return false;
+    return true;
+  }
+
+  /// 鼠标/触控板用更紧的 slop：拖选用字通常只有几个像素，也必须跟单击分开。
+  double _rowTapMaxTravelFor(PointerDeviceKind kind) {
+    switch (kind) {
+      case PointerDeviceKind.mouse:
+      case PointerDeviceKind.trackpad:
+        return kPrecisePointerHitSlop;
+      default:
+        return kTouchSlop;
+    }
+  }
+
+  /// 确认是单击之后才 seek，并（在自动跟随开启时）把文稿滚到那一句。
+  void _completeSubtitleTap(int index) {
+    if (_hasTextSelection || _pointerSessionStartedWithTextSelection) {
+      _pointerSessionStartedWithTextSelection = false;
+      clearTextSelection();
+      widget.onClearSelection?.call();
+      _suppressedRowTapIndex = null;
+      return;
+    }
+    // 拖拽会话中的副指针轻点、长按、滑动选字都不能落地常规 seek。
+    if (!_isConfirmedSubtitleClick(index)) {
+      _suppressedRowTapIndex = null;
+      return;
+    }
+    _suppressedRowTapIndex = null;
+    _commitConfirmedSubtitleTap(index);
+  }
+
+  void _commitConfirmedSubtitleTap(int index) {
     final subtitles = _displaySubtitles;
     if (index < 0 || index >= subtitles.length) return;
 
     final item = subtitles[index];
     widget.onClearSelection?.call();
-    // 手动选择接管定位：作废在途的自动修复请求。
-    _invalidateLocateRequests();
-    _cancelPendingAutoScroll();
-    _pointerDownSubtitleIndex = index;
-    _pendingLocateIndex = index;
-    _markManualLocateLock(index);
-    _markManualLocateAutoFollowCooldown();
-    _markManualAnimationFreeze(index, animated: true);
-    _markAutoScrollSuppressedForIndex(index);
-    _activeIndexNotifier.value = index;
-    final List<int> tappedIndices = <int>[index];
-    if (!_isSameIndices(tappedIndices, _activeIndicesNotifier.value)) {
-      _activeIndicesNotifier.value = tappedIndices;
-    }
     // onItemTap 的接收方把参数当作视频时间直接 seek，字幕时间需加上
     // 延迟换算，才能让画面字幕与点击项一致。
     widget.onItemTap?.call(
       item.startTime + Duration(milliseconds: _subtitleOffsetMs),
     );
     Future.microtask(() => widget.focusNode?.requestFocus());
-  }
-
-  void _completeSubtitleTap(int index) {
     _pointerDownSubtitleIndex = null;
     _locateTappedSubtitle(index);
   }
@@ -1262,6 +2575,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (!_isSameIndices(tappedIndices, _activeIndicesNotifier.value)) {
       _activeIndicesNotifier.value = tappedIndices;
     }
+    // 关闭自动跟随时，点击只负责 seek，不把文稿滚到当前句，
+    // 避免打断用户正在浏览的字幕列表。手动「定位」按钮仍可随时对齐。
+    if (!SettingsService().autoScrollSubtitles) return;
+    lastTappedLocateScrollIndex = index;
     _scrollToIndex(index, isAuto: false, preferSingleStage: true);
   }
 
@@ -1290,7 +2607,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
         ? _articleItemScrollController
         : _itemScrollController;
     if (!controller.isAttached) return;
-    final targetIndex = _isArticleMode ? index ~/ _articleChunkSize : index;
+    final targetIndex = _isArticleMode
+        ? _articleItemIndexForSubtitle(index)
+        : index;
+    if (targetIndex < 0) return;
     // scrollable_positioned_list 0.3.8 uses a second list and a deferred
     // opacity animation when the target has not been laid out. A repair jump
     // can remove that second list before its post-mount callback runs. The
@@ -1305,7 +2625,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       return;
     }
     if (_isArticleMode) {
-      final chunkIndex = index ~/ _articleChunkSize;
+      final chunkIndex = _articleItemIndexForSubtitle(index);
+      if (chunkIndex < 0) return;
 
       if (preferSingleStage &&
           _shouldPreferJumpForManualLocate(
@@ -1404,7 +2725,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (index < 0 || index >= _displaySubtitles.length) return;
 
     if (_isArticleMode) {
-      final int chunkIndex = index ~/ _articleChunkSize;
+      final int chunkIndex = _articleItemIndexForSubtitle(index);
+      if (chunkIndex < 0) return;
       if (!_articleItemScrollController.isAttached) return;
       final double effectiveAlignment = _resolveReachableAlignment(
         targetIndex: chunkIndex,
@@ -1452,7 +2774,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (positions.isEmpty) return requestedAlignment;
 
     final int itemCount = isArticleMode
-        ? (_displaySubtitles.length / _articleChunkSize).ceil()
+        ? _articleItemCount
         : _displaySubtitles.length;
     if (itemCount <= 0) return requestedAlignment;
 
@@ -1534,7 +2856,8 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
         }
         return;
       }
-      final int chunkIndex = targetIndex ~/ _articleChunkSize;
+      final int chunkIndex = _articleItemIndexForSubtitle(targetIndex);
+      if (chunkIndex < 0) return;
       _articleItemScrollController.jumpTo(index: chunkIndex, alignment: 0.0);
     } else {
       if (!_itemScrollController.isAttached) {
@@ -1569,6 +2892,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           color: Colors.transparent,
           child: GestureDetector(
             onTap: () {
+              clearTextSelection();
               widget.onClearSelection?.call();
               widget.focusNode?.requestFocus();
             },
@@ -1576,6 +2900,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
             child: Listener(
               behavior: HitTestBehavior.translucent,
               onPointerDown: _onPointerDown,
+              onPointerMove: _onPointerMove,
               onPointerUp: _onPointerUpOrCancel,
               onPointerCancel: _onPointerUpOrCancel,
               child: Column(
@@ -1620,6 +2945,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                                   ],
                                   onTap: (index) {
                                     final isArticle = index == 1;
+                                    _clearTextSelection(
+                                      resumeAutoFollow: false,
+                                    );
                                     setState(() => _isArticleMode = isArticle);
                                     SettingsService().updateSetting(
                                       'subtitleViewMode',
@@ -1653,11 +2981,14 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                                     ), // Larger
                                   ],
                                   onTap: (index) {
+                                    _clearTextSelection(
+                                      resumeAutoFollow: false,
+                                    );
                                     setState(() {
                                       _lineFilterMode = index;
                                       _invalidateDisplaySubtitlesCache();
                                     });
-                                    _rebuildSubtitleIndex();
+                                    _rebuildTimelineResolver();
                                     _triggerLocateButtonAfterModeSwitch();
                                   },
                                   selectedIndex: _lineFilterMode,
@@ -1748,7 +3079,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                               // 定位按钮
                               _buildCompactIconButton(
                                 icon: Icons.my_location,
-                                onTap: _scrollToActiveIndex,
+                                onTap: () {
+                                  clearTextSelection();
+                                  _scrollToActiveIndex();
+                                },
                                 tooltip: "定位到当前字幕",
                               ),
 
@@ -2129,6 +3463,78 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                                   ),
                                   if (_isArticleMode)
                                     SizedBox(
+                                      height: 32,
+                                      child: Semantics(
+                                        toggled: _articleParagraphModeEnabled,
+                                        button: true,
+                                        label: '段落模式',
+                                        hint: '关闭后连续显示全部字幕',
+                                        onTap: () =>
+                                            _updateArticleParagraphMode(
+                                              !_articleParagraphModeEnabled,
+                                            ),
+                                        child: GestureDetector(
+                                          key: const ValueKey(
+                                            'subtitle-paragraph-mode-control',
+                                          ),
+                                          behavior: HitTestBehavior.opaque,
+                                          onTap: () =>
+                                              _updateArticleParagraphMode(
+                                                !_articleParagraphModeEnabled,
+                                              ),
+                                          child: Row(
+                                            children: [
+                                              SizedBox(
+                                                width: labelWidth,
+                                                child: Text(
+                                                  isVeryNarrow ? "段" : "段落模式",
+                                                  style: const TextStyle(
+                                                    fontSize: 11,
+                                                    color: Colors.white70,
+                                                  ),
+                                                ),
+                                              ),
+                                              Tooltip(
+                                                message: "关闭后连续显示全部字幕",
+                                                child: SizedBox(
+                                                  width: 44,
+                                                  height: 30,
+                                                  child: FittedBox(
+                                                    fit: BoxFit.contain,
+                                                    child: Switch(
+                                                      key: const ValueKey(
+                                                        'subtitle-paragraph-mode-switch',
+                                                      ),
+                                                      value:
+                                                          _articleParagraphModeEnabled,
+                                                      onChanged:
+                                                          _updateArticleParagraphMode,
+                                                      materialTapTargetSize:
+                                                          MaterialTapTargetSize
+                                                              .shrinkWrap,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                              if (!isVeryNarrow)
+                                                const Expanded(
+                                                  child: Text(
+                                                    "关闭后连续显示全部字幕",
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 10,
+                                                      color: Colors.white54,
+                                                    ),
+                                                  ),
+                                                ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  if (_isArticleMode)
+                                    SizedBox(
                                       height: 28,
                                       child: Row(
                                         children: [
@@ -2143,12 +3549,22 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                                             ),
                                           ),
                                           Expanded(
-                                            child: _SentenceCountInputWidget(
-                                              value: _articleChunkSize,
-                                              min: _minArticleChunkSize,
-                                              max: _maxArticleChunkSize,
-                                              onChanged:
-                                                  _updateArticleChunkSize,
+                                            child: IgnorePointer(
+                                              ignoring:
+                                                  !_articleParagraphModeEnabled,
+                                              child: Opacity(
+                                                opacity:
+                                                    _articleParagraphModeEnabled
+                                                    ? 1
+                                                    : 0.45,
+                                                child: _SentenceCountInputWidget(
+                                                  value: _articleChunkSize,
+                                                  min: _minArticleChunkSize,
+                                                  max: _maxArticleChunkSize,
+                                                  onChanged:
+                                                      _updateArticleChunkSize,
+                                                ),
+                                              ),
                                             ),
                                           ),
                                         ],
@@ -2315,9 +3731,33 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                               ],
                             ),
                           )
-                        : (_isArticleMode
-                              ? _buildArticleView(isSmallScreen)
-                              : _buildListView(isSmallScreen)),
+                        // 只给字幕列表区再套一层指针登记：顶部工具栏按钮上的
+                        // 手指既不能充当双击的锚点，也不会被当成候选轻点。
+                        : Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              SelectionArea(
+                                key: _textSelectionKey,
+                                focusNode: _textSelectionFocusNode,
+                                contextMenuBuilder:
+                                    _buildTextSelectionContextMenu,
+                                onSelectionChanged: _handleTextSelectionChanged,
+                                child: _SelectionStatusObserver(
+                                  onStatusChanged:
+                                      _handleSelectionRegionStatusChanged,
+                                  child: Listener(
+                                    behavior: HitTestBehavior.translucent,
+                                    onPointerDown: _onListAreaPointerDown,
+                                    child: _isArticleMode
+                                        ? _buildArticleView(isSmallScreen)
+                                        : _buildListView(isSmallScreen),
+                                  ),
+                                ),
+                              ),
+                              if (_hasTextSelection)
+                                _buildSelectionPreservingScrollShield(),
+                            ],
+                          ),
                   ),
                 ],
               ),
@@ -2488,16 +3928,16 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       final List<InlineSpan> spans = <InlineSpan>[];
       for (int index = startIndex; index < endIndex; index++) {
         final SubtitleItem item = _displaySubtitles[index];
-        String text = index < _displayTextCache.length
-            ? _displayTextCache[index]
+        String text = index < _selectionTextCache.length
+            ? _selectionTextCache[index]
             : '';
         if (text.isEmpty && item.imageLoader != null) {
           text = '[图片字幕]';
         }
-        text = text.replaceAll('\n', ' ').trim();
+        text = text.replaceAll(RegExp(r'\s+'), ' ');
         if (text.isEmpty) continue;
         if (spans.isNotEmpty) {
-          spans.add(const TextSpan(text: '  '));
+          spans.add(const TextSpan(text: ' '));
         }
         spans.add(TextSpan(text: text, style: articleTextStyle));
       }
@@ -2548,132 +3988,177 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
         final list = NotificationListener<ScrollNotification>(
           onNotification: _handleScrollNotification,
-          child: ScrollablePositionedList.builder(
-            itemScrollController: _itemScrollController,
-            itemPositionsListener: _itemPositionsListener,
-            initialScrollIndex: effectiveInitialIndex,
-            initialAlignment: effectiveInitialAlignment,
-            itemCount: displaySubtitles.length,
-            shrinkWrap: shouldTopAlign,
-            physics: shouldTopAlign
-                ? const NeverScrollableScrollPhysics()
-                : null,
-            itemBuilder: (context, index) {
-              final item = displaySubtitles[index];
-              final timeText = _formatDuration(item.startTime);
-              final subtitleText =
-                  (item.text.isEmpty && item.imageLoader != null)
-                  ? "[图片字幕]"
-                  : _getFilteredText(item.text, index);
-              return ValueListenableBuilder<List<int>>(
-                valueListenable: _activeIndicesNotifier,
-                builder: (context, activeIndices, _) {
-                  final isCurrent = activeIndices.contains(index);
+          // KeyedSubtree 不产生 RenderObject，findRenderObject 会直接拿到列表
+          // 自身的盒子（正好等于视口），供 [_resolveRowIndexAt] 做比例换算。
+          child: KeyedSubtree(
+            key: _listViewportKey,
+            child: ScrollablePositionedList.builder(
+              itemScrollController: _itemScrollController,
+              itemPositionsListener: _itemPositionsListener,
+              scrollOffsetController: _listScrollOffsetController,
+              initialScrollIndex: effectiveInitialIndex,
+              initialAlignment: effectiveInitialAlignment,
+              itemCount: displaySubtitles.length,
+              shrinkWrap: shouldTopAlign,
+              physics: shouldTopAlign
+                  ? const NeverScrollableScrollPhysics()
+                  : null,
+              itemBuilder: (context, index) {
+                final item = displaySubtitles[index];
+                final timeText = _formatDuration(item.startTime);
+                final subtitleText =
+                    (item.text.isEmpty && item.imageLoader != null)
+                    ? "[图片字幕]"
+                    : _getFilteredText(item.text, index);
+                return _keepSelectionNodeAlive(
+                  ValueListenableBuilder<List<int>>(
+                    valueListenable: _activeIndicesNotifier,
+                    builder: (context, activeIndices, _) {
+                      final isCurrent = activeIndices.contains(index);
 
-                  return RepaintBoundary(
-                    child: Padding(
-                      padding: EdgeInsets.only(
-                        left: isSmallScreen ? 2 : 6,
-                        right: isSmallScreen ? 2 : 6,
-                        bottom: itemGap,
-                      ),
-                      child: InkWell(
-                        onTapDown: (_) => _handleSubtitleTapDown(index),
-                        onTap: () => _completeSubtitleTap(index),
-                        canRequestFocus: false,
-                        borderRadius: BorderRadius.circular(4),
-                        child: Container(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: innerH,
-                            vertical: innerV,
+                      return RepaintBoundary(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                            left: isSmallScreen ? 2 : 6,
+                            right: isSmallScreen ? 2 : 6,
+                            bottom: itemGap,
                           ),
-                          decoration: BoxDecoration(
-                            color: isCurrent
-                                ? Colors.blueAccent.withValues(alpha: 0.15)
-                                : Colors.transparent,
+                          child: InkWell(
+                            // 不能用 onTapDown：按住约 100ms 就会触发，长按/
+                            // 滑动浏览/拖选用字都会被误判成单击并 seek。
+                            onTap: () => _completeSubtitleTap(index),
+                            canRequestFocus: false,
                             borderRadius: BorderRadius.circular(4),
-                            border: Border.all(
-                              color: isCurrent
-                                  ? Colors.blueAccent.withValues(alpha: 0.3)
-                                  : Colors.transparent,
-                            ),
-                          ),
-                          child: LayoutBuilder(
-                            builder: (context, itemConstraints) {
-                              final timeColumnWidth =
-                                  itemConstraints.maxWidth * _timeColumnRatio;
-                              return Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (_showTimestamps)
-                                    SizedBox(
-                                      key: ValueKey(
-                                        'subtitle-time-column-$index',
-                                      ),
-                                      width: timeColumnWidth,
-                                      child: Padding(
-                                        padding: EdgeInsets.only(
-                                          top: 2 * scale,
-                                          right: timeGap,
-                                        ),
-                                        child: Align(
-                                          alignment: Alignment.topLeft,
-                                          child: FittedBox(
-                                            fit: BoxFit.scaleDown,
-                                            alignment: Alignment.topLeft,
-                                            child: Text(
-                                              timeText,
-                                              key: ValueKey(
-                                                'subtitle-time-$index',
+                            child: Container(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: innerH,
+                                vertical: innerV,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isCurrent
+                                    ? Colors.blueAccent.withValues(alpha: 0.15)
+                                    : Colors.transparent,
+                                borderRadius: BorderRadius.circular(4),
+                                border: Border.all(
+                                  color: isCurrent
+                                      ? Colors.blueAccent.withValues(alpha: 0.3)
+                                      : Colors.transparent,
+                                ),
+                              ),
+                              child: LayoutBuilder(
+                                builder: (context, itemConstraints) {
+                                  final timeColumnWidth =
+                                      itemConstraints.maxWidth *
+                                      _timeColumnRatio;
+                                  return Row(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      if (_showTimestamps)
+                                        SelectionContainer.disabled(
+                                          child: SizedBox(
+                                            key: ValueKey(
+                                              'subtitle-time-column-$index',
+                                            ),
+                                            width: timeColumnWidth,
+                                            child: Padding(
+                                              padding: EdgeInsets.only(
+                                                top: 2 * scale,
+                                                right: timeGap,
                                               ),
-                                              maxLines: 1,
-                                              style: TextStyle(
-                                                color: isCurrent
-                                                    ? Colors.blueAccent
-                                                    : Colors.white30,
-                                                fontSize:
-                                                    (isSmallScreen ? 10 : 11) *
-                                                    _fontSizeScale,
-                                                fontFamily: 'monospace',
+                                              child: Align(
+                                                alignment: Alignment.topLeft,
+                                                child: FittedBox(
+                                                  fit: BoxFit.scaleDown,
+                                                  alignment: Alignment.topLeft,
+                                                  child: Text(
+                                                    timeText,
+                                                    key: ValueKey(
+                                                      'subtitle-time-$index',
+                                                    ),
+                                                    maxLines: 1,
+                                                    style: TextStyle(
+                                                      color: isCurrent
+                                                          ? Colors.blueAccent
+                                                          : Colors.white30,
+                                                      fontSize:
+                                                          (isSmallScreen
+                                                              ? 10
+                                                              : 11) *
+                                                          _fontSizeScale,
+                                                      fontFamily: 'monospace',
+                                                    ),
+                                                  ),
+                                                ),
                                               ),
                                             ),
                                           ),
                                         ),
-                                      ),
-                                    ),
-                                  Expanded(
-                                    child: Text(
-                                      subtitleText,
-                                      strutStyle: StrutStyle(
-                                        fontSize: _subtitleTextFontSize(
-                                          isSmallScreen,
+                                      Expanded(
+                                        child: Stack(
+                                          clipBehavior: Clip.none,
+                                          children: [
+                                            Text(
+                                              subtitleText,
+                                              strutStyle: StrutStyle(
+                                                fontSize: _subtitleTextFontSize(
+                                                  isSmallScreen,
+                                                ),
+                                                height: 1.3,
+                                                forceStrutHeight: true,
+                                              ),
+                                              style: TextStyle(
+                                                color: isCurrent
+                                                    ? Colors.white
+                                                    : Colors.white70,
+                                                fontSize: _subtitleTextFontSize(
+                                                  isSmallScreen,
+                                                ),
+                                                height: 1.3,
+                                                fontWeight: FontWeight.normal,
+                                              ),
+                                            ),
+                                            if (_hasSelectableTextAfter(index))
+                                              Positioned(
+                                                right: 0,
+                                                bottom: 0,
+                                                child: Text(
+                                                  ' ',
+                                                  key: ValueKey(
+                                                    'subtitle-separator-$index',
+                                                  ),
+                                                  // This selectable spacer keeps
+                                                  // copied cues separated without
+                                                  // painting an isolated blue
+                                                  // selection bar at the far edge
+                                                  // of the row.
+                                                  selectionColor:
+                                                      Colors.transparent,
+                                                  style: TextStyle(
+                                                    fontSize:
+                                                        _subtitleTextFontSize(
+                                                          isSmallScreen,
+                                                        ),
+                                                    height: 1.3,
+                                                  ),
+                                                ),
+                                              ),
+                                          ],
                                         ),
-                                        height: 1.3,
-                                        forceStrutHeight: true,
                                       ),
-                                      style: TextStyle(
-                                        color: isCurrent
-                                            ? Colors.white
-                                            : Colors.white70,
-                                        fontSize: _subtitleTextFontSize(
-                                          isSmallScreen,
-                                        ),
-                                        height: 1.3,
-                                        fontWeight: FontWeight.normal,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              );
-                            },
+                                    ],
+                                  );
+                                },
+                              ),
+                            ),
                           ),
                         ),
-                      ),
-                    ),
-                  );
-                },
-              );
-            },
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
           ),
         );
         return shouldTopAlign
@@ -2685,6 +4170,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   // 文章模式视图
   Widget _buildArticleView(bool isSmallScreen) {
+    if (_isContinuousArticleMode) {
+      return _buildContinuousArticleView(isSmallScreen);
+    }
     final displaySubtitles = _displaySubtitles;
     final int chunkCount = (displaySubtitles.length / _articleChunkSize).ceil();
     final int activeIndex = _activeIndexNotifier.value;
@@ -2712,66 +4200,207 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
         final list = NotificationListener<ScrollNotification>(
           onNotification: _handleScrollNotification,
-          child: ScrollablePositionedList.builder(
-            key: ValueKey('subtitle-article-list-$_articleChunkSize'),
-            itemScrollController: _articleItemScrollController,
-            itemPositionsListener: _articleItemPositionsListener,
-            initialScrollIndex: effectiveInitialChunkIndex,
-            initialAlignment: effectiveInitialAlignment,
-            itemCount: chunkCount,
-            padding: EdgeInsets.symmetric(
-              horizontal: _subtitleTextHorizontalInset(isSmallScreen),
-            ),
-            shrinkWrap: shouldTopAlign,
-            physics: shouldTopAlign
-                ? const NeverScrollableScrollPhysics()
-                : null,
-            itemBuilder: (context, chunkIndex) {
-              final int startIndex = chunkIndex * _articleChunkSize;
-              final int endIndex =
-                  (startIndex + _articleChunkSize) > displaySubtitles.length
-                  ? displaySubtitles.length
-                  : startIndex + _articleChunkSize;
+          child: KeyedSubtree(
+            key: _listViewportKey,
+            child: ScrollablePositionedList.builder(
+              key: ValueKey('subtitle-article-list-$_articleChunkSize'),
+              itemScrollController: _articleItemScrollController,
+              itemPositionsListener: _articleItemPositionsListener,
+              scrollOffsetController: _articleScrollOffsetController,
+              initialScrollIndex: effectiveInitialChunkIndex,
+              initialAlignment: effectiveInitialAlignment,
+              itemCount: chunkCount,
+              padding: EdgeInsets.symmetric(
+                horizontal: _subtitleTextHorizontalInset(isSmallScreen),
+              ),
+              shrinkWrap: shouldTopAlign,
+              physics: shouldTopAlign
+                  ? const NeverScrollableScrollPhysics()
+                  : null,
+              itemBuilder: (context, chunkIndex) {
+                final int startIndex = chunkIndex * _articleChunkSize;
+                final int endIndex =
+                    (startIndex + _articleChunkSize) > displaySubtitles.length
+                    ? displaySubtitles.length
+                    : startIndex + _articleChunkSize;
 
-              return ValueListenableBuilder<List<int>>(
-                valueListenable: _activeIndicesNotifier,
-                builder: (context, activeIndices, child) {
-                  final double verticalInset = isSmallScreen ? 12 : 20;
-                  return RepaintBoundary(
-                    child: Padding(
-                      padding: EdgeInsets.only(
-                        top: chunkIndex == 0 ? verticalInset : 0,
-                        bottom: chunkIndex == chunkCount - 1
-                            ? verticalInset
-                            : 0,
-                      ),
-                      child: SubtitleArticleChunk(
-                        subtitles: displaySubtitles,
-                        displayTexts: _displayTextCache,
-                        startIndex: startIndex,
-                        endIndex: endIndex,
-                        activeIndices: activeIndices.toSet(),
-                        fontSizeScale: _fontSizeScale,
-                        onSubtitleTapDown: _handleSubtitleTapDown,
-                        onSubtitleTap: _completeSubtitleTap,
-                        isSmallScreen: isSmallScreen,
-                        lineFilterMode: _lineFilterMode,
-                        secondaryTextCache: _secondaryTextCache,
-                        isBilingualMode: _isBilingualMode,
-                        usesSecondaryTrackForDisplay:
-                            _usesSecondaryTrackForDisplay,
-                      ),
-                    ),
-                  );
-                },
-              );
-            },
+                return _keepSelectionNodeAlive(
+                  ValueListenableBuilder<List<int>>(
+                    valueListenable: _activeIndicesNotifier,
+                    builder: (context, activeIndices, child) {
+                      final double verticalInset = isSmallScreen ? 12 : 20;
+                      return RepaintBoundary(
+                        child: Padding(
+                          padding: EdgeInsets.only(
+                            top: chunkIndex == 0 ? verticalInset : 0,
+                            bottom: chunkIndex == chunkCount - 1
+                                ? verticalInset
+                                : 0,
+                          ),
+                          child: SubtitleArticleChunk(
+                            key: _articleChunkKeys.putIfAbsent(
+                              chunkIndex,
+                              () => GlobalKey<State<SubtitleArticleChunk>>(),
+                            ),
+                            subtitles: displaySubtitles,
+                            displayTexts: _selectionTextCache,
+                            startIndex: startIndex,
+                            endIndex: endIndex,
+                            activeIndices: activeIndices.toSet(),
+                            fontSizeScale: _fontSizeScale,
+                            onSubtitleTap: _completeSubtitleTap,
+                            isSmallScreen: isSmallScreen,
+                            lineFilterMode: _lineFilterMode,
+                            secondaryTextCache: _secondaryTextCache,
+                            isBilingualMode: _isBilingualMode,
+                            usesSecondaryTrackForDisplay:
+                                _usesSecondaryTrackForDisplay,
+                            appendTrailingSeparator: _hasSelectableTextAfter(
+                              endIndex - 1,
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
           ),
         );
         return shouldTopAlign
             ? Align(alignment: Alignment.topCenter, child: list)
             : list;
       },
+    );
+  }
+
+  Widget _buildContinuousArticleView(bool isSmallScreen) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _handleScrollableViewportLayout(constraints);
+        final double horizontalInset = _subtitleTextHorizontalInset(
+          isSmallScreen,
+        );
+        final double contentWidth = (constraints.maxWidth - horizontalInset * 2)
+            .clamp(1.0, double.infinity)
+            .toDouble();
+        final double fontSize = (isSmallScreen ? 12 : 13) * _fontSizeScale;
+        final TextStyle style = TextStyle(
+          color: Colors.white70,
+          fontSize: fontSize,
+          height: 1.6,
+          fontWeight: FontWeight.normal,
+        );
+        final document = _continuousArticleDocument;
+        if (document == null) return const SizedBox.shrink();
+        final layoutKey = ArticleLayoutKey(
+          documentGeneration: document.generation,
+          width: contentWidth,
+          style: style,
+          textDirection: Directionality.of(context),
+          textScaler: MediaQuery.textScalerOf(context),
+        );
+        final ArticleLayout? cachedLayout = _continuousArticleLayout;
+        if (cachedLayout != null && _continuousArticleLayoutKey == layoutKey) {
+          return _buildResolvedContinuousArticleView(
+            document: document,
+            layout: cachedLayout,
+            style: style,
+            horizontalInset: horizontalInset,
+            isSmallScreen: isSmallScreen,
+          );
+        }
+        if (_continuousArticleLayoutFuture == null ||
+            _continuousArticlePendingKey != layoutKey) {
+          final int requestId = ++_continuousArticleLayoutRequestId;
+          _continuousArticlePendingKey = layoutKey;
+          _continuousArticleLayoutFuture = const ArticleLayoutEngine()
+              .layoutIncrementally(
+                document: document,
+                key: layoutKey,
+                isCancelled: () =>
+                    !mounted ||
+                    requestId != _continuousArticleLayoutRequestId ||
+                    !_isContinuousArticleMode ||
+                    !widget.isVisible,
+              );
+        }
+        return FutureBuilder<ArticleLayout?>(
+          future: _continuousArticleLayoutFuture,
+          builder: (context, snapshot) {
+            final ArticleLayout? layout = snapshot.data;
+            if (layout == null || layout.key != layoutKey) {
+              return const Center(
+                child: Text(
+                  '正在准备文章…',
+                  key: ValueKey('subtitle-continuous-article-preparing'),
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              );
+            }
+            final bool isNewLayout = _continuousArticleLayoutKey != layoutKey;
+            _continuousArticleLayout = layout;
+            _continuousArticleLayoutKey = layoutKey;
+            if (isNewLayout) {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!mounted || !_isContinuousArticleMode) return;
+                _triggerLocateButtonAfterModeSwitch();
+              });
+            }
+            return _buildResolvedContinuousArticleView(
+              document: document,
+              layout: layout,
+              style: style,
+              horizontalInset: horizontalInset,
+              isSmallScreen: isSmallScreen,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildResolvedContinuousArticleView({
+    required ArticleDocument document,
+    required ArticleLayout layout,
+    required TextStyle style,
+    required double horizontalInset,
+    required bool isSmallScreen,
+  }) {
+    final activeIndex = _activeIndexNotifier.value;
+    final initialIndex = activeIndex >= 0 ? activeIndex : 0;
+    final double verticalInset = isSmallScreen ? 12 : 20;
+    return NotificationListener<ScrollNotification>(
+      onNotification: _handleScrollNotification,
+      child: KeyedSubtree(
+        key: _listViewportKey,
+        child: ContinuousArticleView(
+          key: _continuousArticleViewKey,
+          document: document,
+          layout: layout,
+          style: style,
+          highlightStyle: style.copyWith(
+            color: Colors.blueAccent,
+            backgroundColor: Colors.blueAccent.withValues(alpha: 0.1),
+          ),
+          activeIndices: _activeIndicesNotifier,
+          itemScrollController: _articleItemScrollController,
+          itemPositionsListener: _articleItemPositionsListener,
+          scrollOffsetController: _articleScrollOffsetController,
+          keepSelectionAlive: _hasTextSelection,
+          onScrollableChanged: _handleSelectionScrollableChanged,
+          onSubtitleTap: _completeSubtitleTap,
+          initialSentenceIndex: initialIndex,
+          initialAlignment: _locateAlignment,
+          padding: EdgeInsets.fromLTRB(
+            horizontalInset,
+            verticalInset,
+            horizontalInset,
+            verticalInset,
+          ),
+        ),
+      ),
     );
   }
 
@@ -2783,6 +4412,174 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 }
 
+class _SelectionKeepAlive extends StatefulWidget {
+  const _SelectionKeepAlive({required this.keepAlive, required this.child});
+
+  final bool keepAlive;
+  final Widget child;
+
+  @override
+  State<_SelectionKeepAlive> createState() => _SelectionKeepAliveState();
+}
+
+class _SelectionKeepAliveState extends State<_SelectionKeepAlive>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => widget.keepAlive;
+
+  @override
+  void didUpdateWidget(covariant _SelectionKeepAlive oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.keepAlive != widget.keepAlive) updateKeepAlive();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.child;
+  }
+}
+
+class _TranscriptScrollableObserver extends StatefulWidget {
+  const _TranscriptScrollableObserver({
+    required this.onScrollableChanged,
+    required this.child,
+  });
+
+  final ValueChanged<ScrollableState> onScrollableChanged;
+  final Widget child;
+
+  @override
+  State<_TranscriptScrollableObserver> createState() =>
+      _TranscriptScrollableObserverState();
+}
+
+class _TranscriptScrollableObserverState
+    extends State<_TranscriptScrollableObserver> {
+  ScrollableState? _scrollable;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final next = Scrollable.maybeOf(context);
+    if (next == null || identical(next, _scrollable)) return;
+    _scrollable = next;
+    widget.onScrollableChanged(next);
+  }
+
+  @override
+  void didUpdateWidget(covariant _TranscriptScrollableObserver oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.onScrollableChanged != widget.onScrollableChanged &&
+        _scrollable != null) {
+      widget.onScrollableChanged(_scrollable!);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+class _SelectionStatusObserver extends StatefulWidget {
+  const _SelectionStatusObserver({
+    required this.onStatusChanged,
+    required this.child,
+  });
+
+  final ValueChanged<SelectableRegionSelectionStatus> onStatusChanged;
+  final Widget child;
+
+  @override
+  State<_SelectionStatusObserver> createState() =>
+      _SelectionStatusObserverState();
+}
+
+class _SelectionStatusObserverState extends State<_SelectionStatusObserver> {
+  ValueListenable<SelectableRegionSelectionStatus>? _notifier;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final next = SelectableRegionSelectionStatusScope.maybeOf(context);
+    if (identical(next, _notifier)) return;
+    _notifier?.removeListener(_notifyParent);
+    _notifier = next;
+    _notifier?.addListener(_notifyParent);
+    _notifyParent();
+  }
+
+  void _notifyParent() {
+    final status = _notifier?.value;
+    if (status != null) widget.onStatusChanged(status);
+  }
+
+  @override
+  void didUpdateWidget(covariant _SelectionStatusObserver oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.onStatusChanged != widget.onStatusChanged) {
+      _notifyParent();
+    }
+  }
+
+  @override
+  void dispose() {
+    _notifier?.removeListener(_notifyParent);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+/// 侧边栏内一根手指按下时的快照，服务于「拖拽中副指针双击」判定。
+class _SidebarPointerRecord {
+  _SidebarPointerRecord({
+    required this.downPosition,
+    required this.downTimeMs,
+    required this.kind,
+    required this.inListArea,
+    required this.anchorPointerIds,
+    required this.rowIndex,
+  });
+
+  /// 落点（全局坐标），用于位移判定与「两次点是否同一根手指」判定。
+  final Offset downPosition;
+
+  /// 取自事件时间戳而非墙上时钟，和后续的抬起事件同源，不受帧调度抖动影响。
+  final int downTimeMs;
+
+  final PointerDeviceKind kind;
+
+  /// 落点是否在字幕列表区（而非顶部工具栏）。
+  final bool inListArea;
+
+  /// 本指针按下瞬间，列表区内已按住的其他指针 id。非空即表示它是副指针。
+  final Set<int> anchorPointerIds;
+
+  /// 落点命中的字幕行号；null 表示没落在任何一行上（行间空隙、空白区等）。
+  final int? rowIndex;
+
+  /// 离落点的最远距离；超过 slop 即认为这根手指在滑动而非点击。
+  double maxTravel = 0;
+}
+
+/// 一次已被接受的候选轻点，等待在 300ms 内被第二次轻点凑成双击。
+class _SidebarTapRecord {
+  const _SidebarTapRecord({
+    required this.rowIndex,
+    required this.downPosition,
+    required this.upTimeMs,
+    required this.anchorPointerIds,
+  });
+
+  final int rowIndex;
+  final Offset downPosition;
+  final int upTimeMs;
+
+  /// 第一次轻点时按住的锚定手指；第二次轻点必须与其中至少一根仍然重合。
+  final Set<int> anchorPointerIds;
+}
+
 class SubtitleArticleChunk extends StatefulWidget {
   final List<SubtitleItem> subtitles;
   final List<String> displayTexts;
@@ -2790,13 +4587,13 @@ class SubtitleArticleChunk extends StatefulWidget {
   final int endIndex;
   final Set<int> activeIndices;
   final double fontSizeScale;
-  final ValueChanged<int>? onSubtitleTapDown;
   final ValueChanged<int>? onSubtitleTap;
   final bool isSmallScreen;
   final int lineFilterMode;
   final Map<int, String> secondaryTextCache;
   final bool isBilingualMode;
   final bool usesSecondaryTrackForDisplay;
+  final bool appendTrailingSeparator;
 
   const SubtitleArticleChunk({
     super.key,
@@ -2806,13 +4603,13 @@ class SubtitleArticleChunk extends StatefulWidget {
     required this.endIndex,
     required this.activeIndices,
     required this.fontSizeScale,
-    this.onSubtitleTapDown,
     this.onSubtitleTap,
     required this.isSmallScreen,
     required this.lineFilterMode,
     this.secondaryTextCache = const {},
     this.isBilingualMode = false,
     this.usesSecondaryTrackForDisplay = false,
+    this.appendTrailingSeparator = false,
   });
 
   @override
@@ -2822,6 +4619,40 @@ class SubtitleArticleChunk extends StatefulWidget {
 class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
   final Map<int, TapGestureRecognizer> _recognizers =
       <int, TapGestureRecognizer>{};
+
+  /// 段落文本的 key，用于把全局坐标换算进 [RenderParagraph]。
+  final GlobalKey _paragraphKey = GlobalKey();
+
+  /// 每个 span 对应的字幕行号；[InlineSpan] 用身份相等，可直接做 key。
+  final Map<InlineSpan, int> _spanSubtitleIndex = <InlineSpan, int>{};
+
+  /// 把全局坐标定位到本段落内的字幕行号；不在本段落内则返回 null。
+  ///
+  /// 拖拽期间 Scrollable 会用 IgnorePointer 屏蔽视口内部，span 上的
+  /// [TapGestureRecognizer] 收不到事件，只能这样直接问排版结果。
+  int? subtitleIndexAtGlobalPosition(Offset globalPosition) {
+    final RenderObject? root = _paragraphKey.currentContext?.findRenderObject();
+    final RenderParagraph? paragraph = root == null
+        ? null
+        : _findParagraph(root);
+    if (paragraph == null || !paragraph.hasSize) return null;
+    final Offset local = paragraph.globalToLocal(globalPosition);
+    if (!(Offset.zero & paragraph.size).contains(local)) return null;
+    final InlineSpan? span = paragraph.text.getSpanForPosition(
+      paragraph.getPositionForOffset(local),
+    );
+    return span == null ? null : _spanSubtitleIndex[span];
+  }
+
+  /// [Text.rich] 外层可能还套着 Semantics 等包装，这里向下找到真正的段落。
+  RenderParagraph? _findParagraph(RenderObject object) {
+    if (object is RenderParagraph) return object;
+    RenderParagraph? found;
+    object.visitChildren((RenderObject child) {
+      found ??= _findParagraph(child);
+    });
+    return found;
+  }
 
   @override
   void initState() {
@@ -2847,14 +4678,12 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
   }
 
   void _syncRecognizers() {
-    if (widget.onSubtitleTapDown == null && widget.onSubtitleTap == null) {
+    if (widget.onSubtitleTap == null) {
       return;
     }
     for (int i = widget.startIndex; i < widget.endIndex; i++) {
+      // 只认 onTap：onTapDown 会在按住约 100ms 时触发，长按选字会被误 seek。
       _recognizers[i] = TapGestureRecognizer()
-        ..onTapDown = (_) {
-          widget.onSubtitleTapDown?.call(i);
-        }
         ..onTap = () {
           widget.onSubtitleTap?.call(i);
         };
@@ -2871,6 +4700,7 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
   @override
   Widget build(BuildContext context) {
     final List<InlineSpan> spans = <InlineSpan>[];
+    _spanSubtitleIndex.clear();
 
     for (int i = widget.startIndex; i < widget.endIndex; i++) {
       final item = widget.subtitles[i];
@@ -2881,40 +4711,60 @@ class _SubtitleArticleChunkState extends State<SubtitleArticleChunk> {
       if (rawText.isEmpty && item.imageLoader != null) {
         rawText = "[图片字幕]";
       }
-      final text = rawText.replaceAll('\n', ' ').trim();
+      final text = rawText.replaceAll(RegExp(r'\s+'), ' ');
       if (text.isEmpty) continue;
       if (spans.isNotEmpty) {
-        spans.add(const TextSpan(text: '  '));
+        spans.add(const TextSpan(text: ' '));
       }
-      spans.add(
-        TextSpan(
-          text: text,
-          recognizer: _recognizers[i],
-          style: TextStyle(
-            color: isCurrent ? Colors.blueAccent : Colors.white70,
-            backgroundColor: isCurrent
-                ? Colors.blueAccent.withValues(alpha: 0.1)
-                : Colors.transparent,
-            fontSize: (widget.isSmallScreen ? 12 : 13) * widget.fontSizeScale,
-            height: 1.6,
-            // Keep weight stable in article mode to avoid paragraph reflow.
-            fontWeight: FontWeight.normal,
-          ),
-        ),
-      );
-    }
-
-    return SelectionContainer.disabled(
-      child: Text.rich(
-        TextSpan(children: spans),
-        textAlign: TextAlign.start,
-        softWrap: true,
-        strutStyle: StrutStyle(
+      final TextSpan span = TextSpan(
+        text: text,
+        recognizer: _recognizers[i],
+        style: TextStyle(
+          color: isCurrent ? Colors.blueAccent : Colors.white70,
+          backgroundColor: isCurrent
+              ? Colors.blueAccent.withValues(alpha: 0.1)
+              : Colors.transparent,
           fontSize: (widget.isSmallScreen ? 12 : 13) * widget.fontSizeScale,
           height: 1.6,
-          forceStrutHeight: true,
+          // Keep weight stable in article mode to avoid paragraph reflow.
+          fontWeight: FontWeight.normal,
         ),
-      ),
+      );
+      _spanSubtitleIndex[span] = i;
+      spans.add(span);
+    }
+
+    final TextStyle separatorStyle = TextStyle(
+      fontSize: (widget.isSmallScreen ? 12 : 13) * widget.fontSizeScale,
+      height: 1.6,
+    );
+    return Stack(
+      fit: StackFit.passthrough,
+      clipBehavior: Clip.none,
+      children: [
+        Text.rich(
+          key: _paragraphKey,
+          TextSpan(children: spans),
+          textAlign: TextAlign.start,
+          softWrap: true,
+          strutStyle: StrutStyle(
+            fontSize: (widget.isSmallScreen ? 12 : 13) * widget.fontSizeScale,
+            height: 1.6,
+            forceStrutHeight: true,
+          ),
+        ),
+        if (widget.appendTrailingSeparator)
+          Positioned(
+            right: 0,
+            bottom: 0,
+            child: Text(
+              ' ',
+              key: ValueKey('subtitle-article-separator-${widget.startIndex}'),
+              selectionColor: Colors.transparent,
+              style: separatorStyle,
+            ),
+          ),
+      ],
     );
   }
 }

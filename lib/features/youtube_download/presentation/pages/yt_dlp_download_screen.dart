@@ -16,6 +16,10 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_input
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_version.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/utils/android_hardware_input_bridge.dart';
+import 'package:video_player_app/utils/hardware_keyboard_shortcuts.dart';
+import 'package:video_player_app/utils/link_download_shortcuts.dart';
+import 'package:video_player_app/utils/page_shortcut_keys.dart';
 import 'package:video_player_app/widgets/adaptive_settings_dialog.dart';
 
 class YtDlpDownloadScreen extends StatefulWidget {
@@ -37,6 +41,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
   final FocusNode _shortcutFocusNode = FocusNode(
     debugLabel: 'YtDlpDownloadShortcutFocus',
   );
+  final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
+      AndroidHardwareKeyDeduplicator();
   final Map<String, bool> _taskExpansionOverrides = <String, bool>{};
   bool _isCheckingBinaryStatus = false;
   late final YtDlpDownloadService _service;
@@ -44,13 +50,15 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
   @override
   void initState() {
     super.initState();
+    AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
     _service = context.read<YtDlpDownloadService>();
     if (widget.initialInput != null) {
       _inputController.text = widget.initialInput!;
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_service.activatePage());
-      if (Platform.isWindows && mounted) {
+      if (supportsNativeHardwareKeyboardShortcuts && mounted) {
         _shortcutFocusNode.requestFocus();
       }
     });
@@ -59,20 +67,121 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
   @override
   void dispose() {
     unawaited(_service.deactivatePage());
+    AndroidHardwareInputBridge.removeKeyListener(
+      _handleAndroidHardwareKeyEvent,
+    );
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
     _shortcutFocusNode.dispose();
     _inputController.dispose();
     super.dispose();
   }
 
   KeyEventResult _handleEscKeyEvent(KeyEvent event) {
-    if (!Platform.isWindows) return KeyEventResult.ignored;
-    if (event is KeyRepeatEvent) return KeyEventResult.handled;
-    if (event is KeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.escape) {
-      Navigator.of(context).maybePop();
+    return _handleShortcutKeyEvent(event);
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_shortcutFocusNode.hasFocus) return false;
+    return _handleShortcutKeyEvent(event) != KeyEventResult.ignored;
+  }
+
+  void _handleAndroidHardwareKeyEvent(AndroidHardwareKeyMessage message) {
+    _handleShortcutKeyEvent(
+      message.toKeyEvent(),
+      fromAndroidNativeBridge: true,
+      hasBlockingModifierOverride: message.hasBlockingModifier,
+    );
+  }
+
+  String _dlTooltip(String label, LinkDownloadShortcutAction action) {
+    return hoverAwareShortcutTooltip(
+      label,
+      LinkDownloadShortcuts.defaults[action]!,
+    );
+  }
+
+  KeyEventResult _handleShortcutKeyEvent(
+    KeyEvent event, {
+    bool fromAndroidNativeBridge = false,
+    bool? hasBlockingModifierOverride,
+  }) {
+    if (!supportsNativeHardwareKeyboardShortcuts) {
+      return KeyEventResult.ignored;
+    }
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return KeyEventResult.ignored;
+    if (Platform.isAndroid &&
+        !_androidKeyDeduplicator.shouldDispatch(
+          event,
+          fromNativeBridge: fromAndroidNativeBridge,
+        )) {
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+    final bool hasBlockingModifier =
+        hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
+    if (hasBlockingModifier) return KeyEventResult.ignored;
+    final LinkDownloadShortcutAction? action =
+        LinkDownloadShortcuts.matchAction(event.logicalKey);
+    final platform = currentNativeTargetPlatform;
+    if (action == null ||
+        platform == null ||
+        !LinkDownloadShortcuts.isAvailableOnPlatform(action, platform)) {
+      return KeyEventResult.ignored;
+    }
+    final bool allowWhileEditing =
+        action == LinkDownloadShortcutAction.parse ||
+        action == LinkDownloadShortcutAction.back;
+    if (isEditableTextFocused() && !allowWhileEditing) {
+      return KeyEventResult.ignored;
+    }
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.handled;
+
+    switch (action) {
+      case LinkDownloadShortcutAction.back:
+        Navigator.of(context).maybePop();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.toggleMode:
+      case LinkDownloadShortcutAction.login:
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.parse:
+        unawaited(_resolveInput(_service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.paste:
+        unawaited(_pasteInput());
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.clearInput:
+        _inputController.clear();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.openSettings:
+        unawaited(_showSettings(_service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.selectAll:
+        _service.selectAll();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.primaryRun:
+        _service.startSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.pause:
+        _service.pauseSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.prioritize:
+        _service.prioritizeSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.cancel:
+        _service.cancelSelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.retry:
+        _service.retrySelected();
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.exportToLibrary:
+      case LinkDownloadShortcutAction.importToLibrary:
+        unawaited(_importToLibrary(_service));
+        return KeyEventResult.handled;
+      case LinkDownloadShortcutAction.remove:
+        _service.removeSelected();
+        return KeyEventResult.handled;
+    }
   }
 
   Future<void> _resolveInput(YtDlpDownloadService service) async {
@@ -1180,12 +1289,13 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     final service = _service;
     return Focus(
       focusNode: _shortcutFocusNode,
-      autofocus: Platform.isWindows,
+      autofocus: supportsNativeHardwareKeyboardShortcuts,
       onKeyEvent: (node, event) => _handleEscKeyEvent(event),
       child: Listener(
         behavior: HitTestBehavior.translucent,
         onPointerDown: (_) {
-          if (Platform.isWindows && !_shortcutFocusNode.hasFocus) {
+          if (supportsNativeHardwareKeyboardShortcuts &&
+              !_shortcutFocusNode.hasFocus) {
             _shortcutFocusNode.requestFocus();
           }
         },
@@ -1345,7 +1455,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                     ),
                     IconButton(
                       icon: Icon(Icons.settings, size: appBarIconSize),
-                      tooltip: '下载设置',
+                      tooltip: _dlTooltip(
+                        '下载设置',
+                        LinkDownloadShortcutAction.openSettings,
+                      ),
                       padding: appBarIconPadding,
                       constraints: appBarIconConstraints,
                       onPressed: () => _showSettings(service),
@@ -1379,7 +1492,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                         runSpacing: actionGap,
                                         children: [
                                           _buildCompactActionButton(
-                                            tooltip: '粘贴',
+                                            tooltip: _dlTooltip(
+                                              '粘贴',
+                                              LinkDownloadShortcutAction.paste,
+                                            ),
                                             icon: Icons.paste,
                                             iconSize: actionIconSize,
                                             extent: actionButtonExtent,
@@ -1387,7 +1503,11 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                             onPressed: _pasteInput,
                                           ),
                                           _buildCompactActionButton(
-                                            tooltip: '清空',
+                                            tooltip: _dlTooltip(
+                                              '清空',
+                                              LinkDownloadShortcutAction
+                                                  .clearInput,
+                                            ),
                                             icon: Icons.clear,
                                             iconSize: actionIconSize,
                                             extent: actionButtonExtent,
@@ -1440,7 +1560,13 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                                         color: Colors.white,
                                                       ),
                                                 )
-                                              : const Text('解析'),
+                                              : Text(
+                                                  _dlTooltip(
+                                                    '解析',
+                                                    LinkDownloadShortcutAction
+                                                        .parse,
+                                                  ),
+                                                ),
                                         );
                                       },
                                     ),
@@ -1463,7 +1589,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
                                     _buildCompactActionButton(
-                                      tooltip: '粘贴',
+                                      tooltip: _dlTooltip(
+                                        '粘贴',
+                                        LinkDownloadShortcutAction.paste,
+                                      ),
                                       icon: Icons.paste,
                                       iconSize: actionIconSize,
                                       extent: actionButtonExtent,
@@ -1472,7 +1601,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                     ),
                                     SizedBox(width: actionGap),
                                     _buildCompactActionButton(
-                                      tooltip: '清空',
+                                      tooltip: _dlTooltip(
+                                        '清空',
+                                        LinkDownloadShortcutAction.clearInput,
+                                      ),
                                       icon: Icons.clear,
                                       iconSize: actionIconSize,
                                       extent: actionButtonExtent,
@@ -1524,7 +1656,12 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                                 color: Colors.white,
                                               ),
                                             )
-                                          : const Text('解析'),
+                                          : Text(
+                                              _dlTooltip(
+                                                '解析',
+                                                LinkDownloadShortcutAction.parse,
+                                              ),
+                                            ),
                                     );
                                   },
                                 ),
@@ -1700,13 +1837,19 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                               children: [
                                 _buildBottomAction(
                                   icon: Icons.select_all,
-                                  label: '全选',
+                                  label: _dlTooltip(
+                                    '全选',
+                                    LinkDownloadShortcutAction.selectAll,
+                                  ),
                                   subtitle: '已选 ${summary.selectedCount} 项',
                                   onTap: currentService.selectAll,
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.download,
-                                  label: '开始',
+                                  label: _dlTooltip(
+                                    '开始',
+                                    LinkDownloadShortcutAction.primaryRun,
+                                  ),
                                   subtitle:
                                       '可运行 ${summary.selectedRunnableCount}',
                                   onTap: summary.selectedRunnableCount > 0
@@ -1715,7 +1858,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.priority_high,
-                                  label: '插队',
+                                  label: _dlTooltip(
+                                    '插队',
+                                    LinkDownloadShortcutAction.prioritize,
+                                  ),
                                   subtitle:
                                       '可优先 ${summary.selectedPrioritizableCount}',
                                   onTap: summary.selectedPrioritizableCount > 0
@@ -1724,7 +1870,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.pause,
-                                  label: '暂停',
+                                  label: _dlTooltip(
+                                    '暂停',
+                                    LinkDownloadShortcutAction.pause,
+                                  ),
                                   subtitle:
                                       '可暂停 ${summary.selectedPausableCount}',
                                   onTap: summary.selectedPausableCount > 0
@@ -1733,7 +1882,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.stop_circle_outlined,
-                                  label: '取消',
+                                  label: _dlTooltip(
+                                    '取消',
+                                    LinkDownloadShortcutAction.cancel,
+                                  ),
                                   subtitle:
                                       '可取消 ${summary.selectedCancellableCount}',
                                   onTap: summary.selectedCancellableCount > 0
@@ -1742,7 +1894,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.refresh,
-                                  label: '重试',
+                                  label: _dlTooltip(
+                                    '重试',
+                                    LinkDownloadShortcutAction.retry,
+                                  ),
                                   subtitle:
                                       '可重试 ${summary.selectedRetryableCount}',
                                   onTap: summary.selectedRetryableCount > 0
@@ -1751,7 +1906,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.video_library_outlined,
-                                  label: '导出',
+                                  label: _dlTooltip(
+                                    '导出',
+                                    LinkDownloadShortcutAction.exportToLibrary,
+                                  ),
                                   subtitle:
                                       '可导出 ${summary.selectedCompletedCount}',
                                   onTap: summary.selectedCompletedCount > 0
@@ -1760,7 +1918,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                 ),
                                 _buildBottomAction(
                                   icon: Icons.delete,
-                                  label: '移除',
+                                  label: _dlTooltip(
+                                    '移除',
+                                    LinkDownloadShortcutAction.remove,
+                                  ),
                                   subtitle: summary.selectedCount > 0
                                       ? '移除 ${summary.selectedCount} 项'
                                       : '未选择',

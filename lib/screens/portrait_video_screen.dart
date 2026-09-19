@@ -19,12 +19,14 @@ import '../services/task_subtitle_storage_service.dart';
 import '../services/settings_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
+import '../services/playback_behavior_policy.dart';
 import '../services/playback_exit_guard.dart';
 import '../services/subtitle_timeline_resolver.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../services/playlist_manager.dart';
 import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_settings_sheet.dart';
+import '../widgets/bilibili_buffering_overlay.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/playback_speed_dialog.dart';
 import '../widgets/sleep_timer_dialog.dart';
@@ -81,8 +83,8 @@ class PortraitVideoScreen extends StatefulWidget {
 
 class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     with WidgetsBindingObserver, RouteAware {
-  final GlobalKey<SelectableRegionState> _selectionKey =
-      GlobalKey<SelectableRegionState>();
+  final GlobalKey<SelectionAreaState> _selectionKey =
+      GlobalKey<SelectionAreaState>();
   final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey =
       GlobalKey<SubtitleSidebarState>();
   final FocusNode _selectionFocusNode = FocusNode();
@@ -93,6 +95,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   );
   final GlobalKey<VideoControlsOverlayState> _controlsKey =
       GlobalKey<VideoControlsOverlayState>();
+
+  /// Last overlay chrome intent. Used when handing off to landscape so a
+  /// hidden portrait overlay does not reopen on the landscape page.
+  bool _playbackChromeVisible = true;
   final GlobalKey _videoTextureKey = GlobalKey(
     debugLabel: 'PortraitPlaybackVideoTexture',
   );
@@ -100,6 +106,52 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _initialized = false;
   bool _pageEntryAutoPlayConsumed = false;
   bool _isControllerAssigned = false;
+
+  /// The loading overlay is fully opaque. Keep VideoPlayer mounted whenever
+  /// the assigned controller already has a decoded picture.
+  bool get _hasDecodedVideoTexture {
+    if (!_isControllerAssigned) return false;
+    try {
+      return _controller.value.isInitialized && !_controller.value.hasError;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Never mount [VideoPlayer] until [_isControllerAssigned] is true.
+  bool get _shouldKeepVideoSurface =>
+      _isControllerAssigned && (_initialized || _hasDecodedVideoTexture);
+
+  bool get _isCurrentBilibiliOnlineStream =>
+      _currentItem.sourceRef?.kind == MediaSourceKind.bilibiliStream;
+
+  /// Poster over an empty texture until the first decoded frame arrives.
+  Widget _buildVisibleVideoFrameCover() {
+    return ListenableBuilder(
+      listenable: MediaPlaybackService(),
+      builder: (context, _) {
+        if (!MediaPlaybackService().isCoveringUntilVisibleVideoFrame) {
+          return const SizedBox.shrink();
+        }
+        final path = _currentItem.thumbnailPath;
+        if (path != null && path.isNotEmpty && File(path).existsSync()) {
+          return IgnorePointer(
+            child: Image.file(
+              File(path),
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) =>
+                  const ColoredBox(color: Color(0xFF141414)),
+            ),
+          );
+        }
+        return const IgnorePointer(
+          child: ColoredBox(color: Color(0xFF141414)),
+        );
+      },
+    );
+  }
+
   bool _isSourceMissing = false;
   int _danmakuRevision = 0;
   bool _isControllerOwner = false;
@@ -169,6 +221,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _subtitleSidebarRestoreCallbackScheduled = false;
   int _subtitleSidebarRestoreRetries = 0;
   static const int _subtitleSidebarRestoreMaxRetries = 30;
+
   /// 状态栏/底部触控条的稳定安全区预留。
   ///
   /// 退出沉浸式横屏页时系统栏带回场动画，实时 MediaQuery.padding 会被逐帧
@@ -372,9 +425,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
   bool _tryAdoptBilibiliQualityHandoff(MediaPlaybackService service) {
     final replacement = service.controller;
-    if (!service.isCurrentItemBilibiliStream ||
-        !service.isSwitchingStreamQuality ||
-        replacement == null ||
+    // Same-item replacements must keep the page initialized. The loading
+    // branch covers an already-decoded picture with a black overlay.
+    if (replacement == null ||
         service.currentItem?.id != _currentItem.id ||
         !service.canMountControllerFor(
           _currentItem.id,
@@ -528,7 +581,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         setState(() {
           _isControllerAssigned = false;
           _isControllerOwner = false;
-          _initialized = false;
         });
         if (shouldDisposePrevious) {
           unawaited(previousController.dispose());
@@ -1155,7 +1207,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       unawaited(
         visiblePlaybackService.ensureVisibleVideoOutput(currentItem.id),
       );
-      return;
     }
 
     // 检查 MediaPlaybackService 状态
@@ -1179,7 +1230,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         debugPrint(
           "PortraitVideoScreen: Waiting for service to load ${currentItem.title}",
         );
-        if (mounted) {
+        if (mounted && !(_initialized && _isControllerAssigned)) {
           setState(() {
             _initialized = false;
           });
@@ -1206,12 +1257,15 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
         if (!mounted) return;
 
-        await _applyInitialPortraitDefaultAspectRatioIfNeeded();
-
+        // Mark the texture visible before the aspect-ratio persist await.
+        // That await yields; a rebuild in the gap used to swap in the opaque
+        // loading overlay and unmount an already-decoded Bilibili picture.
         setState(() {
           _isSourceMissing = false;
           _initialized = true;
         });
+
+        await _applyInitialPortraitDefaultAspectRatioIfNeeded();
 
         _bindControllerListener();
         _scheduleDeferredPostInitWork(currentItem);
@@ -1231,10 +1285,17 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         // transient isPlaying flag) decides, so the auto-play-after-switch
         // setting is never overwritten by a page-side "correction".
         if (playbackService.state != PlaybackState.loading) {
-          if (playbackService.desiredPlaying) {
-            if (!_controller.value.isPlaying) playbackService.resume();
-          } else {
-            if (_controller.value.isPlaying) playbackService.pause();
+          if (MediaPlaybackService.shouldResumeOnPageAdopt(
+            desiredPlaying: playbackService.desiredPlaying,
+            state: playbackService.state,
+          )) {
+            unawaited(playbackService.resume());
+          } else if (MediaPlaybackService.shouldPauseOnPageAdopt(
+            desiredPlaying: playbackService.desiredPlaying,
+            state: playbackService.state,
+            controllerPlaying: _controller.value.isPlaying,
+          )) {
+            unawaited(playbackService.pause());
           }
         }
         return;
@@ -1249,11 +1310,19 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         context,
         listen: false,
       );
-      if (mounted) {
+      if (mounted && !(_initialized && _isControllerAssigned)) {
         setState(() {
           _initialized = false;
           _isSourceMissing = false;
         });
+      }
+      if (playbackService.currentItem?.id == currentItem.id &&
+          playbackService.state == PlaybackState.loading &&
+          !playbackService.hasMountableController) {
+        return;
+      }
+      if (playbackService.shouldDeferPlayForActiveSession(currentItem.id)) {
+        return;
       }
       // Native controllers are created and owned only by the playback service.
       // The service listener re-enters this method once this exact session is
@@ -1265,6 +1334,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
             entryAutoPlay: _consumePageEntryAutoPlay(),
             isCurrentItem: playbackService.currentItem?.id == currentItem.id,
             desiredPlaying: playbackService.desiredPlaying,
+          ),
+          startPosition: MediaPlaybackService.startPositionForCurrentSession(
+            currentItemId: playbackService.currentItem?.id,
+            itemId: currentItem.id,
+            currentPosition: playbackService.position,
           ),
         ),
       );
@@ -1296,6 +1370,23 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     _updateSubtitle();
   }
 
+  /// Hop seeks publish an optimistic service clock immediately. Native
+  /// [VideoPlayerController.position] on online Bilibili can lag on the
+  /// previous cue and flash the sidebar/overlay backward.
+  Duration _subtitleLookupPosition() {
+    final native = _controller.value.position;
+    try {
+      final service = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (!identical(service.controller, _controller)) return native;
+      return service.positionForSubtitleOverlay(native);
+    } catch (_) {
+      return native;
+    }
+  }
+
   void _updateSubtitle() {
     if (!_initialized) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
@@ -1323,7 +1414,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       return;
     }
 
-    final position = _controller.value.position;
+    final position = _subtitleLookupPosition();
     final adjustedPosition = position - settings.subtitleOffset;
     final int posMs = adjustedPosition.inMilliseconds;
     final continuousSubtitleEnabled = _isAudio
@@ -1447,6 +1538,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   void _seekPlaybackPosition(
     Duration target, {
     bool syncSubtitleSidebar = false,
+    String source = 'ui',
   }) {
     if (!_initialized || !_controller.value.isInitialized) return;
     final duration = _controller.value.duration;
@@ -1465,7 +1557,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         listen: false,
       );
       if (playbackService.controller == _controller) {
-        playbackService.seekTo(clamped);
+        playbackService.seekTo(clamped, source: source);
       } else {
         _controller.seekTo(clamped);
       }
@@ -1475,7 +1567,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   void _seekToSubtitleFast(Duration target) {
-    _seekPlaybackPosition(target);
+    _seekPlaybackPosition(target, source: 'subtitle_hop');
   }
 
   void _togglePlay() {
@@ -1732,7 +1824,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
             displayArea: settings.bilibiliDanmakuDisplayArea,
             opacity: settings.bilibiliDanmakuOpacity,
             fontScale: settings.bilibiliDanmakuFontScale,
-            speed: settings.bilibiliDanmakuSpeed,
+            // Locked playback already advances the position clock; compensate here.
+            speed: settings.effectiveBilibiliDanmakuSpeed,
             fontFamily: settings.bilibiliDanmakuFontFamily,
             fontWeight: settings.bilibiliDanmakuFontWeight,
             outlineType: settings.bilibiliDanmakuOutlineType,
@@ -2359,7 +2452,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       final itemId = _currentItem.id;
       final exitController = _isControllerAssigned ? _controller : null;
       final exitControllerOwner = _isControllerOwner;
+      final suppressRouteCleanup =
+          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      final shouldAutoPause = PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+        autoPauseOnExit: settings.autoPauseOnExit,
+        explicitExit: _explicitPlaybackExitRequested,
+        suppressRouteCleanup: suppressRouteCleanup,
+        transportPlaying: playbackService.isTransportPlaying,
+      );
       if (exitController == null) {
+        if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
+          await playbackService.pause(expectedItemId: itemId);
+        }
         await playbackService.persistCurrentProgress(expectedItemId: itemId);
         return;
       }
@@ -2370,23 +2474,22 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
       if (!exitControllerOwner && !serviceOwnsExitSession()) return;
 
-      final suppressRouteCleanup =
-          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
-      final exitSessionIsPlaying = serviceOwnsExitSession()
-          ? playbackService.isPlaying || exitController.value.isPlaying
-          : exitController.value.isPlaying;
-      if (_explicitPlaybackExitRequested &&
-          !suppressRouteCleanup &&
-          settings.autoPauseOnExit &&
-          exitSessionIsPlaying) {
-        if (serviceOwnsExitSession()) {
-          await playbackService.pause(
-            expectedItemId: itemId,
-            expectedController: exitController,
+      final shouldAutoPauseSession =
+          PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+            autoPauseOnExit: settings.autoPauseOnExit,
+            explicitExit: _explicitPlaybackExitRequested,
+            suppressRouteCleanup: suppressRouteCleanup,
+            transportPlaying: serviceOwnsExitSession()
+                ? playbackService.isTransportPlaying
+                : exitController.value.isPlaying,
           );
-        } else {
-          await exitController.pause();
-        }
+      if (shouldAutoPauseSession && serviceOwnsExitSession()) {
+        await playbackService.pause(
+          expectedItemId: itemId,
+          expectedController: exitController,
+        );
+      } else if (shouldAutoPauseSession) {
+        await exitController.pause();
       }
 
       if (!exitControllerOwner) {
@@ -2722,6 +2825,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     if (controllerForHandoff != null) {
       _isControllerOwner = false;
     }
+    final bool landscapeChromeVisible = landscapePlaybackChromeFromPortrait(
+      overlayControlsVisible: _controlsKey.currentState?.controlsVisible,
+      lastIntent: _playbackChromeVisible,
+    );
+    _playbackChromeVisible = landscapeChromeVisible;
 
     // From here on the portrait page is (or will be) the covered route: open
     // the restoration window so didPopNext / service notifications cannot run
@@ -2731,8 +2839,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     _isRestoringFromLandscape = true;
 
     try {
-      await navigator.push(
-        PageRouteBuilder(
+      final bool? landscapeChromeOnExit = await navigator.push<bool>(
+        PageRouteBuilder<bool>(
           settings: PlaybackNavigationService.landscapeRouteSettings(
             _currentItem,
           ),
@@ -2742,6 +2850,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                 existingController: controllerForHandoff,
                 videoItem: _currentItem, // Pass item for context
                 skipAutoPauseOnExit: true,
+                initialShowControls: landscapeChromeVisible,
               ),
           opaque: true,
           transitionsBuilder: (context, animation, secondaryAnimation, child) {
@@ -2750,6 +2859,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           transitionDuration: const Duration(milliseconds: 300),
         ),
       );
+      if (mounted && landscapeChromeOnExit != null) {
+        _playbackChromeVisible = landscapeChromeOnExit;
+        _controlsKey.currentState?.applyControlsVisibilityIntent(
+          landscapeChromeOnExit,
+        );
+      }
     } catch (error, stackTrace) {
       debugPrint('Opening landscape playback failed: $error');
       debugPrintStack(stackTrace: stackTrace);
@@ -2770,9 +2885,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         unawaited(_controller.dispose());
       }
     }
-    _isControllerAssigned = false;
-    _initialized = false;
-    _isSourceMissing = false;
 
     // Restore orientation logic based on device type
     _updateOrientations();
@@ -2791,6 +2903,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         !canReuseServiceController ||
         playbackService.needsVisibleVideoOutputRecovery(_currentItem.id);
     if (needsReinit) {
+      // Only drop the decoded picture once reuse is impossible. Clearing
+      // these flags first painted the opaque loading overlay over a still-
+      // valid Bilibili texture while _initPlayer awaited aspect-ratio work.
+      _isControllerAssigned = false;
+      _initialized = false;
+      _isSourceMissing = false;
       _postInitWorkToken++;
       _initPlayer();
     } else {
@@ -3676,10 +3794,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text(
-                              "${value.playbackSpeed}x",
-                              maxLines: 1,
-                              overflow: TextOverflow.fade,
+                            PlaybackSpeedText(
+                              speed: value.playbackSpeed,
                               style: TextStyle(
                                 color: value.isInitialized
                                     ? Colors.white
@@ -4092,8 +4208,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 5),
-            child: Text(
-              '${settings.effectiveGlobalPlaybackSpeed}x',
+            child: PlaybackSpeedText(
+              speed: settings.effectiveGlobalPlaybackSpeed,
               style: const TextStyle(
                 color: Colors.white38,
                 fontSize: 10,
@@ -4138,9 +4254,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     return Consumer<SettingsService>(
       builder: (context, settings, child) {
         // 稳定化后的状态栏/触控条安全区（见 _systemUiInsetController 的说明）。
-        final EdgeInsets stableSystemUiInsets = _systemUiInsetController.observe(
-          MediaQuery.of(context),
-        );
+        final EdgeInsets stableSystemUiInsets = _systemUiInsetController
+            .observe(MediaQuery.of(context));
         // Use WillPopScope to handle back button and reset orientation early
         // This helps reduce the "jank" when returning to a landscape screen
         return PopScope(
@@ -4156,15 +4271,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                 KeyEventResult.ignored,
             child: Scaffold(
               backgroundColor: Colors.black,
-              body: SelectableRegion(
+              body: SelectionArea(
                 key: _selectionKey,
-                selectionControls: materialTextSelectionControls,
                 focusNode: _selectionFocusNode,
                 child: GestureDetector(
                   onTap: () {
                     // 点击空白区域取消文字选择，仅清除选择焦点，
                     // 不调用 unfocus() 避免清除视频控制焦点的键盘快捷键
-                    _selectionKey.currentState?.clearSelection();
+                    _selectionKey.currentState?.selectableRegion
+                        .clearSelection();
+                    _subtitleSidebarKey.currentState?.clearTextSelection();
                     _selectionFocusNode.unfocus();
                     _scheduleVideoFocusRestore();
                   },
@@ -4217,7 +4333,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                         ),
                                                       ),
                                                     )
-                                                  else if (_initialized)
+                                                  else if (_shouldKeepVideoSurface)
                                                     if (_isAudio)
                                                       Container(
                                                         color: Colors.black,
@@ -4240,10 +4356,18 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                                 .center,
                                                             transform:
                                                                 _buildVideoDisplayTransformMatrix(),
-                                                            child: VideoPlayer(
-                                                              _controller,
-                                                              key:
-                                                                  _videoTextureKey,
+                                                            child: Stack(
+                                                              fit: StackFit
+                                                                  .expand,
+                                                              children: [
+                                                                VideoPlayer(
+                                                                  _controller,
+                                                                  key:
+                                                                      _videoTextureKey,
+                                                                ),
+                                                                _buildVisibleVideoFrameCover(),
+                                                                const BilibiliBufferingOverlay(),
+                                                              ],
                                                             ),
                                                           ),
                                                         ),
@@ -4268,15 +4392,19 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       Container(
                                                         color: Colors.black,
                                                       ),
-                                                    Center(
-                                                      child:
-                                                          CircularProgressIndicator(
-                                                            color: Colors.white
-                                                                .withValues(
-                                                                  alpha: 0.5,
-                                                                ),
-                                                          ),
-                                                    ),
+                                                    if (_isCurrentBilibiliOnlineStream)
+                                                      const BilibiliBufferingOverlay(
+                                                        forceVisible: true,
+                                                      )
+                                                    else
+                                                      Center(
+                                                        child: CircularProgressIndicator(
+                                                          color: Colors.white
+                                                              .withValues(
+                                                                alpha: 0.5,
+                                                              ),
+                                                        ),
+                                                      ),
                                                   ],
                                                   if (_isDraggingProgress &&
                                                       !_isLocked)
@@ -4349,6 +4477,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       onSeekTo: (position) {
                                                         _seekPlaybackPosition(
                                                           position,
+                                                        );
+                                                      },
+                                                      onHopSeekTo: (position) {
+                                                        _seekPlaybackPosition(
+                                                          position,
+                                                          source:
+                                                              'subtitle_hop',
                                                         );
                                                       },
                                                       onExitPressed: () async {
@@ -4443,7 +4578,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       onClearSelection: () =>
                                                           _selectionKey
                                                               .currentState
-                                                              ?.clearSelection(),
+                                                              ?.selectableRegion
+                                                              .clearSelection(),
                                                       showPlayControls: false,
                                                       showBottomBar: false,
                                                       focusNode:
@@ -4473,6 +4609,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                           ),
                                                       compactTopRightButtons:
                                                           true,
+                                                      initialShowControls:
+                                                          _playbackChromeVisible,
+                                                      onControlsVisibilityIntent:
+                                                          (visible) {
+                                                            _playbackChromeVisible =
+                                                                visible;
+                                                          },
                                                     ),
 
                                                   // Fullscreen Button (Custom for Portrait)
@@ -5259,7 +5402,8 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           onLoadSubtitle: _pickSubtitle,
           onOpenSubtitleStyle: _openSubtitleStyleSettings,
           onOpenSubtitleManager: _openSubtitleManager,
-          onClearSelection: () => _selectionKey.currentState?.clearSelection(),
+          onClearSelection: () =>
+              _selectionKey.currentState?.selectableRegion.clearSelection(),
           onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
           onOpenEpisodePicker: () =>
               setState(() => _activePanel = PortraitPanel.episodePicker),

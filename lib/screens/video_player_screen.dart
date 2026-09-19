@@ -17,6 +17,7 @@ import 'package:path/path.dart' as p;
 import '../services/embedded_subtitle_service.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
+import '../services/playback_behavior_policy.dart';
 import '../services/playback_exit_guard.dart';
 import '../services/playlist_manager.dart';
 import '../services/system_media_session_service.dart';
@@ -35,6 +36,7 @@ import '../services/task_subtitle_storage_service.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../widgets/subtitle_display_layer.dart';
 import '../models/subtitle_display_state.dart';
+import '../widgets/bilibili_buffering_overlay.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/player_control_metrics.dart';
 import '../widgets/sleep_timer_dialog.dart';
@@ -62,6 +64,7 @@ import '../utils/playback_page_visibility.dart';
 import '../utils/subtitle_drag_snap.dart';
 import '../utils/subtitle_file_picker.dart';
 import '../utils/video_gesture_session_gate.dart';
+import '../utils/landscape_sidebar_safe_insets.dart';
 
 enum SidebarType {
   none,
@@ -102,12 +105,29 @@ bool isLandscapeSubtitleViewportReady({
   return size.shortestSide >= 600 || size.width >= size.height;
 }
 
+/// Chrome shown on the landscape overlay after leaving the portrait player.
+///
+/// Prefer the live overlay state so a just-hidden (or still-visible) portrait
+/// chrome survives the route change. Fall back to the last intent only when
+/// the overlay is unmounted (subtitle drag, missing source, etc.).
+@visibleForTesting
+bool landscapePlaybackChromeFromPortrait({
+  required bool? overlayControlsVisible,
+  required bool lastIntent,
+}) {
+  return overlayControlsVisible ?? lastIntent;
+}
+
 class VideoPlayerScreen extends StatefulWidget {
   final XFile? videoFile; // Optional now
   final VideoPlayerController? existingController; // New
   final VideoItem? videoItem; // New
   final bool skipAutoPauseOnExit;
   final bool? autoPlayOnEntry;
+
+  /// Immediate chrome intent from the portrait overlay. Direct landscape
+  /// entry (skip-portrait, desktop) keeps the default of showing controls.
+  final bool initialShowControls;
 
   const VideoPlayerScreen({
     super.key,
@@ -116,6 +136,7 @@ class VideoPlayerScreen extends StatefulWidget {
     this.videoItem,
     this.skipAutoPauseOnExit = false,
     this.autoPlayOnEntry,
+    this.initialShowControls = true,
   });
 
   @override
@@ -125,8 +146,8 @@ class VideoPlayerScreen extends StatefulWidget {
 class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     with WidgetsBindingObserver, TickerProviderStateMixin, RouteAware {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
-  final GlobalKey<SelectableRegionState> _selectionKey =
-      GlobalKey<SelectableRegionState>();
+  final GlobalKey<SelectionAreaState> _selectionKey =
+      GlobalKey<SelectionAreaState>();
   final FocusNode _selectionFocusNode = FocusNode();
   final FocusNode _videoFocusNode =
       FocusNode(); // New: Dedicated focus node for video controls
@@ -138,7 +159,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   final GlobalKey _videoTextureKey = GlobalKey(
     debugLabel: 'LandscapePlaybackVideoTexture',
   );
-  final ValueNotifier<bool> _playbackControlsVisibility = ValueNotifier(true);
+  late final ValueNotifier<bool> _playbackControlsVisibility;
+
+  /// Last immediate chrome intent. Survives overlay remounts (episode skip,
+  /// subtitle drag) so hidden controls do not flash back on.
+  late bool _playbackChromeVisible;
   final GlobalKey<SubtitleSidebarState> _subtitleSidebarKey =
       GlobalKey<SubtitleSidebarState>();
   late VideoPlayerController _controller;
@@ -217,7 +242,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
 
     SystemChrome.setPreferredOrientations(<DeviceOrientation>[]);
-    if (mounted) navigator.pop();
+    if (mounted) {
+      navigator.pop<bool>(
+        _controlsKey.currentState?.controlsVisible ?? _playbackChromeVisible,
+      );
+    }
   }
 
   Future<void> _forceExitPlayer() async {
@@ -425,6 +454,56 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         !_isSubtitleDragMode &&
         !_isGhostDragMode &&
         !_isStyleSidebarDragMode;
+  }
+
+  /// The loading overlay is fully opaque. Keep the texture mounted whenever
+  /// the assigned controller already has a decoded picture, even if a later
+  /// init pass briefly cleared [_initialized].
+  bool get _hasDecodedVideoTexture {
+    if (!_controllerAssigned) return false;
+    try {
+      return _controller.value.isInitialized && !_controller.value.hasError;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Never mount [VideoPlayer] until [_controllerAssigned] is true. Keeping
+  /// [_initialized] alone caused LateInitializationError on Bilibili re-entry
+  /// when a service notification cleared the assignment before _initVideo ran.
+  bool get _shouldKeepVideoSurface =>
+      _controllerAssigned && (_initialized || _hasDecodedVideoTexture);
+
+  bool get _isCurrentBilibiliOnlineStream =>
+      _currentItem?.sourceRef?.kind == MediaSourceKind.bilibiliStream;
+
+  /// Poster over an empty texture until the first decoded frame (or a
+  /// background→foreground track re-enable) arrives. Instantly removed once
+  /// the video track is on the audio clock — no spinner and no fade.
+  Widget _buildVisibleVideoFrameCover() {
+    return ListenableBuilder(
+      listenable: MediaPlaybackService(),
+      builder: (context, _) {
+        if (!MediaPlaybackService().isCoveringUntilVisibleVideoFrame) {
+          return const SizedBox.shrink();
+        }
+        final path = _currentItem?.thumbnailPath;
+        if (path != null && path.isNotEmpty && File(path).existsSync()) {
+          return IgnorePointer(
+            child: Image.file(
+              File(path),
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) =>
+                  const ColoredBox(color: Color(0xFF141414)),
+            ),
+          );
+        }
+        return const IgnorePointer(
+          child: ColoredBox(color: Color(0xFF141414)),
+        );
+      },
+    );
   }
 
   bool get _hasCustomVideoTransform {
@@ -805,7 +884,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       displayArea: settings.bilibiliDanmakuDisplayArea,
       opacity: settings.bilibiliDanmakuOpacity,
       fontScale: settings.bilibiliDanmakuFontScale,
-      speed: settings.bilibiliDanmakuSpeed,
+      // Locked playback already advances the position clock; compensate here.
+      speed: settings.effectiveBilibiliDanmakuSpeed,
       fontFamily: settings.bilibiliDanmakuFontFamily,
       fontWeight: settings.bilibiliDanmakuFontWeight,
       outlineType: settings.bilibiliDanmakuOutlineType,
@@ -1308,6 +1388,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   @override
   void initState() {
     super.initState();
+    _playbackChromeVisible = widget.initialShowControls;
+    _playbackControlsVisibility = ValueNotifier(widget.initialShowControls);
     _videoTransformAnimationController = AnimationController(vsync: this)
       ..addListener(() {
         final Animation<double>? scaleAnimation = _videoScaleAnimation;
@@ -1735,9 +1817,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   bool _tryAdoptBilibiliQualityHandoff(MediaPlaybackService service) {
     final replacement = service.controller;
-    if (!service.isCurrentItemBilibiliStream ||
-        !service.isSwitchingStreamQuality ||
-        replacement == null ||
+    // Same-item controller replacement (quality, local materialize, reopen)
+    // must not drop through to the generic loading branch. That branch covers
+    // the already-decoded picture with a black overlay even though audio is
+    // still running.
+    if (replacement == null ||
         service.currentItem?.id != _currentItem?.id ||
         !service.canMountControllerFor(
           _currentItem!.id,
@@ -1901,10 +1985,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         try {
           previousController.removeListener(_videoListener);
         } catch (_) {}
+        // Swap in place. Setting _initialized false here unmounts VideoPlayer
+        // and covers a ready Bilibili stream with the loading overlay.
         setState(() {
           _controllerAssigned = false;
           _isControllerOwner = false;
-          _initialized = false;
         });
         if (shouldDisposePrevious) {
           unawaited(previousController.dispose());
@@ -2027,8 +2112,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
       final sidebarVisible = _isSubtitleSidebarVisible;
       await settings.saveLandscapeSubtitleSidebarVisible(sidebarVisible);
+      final suppressRouteCleanup =
+          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
+      final shouldAutoPause = PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+        autoPauseOnExit: settings.autoPauseOnExit && !shouldSkipAutoPause,
+        explicitExit: _explicitPlaybackExitRequested,
+        suppressRouteCleanup: suppressRouteCleanup,
+        transportPlaying: playbackService.isTransportPlaying,
+      );
       if (exitController == null) {
         if (itemId != null) {
+          if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
+            await playbackService.pause(expectedItemId: itemId);
+          }
           await playbackService.persistCurrentProgress(expectedItemId: itemId);
         }
         return;
@@ -2044,24 +2140,22 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       // this route must not pause, sync, or persist through global state.
       if (!exitControllerOwner && !serviceOwnsExitSession()) return;
 
-      final suppressRouteCleanup =
-          PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
-      final exitSessionIsPlaying = serviceOwnsExitSession()
-          ? playbackService.isPlaying || exitController.value.isPlaying
-          : exitController.value.isPlaying;
-      if (_explicitPlaybackExitRequested &&
-          !suppressRouteCleanup &&
-          !shouldSkipAutoPause &&
-          settings.autoPauseOnExit &&
-          exitSessionIsPlaying) {
-        if (serviceOwnsExitSession()) {
-          await playbackService.pause(
-            expectedItemId: itemId,
-            expectedController: exitController,
+      final shouldAutoPauseSession =
+          PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+            autoPauseOnExit: settings.autoPauseOnExit && !shouldSkipAutoPause,
+            explicitExit: _explicitPlaybackExitRequested,
+            suppressRouteCleanup: suppressRouteCleanup,
+            transportPlaying: serviceOwnsExitSession()
+                ? playbackService.isTransportPlaying
+                : exitController.value.isPlaying,
           );
-        } else {
-          await exitController.pause();
-        }
+      if (shouldAutoPauseSession && serviceOwnsExitSession()) {
+        await playbackService.pause(
+          expectedItemId: itemId,
+          expectedController: exitController,
+        );
+      } else if (shouldAutoPauseSession) {
+        await exitController.pause();
       }
 
       if (!exitControllerOwner) {
@@ -2787,7 +2881,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       playbackService.setPlaybackPageVisible(this, true);
       if (playbackService.needsVisibleVideoOutputRecovery(currentItem.id)) {
         unawaited(playbackService.ensureVisibleVideoOutput(currentItem.id));
-        return;
       }
     }
 
@@ -2845,10 +2938,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         // and pausing here used to kill the auto-play-after-switch setting.
         if (pageEntryAutoPlay != true &&
             playbackService.state != PlaybackState.loading) {
-          if (playbackService.desiredPlaying) {
-            if (!_controller.value.isPlaying) playbackService.resume();
-          } else {
-            if (_controller.value.isPlaying) playbackService.pause();
+          if (MediaPlaybackService.shouldResumeOnPageAdopt(
+            desiredPlaying: playbackService.desiredPlaying,
+            state: playbackService.state,
+          )) {
+            unawaited(playbackService.resume());
+          } else if (MediaPlaybackService.shouldPauseOnPageAdopt(
+            desiredPlaying: playbackService.desiredPlaying,
+            state: playbackService.state,
+            controllerPlaying: _controller.value.isPlaying,
+          )) {
+            unawaited(playbackService.pause());
           }
         }
 
@@ -2908,10 +3008,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             debugPrint(
               "VideoPlayerScreen: Waiting for service to load ${currentItem.title}",
             );
-            setState(() {
-              _initialized = false;
-              // Clear old controller if we owned it? No, keep it until new one ready or just show loading.
-            });
+            // Keep an already-mounted texture. Replacing it with the loading
+            // overlay is the "black page stacked on a ready video" flash.
+            if (!(_initialized && _controllerAssigned)) {
+              setState(() {
+                _initialized = false;
+              });
+            }
             return;
           }
 
@@ -2963,10 +3066,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               // service commits the transport intent itself; a page-side
               // "correction" here used to pause the optimistic autoplay and
               // overwrite the「切换上下集自动播放」setting.
-              if (playbackService.desiredPlaying) {
-                if (!_controller.value.isPlaying) playbackService.resume();
-              } else {
-                if (_controller.value.isPlaying) playbackService.pause();
+              if (MediaPlaybackService.shouldResumeOnPageAdopt(
+                desiredPlaying: playbackService.desiredPlaying,
+                state: playbackService.state,
+              )) {
+                unawaited(playbackService.resume());
+              } else if (MediaPlaybackService.shouldPauseOnPageAdopt(
+                desiredPlaying: playbackService.desiredPlaying,
+                state: playbackService.state,
+                controllerPlaying: _controller.value.isPlaying,
+              )) {
+                unawaited(playbackService.pause());
               }
             }
 
@@ -3016,7 +3126,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             context,
             listen: false,
           );
-          if (mounted) {
+          if (mounted && !(_initialized && _controllerAssigned)) {
             setState(() {
               _initialized = false;
               _isPlaying = false;
@@ -3035,6 +3145,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             // ready.
             return;
           }
+          if (playbackService.shouldDeferPlayForActiveSession(currentItem.id)) {
+            // Bilibili audio kept playing off-page; wait for video-track
+            // re-enable instead of reopening the stream via play().
+            return;
+          }
           unawaited(
             playbackService.play(
               currentItem,
@@ -3043,6 +3158,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                 isCurrentItem:
                     playbackService.currentItem?.id == currentItem.id,
                 desiredPlaying: playbackService.desiredPlaying,
+              ),
+              startPosition: MediaPlaybackService.startPositionForCurrentSession(
+                currentItemId: playbackService.currentItem?.id,
+                itemId: currentItem.id,
+                currentPosition: playbackService.position,
               ),
             ),
           );
@@ -3327,6 +3447,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     );
   }
 
+  /// Hop seeks publish an optimistic service clock immediately. Native
+  /// [VideoPlayerController.position] on online Bilibili can lag on the
+  /// previous cue and flash the sidebar/overlay backward.
+  Duration _subtitleLookupPosition() {
+    final native = _controller.value.position;
+    try {
+      final service = Provider.of<MediaPlaybackService>(
+        context,
+        listen: false,
+      );
+      if (!identical(service.controller, _controller)) return native;
+      return service.positionForSubtitleOverlay(native);
+    } catch (_) {
+      return native;
+    }
+  }
+
   void _updateSubtitle() {
     if (!_initialized) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
@@ -3355,7 +3492,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       return;
     }
 
-    final position = _controller.value.position;
+    final position = _subtitleLookupPosition();
     final adjustedPosition = position - settings.subtitleOffset;
     final int posMs = adjustedPosition.inMilliseconds;
     final continuousSubtitleEnabled = _isAudio
@@ -3485,6 +3622,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void _seekPlaybackPosition(
     Duration target, {
     bool syncSubtitleSidebar = false,
+    String source = 'ui',
   }) {
     if (!_initialized || !_controller.value.isInitialized) return;
     final duration = _controller.value.duration;
@@ -3505,7 +3643,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         listen: false,
       );
       if (playbackService.controller == _controller) {
-        playbackService.seekTo(clamped);
+        playbackService.seekTo(clamped, source: source);
       } else {
         _controller.seekTo(clamped);
       }
@@ -3515,7 +3653,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _seekToSubtitleFast(Duration target) {
-    _seekPlaybackPosition(target);
+    _seekPlaybackPosition(target, source: 'subtitle_hop');
   }
 
   void _togglePlay() async {
@@ -3980,7 +4118,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   // --- Drag Logic ---
   void _enterSubtitleDragMode() {
-    if (SubtitleDebugSession.instance.usesPresets) return;
+    // Preset layout locks ordinary overlay dragging, but the move-subtitle
+    // sidebar must still open. Ghost editing is only available while the
+    // subtitle sidebar is visible, so closing that sidebar takes this path.
     setState(() {
       _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
       _isSubtitleDragMode = true;
@@ -4273,12 +4413,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                   )
                 : const ColoredBox(color: Colors.black),
           ),
-          // 简单的半透明遮罩，确保加载圈和顶部栏可见
-          DecoratedBox(
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.4),
+          // Local files keep a light dim so the spinner reads on a bright
+          // poster. Online Bilibili loading must not cover the frame.
+          if (!_isCurrentBilibiliOnlineStream)
+            const DecoratedBox(
+              decoration: BoxDecoration(color: Color(0x66000000)),
             ),
-          ),
           Positioned(
             top: 16,
             left: 16,
@@ -4314,16 +4454,19 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               ),
             ),
           ),
-          Center(
-            child: SizedBox(
-              width: 48,
-              height: 48,
-              child: CircularProgressIndicator(
-                strokeWidth: 3,
-                color: Colors.white.withValues(alpha: 0.8),
+          if (_isCurrentBilibiliOnlineStream)
+            const BilibiliBufferingOverlay(forceVisible: true)
+          else
+            Center(
+              child: SizedBox(
+                width: 48,
+                height: 48,
+                child: CircularProgressIndicator(
+                  strokeWidth: 3,
+                  color: Colors.white.withValues(alpha: 0.8),
+                ),
               ),
             ),
-          ),
         ],
       ),
     );
@@ -4335,12 +4478,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     return Consumer<SettingsService>(
       builder: (context, settings, child) {
         final bool isLeftHandedMode = settings.isLeftHandedMode;
+        final MediaQueryData? mediaQuery = MediaQuery.maybeOf(context);
         final EdgeInsets viewPadding =
-            MediaQuery.maybeOf(context)?.viewPadding ?? EdgeInsets.zero;
-        final EdgeInsets sidebarSafePadding = EdgeInsets.only(
-          left: isLeftHandedMode ? viewPadding.left : 0,
-          right: isLeftHandedMode ? 0 : viewPadding.right,
-        );
+            mediaQuery?.viewPadding ?? EdgeInsets.zero;
+        final EdgeInsets gestureInsets =
+            mediaQuery?.systemGestureInsets ?? EdgeInsets.zero;
+        // Some Android landscape devices report the navigation gesture strip
+        // only through systemGestureInsets. Respect both sources so the strip
+        // cannot cover article text or intercept the paragraph-mode switch.
+        final EdgeInsets sidebarSafePadding =
+            resolveLandscapeSidebarSafePadding(
+              viewPadding: viewPadding,
+              systemGestureInsets: gestureInsets,
+              isLeftHandedMode: isLeftHandedMode,
+            );
         final Widget sidebarResizer = Container(
           width: _subtitleSidebarResizerLayoutWidth,
           color: _isResizingSidebar ? Colors.blueAccent : Colors.black12,
@@ -4491,15 +4642,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               key: _scaffoldKey,
               backgroundColor: Colors.black,
               resizeToAvoidBottomInset: false,
-              body: SelectableRegion(
+              body: SelectionArea(
                 key: _selectionKey,
-                selectionControls: materialTextSelectionControls,
                 focusNode: _selectionFocusNode,
                 child: GestureDetector(
                   onTap: () {
                     // 点击空白区域取消文字选择，仅清除选择焦点，
                     // 不调用 unfocus() 避免清除视频控制焦点的键盘快捷键
-                    _selectionKey.currentState?.clearSelection();
+                    _selectionKey.currentState?.selectableRegion
+                        .clearSelection();
+                    _subtitleSidebarKey.currentState?.clearTextSelection();
                     _selectionFocusNode.unfocus();
                     // 恢复焦点到视频控制 FocusNode，确保快捷键持续可用
                     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -4767,7 +4919,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                       ),
                                                     ],
                                                   )
-                                                : _initialized
+                                                : _shouldKeepVideoSurface
                                                 ? RepaintBoundary(
                                                     child: SizedBox.expand(
                                                       child: Stack(
@@ -4811,9 +4963,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                                           child: ColoredBox(
                                                                             color:
                                                                                 Colors.black,
-                                                                            child: VideoPlayer(
-                                                                              _controller,
-                                                                              key: _videoTextureKey,
+                                                                            child: Stack(
+                                                                              fit: StackFit.expand,
+                                                                              children: [
+                                                                                VideoPlayer(
+                                                                                  _controller,
+                                                                                  key: _videoTextureKey,
+                                                                                ),
+                                                                                _buildVisibleVideoFrameCover(),
+                                                                                const BilibiliBufferingOverlay(),
+                                                                              ],
                                                                             ),
                                                                           ),
                                                                         ),
@@ -4903,6 +5062,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                         .bilibiliStream,
                                                 playbackControlsVisibility:
                                                     _playbackControlsVisibility,
+                                                initialShowControls:
+                                                    _playbackChromeVisible,
+                                                onControlsVisibilityIntent:
+                                                    (visible) {
+                                                      _playbackChromeVisible =
+                                                          visible;
+                                                    },
                                                 controller: _controllerAssigned
                                                     ? _controller
                                                     : null,
@@ -4913,6 +5079,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                 onSeekTo: (position) {
                                                   _seekPlaybackPosition(
                                                     position,
+                                                  );
+                                                },
+                                                onHopSeekTo: (position) {
+                                                  _seekPlaybackPosition(
+                                                    position,
+                                                    source: 'subtitle_hop',
                                                   );
                                                 },
                                                 onExitPressed: () async {
@@ -5085,8 +5257,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                 onEnterSubtitleDragMode:
                                                     _enterSubtitleDragMode,
                                                 onClearSelection: () =>
-                                                    _selectionKey.currentState
-                                                        ?.clearSelection(),
+                                                    _selectionKey
+                                                        .currentState
+                                                        ?.selectableRegion
+                                                        .clearSelection(),
                                                 onToggleEpisodePicker: () =>
                                                     setState(
                                                       () => _showEpisodePicker =
@@ -5807,7 +5981,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onOpenSubtitleEditor: _showSubtitleEditor,
           onOpenVideoCompose: _showVideoCompose,
           onOpenOcrSubtitle: _supportsOcrSubtitle ? _showOcrSubtitle : null,
-          onClearSelection: () => _selectionKey.currentState?.clearSelection(),
+          onClearSelection: () =>
+              _selectionKey.currentState?.selectableRegion.clearSelection(),
           onScanEmbeddedSubtitles: _checkAndLoadEmbeddedSubtitle,
           isCompact: true,
           isPortrait: false,

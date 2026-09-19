@@ -189,6 +189,14 @@ void main() {
       ),
       isFalse,
     );
+    expect(
+      NativeVideoPlayerMediaKit.shouldCreateVideoOutput(
+        resource: 'http://127.0.0.1:47821/session/abc/audio',
+        operatingSystem: 'windows',
+        lifecycleState: AppLifecycleState.resumed,
+      ),
+      isFalse,
+    );
   });
 
   test('Android local files retain the stable platform player backend', () {
@@ -386,6 +394,82 @@ void main() {
     );
   });
 
+  test('re-enabling a split video track seeks back to the audio clock', () {
+    expect(
+      NativeVideoPlayerMediaKit.shouldSeekAfterExternalVideoTrackEnable(
+        previousTrackId: 'no',
+        nextTrackId: '1',
+        clockPosition: const Duration(minutes: 3, seconds: 12),
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldSeekAfterExternalVideoTrackEnable(
+        previousTrackId: '1',
+        nextTrackId: '1',
+        clockPosition: const Duration(minutes: 3),
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldSeekAfterExternalVideoTrackEnable(
+        previousTrackId: 'no',
+        nextTrackId: '1',
+        clockPosition: Duration.zero,
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldRepairClockAfterExternalVideoTrackEnable(
+        clockBefore: const Duration(minutes: 3),
+        clockAfter: Duration.zero,
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldRepairClockAfterExternalVideoTrackEnable(
+        clockBefore: const Duration(minutes: 3),
+        clockAfter: const Duration(minutes: 3, milliseconds: 80),
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.liveClockAfterVideoTrackEnable(
+        clockBefore: const Duration(seconds: 12),
+        elapsed: const Duration(milliseconds: 240),
+        clockAfter: Duration.zero,
+      ),
+      const Duration(milliseconds: 12240),
+    );
+    expect(
+      NativeVideoPlayerMediaKit.liveClockAfterVideoTrackEnable(
+        clockBefore: const Duration(seconds: 12),
+        elapsed: const Duration(milliseconds: 80),
+        clockAfter: const Duration(milliseconds: 12100),
+      ),
+      const Duration(milliseconds: 12100),
+    );
+  });
+
+  test('video track enable interpolates the live audio clock', () {
+    expect(
+      NativeVideoPlayerMediaKit.liveClockAfterVideoTrackEnable(
+        clockBefore: const Duration(seconds: 12),
+        elapsed: const Duration(milliseconds: 180),
+        clockAfter: Duration.zero,
+      ),
+      const Duration(milliseconds: 12180),
+    );
+    expect(
+      NativeVideoPlayerMediaKit.liveClockAfterVideoTrackEnable(
+        clockBefore: const Duration(seconds: 12),
+        elapsed: const Duration(milliseconds: 40),
+        clockAfter: const Duration(milliseconds: 12080),
+      ),
+      const Duration(milliseconds: 12080),
+    );
+  });
+
   test('recoverable decoder logs do not invalidate an active controller', () {
     expect(
       NativeVideoPlayerMediaKit.shouldForwardPlayerError(
@@ -411,5 +495,17 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  test('re-enabling a video track honors keepPlaying over a stale pause', () {
+    final source = File(
+      'lib/platform/windows_video_player_media_kit.dart',
+    ).readAsStringSync();
+    expect(source, contains('bool keepPlaying = false'));
+    expect(
+      source,
+      contains('final resumePlaying = player.state.playing || keepPlaying;'),
+    );
+    expect(source, contains('!keepPlaying)'));
   });
 }

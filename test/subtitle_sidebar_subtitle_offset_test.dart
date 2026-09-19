@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -63,6 +64,7 @@ void main() {
     VideoPlayerController controller,
     List<SubtitleItem> subtitles, {
     ValueChanged<Duration>? onItemTap,
+    ValueListenable<Duration>? positionListenable,
   }) {
     return tester.pumpWidget(
       MaterialApp(
@@ -73,6 +75,7 @@ void main() {
             child: SubtitleSidebar(
               subtitles: subtitles,
               controller: controller,
+              positionListenable: positionListenable,
               isCompact: true,
               isPortrait: true,
               onItemTap: onItemTap,
@@ -141,6 +144,36 @@ void main() {
     await controller.dispose();
   });
 
+  testWidgets('高亮跟随播放器真实位置，不被插值时钟超前', (tester) async {
+    await prepareSettings(0);
+    final controller = buildController();
+    final subtitles = buildSubtitles();
+    // 插值时钟比 controller 超前约 6s，若误用它判定当前句会高亮第 2 条。
+    final positionNotifier = ValueNotifier<Duration>(
+      const Duration(milliseconds: 12500),
+    );
+    await pumpSidebar(
+      tester,
+      controller,
+      subtitles,
+      positionListenable: positionNotifier,
+    );
+    await tester.pump();
+    // controller 在 6.5s，插值时钟在 12.5s；高亮必须跟随 controller。
+    controller.value = controller.value.copyWith(
+      position: const Duration(milliseconds: 6500),
+      isPlaying: true,
+    );
+    await tester.pump();
+
+    expect(timestampColor(tester, 1), Colors.blueAccent);
+    expect(timestampColor(tester, 2), isNot(Colors.blueAccent));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    positionNotifier.dispose();
+    await controller.dispose();
+  });
+
   testWidgets('点击字幕跳转时补偿字幕延迟', (tester) async {
     await prepareSettings(3000);
     final controller = buildController();
@@ -159,6 +192,57 @@ void main() {
 
     // 点击方按视频时间 seek：6s 的字幕应跳到 9s。
     expect(tapped, const Duration(seconds: 9));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.dispose();
+  });
+
+  testWidgets('句间空隙仍高亮上一句，直到下一句开始', (tester) async {
+    await prepareSettings(0);
+    final controller = buildController();
+    final subtitles = buildSubtitles();
+    await pumpSidebar(tester, controller, subtitles);
+    await tester.pump();
+
+    // 4s 结束、6s 才开始：空隙里阅读光标应停在第 0 条。
+    controller.value = controller.value.copyWith(
+      position: const Duration(milliseconds: 5000),
+    );
+    await tester.pump();
+    expect(timestampColor(tester, 0), Colors.blueAccent);
+    expect(timestampColor(tester, 1), isNot(Colors.blueAccent));
+
+    controller.value = controller.value.copyWith(
+      position: const Duration(seconds: 6),
+    );
+    await tester.pump();
+    expect(timestampColor(tester, 1), Colors.blueAccent);
+    expect(timestampColor(tester, 0), isNot(Colors.blueAccent));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await controller.dispose();
+  });
+
+  testWidgets('越过句界时高亮立即切换，不被 80ms 节流拖住', (tester) async {
+    await prepareSettings(0);
+    final controller = buildController();
+    final subtitles = buildSubtitles();
+    await pumpSidebar(tester, controller, subtitles);
+    await tester.pump();
+
+    controller.value = controller.value.copyWith(
+      position: const Duration(milliseconds: 5940),
+    );
+    await tester.pump();
+    expect(timestampColor(tester, 0), Colors.blueAccent);
+
+    // 下一帧只前进 80ms 以内，旧节流会跳过这次计算，画面字幕却已经切句。
+    controller.value = controller.value.copyWith(
+      position: const Duration(milliseconds: 6010),
+    );
+    await tester.pump();
+    expect(timestampColor(tester, 1), Colors.blueAccent);
+    expect(timestampColor(tester, 0), isNot(Colors.blueAccent));
 
     await tester.pumpWidget(const SizedBox.shrink());
     await controller.dispose();

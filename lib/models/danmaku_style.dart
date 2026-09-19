@@ -28,6 +28,36 @@ double danmakuSpeedFromSlider(double sliderValue) {
       math.pow(kDanmakuSpeedMax / kDanmakuSpeedMin, position).toDouble();
 }
 
+/// Turns the user-facing danmaku speed into the media-time multiplier.
+///
+/// Danmaku is driven by the player position clock, which already advances at
+/// the current playback rate. Dividing by a locked rate makes that locked rate
+/// behave like 1x on screen, without touching the overlay animation clock.
+/// Unlocked playback, or a disabled setting, must keep the slider value as-is
+/// even if a leftover lock speed is still stored.
+double resolveDanmakuSpeedWithLockedPlaybackBaseline({
+  required double sliderSpeed,
+  required bool useLockedPlaybackAsBaseline,
+  required bool isPlaybackSpeedLocked,
+  required double lockedPlaybackSpeed,
+}) {
+  if (!sliderSpeed.isFinite || sliderSpeed <= 0) {
+    return 1.0;
+  }
+  if (!useLockedPlaybackAsBaseline || !isPlaybackSpeedLocked) {
+    return sliderSpeed;
+  }
+  final baseline = lockedPlaybackSpeed;
+  if (!baseline.isFinite || baseline <= 0) {
+    return sliderSpeed;
+  }
+  final mediaSpeed = sliderSpeed / baseline;
+  if (!mediaSpeed.isFinite || mediaSpeed <= 0) {
+    return sliderSpeed;
+  }
+  return mediaSpeed;
+}
+
 /// Font families bundled by the application. `null` keeps Flutter's current
 /// default font, which is also the historical danmaku appearance.
 const List<String?> kDanmakuFontFamilies = <String?>[

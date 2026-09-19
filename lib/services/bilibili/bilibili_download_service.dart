@@ -3453,19 +3453,35 @@ class BilibiliDownloadService extends ChangeNotifier {
     targetFolderId: targetFolderId,
   );
 
-  /// Exports a freshly parsed clipboard task without adding it to the
-  /// persistent download/parse list first.
+  /// Clipboard online-card import: put the same task on the Bilibili online
+  /// parse list first, then export it so both surfaces share live progress.
+  /// Same BV/url is always added again; only the identical list node is skipped.
   Future<int> importParsedStreamingTaskToLibrary(
     LibraryService library,
     BilibiliDownloadTask parsedTask, {
     String? targetFolderId,
-  }) {
+  }) async {
     parsedTask.isStreamingImport = true;
+    _attachStreamingTaskToParseList(parsedTask);
+    await saveTasks(task: parsedTask);
     return _importStreamingToLibrary(
       library,
       parsedTask: parsedTask,
       targetFolderId: targetFolderId,
     );
+  }
+
+  /// Shows [task] on the online-import page immediately via the shared [tasks]
+  /// list. Identity-only: never skip a new object just because the BV exists.
+  void _attachStreamingTaskToParseList(BilibiliDownloadTask task) {
+    task.isStreamingImport = true;
+    if (tasks.any((item) => identical(item, task))) {
+      return;
+    }
+    tasks.insert(0, task);
+    _rebuildTaskIndex();
+    _metricsDirty = true;
+    notifyListeners();
   }
 
   Future<int> _importStreamingToLibrary(
@@ -3505,281 +3521,314 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
     notifyListeners();
 
-    late final Directory dataRoot;
-    late final Directory thumbDir;
-    late final Directory danmakuDir;
-    try {
-      dataRoot = await SettingsService().resolveLargeDataRootDir();
-      thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
-      if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
-      danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
-      if (!await danmakuDir.exists()) await danmakuDir.create(recursive: true);
-    } catch (error) {
-      for (final ep in importCandidates) {
-        ep
-          ..status = DownloadStatus.failed
-          ..error = error.toString()
-          ..downloadSpeed = null;
-        _streamingImportingEpisodes.remove(ep);
+    var ownsLibraryProgress = false;
+    void reportLibraryProgress(double progress, String status) {
+      if (library.hasActiveImport && !ownsLibraryProgress) {
+        return;
       }
-      notifyListeners();
-      return 0;
-    }
-    final ensuredCollectionIds = <String>{};
-    // A streaming import is an explicit "create cards" operation. Keep the
-    // collections created during this one call together, but never look up a
-    // pre-existing same-named collection. A second import of the same link
-    // therefore gets a completely independent folder/card tree.
-    final importCollections = <String, Future<String>>{};
-    final importVideoFolders = <BilibiliVideoInfo, Future<String>>{};
-
-    Future<String> createImportCollection(
-      String key,
-      String name,
-      String? parentId,
-      MediaSourceRef? sourceRef,
-    ) {
-      return importCollections[key] ??= library
-          .createCollection(name, parentId, sourceRef: sourceRef)
-          .then((collection) => collection.id);
+      ownsLibraryProgress = library.reportTransientImportProgress(
+        progress: progress,
+        status: status,
+      );
     }
 
-    var count = 0;
+    try {
+      reportLibraryProgress(
+        0.04,
+        importCandidates.length > 1 ? '正在添加在线播放卡片...' : '正在准备视频信息...',
+      );
 
-    for (final ep in importCandidates) {
+      late final Directory dataRoot;
+      late final Directory thumbDir;
+      late final Directory danmakuDir;
       try {
-        final task =
-            parsedTask ??
-            tasks.cast<BilibiliDownloadTask?>().firstWhere(
-              (item) =>
-                  item != null &&
-                  item.isStreamingImport &&
-                  item.videos.any((video) => video.episodes.contains(ep)),
-              orElse: () => null,
-            );
-        if (task == null) {
-          throw StateError('找不到在线播放条目对应的导入任务');
-        }
-        final video = task.videos.firstWhere(
-          (item) => item.episodes.contains(ep),
-        );
-        _setStreamingImportProgress(ep, '正在准备视频信息...');
-        final metadata = await apiService.fetchPlayerMetadata(
-          ep.bvid,
-          ep.page.cid,
-          aid: ep.page.aid ?? video.videoInfo.aid,
-          skipAiSubtitles: false,
-          durationSeconds: ep.page.duration,
-        );
-        ep
-          ..availableSubtitles = metadata.subtitles
-          ..chapters = metadata.chapters;
-        ep.selectedSubtitle ??= _selectBestSubtitle(metadata.subtitles);
-        _setStreamingImportProgress(ep, '正在导出附加内容...');
-
-        String? rootCollectionId;
-        if (task.collectionInfo != null) {
-          rootCollectionId = await createImportCollection(
-            'task:${task.taskId}:root',
-            task.collectionInfo!.title,
-            targetFolderId,
-            task.sourceRef,
-          );
-          if (ensuredCollectionIds.add(rootCollectionId)) {
-            await _ensureCollectionThumbnail(
-              library,
-              thumbDir,
-              rootCollectionId,
-              task.collectionInfo!.cover,
-            );
-          }
-        } else {
-          rootCollectionId = targetFolderId;
-        }
-
-        var targetParentId = rootCollectionId;
-        if (video.videoInfo.pages.length > 1) {
-          final folderId = await (importVideoFolders[video.videoInfo] ??=
-              library
-                  .createCollection(
-                    video.videoInfo.title,
-                    rootCollectionId,
-                    sourceRef: video.sourceRef,
-                  )
-                  .then((collection) => collection.id));
-          targetParentId = folderId;
-          if (ensuredCollectionIds.add(folderId)) {
-            await _ensureCollectionThumbnail(
-              library,
-              thumbDir,
-              folderId,
-              video.videoInfo.pic,
-            );
-          }
-        }
-
-        final uuid = _uuid.v4();
-        String? thumbPath;
-        final coverUrl = video.videoInfo.pic.trim();
-        if (coverUrl.isNotEmpty) {
-          try {
-            final response = await apiService.dio.get<List<int>>(
-              coverUrl,
-              options: Options(responseType: ResponseType.bytes),
-            );
-            final bytes = response.data;
-            if (bytes != null && bytes.isNotEmpty) {
-              final rawExt = p
-                  .extension(Uri.parse(coverUrl).path)
-                  .toLowerCase();
-              final ext = RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt)
-                  ? rawExt
-                  : '.jpg';
-              thumbPath = p.join(thumbDir.path, '$uuid$ext');
-              await File(thumbPath).writeAsBytes(bytes, flush: true);
-            }
-          } catch (error) {
-            debugPrint('Bilibili stream cover download failed: $error');
-          }
-        }
-
-        final subtitleDir = await const TaskSubtitleStorageService()
-            .taskDirectory(uuid, create: true);
-        final extraSubtitles = <String, String>{};
-        String? defaultSubtitlePath;
-        for (final subtitle in metadata.subtitles) {
-          try {
-            final payload = await apiService.fetchSubtitleContent(subtitle.url);
-            final srt = SubtitleUtil.convertJsonToSrt(payload);
-            if (srt.isEmpty) continue;
-            final safeLanguage = subtitle.lan.replaceAll(
-              RegExp(r'[^A-Za-z0-9_-]'),
-              '_',
-            );
-            final output = p.join(
-              subtitleDir.path,
-              'stream_${safeLanguage.isEmpty ? 'subtitle' : safeLanguage}.srt',
-            );
-            await File(output).writeAsString(srt, flush: true);
-            var label = subtitle.lanDoc.trim();
-            if (label.isEmpty) label = subtitle.lan.trim();
-            if (label.isEmpty) label = '字幕';
-            extraSubtitles[label] = output;
-            if (ep.selectedSubtitle == subtitle ||
-                (ep.selectedSubtitle?.id.isNotEmpty == true &&
-                    ep.selectedSubtitle!.id == subtitle.id)) {
-              defaultSubtitlePath = output;
-            }
-          } catch (error) {
-            debugPrint('Bilibili stream subtitle export failed: $error');
-          }
-        }
-
-        String? danmakuPath;
-        try {
-          final xml = await apiService.fetchDanmakuXml(ep.page.cid);
-          final ass = BilibiliDanmakuAss.xmlToAss(xml);
-          danmakuPath = p.join(danmakuDir.path, '${uuid}_danmaku.ass');
-          await File(danmakuPath).writeAsString(ass, flush: true);
-          ep
-            ..danmakuPath = danmakuPath
-            ..danmakuError = null;
-        } catch (error, stack) {
-          developer.log(
-            'Streaming import danmaku download failed for cid=${ep.page.cid}',
-            error: error,
-            stackTrace: stack,
-          );
-          ep
-            ..danmakuPath = null
-            ..danmakuError = 'download_failed';
-          danmakuPath = null;
-        }
-
-        final bvid = ep.bvid.trim().isNotEmpty
-            ? ep.bvid.trim()
-            : video.videoInfo.bvid.trim();
-        if (bvid.isEmpty || ep.page.cid <= 0) {
-          throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
-        }
-        final videoShot = await BilibiliVideoShotService.instance
-            .downloadForCard(
-              apiService: apiService,
-              videoId: uuid,
-              bvid: bvid,
-              cid: ep.page.cid,
-              dataRootOverride: dataRoot,
-            );
-        final sourceRef = MediaSourceRef(
-          value: bvid,
-          kind: MediaSourceKind.bilibiliStream,
-          originalValue: video.sourceRef?.value ?? task.sourceRef?.value,
-          bvid: bvid,
-          aid: ep.page.aid ?? video.videoInfo.aid,
-          cid: ep.page.cid,
-          page: ep.page.page,
-        );
-        final displayTitle = video.videoInfo.pages.length > 1
-            ? ep.page.part
-            : video.videoInfo.title;
-        final item = VideoItem(
-          id: uuid,
-          path: 'bilibili://stream/$bvid?cid=${ep.page.cid}',
-          title: displayTitle,
-          thumbnailPath: thumbPath,
-          durationMs: ep.page.duration * 1000,
-          lastUpdated: DateTime.now().millisecondsSinceEpoch,
-          // An online card is an instance, not a deduplication key. Keeping a
-          // card-scoped fingerprint protects it from any future caller that
-          // enables reuseExistingItem for imported media.
-          sourceFingerprint: 'bilibili-stream-card:$uuid',
-          parentId: targetParentId,
-          subtitlePath: defaultSubtitlePath,
-          additionalSubtitles: extraSubtitles,
-          danmakuPath: danmakuPath,
-          usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
-          isBilibiliExported: true,
-          sourceRef: sourceRef,
-          bilibiliVideoShot: videoShot,
-          chapters: metadata.chapters,
-          hasProbedChapters: true,
-        );
-        _setStreamingImportProgress(ep, '正在写入媒体库...');
-        await library.addSingleVideo(item, reuseExistingItem: false);
-        ep
-          ..status = DownloadStatus.completed
-          ..progress = 1
-          ..isExported = true
-          ..downloadSpeed = '已导出在线播放条目'
-          ..importedVideoIds = <String>[
-            ...ep.importedVideoIds.where((id) => id != item.id),
-            item.id,
-          ];
-        count++;
-        if (autoDeleteTaskAfterImport && parsedTask == null) {
-          await removeEpisode(ep, task);
-        }
+        dataRoot = await SettingsService().resolveLargeDataRootDir();
+        thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
+        if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+        danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
+        if (!await danmakuDir.exists())
+          await danmakuDir.create(recursive: true);
       } catch (error) {
-        ep
-          ..status = DownloadStatus.failed
-          ..error = error.toString()
-          ..downloadSpeed = null;
-      } finally {
-        _streamingImportingEpisodes.remove(ep);
-        if (ep.status == DownloadStatus.fetchingInfo) {
+        for (final ep in importCandidates) {
           ep
             ..status = DownloadStatus.failed
-            ..error ??= '导出在线播放条目未完成'
+            ..error = error.toString()
             ..downloadSpeed = null;
+          _streamingImportingEpisodes.remove(ep);
         }
         notifyListeners();
+        return 0;
       }
+      final ensuredCollectionIds = <String>{};
+      // A streaming import is an explicit "create cards" operation. Keep the
+      // collections created during this one call together, but never look up a
+      // pre-existing same-named collection. A second import of the same link
+      // therefore gets a completely independent folder/card tree.
+      final importCollections = <String, Future<String>>{};
+      final importVideoFolders = <BilibiliVideoInfo, Future<String>>{};
+
+      Future<String> createImportCollection(
+        String key,
+        String name,
+        String? parentId,
+        MediaSourceRef? sourceRef,
+      ) {
+        return importCollections[key] ??= library
+            .createCollection(name, parentId, sourceRef: sourceRef)
+            .then((collection) => collection.id);
+      }
+
+      var count = 0;
+
+      for (var i = 0; i < importCandidates.length; i++) {
+        final ep = importCandidates[i];
+        double stageProgress(double weight) {
+          return ((i + weight) / importCandidates.length).clamp(0.02, 0.99);
+        }
+
+        try {
+          final task =
+              parsedTask ??
+              tasks.cast<BilibiliDownloadTask?>().firstWhere(
+                (item) =>
+                    item != null &&
+                    item.isStreamingImport &&
+                    item.videos.any((video) => video.episodes.contains(ep)),
+                orElse: () => null,
+              );
+          if (task == null) {
+            throw StateError('找不到在线播放条目对应的导入任务');
+          }
+          final video = task.videos.firstWhere(
+            (item) => item.episodes.contains(ep),
+          );
+          _setStreamingImportProgress(ep, '正在准备视频信息...');
+          reportLibraryProgress(stageProgress(0.12), '正在准备视频信息...');
+          final metadata = await apiService.fetchPlayerMetadata(
+            ep.bvid,
+            ep.page.cid,
+            aid: ep.page.aid ?? video.videoInfo.aid,
+            skipAiSubtitles: false,
+            durationSeconds: ep.page.duration,
+          );
+          ep
+            ..availableSubtitles = metadata.subtitles
+            ..chapters = metadata.chapters;
+          ep.selectedSubtitle ??= _selectBestSubtitle(metadata.subtitles);
+          _setStreamingImportProgress(ep, '正在导出附加内容...');
+          reportLibraryProgress(stageProgress(0.48), '正在导出附加内容...');
+
+          String? rootCollectionId;
+          if (task.collectionInfo != null) {
+            rootCollectionId = await createImportCollection(
+              'task:${task.taskId}:root',
+              task.collectionInfo!.title,
+              targetFolderId,
+              task.sourceRef,
+            );
+            if (ensuredCollectionIds.add(rootCollectionId)) {
+              await _ensureCollectionThumbnail(
+                library,
+                thumbDir,
+                rootCollectionId,
+                task.collectionInfo!.cover,
+              );
+            }
+          } else {
+            rootCollectionId = targetFolderId;
+          }
+
+          var targetParentId = rootCollectionId;
+          if (video.videoInfo.pages.length > 1) {
+            final folderId = await (importVideoFolders[video.videoInfo] ??=
+                library
+                    .createCollection(
+                      video.videoInfo.title,
+                      rootCollectionId,
+                      sourceRef: video.sourceRef,
+                    )
+                    .then((collection) => collection.id));
+            targetParentId = folderId;
+            if (ensuredCollectionIds.add(folderId)) {
+              await _ensureCollectionThumbnail(
+                library,
+                thumbDir,
+                folderId,
+                video.videoInfo.pic,
+              );
+            }
+          }
+
+          final uuid = _uuid.v4();
+          String? thumbPath;
+          final coverUrl = video.videoInfo.pic.trim();
+          if (coverUrl.isNotEmpty) {
+            try {
+              final response = await apiService.dio.get<List<int>>(
+                coverUrl,
+                options: Options(responseType: ResponseType.bytes),
+              );
+              final bytes = response.data;
+              if (bytes != null && bytes.isNotEmpty) {
+                final rawExt = p
+                    .extension(Uri.parse(coverUrl).path)
+                    .toLowerCase();
+                final ext = RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt)
+                    ? rawExt
+                    : '.jpg';
+                thumbPath = p.join(thumbDir.path, '$uuid$ext');
+                await File(thumbPath).writeAsBytes(bytes, flush: true);
+              }
+            } catch (error) {
+              debugPrint('Bilibili stream cover download failed: $error');
+            }
+          }
+
+          final subtitleDir = await const TaskSubtitleStorageService()
+              .taskDirectory(uuid, create: true);
+          final extraSubtitles = <String, String>{};
+          String? defaultSubtitlePath;
+          for (final subtitle in metadata.subtitles) {
+            try {
+              final payload = await apiService.fetchSubtitleContent(
+                subtitle.url,
+              );
+              final srt = SubtitleUtil.convertJsonToSrt(payload);
+              if (srt.isEmpty) continue;
+              final safeLanguage = subtitle.lan.replaceAll(
+                RegExp(r'[^A-Za-z0-9_-]'),
+                '_',
+              );
+              final output = p.join(
+                subtitleDir.path,
+                'stream_${safeLanguage.isEmpty ? 'subtitle' : safeLanguage}.srt',
+              );
+              await File(output).writeAsString(srt, flush: true);
+              var label = subtitle.lanDoc.trim();
+              if (label.isEmpty) label = subtitle.lan.trim();
+              if (label.isEmpty) label = '字幕';
+              extraSubtitles[label] = output;
+              if (ep.selectedSubtitle == subtitle ||
+                  (ep.selectedSubtitle?.id.isNotEmpty == true &&
+                      ep.selectedSubtitle!.id == subtitle.id)) {
+                defaultSubtitlePath = output;
+              }
+            } catch (error) {
+              debugPrint('Bilibili stream subtitle export failed: $error');
+            }
+          }
+
+          String? danmakuPath;
+          try {
+            final xml = await apiService.fetchDanmakuXml(ep.page.cid);
+            final ass = BilibiliDanmakuAss.xmlToAss(xml);
+            danmakuPath = p.join(danmakuDir.path, '${uuid}_danmaku.ass');
+            await File(danmakuPath).writeAsString(ass, flush: true);
+            ep
+              ..danmakuPath = danmakuPath
+              ..danmakuError = null;
+          } catch (error, stack) {
+            developer.log(
+              'Streaming import danmaku download failed for cid=${ep.page.cid}',
+              error: error,
+              stackTrace: stack,
+            );
+            ep
+              ..danmakuPath = null
+              ..danmakuError = 'download_failed';
+            danmakuPath = null;
+          }
+
+          final bvid = ep.bvid.trim().isNotEmpty
+              ? ep.bvid.trim()
+              : video.videoInfo.bvid.trim();
+          if (bvid.isEmpty || ep.page.cid <= 0) {
+            throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
+          }
+          final videoShot = await BilibiliVideoShotService.instance
+              .downloadForCard(
+                apiService: apiService,
+                videoId: uuid,
+                bvid: bvid,
+                cid: ep.page.cid,
+                dataRootOverride: dataRoot,
+              );
+          final sourceRef = MediaSourceRef(
+            value: bvid,
+            kind: MediaSourceKind.bilibiliStream,
+            originalValue: video.sourceRef?.value ?? task.sourceRef?.value,
+            bvid: bvid,
+            aid: ep.page.aid ?? video.videoInfo.aid,
+            cid: ep.page.cid,
+            page: ep.page.page,
+          );
+          final displayTitle = video.videoInfo.pages.length > 1
+              ? ep.page.part
+              : video.videoInfo.title;
+          final item = VideoItem(
+            id: uuid,
+            path: 'bilibili://stream/$bvid?cid=${ep.page.cid}',
+            title: displayTitle,
+            thumbnailPath: thumbPath,
+            durationMs: ep.page.duration * 1000,
+            lastUpdated: DateTime.now().millisecondsSinceEpoch,
+            // An online card is an instance, not a deduplication key. Keeping a
+            // card-scoped fingerprint protects it from any future caller that
+            // enables reuseExistingItem for imported media.
+            sourceFingerprint: 'bilibili-stream-card:$uuid',
+            parentId: targetParentId,
+            subtitlePath: defaultSubtitlePath,
+            additionalSubtitles: extraSubtitles,
+            danmakuPath: danmakuPath,
+            usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
+            isBilibiliExported: true,
+            sourceRef: sourceRef,
+            bilibiliVideoShot: videoShot,
+            chapters: metadata.chapters,
+            hasProbedChapters: true,
+          );
+          _setStreamingImportProgress(ep, '正在写入媒体库...');
+          reportLibraryProgress(stageProgress(0.86), '正在写入媒体库...');
+          await library.addSingleVideo(item, reuseExistingItem: false);
+          ep
+            ..status = DownloadStatus.completed
+            ..progress = 1
+            ..isExported = true
+            ..downloadSpeed = '已导出在线播放条目'
+            ..importedVideoIds = <String>[
+              ...ep.importedVideoIds.where((id) => id != item.id),
+              item.id,
+            ];
+          count++;
+          // Clipboard imports now live on the parse list too, so they follow
+          // the same auto-delete / persist rules as in-page online export.
+          if (autoDeleteTaskAfterImport) {
+            await removeEpisode(ep, task);
+          }
+        } catch (error) {
+          ep
+            ..status = DownloadStatus.failed
+            ..error = error.toString()
+            ..downloadSpeed = null;
+        } finally {
+          _streamingImportingEpisodes.remove(ep);
+          if (ep.status == DownloadStatus.fetchingInfo) {
+            ep
+              ..status = DownloadStatus.failed
+              ..error ??= '导出在线播放条目未完成'
+              ..downloadSpeed = null;
+          }
+          notifyListeners();
+        }
+      }
+      if (count > 0 && !autoDeleteTaskAfterImport) {
+        await saveTasks();
+      }
+      notifyListeners();
+      return count;
+    } finally {
+      library.clearTransientImportProgress();
     }
-    if (parsedTask == null && count > 0 && !autoDeleteTaskAfterImport) {
-      await saveTasks();
-    }
-    notifyListeners();
-    return count;
   }
 
   Future<int> importToLibrary(

@@ -21,6 +21,29 @@ String _formatStorageBytes(int bytes) {
   return '${value.toStringAsFixed(digits)} ${units[unit]}';
 }
 
+/// Phone library sheets use the same 600dp shortest-side breakpoint as the rest
+/// of the media library, so tablet/desktop keep the roomier trailing actions.
+@visibleForTesting
+bool mediaLibraryCacheUsesPhoneLayout(Size size) => size.shortestSide < 600;
+
+@visibleForTesting
+const Duration mediaLibraryCacheRowCollapseDuration = Duration(
+  milliseconds: 220,
+);
+
+@visibleForTesting
+ButtonStyle? mediaLibraryCacheActionStyle({required bool compact}) {
+  if (!compact) return null;
+  // Default TextButtons reserve a 64dp minimum width, which pushes 明细/清除
+  // far apart on a phone. Shrink only the compact layout.
+  return TextButton.styleFrom(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    minimumSize: Size.zero,
+    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    visualDensity: VisualDensity.compact,
+  );
+}
+
 BilibiliStreamingService? _maybeBilibiliStreamingService(BuildContext context) {
   try {
     return Provider.of<BilibiliStreamingService>(context, listen: false);
@@ -61,6 +84,8 @@ void showMediaLibrarySettingsBottomSheet(
     ),
     builder: (context) {
       var copyImportedMedia = settings.copyImportedMediaToPrivateStorage;
+      var useSearchResultsAsQueue = settings.useSearchResultsAsPlaybackQueue;
+      var saveBilibiliBackgroundData = settings.bilibiliBackgroundAudioOnly;
       return StatefulBuilder(
         builder: (context, setSheetState) {
           final maxHeight = MediaQuery.sizeOf(context).height * 0.65;
@@ -83,6 +108,7 @@ void showMediaLibrarySettingsBottomSheet(
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
                   child: SwitchListTile.adaptive(
+                    key: const ValueKey('copyImportedMediaToPrivateStorage'),
                     value: copyImportedMedia,
                     activeThumbColor: Colors.blueAccent,
                     contentPadding: const EdgeInsets.symmetric(
@@ -96,7 +122,7 @@ void showMediaLibrarySettingsBottomSheet(
                     subtitle: const Padding(
                       padding: EdgeInsets.only(top: 6),
                       child: Text(
-                        '开启后，新导入的媒体会先完整复制到软件管理的目录，并直接使用副本播放。原文件不会被修改。',
+                        '仅对新导入生效，原文件不变。临时来源仍会保存必要副本。',
                         style: TextStyle(
                           color: Colors.white60,
                           fontSize: 12,
@@ -117,31 +143,91 @@ void showMediaLibrarySettingsBottomSheet(
                     },
                   ),
                 ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
+                  child: SwitchListTile.adaptive(
+                    key: const ValueKey('useSearchResultsAsPlaybackQueue'),
+                    value: useSearchResultsAsQueue,
+                    activeThumbColor: Colors.blueAccent,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 4,
+                    ),
+                    title: const Text(
+                      '搜索结果作为播放队列',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: Text(
+                        '开启后按搜索列表切集，可能跳到其他合集。',
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                    onChanged: (value) {
+                      setSheetState(() => useSearchResultsAsQueue = value);
+                      unawaited(
+                        settings.updateSetting(
+                          'useSearchResultsAsPlaybackQueue',
+                          value,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
+                  child: SwitchListTile.adaptive(
+                    key: const ValueKey('bilibiliBackgroundAudioOnly'),
+                    value: saveBilibiliBackgroundData,
+                    activeThumbColor: Colors.blueAccent,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 4,
+                    ),
+                    title: const Text(
+                      '后台播放哔哩哔哩时只加载音频',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: Text(
+                        '关闭时后台同样加载视频，从 Mini 或通知栏进入播放页可无缝接上画面。开启后仅加载音频以节省流量。',
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                    onChanged: (value) {
+                      setSheetState(() => saveBilibiliBackgroundData = value);
+                      unawaited(
+                        settings.updateSetting(
+                          'bilibiliBackgroundAudioOnly',
+                          value,
+                        ),
+                      );
+                    },
+                  ),
+                ),
                 if (streamService != null) ...[
                   const SizedBox(height: 10),
-                  _OnlineCacheSection(
+                  MediaLibraryBilibiliCacheSection(
                     streamService: streamService,
                     library: library,
                   ),
                 ],
-                const SizedBox(height: 10),
-                const Text(
-                  '仅影响开关变更后新开始的导入任务；不会搬迁已有媒体。副本会占用额外空间，移入回收站后仍会保留并计入占用空间，永久删除卡片时一并删除。',
-                  style: TextStyle(
-                    color: Colors.white54,
-                    fontSize: 12,
-                    height: 1.45,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                const Text(
-                  '即使关闭，若系统只提供临时文件地址，软件仍会保存必要副本，以避免媒体在缓存清理后失效。',
-                  style: TextStyle(
-                    color: Colors.white38,
-                    fontSize: 11,
-                    height: 1.4,
-                  ),
-                ),
               ],
             ),
           );
@@ -154,33 +240,52 @@ void showMediaLibrarySettingsBottomSheet(
 /// 统一的在线视频缓存管理区块：总量统计 + 按卡片明细（素材文件 / 播放网关
 /// 缓存分类）+ 单卡与全局清除。下载中的素材受租约保护，清除时自动转为
 /// 延迟删除，不会损坏正在合成/OCR 的任务。
-class _OnlineCacheSection extends StatefulWidget {
-  final BilibiliStreamingService streamService;
+@visibleForTesting
+class MediaLibraryBilibiliCacheSection extends StatefulWidget {
+  final BilibiliStreamingService? streamService;
   final LibraryService? library;
+  final Future<BilibiliStreamCacheReport> Function()? inspectCache;
+  final Future<void> Function()? clearCache;
 
-  const _OnlineCacheSection({required this.streamService, this.library});
+  const MediaLibraryBilibiliCacheSection({
+    super.key,
+    this.streamService,
+    this.library,
+    this.inspectCache,
+    this.clearCache,
+  }) : assert(
+         streamService != null ||
+             (inspectCache != null && clearCache != null),
+       );
 
   @override
-  State<_OnlineCacheSection> createState() => _OnlineCacheSectionState();
+  State<MediaLibraryBilibiliCacheSection> createState() =>
+      _MediaLibraryBilibiliCacheSectionState();
 }
 
-class _OnlineCacheSectionState extends State<_OnlineCacheSection> {
+class _MediaLibraryBilibiliCacheSectionState
+    extends State<MediaLibraryBilibiliCacheSection> {
   late Future<BilibiliStreamCacheReport> _reportFuture;
-  Future<List<_ItemCacheRow>>? _rowsFuture;
+  List<_ItemCacheRow>? _detailRows;
   bool _showDetail = false;
+  bool _detailLoading = false;
+  bool _clearingAll = false;
   final Set<String> _clearingCardIds = <String>{};
+  final Set<String> _collapsingIds = <String>{};
 
   @override
   void initState() {
     super.initState();
-    _reportFuture = widget.streamService.inspectCache();
+    _reportFuture = _inspectCache();
   }
 
-  void _refresh() {
-    setState(() {
-      _reportFuture = widget.streamService.inspectCache();
-      _rowsFuture = _loadRows();
-    });
+  Future<BilibiliStreamCacheReport> _inspectCache() {
+    return widget.inspectCache?.call() ??
+        widget.streamService!.inspectCache();
+  }
+
+  Future<void> _clearGatewayCache() {
+    return widget.clearCache?.call() ?? widget.streamService!.clearCache();
   }
 
   Future<List<_ItemCacheRow>> _loadRows() async {
@@ -200,37 +305,293 @@ class _OnlineCacheSectionState extends State<_OnlineCacheSection> {
     return rows;
   }
 
+  Future<void> _ensureDetailRows() async {
+    if (_detailRows != null || _detailLoading) return;
+    setState(() => _detailLoading = true);
+    final rows = await _loadRows();
+    if (!mounted) return;
+    setState(() {
+      _detailRows = rows;
+      _detailLoading = false;
+    });
+  }
+
+  void _toggleDetail() {
+    final opening = !_showDetail;
+    setState(() => _showDetail = opening);
+    if (opening) unawaited(_ensureDetailRows());
+  }
+
+  void _beginCollapse(String itemId) {
+    if (_collapsingIds.contains(itemId)) return;
+    setState(() => _collapsingIds.add(itemId));
+  }
+
+  void _removeDetailRow(String itemId) {
+    _detailRows?.removeWhere((row) => row.item.id == itemId);
+    _collapsingIds.remove(itemId);
+    _clearingCardIds.remove(itemId);
+  }
+
   Future<void> _clearItemCache(String itemId) async {
     final library = widget.library;
-    if (library == null || _clearingCardIds.contains(itemId)) return;
-    setState(() => _clearingCardIds.add(itemId));
+    if (library == null ||
+        _clearingAll ||
+        _clearingCardIds.contains(itemId)) {
+      return;
+    }
+    setState(() {
+      _clearingCardIds.add(itemId);
+      _collapsingIds.add(itemId);
+    });
+    await Future<void>.delayed(mediaLibraryCacheRowCollapseDuration);
     try {
       await library.clearOnlineCacheForItem(itemId);
     } finally {
       if (mounted) {
-        setState(() => _clearingCardIds.remove(itemId));
-        _refresh();
+        setState(() {
+          _removeDetailRow(itemId);
+          _reportFuture = _inspectCache();
+        });
       }
     }
   }
 
   Future<void> _clearAll() async {
+    if (_clearingAll) return;
+    // Show inline progress before any disk work so a large cache does not
+    // look frozen. Feedback stays on this tile; no global toast.
+    setState(() => _clearingAll = true);
+
+    final visible = List<_ItemCacheRow>.from(_detailRows ?? const []);
+    if (_showDetail && visible.isNotEmpty) {
+      for (var index = 0; index < visible.length; index++) {
+        final id = visible[index].item.id;
+        final delayMs = 40 * (index < 10 ? index : 10);
+        unawaited(
+          Future<void>.delayed(Duration(milliseconds: delayMs), () {
+            if (!mounted || !_clearingAll) return;
+            _beginCollapse(id);
+          }),
+        );
+      }
+    }
+
     final library = widget.library;
     // 逐卡片走租约感知的清除（正在使用的素材转为延迟删除），再整体清扫
     // 剩余的网关缓存与孤儿目录。
     if (library != null) {
-      for (final item in library.bilibiliStreamItems) {
+      final ids = visible.isNotEmpty
+          ? visible.map((row) => row.item.id)
+          : library.bilibiliStreamItems.map((item) => item.id);
+      for (final id in ids) {
         try {
-          await library.clearOnlineCacheForItem(item.id);
+          await library.clearOnlineCacheForItem(id);
         } catch (_) {}
       }
     }
-    await widget.streamService.clearCache();
-    if (mounted) _refresh();
+    await _clearGatewayCache();
+    if (!mounted) return;
+    setState(() {
+      _detailRows = const <_ItemCacheRow>[];
+      _collapsingIds.clear();
+      _clearingCardIds.clear();
+      _clearingAll = false;
+      _reportFuture = _inspectCache();
+    });
+  }
+
+  Widget _buildActions({
+    required bool compact,
+    required bool waiting,
+  }) {
+    final style = mediaLibraryCacheActionStyle(compact: compact);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (widget.library != null)
+          TextButton(
+            key: const ValueKey('bilibili-cache-detail-button'),
+            style: style,
+            onPressed: _clearingAll ? null : _toggleDetail,
+            child: Text(_showDetail ? '收起' : '明细'),
+          ),
+        TextButton(
+          key: const ValueKey('bilibili-cache-clear-all-button'),
+          style: style,
+          onPressed: waiting || _clearingAll
+              ? null
+              : () => unawaited(_clearAll()),
+          child: _clearingAll
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: compact ? 12 : 14,
+                      height: compact ? 12 : 14,
+                      child: const CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: compact ? 4 : 6),
+                    const Text('清除中'),
+                  ],
+                )
+              : const Text('清除'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHeader({
+    required bool waiting,
+    required BilibiliStreamCacheReport? report,
+  }) {
+    final compact = mediaLibraryCacheUsesPhoneLayout(
+      MediaQuery.sizeOf(context),
+    );
+    const titleStyle = TextStyle(color: Colors.white, fontSize: 15);
+    const subtitleStyle = TextStyle(color: Colors.white60, fontSize: 12);
+    final title = const Text('Bilibili 在线视频缓存', style: titleStyle);
+    final subtitle = Text(
+      _clearingAll
+          ? '正在清除...'
+          : waiting
+          ? '正在统计...'
+          : '${_formatStorageBytes(report?.bytes ?? 0)} · '
+                '${report?.fileCount ?? 0} 个文件',
+      style: subtitleStyle,
+    );
+    final actions = _buildActions(compact: compact, waiting: waiting);
+
+    if (compact) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(top: 1),
+                  child: Icon(
+                    Icons.cloud_download_outlined,
+                    color: Colors.white70,
+                    size: 20,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      title,
+                      const SizedBox(height: 4),
+                      subtitle,
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Align(alignment: Alignment.centerRight, child: actions),
+          ],
+        ),
+      );
+    }
+
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+      leading: const Icon(
+        Icons.cloud_download_outlined,
+        color: Colors.white70,
+      ),
+      title: title,
+      subtitle: Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: subtitle,
+      ),
+      trailing: actions,
+    );
+  }
+
+  Widget _buildDetailRow(_ItemCacheRow row, {required bool compact}) {
+    final collapsing = _collapsingIds.contains(row.item.id);
+    final clearing = _clearingCardIds.contains(row.item.id);
+    return _CollapsingCacheRow(
+      collapsing: collapsing,
+      child: ListTile(
+        dense: true,
+        contentPadding: EdgeInsets.only(
+          left: compact ? 12 : 14,
+          right: compact ? 4 : 8,
+        ),
+        title: Text(
+          row.item.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+        ),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 3),
+          child: Text(
+            '素材 ${_formatStorageBytes(row.breakdown.materializedBytes)}'
+            ' · 播放缓存 ${_formatStorageBytes(row.breakdown.gatewayBytes)}'
+            ' · 共 ${_formatStorageBytes(row.breakdown.totalBytes)}',
+            style: const TextStyle(color: Colors.white54, fontSize: 11),
+          ),
+        ),
+        trailing: clearing
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : TextButton(
+                style: mediaLibraryCacheActionStyle(compact: compact),
+                onPressed: _clearingAll
+                    ? null
+                    : () => unawaited(_clearItemCache(row.item.id)),
+                child: const Text('清除'),
+              ),
+      ),
+    );
+  }
+
+  Widget _buildDetailBody({required bool compact}) {
+    if (_detailLoading && _detailRows == null) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 14),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final rows = _detailRows ?? const <_ItemCacheRow>[];
+    if (rows.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.fromLTRB(14, 0, 14, 14),
+        child: Text(
+          '暂无在线视频缓存',
+          style: TextStyle(color: Colors.white38, fontSize: 12),
+        ),
+      );
+    }
+    return Column(
+      children: [
+        for (final row in rows) _buildDetailRow(row, compact: compact),
+      ],
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final compact = mediaLibraryCacheUsesPhoneLayout(
+      MediaQuery.sizeOf(context),
+    );
     return Material(
       color: const Color(0xFF292929),
       borderRadius: BorderRadius.circular(12),
@@ -240,128 +601,47 @@ class _OnlineCacheSectionState extends State<_OnlineCacheSection> {
           FutureBuilder<BilibiliStreamCacheReport>(
             future: _reportFuture,
             builder: (context, snapshot) {
-              final report = snapshot.data;
-              return ListTile(
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 4,
-                ),
-                leading: const Icon(
-                  Icons.cloud_download_outlined,
-                  color: Colors.white70,
-                ),
-                title: const Text(
-                  'Bilibili 在线视频缓存',
-                  style: TextStyle(color: Colors.white, fontSize: 15),
-                ),
-                subtitle: Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Text(
-                    snapshot.connectionState == ConnectionState.waiting
-                        ? '正在统计...'
-                        : '${_formatStorageBytes(report?.bytes ?? 0)} · '
-                              '${report?.fileCount ?? 0} 个文件（含已下载的离线素材）',
-                    style: const TextStyle(color: Colors.white60, fontSize: 12),
-                  ),
-                ),
-                trailing: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (widget.library != null)
-                      TextButton(
-                        onPressed: () =>
-                            setState(() => _showDetail = !_showDetail),
-                        child: Text(_showDetail ? '收起' : '明细'),
-                      ),
-                    TextButton(
-                      onPressed:
-                          snapshot.connectionState == ConnectionState.waiting
-                          ? null
-                          : () => unawaited(_clearAll()),
-                      child: const Text('清除'),
-                    ),
-                  ],
-                ),
+              return _buildHeader(
+                waiting:
+                    snapshot.connectionState == ConnectionState.waiting &&
+                    !_clearingAll,
+                report: snapshot.data,
               );
             },
           ),
           if (_showDetail && widget.library != null)
-            FutureBuilder<List<_ItemCacheRow>>(
-              future: _rowsFuture ??= _loadRows(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 14),
-                    child: Center(
-                      child: SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                  );
-                }
-                final rows = snapshot.data ?? const <_ItemCacheRow>[];
-                if (rows.isEmpty) {
-                  return const Padding(
-                    padding: EdgeInsets.fromLTRB(14, 0, 14, 14),
-                    child: Text(
-                      '暂无在线视频缓存',
-                      style: TextStyle(color: Colors.white38, fontSize: 12),
-                    ),
-                  );
-                }
-                return Column(
-                  children: [
-                    for (final row in rows)
-                      ListTile(
-                        dense: true,
-                        contentPadding: const EdgeInsets.only(
-                          left: 14,
-                          right: 8,
-                        ),
-                        title: Text(
-                          row.item.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 13,
-                          ),
-                        ),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 3),
-                          child: Text(
-                            '素材 ${_formatStorageBytes(row.breakdown.materializedBytes)}'
-                            ' · 播放缓存 ${_formatStorageBytes(row.breakdown.gatewayBytes)}'
-                            ' · 共 ${_formatStorageBytes(row.breakdown.totalBytes)}',
-                            style: const TextStyle(
-                              color: Colors.white54,
-                              fontSize: 11,
-                            ),
-                          ),
-                        ),
-                        trailing: _clearingCardIds.contains(row.item.id)
-                            ? const SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : TextButton(
-                                onPressed: () => unawaited(
-                                  _clearItemCache(row.item.id),
-                                ),
-                                child: const Text('清除'),
-                              ),
-                      ),
-                  ],
-                );
-              },
-            ),
+            _buildDetailBody(compact: compact),
         ],
       ),
     );
   }
 }
+
+class _CollapsingCacheRow extends StatelessWidget {
+  final bool collapsing;
+  final Widget child;
+
+  const _CollapsingCacheRow({
+    required this.collapsing,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRect(
+      child: AnimatedOpacity(
+        duration: mediaLibraryCacheRowCollapseDuration,
+        opacity: collapsing ? 0 : 1,
+        child: AnimatedSize(
+          duration: mediaLibraryCacheRowCollapseDuration,
+          curve: Curves.easeOutCubic,
+          alignment: Alignment.topCenter,
+          child: collapsing
+              ? const SizedBox(width: double.infinity, height: 0)
+              : child,
+        ),
+      ),
+    );
+  }
+}
+

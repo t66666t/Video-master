@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:video_player_app/platform/windows_video_player_media_kit.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 
 void main() {
@@ -117,12 +118,11 @@ void main() {
       final source = File(path).readAsStringSync();
       expect(source, contains('bool _explicitPlaybackExitRequested = false;'));
       expect(
-        RegExp(
-          r'_explicitPlaybackExitRequested\s*&&\s*!suppressRouteCleanup',
-        ).hasMatch(source),
-        isTrue,
+        source,
+        contains('shouldPauseOnPlaybackPageExit('),
         reason: '$path may pause only after an explicit user exit',
       );
+      expect(source, contains('explicitExit: _explicitPlaybackExitRequested'));
     }
   });
 
@@ -143,4 +143,94 @@ void main() {
       expect(exitLogic, isNot(contains('Platform.isIOS')));
     },
   );
+
+  test('background clock is ready while a stream is still buffering', () {
+    expect(
+      NativeVideoPlayerMediaKit.isBackgroundPlaybackClockReady(
+        playing: true,
+        completed: false,
+        positionAdvanced: true,
+        bufferedAhead: false,
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isBackgroundPlaybackClockReady(
+        playing: true,
+        completed: false,
+        positionAdvanced: false,
+        bufferedAhead: true,
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isBackgroundPlaybackClockReady(
+        playing: true,
+        completed: false,
+        positionAdvanced: false,
+        bufferedAhead: false,
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isBackgroundPlaybackClockReady(
+        playing: false,
+        completed: false,
+        positionAdvanced: true,
+        bufferedAhead: true,
+      ),
+      isTrue,
+    );
+  });
+
+  test('audio-only Bilibili opens attach audio before waiting for video', () {
+    final kit = File(
+      'lib/platform/windows_video_player_media_kit.dart',
+    ).readAsStringSync();
+    final start = kit.indexOf('Future<void> _openMediaWithExternalAudio');
+    final end = kit.indexOf(
+      'Future<VideoTrack> _waitForPrimaryVideoTrack',
+      start,
+    );
+    expect(start, greaterThanOrEqualTo(0));
+    expect(end, greaterThan(start));
+    final method = kit.substring(start, end);
+    expect(
+      method.indexOf('_attachExternalAudio'),
+      lessThan(method.indexOf('_waitForPrimaryVideoTrack')),
+    );
+    expect(method, contains('if (audioOnly)'));
+    expect(method, contains('return;'));
+
+    final waitStart = kit.indexOf(
+      'Future<VideoTrack> _waitForPrimaryVideoTrack',
+    );
+    final waitEnd = kit.indexOf(
+      'Future<void> _configureStreamingBuffer',
+      waitStart,
+    );
+    final waitMethod = kit.substring(waitStart, waitEnd);
+    expect(waitMethod, contains('milliseconds: 400'));
+    expect(waitMethod, isNot(contains('seconds: 8')));
+    expect(waitMethod, isNot(contains('seconds: 20')));
+  });
+
+  test('audio-only streaming uses a small readahead window', () {
+    final kit = File(
+      'lib/platform/windows_video_player_media_kit.dart',
+    ).readAsStringSync();
+    final start = kit.indexOf('Future<void> _configureStreamingBuffer');
+    final end = kit.indexOf(
+      'Future<void> _configureHighResolutionPlayback',
+      start,
+    );
+    expect(start, greaterThanOrEqualTo(0));
+    expect(end, greaterThan(start));
+    final method = kit.substring(start, end);
+    expect(method, contains('audioOnly'));
+    expect(method, contains("cacheSecs = audioOnly ? '6'"));
+    expect(method, contains("readaheadSecs = audioOnly ? '4'"));
+    expect(method, contains('demuxer-lavf-analyzeduration'));
+    expect(method, contains('force-seekable'));
+  });
 }

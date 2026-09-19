@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/models/danmaku_model.dart';
 import 'package:video_player_app/models/danmaku_style.dart';
 import 'package:video_player_app/widgets/danmaku_overlay.dart';
 
@@ -121,5 +122,133 @@ void main() {
     expect(settings.bilibiliDanmakuFontFamily, isNull);
     expect(settings.bilibiliDanmakuFontWeight, 600);
     expect(settings.bilibiliDanmakuOutlineType, DanmakuOutlineType.standard);
+    expect(settings.bilibiliDanmakuUseLockedSpeedAsBaseline, isFalse);
+  });
+
+  test('锁定倍速基准只在开关打开且确实锁定时缩放弹幕媒体速度', () {
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1.2,
+        useLockedPlaybackAsBaseline: false,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 2,
+      ),
+      1.2,
+    );
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1.2,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: false,
+        lockedPlaybackSpeed: 2,
+      ),
+      1.2,
+    );
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1.2,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 2,
+      ),
+      closeTo(0.6, 0.000001),
+    );
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 1.5,
+      ),
+      closeTo(1 / 1.5, 0.000001),
+    );
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 0,
+      ),
+      1,
+    );
+    expect(
+      resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: double.nan,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 2,
+      ),
+      1,
+    );
+  });
+
+  test('以锁定倍速为基准时，2 倍速锁定后弹幕穿越时长回到 1 倍速观感', () {
+    const item = DanmakuItem(
+      index: 0,
+      startTime: Duration.zero,
+      duration: Duration(seconds: 8),
+      text: '弹幕',
+      type: DanmakuType.top,
+      colorValue: 0xFFFFFFFF,
+      sourceY: 40,
+    );
+    final atOneX = resolveDanmakuDurationUs(
+      item,
+      speed: 1,
+      viewportWidth: 1920,
+      referenceWidth: 1920,
+    );
+    final lockedTwoX = resolveDanmakuDurationUs(
+      item,
+      speed: resolveDanmakuSpeedWithLockedPlaybackBaseline(
+        sliderSpeed: 1,
+        useLockedPlaybackAsBaseline: true,
+        isPlaybackSpeedLocked: true,
+        lockedPlaybackSpeed: 2,
+      ),
+      viewportWidth: 1920,
+      referenceWidth: 1920,
+    );
+    // Position clock at 2x consumes media time twice as fast, so doubling the
+    // media-time duration restores the original wall-clock travel.
+    expect(lockedTwoX, atOneX * 2);
+  });
+
+  test('锁定倍速基准勾选即时生效并永久保存，未锁定的残留倍速不会误补偿', () async {
+    SharedPreferences.setMockInitialValues({});
+    final settings = SettingsService();
+    settings.resetForTest();
+    await settings.init();
+
+    expect(settings.bilibiliDanmakuUseLockedSpeedAsBaseline, isFalse);
+    await settings.setPlaybackSpeedLock(2.0, false);
+    expect(settings.effectiveBilibiliDanmakuSpeed, 1.0);
+
+    var notifications = 0;
+    settings.addListener(() => notifications++);
+    final persistence = settings.saveBilibiliDanmakuUseLockedSpeedAsBaseline(
+      true,
+    );
+
+    expect(settings.bilibiliDanmakuUseLockedSpeedAsBaseline, isTrue);
+    expect(notifications, 1);
+    // Unlocked leftover 2x must not change the overlay speed.
+    expect(settings.effectiveBilibiliDanmakuSpeed, 1.0);
+    await persistence;
+
+    await settings.setPlaybackSpeedLock(2.0, true);
+    expect(settings.effectiveBilibiliDanmakuSpeed, closeTo(0.5, 0.000001));
+
+    await settings.saveBilibiliDanmakuUseLockedSpeedAsBaseline(true);
+    expect(notifications, 2);
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getBool('bilibiliDanmakuUseLockedSpeedAsBaseline'), isTrue);
+
+    settings.resetForTest();
+    await settings.init();
+    expect(settings.bilibiliDanmakuUseLockedSpeedAsBaseline, isTrue);
+    expect(settings.isPlaybackSpeedLocked, isTrue);
+    expect(settings.effectiveBilibiliDanmakuSpeed, closeTo(0.5, 0.000001));
   });
 }

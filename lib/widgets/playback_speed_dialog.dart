@@ -19,6 +19,89 @@ const List<double> kPlaybackSpeedPresets = <double>[
   5.0,
 ];
 
+/// Next picker notch in [direction] (`-1` slower, `+1` faster).
+///
+/// Off-list rates snap to the adjacent visible notch instead of jumping to
+/// the nearest neighbor, matching "one tick on the speed bar". Returns
+/// `null` at either end so callers can leave the current rate unchanged.
+double? nextPlaybackSpeedPreset(double current, {required int direction}) {
+  const epsilon = 0.001;
+  if (direction < 0) {
+    for (int i = kPlaybackSpeedPresets.length - 1; i >= 0; i--) {
+      if (kPlaybackSpeedPresets[i] < current - epsilon) {
+        return kPlaybackSpeedPresets[i];
+      }
+    }
+    return null;
+  }
+  for (int i = 0; i < kPlaybackSpeedPresets.length; i++) {
+    if (kPlaybackSpeedPresets[i] > current + epsilon) {
+      return kPlaybackSpeedPresets[i];
+    }
+  }
+  return null;
+}
+
+/// Formats a playback rate for compact control labels (`1.0`, `1.25`).
+String formatPlaybackSpeedLabel(double speed) {
+  if (speed == speed.roundToDouble()) return speed.toStringAsFixed(1);
+  return speed.toString().replaceFirst(RegExp(r'0+$'), '');
+}
+
+/// Invisible width probe so two-digit rates like `1.0x` keep the same slot as
+/// three-digit rates like `1.25x`, avoiding control-bar layout jumps.
+const String kPlaybackSpeedWidthProbe = '1.25x';
+
+/// Control-bar speed text that reserves a stable width across common rates.
+class PlaybackSpeedText extends StatelessWidget {
+  const PlaybackSpeedText({
+    super.key,
+    required this.speed,
+    required this.style,
+    this.maxLines = 1,
+    this.overflow = TextOverflow.fade,
+    this.textAlign = TextAlign.center,
+  });
+
+  final double speed;
+  final TextStyle style;
+  final int maxLines;
+  final TextOverflow overflow;
+  final TextAlign textAlign;
+
+  @override
+  Widget build(BuildContext context) {
+    final labelStyle = style.copyWith(
+      fontFeatures: <FontFeature>[
+        ...?style.fontFeatures,
+        const FontFeature.tabularFigures(),
+      ],
+    );
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        // Reserve the three-digit rate width even when the visible label is shorter.
+        ExcludeSemantics(
+          child: Text(
+            kPlaybackSpeedWidthProbe,
+            maxLines: maxLines,
+            softWrap: false,
+            style: labelStyle.copyWith(color: const Color(0x00000000)),
+          ),
+        ),
+        Text(
+          '${formatPlaybackSpeedLabel(speed)}x',
+          maxLines: maxLines,
+          overflow: overflow,
+          softWrap: false,
+          textAlign: textAlign,
+          style: labelStyle,
+        ),
+      ],
+    );
+  }
+}
+
 Future<void> showPlaybackSpeedDialog({
   required BuildContext context,
   BuildContext? anchorContext,
@@ -461,10 +544,7 @@ class _PlaybackSpeedDialogState extends State<PlaybackSpeedDialog> {
     );
   }
 
-  String _formatSpeed(double speed) {
-    if (speed == speed.roundToDouble()) return speed.toStringAsFixed(1);
-    return speed.toString().replaceFirst(RegExp(r'0+$'), '');
-  }
+  String _formatSpeed(double speed) => formatPlaybackSpeedLabel(speed);
 }
 
 class _PopoverPlacement {

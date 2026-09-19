@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/subtitle_debug_session.dart';
 import 'subtitle_overlay.dart';
+import 'subtitle_preset_chrome.dart';
 
 class SubtitlePresetSettingsPanel extends StatelessWidget {
   final String id;
@@ -19,35 +20,61 @@ class SubtitlePresetSettingsPanel extends StatelessWidget {
       return Column(
         key: const ValueKey('subtitle-preset-inline-settings'),
         children: [
-          Row(
-            children: [
-              IconButton(
-                onPressed: onBack,
-                tooltip: '返回预设列表',
-                icon: const Icon(Icons.arrow_back),
-              ),
-              Expanded(
-                child: Text(
-                  '${p.name} · 微调',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final chrome = SubtitlePresetChrome.of(constraints);
+              return SizedBox(
+                height: chrome.rowHeight + 4,
+                child: Padding(
+                  padding: EdgeInsets.fromLTRB(2, 2, chrome.pad, 0),
+                  child: Row(
+                    children: [
+                      SubtitlePresetIconButton(
+                        onPressed: onBack,
+                        tooltip: '返回预设列表',
+                        icon: Icons.arrow_back,
+                        size: chrome.iconButton,
+                        iconSize: chrome.iconSize,
+                      ),
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4),
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              '${p.name} · 微调',
+                              maxLines: 1,
+                              style: TextStyle(
+                                fontSize: chrome.bodySize,
+                                fontWeight: FontWeight.w600,
+                                height: 1.1,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      SubtitlePresetTextAction(
+                        onPressed: () => session.resetPreset(id),
+                        label: '重置本预设',
+                        fontSize: chrome.actionSize,
+                        height: chrome.rowHeight,
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              TextButton(
-                onPressed: () => session.resetPreset(id),
-                child: const Text('重置本预设'),
-              ),
-            ],
+              );
+            },
           ),
           Expanded(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.fromLTRB(10, 6, 10, 12),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   const Text(
                     '自动保存到本预设；其他预设不受影响。',
-                    style: TextStyle(fontSize: 12, color: Colors.white70),
+                    style: TextStyle(fontSize: 11, color: Colors.white70),
                   ),
                   Container(
                     margin: const EdgeInsets.symmetric(vertical: 8),
@@ -119,8 +146,10 @@ class SubtitlePresetSettingsPanel extends StatelessWidget {
                     style: TextStyle(fontSize: 11, color: Colors.white60),
                   ),
                   SwitchListTile(
+                    dense: true,
+                    visualDensity: VisualDensity.compact,
                     contentPadding: EdgeInsets.zero,
-                    title: const Text('阴影'),
+                    title: const Text('阴影', style: TextStyle(fontSize: 12)),
                     value: p.shadowEnabled,
                     onChanged: (v) =>
                         session.updatePreset(p.copyWith(shadowEnabled: v)),
@@ -165,7 +194,18 @@ class SubtitlePresetSettingsPanel extends StatelessWidget {
               ),
             ),
           ),
-          TextButton(onPressed: onBack, child: const Text('完成')),
+          Align(
+            alignment: Alignment.centerRight,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 6),
+              child: SubtitlePresetTextAction(
+                onPressed: onBack,
+                label: '完成',
+                fontSize: 12,
+                height: 28,
+              ),
+            ),
+          ),
         ],
       );
     },
@@ -181,14 +221,21 @@ class SubtitlePresetSettingsPanel extends StatelessWidget {
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
       Padding(
-        padding: const EdgeInsets.only(top: 10),
-        child: Text('$name · $label', style: const TextStyle(fontSize: 12)),
+        padding: const EdgeInsets.only(top: 6),
+        child: Text('$name · $label', style: const TextStyle(fontSize: 11)),
       ),
-      Slider(
-        value: value.clamp(min, max),
-        min: min,
-        max: max,
-        onChanged: onChanged,
+      SliderTheme(
+        data: const SliderThemeData(
+          trackHeight: 2,
+          thumbShape: RoundSliderThumbShape(enabledThumbRadius: 6),
+          overlayShape: RoundSliderOverlayShape(overlayRadius: 10),
+        ),
+        child: Slider(
+          value: value.clamp(min, max),
+          min: min,
+          max: max,
+          onChanged: onChanged,
+        ),
       ),
     ],
   );
@@ -199,6 +246,8 @@ class SubtitlePresetSettingsPanel extends StatelessWidget {
     ValueChanged<Color> onChanged,
   ) => ExpansionTile(
     tilePadding: EdgeInsets.zero,
+    dense: true,
+    visualDensity: VisualDensity.compact,
     title: Text(title, style: const TextStyle(fontSize: 12)),
     leading: Container(
       width: 24,
