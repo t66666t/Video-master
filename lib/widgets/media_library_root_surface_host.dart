@@ -73,6 +73,7 @@ class _MediaLibraryRootSurfaceHostState extends State<MediaLibraryRootSurfaceHos
   late final AnimationController _snap;
   late final Animation<double> _snapCurve;
   int _switchGeneration = 0;
+  int _snapGeneration = 0;
 
   /// Finger offset. A [ValueNotifier] so layers can slide without setState
   /// on the parked grids.
@@ -215,10 +216,29 @@ class _MediaLibraryRootSurfaceHostState extends State<MediaLibraryRootSurfaceHos
   }
 
   void _onSwipeStart(DragStartDetails details) {
-    if (_dragging) return;
-    _snap.stop();
-    _clearSnapTick();
-    _setDx(0);
+    final width = _hostWidth();
+    final wasDragging = _dragging;
+    _abortSnap();
+    if (wasDragging) {
+      final target = _dragTarget;
+      final progress = width <= 0 ? 0.0 : _dragDx.value.abs() / width;
+      final finish =
+          target != null &&
+          (progress >= 0.5 ||
+              MediaLibraryRootSwipePolicy.shouldCommit(
+                dragDx: _dragDx.value,
+                width: width,
+                velocityDx: 0,
+              ));
+      // A new finger during snap-to-next lands on that page first so the
+      // reverse swipe is not eaten by `if (_dragging) return`.
+      if (finish) {
+        _finishSwipe(target);
+      } else {
+        _publishSettled();
+        return;
+      }
+    }
     setState(() {
       _dragging = true;
       _dragTarget = null;
@@ -226,6 +246,7 @@ class _MediaLibraryRootSurfaceHostState extends State<MediaLibraryRootSurfaceHos
       _fadingOutEntry = null;
       _fade.value = 1;
     });
+    _setDx(0);
     _publishSettled();
   }
 
@@ -295,8 +316,7 @@ class _MediaLibraryRootSurfaceHostState extends State<MediaLibraryRootSurfaceHos
   void _cancelDrag({required bool snap}) {
     if (!_dragging && _dragDx.value == 0) return;
     if (!snap) {
-      _clearSnapTick();
-      _snap.stop();
+      _abortSnap();
       _dragging = false;
       _dragTarget = null;
       _incomingNeedsLiveLayout = false;
@@ -322,17 +342,25 @@ class _MediaLibraryRootSurfaceHostState extends State<MediaLibraryRootSurfaceHos
     _snapTick = null;
   }
 
+  void _abortSnap() {
+    _snapGeneration++;
+    _clearSnapTick();
+    if (_snap.isAnimating) _snap.stop();
+  }
+
   void _animateDragTo(double end, VoidCallback onDone) {
     _clearSnapTick();
+    final generation = ++_snapGeneration;
     final start = _dragDx.value;
     late final VoidCallback tick;
     tick = () {
-      if (!mounted) return;
+      if (!mounted || generation != _snapGeneration) return;
       _setDx(start + (end - start) * _snapCurve.value);
     };
     _snapTick = tick;
     _snap.addListener(tick);
     _snap.forward(from: 0).whenComplete(() {
+      if (generation != _snapGeneration) return;
       _clearSnapTick();
       onDone();
     });

@@ -57,7 +57,11 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
         : mediaLibraryCompactTitleStyle;
     final highlight = _visualHighlight;
     final ordered = MediaLibraryRootEntryOrder.normalize(entries);
-    final canReorder = reorderEnabled && onReorder != null && ordered.length > 1;
+    // Keep one chip row widget for the whole swipe. Swapping
+    // ReorderableListView ↔ Row when [reorderEnabled] flips is what
+    // made the titles jump mid-gesture.
+    final useReorderableRow = onReorder != null && ordered.length > 1;
+    final canDragReorder = useReorderableRow && reorderEnabled;
 
     final chips = <Widget>[
       for (var i = 0; i < ordered.length; i++)
@@ -66,7 +70,8 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
           ordered: ordered,
           highlight: highlight,
           style: style,
-          canReorder: canReorder,
+          useReorderableRow: useReorderableRow,
+          canDragReorder: canDragReorder,
         ),
     ];
 
@@ -74,7 +79,7 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
       offset: const Offset(0, mediaLibraryCompactTitleOpticalOffset),
       child: SizedBox(
         height: compact ? 32 : 36,
-        child: canReorder
+        child: useReorderableRow
             ? ReorderableListView(
                 scrollDirection: Axis.horizontal,
                 shrinkWrap: true,
@@ -94,7 +99,7 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
       ),
     );
 
-    if (canReorder) {
+    if (useReorderableRow) {
       return Align(alignment: Alignment.centerLeft, child: translated);
     }
     return Align(
@@ -112,7 +117,8 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
     required List<MediaLibraryRootEntry> ordered,
     required double highlight,
     required TextStyle style,
-    required bool canReorder,
+    required bool useReorderableRow,
+    required bool canDragReorder,
   }) {
     final entry = ordered[index];
     final chip = _EntryChip(
@@ -128,10 +134,11 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
       onSelected: onSelected,
       trailingGap: index == ordered.length - 1 ? 0 : _EntryChip._gapAfter(compact),
     );
-    if (!canReorder) return chip;
+    if (!useReorderableRow) return chip;
     return ReorderableDelayedDragStartListener(
       key: ValueKey<MediaLibraryRootEntry>(entry),
       index: index,
+      enabled: canDragReorder,
       child: chip,
     );
   }
@@ -196,11 +203,11 @@ class _EntryChip extends StatelessWidget {
     final color = !enabled
         ? Colors.white24
         : Color.lerp(Colors.white70, Colors.blueAccent, highlightWeight)!;
-    final weight = FontWeight.lerp(
-      style.fontWeight ?? FontWeight.w400,
-      FontWeight.w500,
-      highlightWeight,
-    );
+    // Weight stays discrete. Lerping w300→w500 mid-swipe changes glyph
+    // advance and the three labels appear to shuffle, then jump back.
+    final weight = selected && enabled
+        ? FontWeight.w500
+        : style.fontWeight;
     final canSelect = enabled && !selected;
     return Padding(
       padding: EdgeInsets.only(right: trailingGap),

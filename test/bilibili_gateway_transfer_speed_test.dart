@@ -27,7 +27,7 @@ void main() {
     );
   });
 
-  test('buffering overlay hides while the clock is already playing', () {
+  test('online Bilibili playback never paints a buffering spinner', () {
     expect(
       MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
         isStreamingCard: true,
@@ -45,7 +45,7 @@ void main() {
         controllerBuffering: true,
         controllerPlaying: false,
       ),
-      isTrue,
+      isFalse,
     );
     expect(
       MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
@@ -55,7 +55,7 @@ void main() {
         controllerBuffering: false,
         seekHold: true,
       ),
-      isTrue,
+      isFalse,
     );
     expect(
       MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
@@ -64,7 +64,7 @@ void main() {
         coveringUntilFrame: false,
         controllerBuffering: false,
       ),
-      isTrue,
+      isFalse,
     );
     expect(
       MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
@@ -72,53 +72,13 @@ void main() {
         state: PlaybackState.paused,
         coveringUntilFrame: false,
         controllerBuffering: true,
-      ),
-      isTrue,
-    );
-    expect(
-      MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
-        isStreamingCard: true,
-        state: PlaybackState.playing,
-        coveringUntilFrame: false,
-        controllerBuffering: false,
-        controllerPlaying: true,
         seekHold: true,
-      ),
-      isTrue,
-    );
-    expect(
-      MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
-        isStreamingCard: true,
-        state: PlaybackState.playing,
-        coveringUntilFrame: true,
-        controllerBuffering: false,
-        controllerPlaying: true,
-      ),
-      isFalse,
-    );
-    expect(
-      MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
-        isStreamingCard: true,
-        state: PlaybackState.playing,
-        coveringUntilFrame: true,
-        controllerBuffering: false,
-        controllerPlaying: false,
-      ),
-      isFalse,
-    );
-    expect(
-      MediaPlaybackService.shouldShowBilibiliBufferingOverlay(
-        isStreamingCard: true,
-        state: PlaybackState.loading,
-        coveringUntilFrame: true,
-        controllerBuffering: false,
-        controllerPlaying: false,
       ),
       isFalse,
     );
   });
 
-  test('seek-hold spinner waits so short hops do not flash', () {
+  test('seek-hold still freezes the timeline without painting a spinner', () {
     expect(
       MediaPlaybackService.bilibiliSeekHoldOverlayDelay,
       const Duration(milliseconds: 350),
@@ -131,8 +91,8 @@ void main() {
     );
     final end = source.indexOf('String get bilibiliBufferingStatusText', start);
     final method = source.substring(start, end);
-    expect(method, contains('if (seekHold) return true'));
-    expect(method, isNot(contains('seekInFlight')));
+    expect(method, contains('return false'));
+    expect(method, isNot(contains('if (seekHold) return true')));
     expect(source, contains('Timer(bilibiliSeekHoldOverlayDelay'));
   });
 

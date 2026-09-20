@@ -303,7 +303,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
     return Row(
       children: [
         // 缩略图
-        _buildThumbnail(currentItem, dimensions, playbackService),
+        _buildThumbnail(currentItem, dimensions),
 
         SizedBox(width: dimensions.padding),
 
@@ -322,7 +322,6 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   Widget _buildThumbnail(
     VideoItem item,
     PlaybackCardDimensions dimensions,
-    MediaPlaybackService playbackService,
   ) {
     final thumbnail = Container(
       width: dimensions.thumbnailSize,
@@ -345,24 +344,9 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
             : _buildVideoThumbnail(item, dimensions),
       ),
     );
-    if (!playbackService.isBilibiliBufferingOverlayVisible) {
-      return thumbnail;
-    }
-    final spinnerSize = (dimensions.thumbnailSize * 0.42).clamp(16.0, 28.0);
-    return Stack(
-      alignment: Alignment.center,
-      children: [
-        thumbnail,
-        SizedBox(
-          width: spinnerSize,
-          height: spinnerSize,
-          child: const CircularProgressIndicator(
-            strokeWidth: 2.4,
-            color: Color(0xFFFB7299),
-          ),
-        ),
-      ],
-    );
+    // Online Bilibili buffering chrome is retired. Download/cache
+    // progress lives on the download screen, not Mini.
+    return thumbnail;
   }
 
   /// 构建音频缩略图（优先显示封面图，无封面则显示占位图标）

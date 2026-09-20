@@ -36,7 +36,6 @@ import '../services/task_subtitle_storage_service.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../widgets/subtitle_display_layer.dart';
 import '../models/subtitle_display_state.dart';
-import '../widgets/bilibili_buffering_overlay.dart';
 import '../widgets/relocate_local_media_source.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/player_control_metrics.dart';
@@ -4470,9 +4469,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
               ),
             ),
           ),
-          if (_isCurrentBilibiliOnlineStream)
-            const BilibiliBufferingOverlay(forceVisible: true)
-          else
+          if (!_isCurrentBilibiliOnlineStream)
             Center(
               child: SizedBox(
                 width: 48,
@@ -4977,7 +4974,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                                                   key: _videoTextureKey,
                                                                                 ),
                                                                                 _buildVisibleVideoFrameCover(),
-                                                                                const BilibiliBufferingOverlay(),
                                                                               ],
                                                                             ),
                                                                           ),

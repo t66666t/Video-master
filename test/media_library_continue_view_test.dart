@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
@@ -257,6 +258,24 @@ void main() {
     expect(find.text('继续观看门槛'), findsOneWidget);
     expect(find.text('取更容易的'), findsOneWidget);
     expect(find.byKey(const ValueKey('continuePolicyExamples')), findsOneWidget);
+  });
+
+  testWidgets('continue policy duration can be typed instead of snapped', (
+    tester,
+  ) async {
+    await tester.pumpWidget(await _harness(library, scroll));
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('continueFilterMenu')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('continueFilterPolicy')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(CupertinoButton, '30秒'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(CupertinoTextField), '25');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(find.widgetWithText(CupertinoButton, '25秒'), findsOneWidget);
   });
 
   test('continue learning opens media through prepareLibraryPlayback', () {

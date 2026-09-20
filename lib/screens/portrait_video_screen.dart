@@ -26,7 +26,6 @@ import '../services/video_compose/video_compose_preview_controller.dart';
 import '../services/playlist_manager.dart';
 import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_settings_sheet.dart';
-import '../widgets/bilibili_buffering_overlay.dart';
 import '../widgets/relocate_local_media_source.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/playback_speed_dialog.dart';
@@ -4358,7 +4357,6 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                                       _videoTextureKey,
                                                                 ),
                                                                 _buildVisibleVideoFrameCover(),
-                                                                const BilibiliBufferingOverlay(),
                                                               ],
                                                             ),
                                                           ),
@@ -4384,11 +4382,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       Container(
                                                         color: Colors.black,
                                                       ),
-                                                    if (_isCurrentBilibiliOnlineStream)
-                                                      const BilibiliBufferingOverlay(
-                                                        forceVisible: true,
-                                                      )
-                                                    else
+                                                    if (!_isCurrentBilibiliOnlineStream)
                                                       Center(
                                                         child:
                                                             CircularProgressIndicator(

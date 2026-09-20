@@ -109,4 +109,35 @@ void main() {
     expect(continueX < foldersX, isTrue);
     expect(foldersX < recentX, isTrue);
   });
+
+  testWidgets('swipe highlight does not shift chip positions', (tester) async {
+    Future<List<double>> pumpHighlight(double highlight) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            appBar: AppBar(
+              title: MediaLibraryEntrySwitcher(
+                selected: MediaLibraryRootEntry.continueLearning,
+                highlightIndex: highlight,
+                availableEntries: MediaLibraryRootEntry.values.toSet(),
+                onSelected: (_) {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      return [
+        tester.getTopLeft(find.text('继续学习')).dx,
+        tester.getTopLeft(find.text('文件夹')).dx,
+        tester.getTopLeft(find.text('最近添加')).dx,
+      ];
+    }
+
+    final rest = await pumpHighlight(0);
+    final mid = await pumpHighlight(0.5);
+    expect(mid[0], closeTo(rest[0], 0.5));
+    expect(mid[1], closeTo(rest[1], 0.5));
+    expect(mid[2], closeTo(rest[2], 0.5));
+  });
 }

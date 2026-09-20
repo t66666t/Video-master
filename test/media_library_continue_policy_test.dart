@@ -28,19 +28,19 @@ void main() {
     expect(either.hasReachedWatchGate(1000, 100000), isFalse);
   });
 
-  test('json round-trip clamps unknown fields to defaults', () {
+  test('json round-trip keeps custom age days instead of snapping to chips', () {
     final restored = ContinueWatchPolicy.fromJsonString(
       ContinueWatchPolicy.defaults
-          .copyWith(minWatchMs: 90000, maxAgeDays: 30)
+          .copyWith(minWatchMs: 25000, maxAgeDays: 3)
           .toJsonString(),
     );
-    expect(restored.minWatchMs, 90000);
-    expect(restored.maxAgeDays, 30);
+    expect(restored.minWatchMs, 25000);
+    expect(restored.maxAgeDays, 3);
     expect(ContinueWatchPolicy.fromJsonString('not-json').minWatchMs, 30000);
   });
 
   test('duration slider ticks are equal-width, first steps are 0 then 1s', () {
-    const steps = ContinueWatchSliderSteps.minWatchMs;
+    final steps = ContinueWatchSliderSteps.minWatchMs;
     final last = steps.length - 1;
     expect(ContinueWatchSliderSteps.msOf(0, steps), 0);
     expect(ContinueWatchSliderSteps.msOf(1 / last, steps), 1000);
@@ -49,6 +49,33 @@ void main() {
     expect(ContinueWatchSliderSteps.sliderOf(1000, steps), closeTo(1 / last, 1e-9));
     expect(ContinueWatchSliderSteps.sliderOf(30000, steps), greaterThan(0.4));
     expect(ContinueWatchSliderSteps.sliderOf(30000, steps), lessThan(0.7));
+    // Off-tick values sit between neighbors instead of snapping the thumb.
+    final custom = ContinueWatchSliderSteps.sliderOf(32000, steps);
+    expect(custom, greaterThan(ContinueWatchSliderSteps.sliderOf(30000, steps)));
+    expect(custom, lessThan(ContinueWatchSliderSteps.sliderOf(35000, steps)));
+  });
+
+  test('duration and percent inputs accept typed custom values', () {
+    expect(
+      ContinueWatchPolicy.parseDurationMs('25', maxMs: 600000),
+      25000,
+    );
+    expect(
+      ContinueWatchPolicy.parseDurationMs('1:30', maxMs: 600000),
+      90000,
+    );
+    expect(
+      ContinueWatchPolicy.parseDurationMs('1分30秒', maxMs: 600000),
+      90000,
+    );
+    expect(ContinueWatchPolicy.parseDurationMs('不限', maxMs: 600000), 0);
+    expect(ContinueWatchPolicy.parseDurationMs('nope', maxMs: 600000), isNull);
+    expect(
+      ContinueWatchPolicy.parsePercentFraction('12.5', maxFraction: 0.8),
+      closeTo(0.125, 1e-9),
+    );
+    expect(ContinueWatchPolicy.parseAgeDays('3'), 3);
+    expect(ContinueWatchPolicy.parseAgeDays(''), 0);
   });
 
   test('watchNeedMsForDuration follows easier vs both', () {

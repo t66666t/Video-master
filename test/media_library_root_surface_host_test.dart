@@ -196,6 +196,48 @@ void main() {
     expect(swiped, MediaLibraryRootEntry.folders);
   });
 
+  testWidgets('a reverse fling during snap is not dropped', (tester) async {
+    var displayed = MediaLibraryRootEntry.continueLearning;
+    final swiped = <MediaLibraryRootEntry>[];
+
+    Widget host() {
+      return MediaLibraryRootSurfaceHost(
+        displayedEntry: displayed,
+        onUserSwipe: (entry) {
+          swiped.add(entry);
+          displayed = entry;
+        },
+        continueBuilder: (_, _) => const Center(child: Text('continue')),
+        recentBuilder: (_, _) => const Center(child: Text('recent')),
+        foldersBuilder: (_, _) => const Center(child: Text('folders')),
+      );
+    }
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(width: 400, height: 640, child: host()),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.fling(
+      find.byType(MediaLibraryRootSurfaceHost),
+      const Offset(-240, 0),
+      1800,
+    );
+    await tester.pump(const Duration(milliseconds: 40));
+    await tester.fling(
+      find.byType(MediaLibraryRootSurfaceHost),
+      const Offset(240, 0),
+      1800,
+    );
+    await tester.pumpAndSettle();
+    expect(swiped, isNotEmpty);
+    expect(displayed, MediaLibraryRootEntry.continueLearning);
+  });
+
   testWidgets('touch drag publishes a fractional chip highlight', (
     tester,
   ) async {

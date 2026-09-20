@@ -159,9 +159,10 @@ class _ContinuePolicySheetBody extends StatelessWidget {
                                 ),
                                 _SteppedDurationSlider(
                                   title: '最少看满',
-                                  hint: '真实经过的观看时间，不是进度条位置。',
+                                  hint: '真实经过的观看时间，不是进度条位置。点按数字可直接填写。',
                                   stepsMs: ContinueWatchSliderSteps.minWatchMs,
                                   valueMs: policy.minWatchMs,
+                                  maxMs: ContinueWatchPolicy.minWatchMsMax,
                                   onChanged: (ms) => _save(
                                     settings,
                                     policy.copyWith(minWatchMs: ms),
@@ -169,38 +170,16 @@ class _ContinuePolicySheetBody extends StatelessWidget {
                                 ),
                                 _PercentSlider(
                                   title: '占片长',
-                                  hint: '实际观看 ÷ 片子总时长。10 分钟片子的 20% 是 2 分钟。',
-                                  valueLabel: policy.minDurationFraction <= 0
-                                      ? '不限'
-                                      : '${(policy.minDurationFraction * 100).round()}%',
-                                  sliderValue:
-                                      policy.minDurationFraction /
-                                      ContinueWatchPolicy
-                                          .minDurationFractionMax,
-                                  divisions:
-                                      (ContinueWatchPolicy
-                                                  .minDurationFractionMax *
-                                              100)
-                                          .round(),
-                                  onChanged: (t) {
-                                    final fraction =
-                                        (t *
-                                                ContinueWatchPolicy
-                                                    .minDurationFractionMax)
-                                            .clamp(
-                                              ContinueWatchPolicy
-                                                  .minDurationFractionMin,
-                                              ContinueWatchPolicy
-                                                  .minDurationFractionMax,
-                                            );
-                                    _save(
-                                      settings,
-                                      policy.copyWith(
-                                        minDurationFraction:
-                                            (fraction * 100).round() / 100,
-                                      ),
-                                    );
-                                  },
+                                  hint: '实际观看 ÷ 片子总时长。10 分钟片子的 20% 是 2 分钟。点按数字可直接填写。',
+                                  fraction: policy.minDurationFraction,
+                                  maxFraction: ContinueWatchPolicy
+                                      .minDurationFractionMax,
+                                  onChanged: (fraction) => _save(
+                                    settings,
+                                    policy.copyWith(
+                                      minDurationFraction: fraction,
+                                    ),
+                                  ),
                                 ),
                                 const SizedBox(height: 10),
                                 Text(
@@ -242,46 +221,25 @@ class _ContinuePolicySheetBody extends StatelessWidget {
                                   children: [
                                     _PercentSlider(
                                       title: '播放进度不到就不列',
-                                      hint: '看进度条走到哪里，和上面「实际看了多久」不是一回事。',
-                                      valueLabel:
-                                          policy.minProgressFraction <= 0
-                                          ? '不限'
-                                          : '${(policy.minProgressFraction * 100).round()}%',
-                                      sliderValue:
-                                          policy.minProgressFraction /
-                                          ContinueWatchPolicy
-                                              .minProgressFractionMax,
-                                      divisions:
-                                          (ContinueWatchPolicy
-                                                      .minProgressFractionMax *
-                                                  100)
-                                              .round(),
-                                      onChanged: (t) {
-                                        final fraction =
-                                            (t *
-                                                    ContinueWatchPolicy
-                                                        .minProgressFractionMax)
-                                                .clamp(
-                                                  ContinueWatchPolicy
-                                                      .minProgressFractionMin,
-                                                  ContinueWatchPolicy
-                                                      .minProgressFractionMax,
-                                                );
-                                        _save(
-                                          settings,
-                                          policy.copyWith(
-                                            minProgressFraction:
-                                                (fraction * 100).round() / 100,
-                                          ),
-                                        );
-                                      },
+                                      hint: '看进度条走到哪里，和上面「实际看了多久」不是一回事。点按数字可直接填写。',
+                                      fraction: policy.minProgressFraction,
+                                      maxFraction: ContinueWatchPolicy
+                                          .minProgressFractionMax,
+                                      onChanged: (fraction) => _save(
+                                        settings,
+                                        policy.copyWith(
+                                          minProgressFraction: fraction,
+                                        ),
+                                      ),
                                     ),
                                     _SteppedDurationSlider(
                                       title: '还剩这么短就隐藏',
-                                      hint: '快看完的片子从列表里拿掉。',
+                                      hint: '快看完的片子从列表里拿掉。点按数字可直接填写。',
                                       stepsMs: ContinueWatchSliderSteps
                                           .remainingOrItemMs,
                                       valueMs: policy.hideRemainingBelowMs,
+                                      maxMs: ContinueWatchPolicy
+                                          .hideRemainingBelowMsMax,
                                       onChanged: (ms) => _save(
                                         settings,
                                         policy.copyWith(
@@ -291,10 +249,12 @@ class _ContinuePolicySheetBody extends StatelessWidget {
                                     ),
                                     _SteppedDurationSlider(
                                       title: '片子太短不列入',
-                                      hint: '总时长短于这个数的不进未完成。',
+                                      hint: '总时长短于这个数的不进未完成。点按数字可直接填写。',
                                       stepsMs: ContinueWatchSliderSteps
                                           .remainingOrItemMs,
                                       valueMs: policy.minItemDurationMs,
+                                      maxMs: ContinueWatchPolicy
+                                          .minItemDurationMsMax,
                                       onChanged: (ms) => _save(
                                         settings,
                                         policy.copyWith(minItemDurationMs: ms),
@@ -326,6 +286,38 @@ class _ContinuePolicySheetBody extends StatelessWidget {
                                       policy.copyWith(maxAgeDays: days),
                                     ),
                                   ),
+                                if (!ContinueWatchPolicy.maxAgeDayChoices
+                                    .contains(policy.maxAgeDays))
+                                  _IosChoiceChip(
+                                    label: '${policy.maxAgeDays}天',
+                                    selected: true,
+                                    onTap: () async {
+                                      final next = await _promptAgeDays(
+                                        context,
+                                        policy.maxAgeDays,
+                                      );
+                                      if (next == null) return;
+                                      _save(
+                                        settings,
+                                        policy.copyWith(maxAgeDays: next),
+                                      );
+                                    },
+                                  ),
+                                _IosChoiceChip(
+                                  label: '自定义',
+                                  selected: false,
+                                  onTap: () async {
+                                    final next = await _promptAgeDays(
+                                      context,
+                                      policy.maxAgeDays,
+                                    );
+                                    if (next == null) return;
+                                    _save(
+                                      settings,
+                                      policy.copyWith(maxAgeDays: next),
+                                    );
+                                  },
+                                ),
                               ],
                             ),
                           ),
@@ -394,6 +386,40 @@ class _ContinuePolicySheetBody extends StatelessWidget {
       ),
     );
   }
+
+  static Future<int?> _promptAgeDays(BuildContext context, int currentDays) {
+    return _promptParsedValue<int>(
+      context: context,
+      title: '只看最近几天',
+      hint: '输入天数，0 或不填表示不限。',
+      placeholder: '例如 3',
+      initialText: currentDays <= 0 ? '' : '$currentDays',
+      keyboardType: const TextInputType.numberWithOptions(decimal: false),
+      parse: ContinueWatchPolicy.parseAgeDays,
+    );
+  }
+}
+
+Future<T?> _promptParsedValue<T>({
+  required BuildContext context,
+  required String title,
+  required String hint,
+  required String placeholder,
+  required String initialText,
+  required TextInputType keyboardType,
+  required T? Function(String raw) parse,
+}) {
+  return showCupertinoDialog<T>(
+    context: context,
+    builder: (dialogContext) => _PolicyValueDialog<T>(
+      title: title,
+      hint: hint,
+      placeholder: placeholder,
+      initialText: initialText,
+      keyboardType: keyboardType,
+      parse: parse,
+    ),
+  );
 }
 
 class _SectionLabel extends StatelessWidget {
@@ -539,6 +565,7 @@ class _SteppedDurationSlider extends StatelessWidget {
     required this.hint,
     required this.stepsMs,
     required this.valueMs,
+    required this.maxMs,
     required this.onChanged,
   });
 
@@ -546,6 +573,7 @@ class _SteppedDurationSlider extends StatelessWidget {
   final String hint;
   final List<int> stepsMs;
   final int valueMs;
+  final int maxMs;
   final ValueChanged<int> onChanged;
 
   @override
@@ -557,22 +585,28 @@ class _SteppedDurationSlider extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                title,
-                style: const TextStyle(color: Colors.white, fontSize: 15),
+        _TuneHeader(
+          title: title,
+          valueLabel: label,
+          onMinus: () => onChanged(_maxInt(0, valueMs - 1000)),
+          onPlus: () => onChanged(_minInt(maxMs, _nudgeDurationUp(valueMs))),
+          onEdit: () async {
+            final next = await _promptParsedValue<int>(
+              context: context,
+              title: title,
+              hint: '直接填秒数，或 1:30、1分30秒。0 或不填表示不限。',
+              placeholder: '例如 25 或 1:30',
+              initialText: valueMs <= 0 ? '' : '${(valueMs / 1000).round()}',
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: false,
+                signed: false,
               ),
-            ),
-            Text(
-              label,
-              style: const TextStyle(
-                color: MediaLibraryContinuePolicySheet.secondaryLabel,
-                fontSize: 15,
-              ),
-            ),
-          ],
+              parse: (raw) =>
+                  ContinueWatchPolicy.parseDurationMs(raw, maxMs: maxMs),
+            );
+            if (next == null) return;
+            onChanged(next);
+          },
         ),
         Text(
           hint,
@@ -586,52 +620,66 @@ class _SteppedDurationSlider extends StatelessWidget {
           value: ContinueWatchSliderSteps.sliderOf(valueMs, stepsMs),
           divisions: stepsMs.length - 1,
           activeColor: MediaLibraryContinuePolicySheet.iosBlue,
-          onChanged: (t) => onChanged(ContinueWatchSliderSteps.msOf(t, stepsMs)),
+          onChanged: (t) =>
+              onChanged(ContinueWatchSliderSteps.msOf(t, stepsMs)),
         ),
       ],
     );
   }
+
+  /// 0 → 1s so the first plus doesn't sit on「不限」；already ≥1s adds one second.
+  static int _nudgeDurationUp(int valueMs) =>
+      valueMs <= 0 ? 1000 : valueMs + 1000;
 }
 
 class _PercentSlider extends StatelessWidget {
   const _PercentSlider({
     required this.title,
     required this.hint,
-    required this.valueLabel,
-    required this.sliderValue,
-    required this.divisions,
+    required this.fraction,
+    required this.maxFraction,
     required this.onChanged,
   });
 
   final String title;
   final String hint;
-  final String valueLabel;
-  final double sliderValue;
-  final int divisions;
+  final double fraction;
+  final double maxFraction;
   final ValueChanged<double> onChanged;
 
   @override
   Widget build(BuildContext context) {
+    final divisions = (maxFraction * 100).round();
+    final label = fraction <= 0
+        ? '不限'
+        : ContinueWatchPolicy.formatPercent(fraction);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                title,
-                style: const TextStyle(color: Colors.white, fontSize: 15),
+        _TuneHeader(
+          title: title,
+          valueLabel: label,
+          onMinus: () => onChanged(_snapPercent(fraction - 0.01)),
+          onPlus: () => onChanged(_snapPercent(fraction + 0.01)),
+          onEdit: () async {
+            final next = await _promptParsedValue<double>(
+              context: context,
+              title: title,
+              hint: '输入百分比，0 或不填表示不限。',
+              placeholder: '例如 12 或 12.5',
+              initialText: fraction <= 0 ? '' : _percentEditText(fraction),
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
               ),
-            ),
-            Text(
-              valueLabel,
-              style: const TextStyle(
-                color: MediaLibraryContinuePolicySheet.secondaryLabel,
-                fontSize: 15,
+              parse: (raw) => ContinueWatchPolicy.parsePercentFraction(
+                raw,
+                maxFraction: maxFraction,
               ),
-            ),
-          ],
+            );
+            if (next == null) return;
+            onChanged(next);
+          },
         ),
         Text(
           hint,
@@ -642,12 +690,204 @@ class _PercentSlider extends StatelessWidget {
           ),
         ),
         CupertinoSlider(
-          value: sliderValue.clamp(0.0, 1.0),
+          value: (fraction / maxFraction).clamp(0.0, 1.0),
           divisions: divisions,
           activeColor: MediaLibraryContinuePolicySheet.iosBlue,
-          onChanged: onChanged,
+          onChanged: (t) {
+            final next = (t * maxFraction).clamp(0.0, maxFraction);
+            onChanged((next * 100).round() / 100);
+          },
+        ),
+      ],
+    );
+  }
+
+  double _snapPercent(double value) {
+    final snapped = (value * 100).round() / 100;
+    return snapped.clamp(0.0, maxFraction);
+  }
+
+  static String _percentEditText(double fraction) {
+    final pct = fraction * 100;
+    if ((pct - pct.roundToDouble()).abs() < 0.05) return '${pct.round()}';
+    return pct.toStringAsFixed(1);
+  }
+}
+
+/// Title + minus / tappable value / plus. The number is the custom-entry
+/// affordance so people are not stuck on slider ticks.
+class _TuneHeader extends StatelessWidget {
+  const _TuneHeader({
+    required this.title,
+    required this.valueLabel,
+    required this.onMinus,
+    required this.onPlus,
+    required this.onEdit,
+  });
+
+  final String title;
+  final String valueLabel;
+  final VoidCallback onMinus;
+  final VoidCallback onPlus;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            title,
+            style: const TextStyle(color: Colors.white, fontSize: 15),
+          ),
+        ),
+        _TuneIconButton(
+          icon: CupertinoIcons.minus_circle,
+          onPressed: onMinus,
+        ),
+        CupertinoButton(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          minimumSize: Size.zero,
+          onPressed: onEdit,
+          child: Text(
+            valueLabel,
+            style: const TextStyle(
+              color: MediaLibraryContinuePolicySheet.iosBlue,
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+        _TuneIconButton(
+          icon: CupertinoIcons.plus_circle,
+          onPressed: onPlus,
         ),
       ],
     );
   }
 }
+
+class _TuneIconButton extends StatelessWidget {
+  const _TuneIconButton({required this.icon, required this.onPressed});
+
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoButton(
+      padding: const EdgeInsets.all(2),
+      minimumSize: const Size(28, 28),
+      onPressed: onPressed,
+      child: Icon(
+        icon,
+        size: 22,
+        color: MediaLibraryContinuePolicySheet.iosBlue,
+      ),
+    );
+  }
+}
+
+class _PolicyValueDialog<T> extends StatefulWidget {
+  const _PolicyValueDialog({
+    required this.title,
+    required this.hint,
+    required this.placeholder,
+    required this.initialText,
+    required this.keyboardType,
+    required this.parse,
+  });
+
+  final String title;
+  final String hint;
+  final String placeholder;
+  final String initialText;
+  final TextInputType keyboardType;
+  final T? Function(String raw) parse;
+
+  @override
+  State<_PolicyValueDialog<T>> createState() => _PolicyValueDialogState<T>();
+}
+
+class _PolicyValueDialogState<T> extends State<_PolicyValueDialog<T>> {
+  late final TextEditingController _controller;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialText);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit(String raw) {
+    final parsed = widget.parse(raw);
+    if (parsed == null) {
+      setState(() => _error = '看不懂这个值，请改成数字后再试。');
+      return;
+    }
+    Navigator.of(context).pop(parsed);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
+      title: Text(widget.title),
+      content: Column(
+        children: [
+          const SizedBox(height: 8),
+          Text(widget.hint, style: const TextStyle(fontSize: 13, height: 1.35)),
+          const SizedBox(height: 10),
+          CupertinoTextField(
+            controller: _controller,
+            autofocus: true,
+            keyboardType: widget.keyboardType,
+            placeholder: widget.placeholder,
+            textInputAction: TextInputAction.done,
+            onSubmitted: _submit,
+            style: const TextStyle(color: Colors.white),
+            placeholderStyle: const TextStyle(
+              color: MediaLibraryContinuePolicySheet.tertiaryLabel,
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1C1C1E),
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: const TextStyle(color: Color(0xFFFF453A), fontSize: 12),
+            ),
+          ],
+        ],
+      ),
+      actions: [
+        CupertinoDialogAction(
+          onPressed: () => Navigator.of(context).pop(widget.parse('')),
+          child: const Text('不限'),
+        ),
+        CupertinoDialogAction(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        CupertinoDialogAction(
+          isDefaultAction: true,
+          onPressed: () => _submit(_controller.text),
+          child: const Text('确定'),
+        ),
+      ],
+    );
+  }
+}
+
+int _maxInt(int a, int b) => a > b ? a : b;
+
+int _minInt(int a, int b) => a < b ? a : b;

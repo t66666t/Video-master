@@ -593,10 +593,17 @@ class MediaPlaybackService extends ChangeNotifier {
   /// libmpv reports seekTo as complete and often keeps isPlaying=true while
   /// cache-pause / GOP decode still freeze the picture. The spinner stays
   /// until the native clock lands near the target and then actually ticks.
+  /// Paused hops never tick; treat "landed on the still frame" as done.
   void _syncSeekHoldOverlayFromNative(Duration nativePosition) {
     if (!_seekHoldPending && !_seekHoldOverlay) return;
     final target = _lastRequestedSeekPosition ?? _position;
     final nearTarget = (nativePosition - target).inMilliseconds.abs() <= 450;
+    if (_state == PlaybackState.paused) {
+      if (nearTarget) {
+        _clearSeekHoldOverlay();
+      }
+      return;
+    }
     if (_seekHoldLandedNative == null) {
       if (nearTarget) {
         _seekHoldLandedNative = nativePosition;
@@ -1353,7 +1360,9 @@ class MediaPlaybackService extends ChangeNotifier {
   String? get bilibiliGatewaySpeedLabel =>
       formatTransferSpeedLabel(_bilibiliGatewayBytesPerSecond);
 
-  /// Whether the Bilibili-style buffering overlay should be visible.
+  /// Online Bilibili playback never paints a spinner. Connecting, seek, and
+  /// cache-pause all used to flash the pink ring over a still frame. Download
+  /// / cache progress stays on the download screen only.
   bool get isBilibiliBufferingOverlayVisible =>
       shouldShowBilibiliBufferingOverlay(
         isStreamingCard: isCurrentItemStreamingBilibiliCard,
@@ -1364,10 +1373,8 @@ class MediaPlaybackService extends ChangeNotifier {
         seekHold: _seekHoldOverlay,
       );
 
-  /// Readahead while the clock is already running is not a stall. Showing a
-  /// spinner for the whole 60s/128MB desktop window made gigabit loads look
-  /// stuck at a fake 40 MB/s. Dart `seekTo` in-flight is also not a stall:
-  /// arrow-key hops set that flag on every tap and would flash the spinner.
+  /// Signature kept so playback tests can still describe stalls that must
+  /// not paint chrome. Arguments are intentionally unused.
   @visibleForTesting
   static bool shouldShowBilibiliBufferingOverlay({
     required bool isStreamingCard,
@@ -1377,16 +1384,7 @@ class MediaPlaybackService extends ChangeNotifier {
     bool controllerPlaying = true,
     bool seekHold = false,
   }) {
-    if (!isStreamingCard) return false;
-    // Mini→page keeps a poster over the texture while video catches the
-    // audio clock. A spinner on top of live audio is the hard-cut feel,
-    // even when `_state` is still loading because Dart isPlaying lagged.
-    if (coveringUntilFrame) return false;
-    if (state == PlaybackState.loading) return true;
-    if (seekHold) return true;
-    if (!controllerBuffering) return false;
-    if (state != PlaybackState.playing) return true;
-    return !controllerPlaying;
+    return false;
   }
 
   /// Fallback status line when throughput has not been measured yet.
@@ -5611,7 +5609,10 @@ class MediaPlaybackService extends ChangeNotifier {
 
     final requestId = _seekRequestId;
     _pendingSeekRequestId = requestId;
-    if (isCurrentItemStreamingBilibiliCard) {
+    // Seek-hold waits for the native clock to move. A paused subtitle hop
+    // never does, so arming it only flashes a spinner over a still frame.
+    if (isCurrentItemStreamingBilibiliCard &&
+        _state == PlaybackState.playing) {
       _armSeekHoldOverlay();
     }
     final awaitAck = SubtitleHopSeekPolicy.shouldAwaitNativeSeekAck(

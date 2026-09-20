@@ -44,6 +44,7 @@ class ContinueWatchPolicy {
   static const double minProgressFractionMax = 0.90;
   static const int minItemDurationMsMax = 300000;
   static const int hideRemainingBelowMsMax = 300000;
+  static const int maxAgeDaysMax = 3650;
   static const List<int> maxAgeDayChoices = <int>[0, 7, 14, 30, 90, 365];
 
   final ContinueWatchCombineMode combineMode;
@@ -202,7 +203,12 @@ class ContinueWatchPolicy {
         0,
         hideRemainingBelowMsMax,
       ),
-      maxAgeDays: _nearestAgeDays(json['maxAgeDays']),
+      maxAgeDays: _clampInt(
+        json['maxAgeDays'],
+        defaults.maxAgeDays,
+        0,
+        maxAgeDaysMax,
+      ),
       excludeCompleted: json['excludeCompleted'] is bool
           ? json['excludeCompleted'] as bool
           : defaults.excludeCompleted,
@@ -237,8 +243,13 @@ class ContinueWatchPolicy {
     }
   }
 
-  static String _percentLabel(double fraction) =>
-      '${(fraction * 100).round()}%';
+  static String _percentLabel(double fraction) => formatPercent(fraction);
+
+  static String formatPercent(double fraction) {
+    final pct = fraction * 100;
+    if ((pct - pct.roundToDouble()).abs() < 0.05) return '${pct.round()}%';
+    return '${pct.toStringAsFixed(1)}%';
+  }
 
   static String formatDurationMs(int ms) {
     final totalSeconds = math.max(0, (ms / 1000).round());
@@ -280,65 +291,123 @@ class ContinueWatchPolicy {
     return value.clamp(min, max);
   }
 
-  static int _nearestAgeDays(Object? raw) {
-    final value = raw is num ? raw.round() : 0;
-    var best = maxAgeDayChoices.first;
-    var bestDelta = (value - best).abs();
-    for (final choice in maxAgeDayChoices) {
-      final delta = (value - choice).abs();
-      if (delta < bestDelta) {
-        best = choice;
-        bestDelta = delta;
-      }
+  /// Empty / 不限 / 0 → 0. Bare numbers are seconds. Also accepts `1:30`,
+  /// `1分30秒`, `90s`. Null means the text is not a duration.
+  static int? parseDurationMs(String raw, {required int maxMs}) {
+    var text = raw.trim().toLowerCase();
+    if (text.isEmpty || text == '不限' || text == '-' || text == 'off') {
+      return 0;
     }
-    return best;
+    text = text
+        .replaceAll('小时', 'h')
+        .replaceAll('钟头', 'h')
+        .replaceAll('时', 'h')
+        .replaceAll('分钟', 'm')
+        .replaceAll('分', 'm')
+        .replaceAll('秒钟', 's')
+        .replaceAll('秒', 's')
+        .replaceAll(RegExp(r'\s+'), '');
+
+    final colon = RegExp(r'^(\d+):(\d{1,2})(?::(\d{1,2}))?$');
+    final colonMatch = colon.firstMatch(text);
+    if (colonMatch != null) {
+      final a = int.parse(colonMatch.group(1)!);
+      final b = int.parse(colonMatch.group(2)!);
+      final cRaw = colonMatch.group(3);
+      final seconds = cRaw == null ? a * 60 + b : a * 3600 + b * 60 + int.parse(cRaw);
+      return (seconds * 1000).clamp(0, maxMs);
+    }
+
+    final unit = RegExp(r'^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$');
+    final unitMatch = unit.firstMatch(text);
+    if (unitMatch != null && text.contains(RegExp(r'[hms]'))) {
+      final hours = int.tryParse(unitMatch.group(1) ?? '') ?? 0;
+      final minutes = int.tryParse(unitMatch.group(2) ?? '') ?? 0;
+      final secs = int.tryParse(unitMatch.group(3) ?? '') ?? 0;
+      return ((hours * 3600 + minutes * 60 + secs) * 1000).clamp(0, maxMs);
+    }
+
+    final asNumber = num.tryParse(text.replaceAll('s', ''));
+    if (asNumber == null || asNumber.isNaN || !asNumber.isFinite) return null;
+    return (asNumber.round() * 1000).clamp(0, maxMs);
+  }
+
+  /// `20` / `20%` / `不限`. Null if unreadable. Stored as 0–1 fraction.
+  static double? parsePercentFraction(
+    String raw, {
+    required double maxFraction,
+  }) {
+    var text = raw.trim().toLowerCase();
+    if (text.isEmpty || text == '不限' || text == '-' || text == 'off') {
+      return 0;
+    }
+    text = text.replaceAll('%', '').replaceAll('％', '').trim();
+    final value = num.tryParse(text);
+    if (value == null || value.isNaN || !value.isFinite) return null;
+    return (value / 100).clamp(0.0, maxFraction);
+  }
+
+  static int? parseAgeDays(String raw) {
+    var text = raw.trim().toLowerCase();
+    if (text.isEmpty || text == '不限' || text == '-' || text == 'off') {
+      return 0;
+    }
+    text = text.replaceAll('天', '').replaceAll('日', '').trim();
+    final value = num.tryParse(text);
+    if (value == null || value.isNaN || !value.isFinite) return null;
+    return value.round().clamp(0, maxAgeDaysMax);
   }
 }
 
-/// Equal-width duration ticks for the policy sheet sliders.
+/// Duration ticks for the policy sheet sliders.
 ///
-/// A log map from 0–10min with a 30s pivot parks almost the entire left half
-/// below 1s (then `_snapMs` keeps showing「不限」). Users need one drag step =
-/// one named duration, not a physics-friendly curve.
+/// Dense in the first minute (where people actually tune), then coarser.
+/// Values that are not on a tick (typed in) sit between neighbors so the
+/// thumb does not jump to a wrong named stop.
 class ContinueWatchSliderSteps {
   ContinueWatchSliderSteps._();
 
-  static const List<int> minWatchMs = <int>[
-    0,
-    1000,
-    2000,
-    3000,
-    5000,
-    10000,
-    15000,
-    20000,
-    30000,
-    45000,
-    60000,
-    90000,
-    120000,
-    180000,
-    300000,
-    600000,
-  ];
+  static final List<int> minWatchMs = buildTicks(
+    maxMs: ContinueWatchPolicy.minWatchMsMax,
+  );
 
-  static const List<int> remainingOrItemMs = <int>[
-    0,
-    5000,
-    10000,
-    15000,
-    30000,
-    45000,
-    60000,
-    90000,
-    120000,
-    180000,
-    300000,
-  ];
+  static final List<int> remainingOrItemMs = buildTicks(
+    maxMs: ContinueWatchPolicy.minItemDurationMsMax,
+  );
+
+  static List<int> buildTicks({required int maxMs}) {
+    final maxSec = math.max(0, (maxMs / 1000).round());
+    final seconds = <int>{0};
+    void addRange(int from, int toInclusive, int step) {
+      for (var s = from; s <= toInclusive && s <= maxSec; s += step) {
+        seconds.add(s);
+      }
+    }
+
+    // 0–30s: 1s. 30–60s: 5s. 1–3min: 15s. 3min–max: 30s.
+    addRange(1, 30, 1);
+    addRange(35, 60, 5);
+    addRange(75, 180, 15);
+    addRange(210, maxSec, 30);
+    seconds.add(maxSec);
+    final list = seconds.toList()..sort();
+    return list.map((s) => s * 1000).toList(growable: false);
+  }
 
   static double sliderOf(int ms, List<int> steps) {
     if (steps.length <= 1) return 0;
-    return nearestIndex(ms, steps) / (steps.length - 1);
+    if (ms <= steps.first) return 0;
+    if (ms >= steps.last) return 1;
+    final last = steps.length - 1;
+    for (var i = 1; i < steps.length; i++) {
+      if (ms <= steps[i]) {
+        final lo = steps[i - 1];
+        final hi = steps[i];
+        final local = hi == lo ? 0.0 : (ms - lo) / (hi - lo);
+        return ((i - 1) + local) / last;
+      }
+    }
+    return 1;
   }
 
   static int msOf(double t, List<int> steps) {
