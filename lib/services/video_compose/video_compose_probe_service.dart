@@ -1,16 +1,22 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 
 import '../../models/video_compose_models.dart';
+import '../../utils/ffmpeg_utils.dart';
 import 'video_compose_types.dart';
 
 class VideoComposeProbeService {
   const VideoComposeProbeService();
 
   Future<VideoProbeInfo> probeVideoInfo(String videoPath) async {
-    // Use the embedded FFprobe implementation on every platform. In
-    // particular, do not resolve `ffprobe` through PATH on desktop: Windows
-    // app launches commonly inherit stale WinGet links, while GUI apps on
-    // macOS do not reliably inherit the user's shell PATH.
+    // Linux: system ffprobe via FFmpegUtils (FFmpeg Kit has no reliable .so).
+    // Windows/macOS/mobile: keep embedded FFprobeKit — desktop GUI launches
+    // often inherit stale PATH links (WinGet) or no shell PATH (macOS).
+    if (Platform.isLinux) {
+      return _probeBySystemFfprobe(videoPath);
+    }
     return _probeByFfmpegKit(videoPath);
   }
 
@@ -44,6 +50,68 @@ class VideoComposeProbeService {
   int ensureEven(int value) {
     final int safe = value <= 0 ? 2 : value;
     return safe.isEven ? safe : safe + 1;
+  }
+
+  Future<VideoProbeInfo> _probeBySystemFfprobe(String videoPath) async {
+    await FFmpegUtils.ensureAvailable();
+    final String ffprobePath = await FFmpegUtils.ffprobePath;
+    final result = await Process.run(ffprobePath, <String>[
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-show_format',
+      '-show_streams',
+      videoPath,
+    ]).timeout(const Duration(seconds: 15));
+    if (result.exitCode != 0) {
+      final err = result.stderr.toString().trim();
+      throw StateError(
+        err.isNotEmpty ? err : FFmpegUtils.missingBinaryUserMessage,
+      );
+    }
+    final dynamic decoded = jsonDecode(result.stdout.toString());
+    if (decoded is! Map) {
+      throw StateError('无法读取视频信息');
+    }
+    final Map<String, dynamic> root = Map<String, dynamic>.from(decoded);
+    final format = root['format'] is Map
+        ? Map<String, dynamic>.from(root['format'] as Map)
+        : const <String, dynamic>{};
+    final double durationSec =
+        double.tryParse(format['duration']?.toString() ?? '') ?? 0;
+    int width = 0;
+    int height = 0;
+    int rotation = 0;
+    String? sar;
+    final List<dynamic> streams =
+        root['streams'] is List ? List<dynamic>.from(root['streams'] as List) : const [];
+    for (final dynamic stream in streams) {
+      if (stream is! Map) continue;
+      final Map<String, dynamic> props = Map<String, dynamic>.from(stream);
+      if (props['codec_type']?.toString() != 'video') continue;
+      width = _toInt(props['width']);
+      height = _toInt(props['height']);
+      sar = props['sample_aspect_ratio']?.toString();
+      rotation = _parseRotationFromStream(props);
+      break;
+    }
+    final int safeWidth = width <= 0 ? 1920 : width;
+    final int safeHeight = height <= 0 ? 1080 : height;
+    final DisplaySize display = _resolveDisplaySize(
+      width: safeWidth,
+      height: safeHeight,
+      sar: sar,
+      rotation: rotation,
+    );
+    return VideoProbeInfo(
+      width: safeWidth,
+      height: safeHeight,
+      displayWidth: display.width,
+      displayHeight: display.height,
+      rotation: rotation,
+      duration: Duration(milliseconds: (durationSec * 1000).round()),
+    );
   }
 
   Future<VideoProbeInfo> _probeByFfmpegKit(String videoPath) async {

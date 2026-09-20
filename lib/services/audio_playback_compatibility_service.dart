@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../utils/ffmpeg_utils.dart';
+
 import '../platform/local_playback_backend_policy.dart';
 
 /// Creates a transparent playback copy for codecs which are not consistently
@@ -111,6 +113,23 @@ class AudioPlaybackCompatibilityService {
 
   static Future<String?> _probeAudioCodec(String path) async {
     try {
+      if (FFmpegUtils.preferSystemFfmpeg) {
+        final ffprobePath = await FFmpegUtils.ffprobePath;
+        final result = await Process.run(ffprobePath, <String>[
+          '-v',
+          'error',
+          '-select_streams',
+          'a:0',
+          '-show_entries',
+          'stream=codec_name',
+          '-of',
+          'default=noprint_wrappers=1:nokey=1',
+          path,
+        ]).timeout(const Duration(seconds: 12));
+        if (result.exitCode != 0) return null;
+        final codec = result.stdout.toString().trim().toLowerCase();
+        return codec.isEmpty ? null : codec;
+      }
       final session = await FFprobeKit.getMediaInformation(
         path,
       ).timeout(const Duration(seconds: 12));
@@ -152,25 +171,50 @@ class AudioPlaybackCompatibilityService {
 
     final partial = File('${output.path}.partial.m4a');
     if (await partial.exists()) await partial.delete();
-    final session = await FFmpegKit.executeWithArguments(<String>[
-      '-y',
-      '-i',
-      source.path,
-      '-map',
-      '0:a:0',
-      '-vn',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '256k',
-      '-movflags',
-      '+faststart',
-      partial.path,
-    ]).timeout(const Duration(minutes: 5));
-    final returnCode = await session.getReturnCode();
-    if (!ReturnCode.isSuccess(returnCode) || !await partial.exists()) {
-      final logs = await session.getAllLogsAsString();
-      throw StateError('Unable to prepare compatible audio: $logs');
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
+      final ffmpegPath = await FFmpegUtils.ffmpegPath;
+      final result = await Process.run(ffmpegPath, <String>[
+        '-y',
+        '-i',
+        source.path,
+        '-map',
+        '0:a:0',
+        '-vn',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '256k',
+        '-movflags',
+        '+faststart',
+        partial.path,
+      ]).timeout(const Duration(minutes: 5));
+      if (result.exitCode != 0 || !await partial.exists()) {
+        throw StateError(
+          'Unable to prepare compatible audio: ${result.stderr}',
+        );
+      }
+    } else {
+      final session = await FFmpegKit.executeWithArguments(<String>[
+        '-y',
+        '-i',
+        source.path,
+        '-map',
+        '0:a:0',
+        '-vn',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '256k',
+        '-movflags',
+        '+faststart',
+        partial.path,
+      ]).timeout(const Duration(minutes: 5));
+      final returnCode = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(returnCode) || !await partial.exists()) {
+        final logs = await session.getAllLogsAsString();
+        throw StateError('Unable to prepare compatible audio: $logs');
+      }
     }
     await partial.rename(output.path);
     return output;

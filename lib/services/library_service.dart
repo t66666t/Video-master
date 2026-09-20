@@ -17,7 +17,6 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_installer.dart';
 import '../models/media_source_ref.dart';
 import '../models/video_collection.dart';
 import '../utils/media_library_search_query.dart';
@@ -34,6 +33,7 @@ import 'audio_playback_compatibility_service.dart';
 import 'settings_service.dart';
 import 'temporary_storage_cleanup_models.dart';
 import 'media_materialization_service.dart';
+import '../utils/ffmpeg_utils.dart';
 import '../utils/media_duration_probe.dart';
 import '../utils/media_chapter_probe.dart';
 import '../utils/serial_task_queue.dart';
@@ -4424,8 +4424,8 @@ class LibraryService extends ChangeNotifier {
       return await _extractAudioCoverArt(videoPath, videoId: videoId);
     }
 
-    // Windows Specific Implementation
-    if (Platform.isWindows) {
+    // Desktop Process ffmpeg (Windows + Linux; Kit unavailable on Linux)
+    if (FFmpegUtils.preferSystemFfmpeg) {
       return await _generateThumbnailWindows(videoPath, videoId: videoId);
     }
 
@@ -4493,6 +4493,14 @@ class LibraryService extends ChangeNotifier {
     List<String> arguments,
     Duration timeout,
   ) async {
+    // Linux: FFmpeg Kit .so missing — callers must use Process via preferSystemFfmpeg.
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      developer.log(
+        'Skipped FFmpegKit on desktop system-ffmpeg path',
+        name: 'library.ffmpeg',
+      );
+      return null;
+    }
     final completer = Completer<FFmpegSession>();
     FFmpegSession? runningSession;
     var timedOut = false;
@@ -4616,11 +4624,53 @@ class LibraryService extends ChangeNotifier {
         return outPath;
       }
 
+      // Prefer system ffmpeg on Windows/Linux (Kit disabled on Linux).
+      if (FFmpegUtils.preferSystemFfmpeg) {
+        if (!await FFmpegUtils.isAvailable) {
+          developer.log(FFmpegUtils.missingBinaryUserMessage);
+          return null;
+        }
+        final ffmpegPath = await FFmpegUtils.ffmpegPath;
+        try {
+          await _runCliProcessWithTimeout(ffmpegPath, [
+            '-y',
+            '-i',
+            audioPath,
+            '-map',
+            '0:v:0?',
+            '-frames:v',
+            '1',
+            '-c:v',
+            'mjpeg',
+            '-q:v',
+            '2',
+            outPath,
+          ], const Duration(seconds: 20));
+          if (await outFile.exists() && await outFile.length() > 0) {
+            developer.log('Audio cover art extracted: $outPath');
+            return outPath;
+          }
+        } catch (_) {}
+        try {
+          await _runCliProcessWithTimeout(ffmpegPath, [
+            '-y',
+            '-i',
+            audioPath,
+            '-map',
+            '0:v:0?',
+            '-frames:v',
+            '1',
+            outPath,
+          ], const Duration(seconds: 20));
+          if (await outFile.exists() && await outFile.length() > 0) {
+            developer.log('Audio cover art extracted (fallback): $outPath');
+            return outPath;
+          }
+        } catch (_) {}
+        return null;
+      }
+
       // FFmpegKit: extract embedded artwork (attached picture stream)
-      // -map 0:v selects video streams (includes attached pictures)
-      // -map -0:V excludes "real" video streams (leaving attached pictures only)
-      // -vframes 1: extract one frame
-      // -q:v 2: high quality JPEG
       final session = await _executeFfmpegWithTimeout(<String>[
         '-y',
         '-i',
@@ -4702,10 +4752,15 @@ class LibraryService extends ChangeNotifier {
     String? videoId,
   }) async {
     try {
-      final ffmpegPath =
-          await YtDlpBinaryInstaller.resolveInstalledBinaryPath('ffmpeg.exe') ??
-          p.join(p.dirname(Platform.resolvedExecutable), 'ffmpeg.exe');
-      if (!await File(ffmpegPath).exists()) {
+      if (!await FFmpegUtils.isAvailable) {
+        developer.log(FFmpegUtils.missingBinaryUserMessage);
+        return null;
+      }
+      final ffmpegPath = await FFmpegUtils.ffmpegPath;
+      if (Platform.isWindows &&
+          ffmpegPath != 'ffmpeg' &&
+          ffmpegPath != 'ffmpeg.exe' &&
+          !await File(ffmpegPath).exists()) {
         developer.log("FFmpeg not found at $ffmpegPath");
         return null;
       }

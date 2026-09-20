@@ -923,7 +923,7 @@ class TranscriptionManager extends ChangeNotifier {
     final isAudioInput = _looksLikeAudioInput(mediaPath);
     Object? lastError;
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final probeProcess = await Process.start(ffprobePath, [
           '-v',
@@ -1018,7 +1018,7 @@ class TranscriptionManager extends ChangeNotifier {
     } catch (e) {
       if (e is _JobCancelledException) rethrow;
       lastError = e;
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final fallbackInfo = await _probeMediaWithFfmpegCli(
           mediaPath,
           isAudioInput: isAudioInput,
@@ -1338,7 +1338,8 @@ class TranscriptionManager extends ChangeNotifier {
       "准备音频: codec=${probe.codec}, isAudio=${probe.isAudioInput}, useCopy=$useCopy, timeout=${timeout.inSeconds}s",
     );
 
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       await _runWindowsFfmpeg(
         args,
         timeout: timeout,
@@ -2387,7 +2388,8 @@ class TranscriptionManager extends ChangeNotifier {
 
     args.add(outputPath);
 
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       await _runEmbedFfmpegWindows(
         args,
         totalSeconds: totalSeconds,

@@ -5,6 +5,8 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'ffmpeg_utils.dart';
+
 class SubtitleConverter {
   /// 将字幕文件转换为指定格式
   /// 返回转换后的文件路径，如果转换失败或不需要转换则返回 null
@@ -36,6 +38,28 @@ class SubtitleConverter {
     }
 
     try {
+      if (FFmpegUtils.preferSystemFfmpeg) {
+        await FFmpegUtils.ensureAvailable();
+        final ffmpegPath = await FFmpegUtils.ffmpegPath;
+        final args = <String>['-y', '-i', inputPath];
+        if (targetExtension == ".sup") {
+          args.addAll(['-c:s', 'hdmv_pgs_subtitle']);
+        } else if (targetExtension == ".srt") {
+          args.addAll(['-c:s', 'text']);
+        }
+        args.add(outputPath);
+        final result = await Process.run(ffmpegPath, args)
+            .timeout(const Duration(seconds: 60));
+        if (result.exitCode == 0) {
+          return outputPath;
+        }
+        developer.log(
+          'Subtitle conversion failed (system ffmpeg)',
+          error: result.stderr,
+        );
+        return null;
+      }
+
       final session = await FFmpegKit.execute(command);
       final returnCode = await session.getReturnCode();
 

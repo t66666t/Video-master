@@ -244,7 +244,7 @@ class VideoPreviewService {
 
   Future<List<int>> _loadKeyframeIndex(String videoPath) async {
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobePath, [
           '-v', 'error',
@@ -318,7 +318,7 @@ class VideoPreviewService {
 
   Future<double?> _loadFrameIntervalMs(String videoPath) async {
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobePath, [
           '-v', 'error',
@@ -505,7 +505,7 @@ class VideoPreviewService {
         outputPath
       ];
 
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffmpegPath = await FFmpegUtils.ffmpegPath;
         final result = await Process.run(ffmpegPath, args).timeout(const Duration(seconds: 30));
         if (result.exitCode != 0) return null;

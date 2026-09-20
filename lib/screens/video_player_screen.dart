@@ -1,6 +1,8 @@
 import '../services/subtitle_debug_session.dart';
 import 'dart:async';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+import 'package:video_player_app/utils/ffmpeg_utils.dart';
+import 'package:video_player_app/utils/media_duration_probe.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/services.dart';
@@ -3362,18 +3364,121 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (durationMs == 0) {
       debugPrint("Duration unknown, probing...");
       try {
-        final session = await FFprobeKit.getMediaInformation(videoPath);
-        final info = session.getMediaInformation();
-        if (info != null) {
-          final durationStr = info.getDuration();
-          if (durationStr != null) {
-            final double d = double.tryParse(durationStr) ?? 0.0;
-            durationMs = (d * 1000).toInt();
+        if (FFmpegUtils.preferSystemFfmpeg) {
+          durationMs = await MediaDurationProbe.probeDurationMs(
+            videoPath,
+            allowVideoPlayerFallback: false,
+          );
+        } else {
+          final session = await FFprobeKit.getMediaInformation(videoPath);
+          final info = session.getMediaInformation();
+          if (info != null) {
+            final durationStr = info.getDuration();
+            if (durationStr != null) {
+              final double d = double.tryParse(durationStr) ?? 0.0;
+              durationMs = (d * 1000).toInt();
+            }
           }
         }
       } catch (e) {
         debugPrint("Probe failed: $e");
       }
+    }
+
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      try {
+        await FFmpegUtils.ensureAvailable();
+      } catch (e) {
+        if (mounted) {
+          setState(() => _isRepairing = false);
+          AppToast.show(e.toString(), type: AppToastType.error);
+        }
+        return;
+      }
+      final ffmpegPath = await FFmpegUtils.ffmpegPath;
+      try {
+        final process = await Process.start(ffmpegPath, [
+          '-y',
+          '-i',
+          videoPath,
+          '-c:v',
+          'libx264',
+          '-preset',
+          'ultrafast',
+          '-crf',
+          '23',
+          '-c:a',
+          'copy',
+          outputPath,
+        ]);
+        final stderrBuf = StringBuffer();
+        process.stderr.transform(const SystemEncoding().decoder).listen((line) {
+          stderrBuf.write(line);
+          final match = RegExp(
+            r'time=(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)',
+          ).firstMatch(line);
+          if (match != null && durationMs > 0 && mounted) {
+            final h = double.tryParse(match.group(1)!) ?? 0;
+            final m = double.tryParse(match.group(2)!) ?? 0;
+            final s = double.tryParse(match.group(3)!) ?? 0;
+            final timeMs = ((h * 3600 + m * 60 + s) * 1000).round();
+            setState(() {
+              _repairProgress = (timeMs / durationMs).clamp(0.0, 1.0);
+            });
+          }
+        });
+        final code = await process.exitCode;
+        if (code == 0) {
+          try {
+            final originalBackup = p.join(dir.path, "${filename}_backup$ext");
+            if (await File(originalBackup).exists()) {
+              await File(originalBackup).delete();
+            }
+            await file.rename(originalBackup);
+            await File(outputPath).rename(videoPath);
+            await File(originalBackup).delete();
+            if (mounted) {
+              AppToast.show("修复成功，正在重新加载...", type: AppToastType.success);
+              setState(() => _isRepairing = false);
+              _controller.dispose();
+              _initVideo();
+            }
+          } catch (e) {
+            debugPrint("File op failed: $e");
+            if (mounted) {
+              setState(() => _isRepairing = false);
+              AppToast.show("文件替换失败", type: AppToastType.error);
+            }
+          }
+        } else {
+          final logContent = stderrBuf.toString();
+          debugPrint("Repair failed: $logContent");
+          if (mounted) {
+            setState(() => _isRepairing = false);
+            showDialog(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text("修复失败"),
+                content: Text(
+                  "转码过程中出错。\n\n日志片段:\n${logContent.length > 500 ? logContent.substring(logContent.length - 500) : logContent}",
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text("关闭"),
+                  ),
+                ],
+              ),
+            );
+          }
+        }
+      } catch (e) {
+        if (mounted) {
+          setState(() => _isRepairing = false);
+          AppToast.show(e.toString(), type: AppToastType.error);
+        }
+      }
+      return;
     }
 
     await FFmpegKit.executeAsync(

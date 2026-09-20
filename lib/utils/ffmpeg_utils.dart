@@ -1,10 +1,33 @@
+import 'dart:developer' as developer;
 import 'dart:io';
+
 import 'package:path/path.dart' as p;
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_binary_installer.dart';
 
+/// Resolves ffmpeg/ffprobe binaries for desktop Process invocations.
+///
+/// **Linux / Phase L2:** `ffmpeg_kit_flutter_new` is not used on Linux — the
+/// desktop bundle typically lacks a working `libffmpegkit.so`, so Kit dlopen
+/// fails at startup. All FFmpeg work on Linux must go through [ffmpegPath] /
+/// [ffprobePath] (system PATH or bundled installers). Windows keeps its
+/// bundled/PATH resolution; Android/iOS keep FFmpegKit at call sites.
 class FFmpegUtils {
   static Future<String>? _ffmpegPathFuture;
   static Future<String>? _ffprobePathFuture;
+  static Future<bool>? _availableFuture;
+
+  /// User-visible message when system ffmpeg/ffprobe cannot be run.
+  static const String missingBinaryUserMessage =
+      '未找到可用的 ffmpeg/ffprobe。Linux 不使用 FFmpeg Kit，请安装系统包（如 ffmpeg）并确保在 PATH 中，然后重试。';
+
+  /// Prefer Process + system/bundled binaries over FFmpegKit.
+  /// True on Windows (existing) and Linux (Kit disabled — no reliable .so).
+  static bool get preferSystemFfmpeg =>
+      Platform.isWindows || Platform.isLinux;
+
+  /// Desktop compose / long-running Process path (Windows, macOS, Linux).
+  static bool get useDesktopProcessFfmpeg =>
+      Platform.isWindows || Platform.isMacOS || Platform.isLinux;
 
   static Future<String> get ffmpegPath async {
     if (!(Platform.isWindows || Platform.isMacOS)) {
@@ -24,6 +47,33 @@ class FFmpegUtils {
       fileName: Platform.isWindows ? 'ffprobe.exe' : 'ffprobe',
       pathFallback: 'ffprobe',
     );
+  }
+
+  /// Returns whether `ffmpeg -version` succeeds for the resolved binary.
+  static Future<bool> get isAvailable async {
+    return _availableFuture ??= () async {
+      final path = await ffmpegPath;
+      final ok = await _isBinaryOperational(path);
+      if (!ok) {
+        developer.log(
+          missingBinaryUserMessage,
+          name: 'ffmpeg.utils',
+        );
+      }
+      return ok;
+    }();
+  }
+
+  /// Throws [StateError] with [missingBinaryUserMessage] when unavailable.
+  static Future<void> ensureAvailable() async {
+    if (!await isAvailable) {
+      throw StateError(missingBinaryUserMessage);
+    }
+  }
+
+  /// Clears cached availability (e.g. after user installs ffmpeg).
+  static void resetAvailabilityCache() {
+    _availableFuture = null;
   }
 
   static Future<String> _resolveDesktopBinaryPath({

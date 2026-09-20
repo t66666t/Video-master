@@ -24,7 +24,7 @@ class VideoComposeExecutor {
     required VideoComposeProgressCallback onProgress,
   }) async {
     Future<void> run(String currentFilter) async {
-      if (Platform.isWindows || Platform.isMacOS) {
+      if (FFmpegUtils.useDesktopProcessFfmpeg) {
         await _executeDesktopCompose(
           request: request,
           filter: currentFilter,
@@ -150,6 +150,7 @@ class VideoComposeExecutor {
     required bool transcodeVideo,
     required VideoComposeProgressCallback onProgress,
   }) async {
+    await FFmpegUtils.ensureAvailable();
     final String ffmpegPath = await FFmpegUtils.ffmpegPath;
     final bool hasSoftSubtitles = softSubtitleInputs.isNotEmpty;
     final List<String> args = <String>['-y', '-i', request.videoPath];

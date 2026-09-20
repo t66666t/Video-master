@@ -3,13 +3,14 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('video compose probing never falls back to a desktop PATH link', () {
+  test('video compose probing uses Kit except on Linux system ffprobe', () {
     final source = File(
       'lib/services/video_compose/video_compose_probe_service.dart',
     ).readAsStringSync();
 
     expect(source, contains('FFprobeKit.getMediaInformation'));
-    expect(source, isNot(contains('FFmpegUtils.ffprobePath')));
+    expect(source, contains('Platform.isLinux'));
+    expect(source, contains('FFmpegUtils.ffprobePath'));
     expect(source, isNot(contains('runInShell: true')));
   });
 
@@ -20,7 +21,9 @@ void main() {
     final resolver = File('lib/utils/ffmpeg_utils.dart').readAsStringSync();
 
     expect(executor, contains('runInShell: false'));
+    expect(executor, contains('FFmpegUtils.useDesktopProcessFfmpeg'));
     expect(resolver, contains('Platform.isWindows || Platform.isMacOS'));
     expect(resolver, contains('_resolveDesktopBinaryPath'));
+    expect(resolver, contains('preferSystemFfmpeg'));
   });
 }

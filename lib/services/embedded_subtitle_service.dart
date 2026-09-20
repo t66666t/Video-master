@@ -116,7 +116,7 @@ class EmbeddedSubtitleService extends ChangeNotifier {
   Future<List<EmbeddedSubtitleTrack>> _probeEmbeddedSubtitles(
     String videoPath,
   ) async {
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
       return _getEmbeddedSubtitlesWindows(videoPath);
     }
 
@@ -302,7 +302,7 @@ class EmbeddedSubtitleService extends ChangeNotifier {
 
       // 如果未提供 codec，则尝试探测
       if (codec == "unknown") {
-        if (Platform.isWindows) {
+        if (FFmpegUtils.preferSystemFfmpeg) {
           codec =
               await _probeSubtitleCodecWindows(videoPath, streamIndex) ??
               "unknown";
@@ -366,7 +366,8 @@ class EmbeddedSubtitleService extends ChangeNotifier {
 
       // Use execute() synchronously to ensure completion before returning.
       // executeAsync caused race conditions if the user clicked multiple times or if UI updated too fast.
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
+        await FFmpegUtils.ensureAvailable();
         final ffmpegPath = await FFmpegUtils.ffmpegPath;
         final List<String> args = [];
         args.addAll(['-i', videoPath, '-map', '0:s:$streamIndex']);
