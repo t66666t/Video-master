@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:developer' as developer;
@@ -22,8 +22,12 @@ import '../models/video_collection.dart';
 import '../utils/media_library_search_query.dart';
 import '../utils/imported_media_title.dart';
 import '../models/video_item.dart';
+import '../models/library_activity.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/media_chapter.dart';
+import 'library_activity_projection.dart';
+import 'media_library_navigation.dart';
+import 'media_library_folder_walk.dart';
 import 'thumbnail_cache_service.dart';
 import 'audio_playback_compatibility_service.dart';
 import 'settings_service.dart';
@@ -49,6 +53,28 @@ enum StructuredImportSortDirection { ascending, descending }
 /// exception: existing callers keep their current behavior while the UI can
 /// truthfully tell the user that the latest changes are not durable yet.
 enum LibraryPersistenceStatus { healthy, retryScheduled }
+
+/// Outcome of rebinding one existing card to a newly chosen local file.
+enum RelocateLocalMediaStatus {
+  success,
+  mediaNotFound,
+  onlineSource,
+  missingFile,
+  unsupportedType,
+  typeMismatch,
+}
+
+class RelocateLocalMediaResult {
+  const RelocateLocalMediaResult({
+    required this.status,
+    this.positionClamped = false,
+  });
+
+  final RelocateLocalMediaStatus status;
+  final bool positionClamped;
+
+  bool get isSuccess => status == RelocateLocalMediaStatus.success;
+}
 
 class StructuredImportSortOptions {
   final StructuredImportSortField field;
@@ -109,6 +135,7 @@ class StructuredImportExecutionResult {
   final int importedMediaCount;
   final int restoredMediaCount;
   final List<String> importedVideoIds;
+  final String? activityBatchId;
 
   const StructuredImportExecutionResult({
     required this.rootCollectionId,
@@ -116,9 +143,26 @@ class StructuredImportExecutionResult {
     required this.importedMediaCount,
     required this.restoredMediaCount,
     this.importedVideoIds = const <String>[],
+    this.activityBatchId,
   });
 
   int get affectedMediaCount => importedMediaCount + restoredMediaCount;
+}
+
+class MediaImportExecutionResult {
+  const MediaImportExecutionResult({
+    this.createdVideoIds = const <String>[],
+    this.reusedVideoIds = const <String>[],
+    this.failedCount = 0,
+    this.activityBatchId,
+    this.ignoredBecauseBusy = false,
+  });
+
+  final List<String> createdVideoIds;
+  final List<String> reusedVideoIds;
+  final int failedCount;
+  final String? activityBatchId;
+  final bool ignoredBecauseBusy;
 }
 
 class _FileSystemEntrySnapshot {
@@ -141,6 +185,7 @@ class _StructuredImportAccumulator {
   int createdFolderCount = 0;
   int importedMediaCount = 0;
   int restoredMediaCount = 0;
+  String? activityBatchId;
 }
 
 class LibraryService extends ChangeNotifier {
@@ -364,6 +409,11 @@ class LibraryService extends ChangeNotifier {
   // Unified storage: ID -> Object
   Map<String, VideoCollection> _collections = {};
   Map<String, VideoItem> _videos = {};
+  LibraryActivityStore _activity = LibraryActivityStore.empty();
+  final Map<String, ImportBatchRecord> _openImportBatches = {};
+  bool _activityUnknownFuture = false;
+  Map<String, dynamic>? _preservedActivityRaw;
+  final ValueNotifier<int> activityRevision = ValueNotifier<int>(0);
   final Map<String, Future<String?>> _thumbnailRepairInFlight = {};
 
   // Root level structure (IDs of collections and videos at root)
@@ -425,6 +475,296 @@ class LibraryService extends ChangeNotifier {
 
   VideoItem? getVideo(String id) => _videos[id];
   VideoCollection? getCollection(String id) => _collections[id];
+
+  /// Local file cards can restore a missing path. Streams, URLs, and Bilibili
+  /// identities must not enter the file-picker recovery flow.
+  bool canRelocateLocalMediaSource(VideoItem item) {
+    if (item.isRecycled) return false;
+    if (_isBilibiliStreamItem(item)) return false;
+    final kind = item.sourceRef?.kind;
+    if (kind == MediaSourceKind.url ||
+        kind == MediaSourceKind.bilibiliStream ||
+        kind == MediaSourceKind.bilibiliBv ||
+        kind == MediaSourceKind.bilibiliId) {
+      return false;
+    }
+    final path = item.path.trim();
+    if (path.startsWith('http://') ||
+        path.startsWith('https://') ||
+        path.startsWith('bilibili://')) {
+      return false;
+    }
+    return true;
+  }
+
+  LibraryActivityProjection get activityProjection {
+    return LibraryActivityProjection(
+      store: _activity,
+      videoOf: getVideo,
+      collectionOf: getCollection,
+      allVideos: () => _videos.values,
+    );
+  }
+
+  MediaActivityRecord? mediaActivity(String id) => _activity.media[id];
+
+  List<ImportBatchRecord> get importBatches =>
+      List<ImportBatchRecord>.unmodifiable(_activity.batches);
+
+  List<String> get pinnedItemIds =>
+      List<String>.unmodifiable(_activity.pinnedIds);
+
+  bool get _canMutateActivity => !_activityUnknownFuture;
+
+  void _bumpActivity({required bool notifyLibrary}) {
+    activityRevision.value++;
+    if (notifyLibrary) {
+      notifyListeners();
+    }
+  }
+
+  Future<void> _persistActivity({required bool notifyLibrary}) async {
+    if (!_canMutateActivity) return;
+    await _saveLibrary();
+    _bumpActivity(notifyLibrary: notifyLibrary);
+  }
+
+  void _purgeActivityForDeletedMedia(String mediaId) {
+    _activity.media.remove(mediaId);
+    _activity.pinnedIds.remove(mediaId);
+    for (final batch in _activity.batches) {
+      batch.createdMediaIds.remove(mediaId);
+    }
+    _activity.batches.removeWhere((batch) => batch.createdMediaIds.isEmpty);
+    for (final batch in _openImportBatches.values) {
+      batch.createdMediaIds.remove(mediaId);
+    }
+  }
+
+  void _purgeActivityForDeletedCollection(String collectionId) {
+    _activity.pinnedIds.remove(collectionId);
+  }
+
+  Future<void> registerImportedMedia(
+    String mediaId, {
+    int? addedAtMs,
+    String? batchId,
+  }) async {
+    noteImportedMedia(mediaId, addedAtMs: addedAtMs, batchId: batchId);
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  void noteImportedMedia(String mediaId, {int? addedAtMs, String? batchId}) {
+    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    final record = _activity.ensureMedia(mediaId);
+    if (record.addedAtMs == null && addedAtMs != null) {
+      record.addedAtMs = addedAtMs;
+    }
+    if (batchId == null) return;
+    final batch = _openImportBatches[batchId];
+    if (batch == null) return;
+    if (!batch.createdMediaIds.contains(mediaId)) {
+      batch.createdMediaIds.add(mediaId);
+    }
+  }
+
+  String? beginImportBatch({
+    required String title,
+    required LibraryImportSourceKind sourceKind,
+    String? targetCollectionId,
+    int? startedAtMs,
+  }) {
+    if (!_canMutateActivity) return null;
+    final trimmed = title.trim();
+    if (trimmed.isEmpty) return null;
+    final id = const Uuid().v4();
+    _openImportBatches[id] = ImportBatchRecord(
+      id: id,
+      startedAtMs: startedAtMs ?? DateTime.now().millisecondsSinceEpoch,
+      title: trimmed,
+      sourceKind: sourceKind,
+      targetCollectionId: targetCollectionId,
+    );
+    return id;
+  }
+
+  Future<bool> completeImportBatch(
+    String batchId, {
+    bool persist = true,
+  }) async {
+    if (!_canMutateActivity) return false;
+    if (_activity.batches.any((batch) => batch.id == batchId)) {
+      return true;
+    }
+    final open = _openImportBatches.remove(batchId);
+    if (open == null) return false;
+    open.createdMediaIds.removeWhere((id) => !_videos.containsKey(id));
+    if (open.createdMediaIds.isEmpty) return false;
+    _activity.batches.insert(0, open);
+    if (persist) {
+      await _persistActivity(notifyLibrary: true);
+    }
+    return true;
+  }
+
+  void abortImportBatch(String batchId) {
+    _openImportBatches.remove(batchId);
+  }
+
+  Future<void> pinLibraryItem(String id) async {
+    if (!_canMutateActivity) return;
+    if (!_videos.containsKey(id) && !_collections.containsKey(id)) return;
+    _activity.pinnedIds.remove(id);
+    _activity.pinnedIds.insert(0, id);
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  Future<void> unpinLibraryItem(String id) async {
+    if (!_canMutateActivity) return;
+    if (!_activity.pinnedIds.remove(id)) return;
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  /// Pin-strip drop only. Indices are [visiblePinnedIds], never folder children.
+  Future<void> reorderVisiblePinnedLibraryItems(
+    int fromVisibleIndex,
+    int toVisibleIndex,
+  ) async {
+    if (!_canMutateActivity) return;
+    final visible = activityProjection.visiblePinnedIds();
+    final next = LibraryActivityStore.reorderVisiblePinnedIds(
+      pinnedIds: _activity.pinnedIds,
+      visibleIds: visible.toSet(),
+      fromVisibleIndex: fromVisibleIndex,
+      toVisibleIndex: toVisibleIndex,
+    );
+    if (listEquals(next, _activity.pinnedIds)) return;
+    _activity.pinnedIds
+      ..clear()
+      ..addAll(next);
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  Future<void> hideLibraryMedia(String mediaId) async {
+    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    _activity.ensureMedia(mediaId).hidden = true;
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  Future<void> unhideLibraryMedia(String mediaId) async {
+    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    final record = _activity.media[mediaId];
+    if (record == null || !record.hidden) return;
+    record.hidden = false;
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  void recordValidPlaybackProgress(
+    String mediaId, {
+    required int deltaWatchMs,
+    int? lastPlayedAtMs,
+  }) {
+    if (!_canMutateActivity || deltaWatchMs <= 0) return;
+    if (!_videos.containsKey(mediaId)) return;
+    final record = _activity.ensureMedia(mediaId);
+    record.accumulatedWatchMs += deltaWatchMs;
+    if (lastPlayedAtMs != null) {
+      record.lastPlayedAtMs = lastPlayedAtMs;
+    }
+    _scheduleDebouncedSave();
+  }
+
+  Future<void> recordPlaybackCompleted(
+    String mediaId, {
+    int? completedAtMs,
+  }) async {
+    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    final record = _activity.ensureMedia(mediaId);
+    record.completed = true;
+    if (completedAtMs != null) {
+      record.lastPlayedAtMs = completedAtMs;
+    }
+    await _persistActivity(notifyLibrary: true);
+  }
+
+  /// Applies a watch-meter flush. Progress stays on the existing debounce;
+  /// enrollment / hide / complete stay immediate.
+  Future<void> applyWatchFlush({
+    required String mediaId,
+    required int deltaWatchMs,
+    int? lastPlayedAtMs,
+    bool enrolled = false,
+    bool uncomplete = false,
+    bool unhide = false,
+    bool completed = false,
+    int? completedAtMs,
+  }) async {
+    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    // First history stamp and first continue-enrollment persist immediately.
+    // Later lastPlayedAt ticks stay on the progress debounce.
+    final existing = _activity.media[mediaId];
+    final hadLastPlayedAt = existing?.lastPlayedAtMs != null;
+    final hadContinueEnrolled = existing?.continueEnrolled == true;
+    if (deltaWatchMs > 0) {
+      recordValidPlaybackProgress(
+        mediaId,
+        deltaWatchMs: deltaWatchMs,
+        lastPlayedAtMs: lastPlayedAtMs,
+      );
+    } else if (lastPlayedAtMs != null) {
+      final record = _activity.ensureMedia(mediaId);
+      record.lastPlayedAtMs = lastPlayedAtMs;
+      _scheduleDebouncedSave();
+    }
+    var boundary = false;
+    final record = _activity.ensureMedia(mediaId);
+    if (lastPlayedAtMs != null && !hadLastPlayedAt) {
+      boundary = true;
+    }
+    if (enrolled && !hadContinueEnrolled) {
+      record.continueEnrolled = true;
+      boundary = true;
+    }
+    if (uncomplete && record.completed) {
+      record.completed = false;
+      boundary = true;
+    }
+    if (unhide && record.hidden) {
+      record.hidden = false;
+      boundary = true;
+    }
+    if (completed) {
+      record.completed = true;
+      if (completedAtMs != null) {
+        record.lastPlayedAtMs = completedAtMs;
+      }
+      boundary = true;
+    }
+    if (boundary) {
+      await _persistActivity(notifyLibrary: true);
+    }
+  }
+
+  /// Drops watch clocks only. Import times, pins and hidden flags stay.
+  Future<void> clearPlaybackHistory() async {
+    if (!_canMutateActivity) return;
+    var changed = false;
+    for (final record in _activity.media.values) {
+      if (record.lastPlayedAtMs == null &&
+          record.accumulatedWatchMs == 0 &&
+          !record.continueEnrolled &&
+          !record.completed) {
+        continue;
+      }
+      record.lastPlayedAtMs = null;
+      record.accumulatedWatchMs = 0;
+      record.continueEnrolled = false;
+      record.completed = false;
+      changed = true;
+    }
+    if (!changed) return;
+    await _persistActivity(notifyLibrary: true);
+  }
 
   /// 获取指定文件夹中的所有视频（不包括回收站中的），并按照正确的顺序排列
   List<VideoItem> getVideosInFolder(String? folderId) {
@@ -670,11 +1010,36 @@ class LibraryService extends ChangeNotifier {
   bool _importOperationActive = false;
   bool get hasActiveImport => _importOperationActive;
 
+  @visibleForTesting
+  set importOperationActiveForTesting(bool value) {
+    _importOperationActive = value;
+  }
+
   /// Overlay-only progress (e.g. clipboard Bilibili cards) that must not
   /// toggle [isImporting], which would grow the collection title.
   bool _transientImportProgressActive = false;
 
   bool _initialized = false;
+
+  bool get isInitialized => _initialized;
+
+  /// Durable evidence of an existing library. Recycled items still count so
+  /// first-open warmup or a late JSON read is never treated as a new install.
+  bool get hasExistingLibraryContent =>
+      _videos.isNotEmpty || _collections.isNotEmpty;
+
+  /// Nearest living (not recycled) ancestor, or null for the root grid.
+  String? resolveLivingFolderId(String? folderId) {
+    return MediaLibraryNavigation.resolveLivingFolderId(
+      requestedId: folderId,
+      isActiveFolder: (id) {
+        final collection = _collections[id];
+        return collection != null && !collection.isRecycled;
+      },
+      parentIdOf: (id) => _collections[id]?.parentId,
+    );
+  }
+
   late Directory _dataRootDir;
   bool _isDurationBackfillRunning = false;
   bool _hasScheduledDurationBackfill = false;
@@ -707,6 +1072,12 @@ class LibraryService extends ChangeNotifier {
   Future<void> Function()? writeLibrarySnapshotOverrideForTesting;
   @visibleForTesting
   List<Duration>? saveRetryDelaysForTesting;
+  @visibleForTesting
+  int Function(String path)? probeMediaDurationOverrideForTesting;
+  @visibleForTesting
+  bool skipImportSidecarWorkForTesting = false;
+  @visibleForTesting
+  int? structuredImportFailAfterCountForTesting;
 
   LibraryPersistenceStatus get persistenceStatus => _persistenceStatus;
   bool get hasPersistenceFailure =>
@@ -864,6 +1235,7 @@ class LibraryService extends ChangeNotifier {
   }
 
   void _scheduleDurationBackfill() {
+    if (skipImportSidecarWorkForTesting) return;
     if (_hasScheduledDurationBackfill) return;
     _hasScheduledDurationBackfill = true;
     Future<void>(() async {
@@ -1255,6 +1627,14 @@ class LibraryService extends ChangeNotifier {
       });
     }
 
+    final activityResult = LibraryActivityStore.parse(
+      data[LibraryActivityStore.snapshotKey],
+    );
+    _activityUnknownFuture = activityResult.unsupportedFutureVersion;
+    _preservedActivityRaw = activityResult.preservedRaw;
+    _activity = activityResult.store;
+    _openImportBatches.clear();
+
     // Default Folder Creation: If library is completely empty
     if (_collections.isEmpty && _videos.isEmpty) {
       await createCollection("默认收藏夹", null);
@@ -1389,6 +1769,46 @@ class LibraryService extends ChangeNotifier {
     _persistenceFailureEpisode = 0;
     writeLibrarySnapshotOverrideForTesting = null;
     saveRetryDelaysForTesting = null;
+    probeMediaDurationOverrideForTesting = null;
+    skipImportSidecarWorkForTesting = false;
+    structuredImportFailAfterCountForTesting = null;
+  }
+
+  @visibleForTesting
+  void resetLibraryForTesting() {
+    resetPersistenceForTesting();
+    _initialized = false;
+    _needsPostLoadSave = false;
+    _collections = {};
+    _videos = {};
+    _rootChildrenIds = [];
+    _activity = LibraryActivityStore.empty();
+    _openImportBatches.clear();
+    _activityUnknownFuture = false;
+    _preservedActivityRaw = null;
+    activityRevision.value = 0;
+  }
+
+  @visibleForTesting
+  void seedVideoForTesting(VideoItem item) {
+    _videos[item.id] = item;
+  }
+
+  @visibleForTesting
+  void seedCollectionForTesting(VideoCollection collection) {
+    _collections[collection.id] = collection;
+  }
+
+  @visibleForTesting
+  void seedMediaActivityForTesting(MediaActivityRecord record) {
+    _activity.media[record.mediaId] = record;
+  }
+
+  @visibleForTesting
+  void seedPinnedIdsForTesting(List<String> ids) {
+    _activity.pinnedIds
+      ..clear()
+      ..addAll(ids);
   }
 
   Future<void> _writeLibrarySnapshot() async {
@@ -1420,6 +1840,7 @@ class LibraryService extends ChangeNotifier {
       'videos': _videos.values.map((e) => e.toJson()).toList(),
       'rootChildrenIds': _rootChildrenIds,
       'schemaVersion': _currentLibrarySchemaVersion,
+      LibraryActivityStore.snapshotKey: _activitySnapshotForWrite(),
     };
 
     // 1. Write to temp file.
@@ -1441,6 +1862,13 @@ class LibraryService extends ChangeNotifier {
       await tempFile.copy(file.path);
       await tempFile.delete();
     }
+  }
+
+  Object _activitySnapshotForWrite() {
+    if (_activityUnknownFuture && _preservedActivityRaw != null) {
+      return _preservedActivityRaw!;
+    }
+    return _activity.toJson();
   }
 
   void _recordPersistenceFailure(Object error) {
@@ -1505,6 +1933,23 @@ class LibraryService extends ChangeNotifier {
     }
 
     return results;
+  }
+
+  /// Read-only DFS of descendant media. Does not change childrenIds.
+  List<VideoItem> mediaInFolderTree(String folderId) {
+    return MediaLibraryFolderWalk.collectMedia(
+      rootId: folderId,
+      folderOf: getCollection,
+      videoOf: getVideo,
+    );
+  }
+
+  String relativeFolderPath(String rootFolderId, String? mediaParentId) {
+    return MediaLibraryFolderWalk.relativePath(
+      rootId: rootFolderId,
+      parentId: mediaParentId,
+      folderOf: getCollection,
+    );
   }
 
   /// Returns a virtual, read-only view of every active folder and media item
@@ -1715,6 +2160,7 @@ class LibraryService extends ChangeNotifier {
         importLabel: '文件夹',
         copyImportedFilesToLibrary: copyImportedFilesToLibrary,
         totalMediaEntriesHint: null,
+        activitySourceKind: LibraryImportSourceKind.folder,
       );
     });
   }
@@ -1746,6 +2192,7 @@ class LibraryService extends ChangeNotifier {
           moveImportedFilesToLibrary: true,
           totalMediaEntriesHint: mediaEntriesHint > 0 ? mediaEntriesHint : null,
           deferPostProcessing: true,
+          activitySourceKind: LibraryImportSourceKind.fluentPack,
         );
       } finally {
         isImporting.value = false;
@@ -1776,6 +2223,8 @@ class LibraryService extends ChangeNotifier {
       final candidates = byStem[item.title.trim().toLowerCase()];
       if (candidates == null || candidates.isEmpty) continue;
       final record = candidates.removeAt(0);
+      // Source-device activity (addedAt/pins/hidden/lastPlayed) must not land
+      // here; only identity-independent playback fields are restored.
       item.title = record['title']?.toString() ?? item.title;
       item.lastPositionMs = (record['lastPositionMs'] as num?)?.toInt() ?? 0;
       item.showFloatingSubtitles =
@@ -1885,6 +2334,7 @@ class LibraryService extends ChangeNotifier {
         moveImportedFilesToLibrary: true,
         totalMediaEntriesHint: extractedMediaEntries,
         deferPostProcessing: true,
+        activitySourceKind: LibraryImportSourceKind.archive,
       );
     } catch (_) {
       await _deleteDirectoryIfExists(importRootDir);
@@ -1916,8 +2366,11 @@ class LibraryService extends ChangeNotifier {
     bool copyImportedFilesToLibrary = false,
     required int? totalMediaEntriesHint,
     bool deferPostProcessing = false,
+    LibraryImportSourceKind? activitySourceKind,
   }) async {
-    await Future.delayed(const Duration(milliseconds: 120));
+    if (!skipImportSidecarWorkForTesting) {
+      await Future.delayed(const Duration(milliseconds: 120));
+    }
     if (parentId != null && !_collections.containsKey(parentId)) {
       throw StateError('目标文件夹不存在');
     }
@@ -1925,6 +2378,13 @@ class LibraryService extends ChangeNotifier {
     final accumulator = _StructuredImportAccumulator();
     DateTime lastNotifyTime = DateTime.now();
     late VideoCollection rootCollection;
+    if (activitySourceKind != null) {
+      accumulator.activityBatchId = beginImportBatch(
+        title: rootCollectionName,
+        sourceKind: activitySourceKind,
+        targetCollectionId: parentId,
+      );
+    }
 
     try {
       _invalidateSizeCaches();
@@ -1952,6 +2412,17 @@ class LibraryService extends ChangeNotifier {
         importLabel: importLabel,
         probeDurationDuringImport: !deferPostProcessing,
       );
+
+      final activityBatchId = accumulator.activityBatchId;
+      if (activityBatchId != null) {
+        final published = await completeImportBatch(
+          activityBatchId,
+          persist: false,
+        );
+        if (!published) {
+          abortImportBatch(activityBatchId);
+        }
+      }
 
       await _saveLibrary();
       notifyListeners();
@@ -1985,8 +2456,13 @@ class LibraryService extends ChangeNotifier {
         importedMediaCount: accumulator.importedMediaCount,
         restoredMediaCount: accumulator.restoredMediaCount,
         importedVideoIds: List<String>.unmodifiable(accumulator.newVideoIds),
+        activityBatchId: accumulator.activityBatchId,
       );
     } catch (e) {
+      final activityBatchId = accumulator.activityBatchId;
+      if (activityBatchId != null) {
+        abortImportBatch(activityBatchId);
+      }
       await _cleanupStructuredImportArtifacts(accumulator.newVideoIds);
       _rollbackStructuredImportState(accumulator);
       await _saveLibrary();
@@ -2257,11 +2733,13 @@ class LibraryService extends ChangeNotifier {
     );
     try {
       await _adoptStructuredImportSubtitles(item, discoveredSubtitles);
-      if (probeDuration) {
+      if (probeDuration && !skipImportSidecarWorkForTesting) {
         item.chapters = await MediaChapterProbe.probe(
           effectivePath,
           durationMs: durationMs,
         );
+        item.hasProbedChapters = true;
+      } else if (skipImportSidecarWorkForTesting) {
         item.hasProbedChapters = true;
       }
       await _prepareCompatiblePlaybackFile(item, saveLibrary: false);
@@ -2283,6 +2761,18 @@ class LibraryService extends ChangeNotifier {
     }
     accumulator.newVideoIds.add(id);
     accumulator.importedMediaCount++;
+    final batchId = accumulator.activityBatchId;
+    if (batchId != null) {
+      noteImportedMedia(
+        id,
+        addedAtMs: DateTime.now().millisecondsSinceEpoch,
+        batchId: batchId,
+      );
+    }
+    final failAfter = structuredImportFailAfterCountForTesting;
+    if (failAfter != null && accumulator.importedMediaCount >= failAfter) {
+      throw StateError('test structured import fault');
+    }
   }
 
   Future<void> _adoptStructuredImportSubtitles(
@@ -2362,6 +2852,7 @@ class LibraryService extends ChangeNotifier {
       } else {
         _rootChildrenIds.remove(videoId);
       }
+      _purgeActivityForDeletedMedia(videoId);
     }
     for (final collectionId in accumulator.newCollectionIds.reversed) {
       final collection = _collections.remove(collectionId);
@@ -2379,6 +2870,9 @@ class LibraryService extends ChangeNotifier {
     required String statusPrefix,
     bool reportProgress = true,
   }) async {
+    if (skipImportSidecarWorkForTesting) {
+      return;
+    }
     if (newIds.isEmpty) {
       if (reportProgress) {
         await _setImportProgress(progress: 1.0, status: '$statusPrefix导入完成');
@@ -2977,7 +3471,7 @@ class LibraryService extends ChangeNotifier {
   // useOriginalPath: 是否直接使用原始文件路径而不复制到应用内部存储
   // originalTitles: 可选参数，原始文件名列表，用于设置视频标题
   // reuseExistingItem: 是否复用已存在的媒体卡片；默认 false，导入同源文件时也创建新卡片
-  Future<void> importVideosBackground(
+  Future<MediaImportExecutionResult> importVideosBackground(
     List<String> filePaths,
     String? parentId, {
     bool shouldCopy = false,
@@ -2985,39 +3479,46 @@ class LibraryService extends ChangeNotifier {
     bool useOriginalPath = false,
     bool reuseExistingItem = false,
     List<String>? originalTitles,
+    LibraryImportSourceKind sourceKind = LibraryImportSourceKind.localFile,
   }) async {
-    int total = filePaths.length;
-    if (total == 0) return;
+    final total = filePaths.length;
+    if (total == 0) {
+      return const MediaImportExecutionResult();
+    }
     final copyImportedMediaToPrivateStorage =
         SettingsService().copyImportedMediaToPrivateStorage;
 
-    // Validate parent
     if (parentId != null && !_collections.containsKey(parentId)) {
-      return; // Parent not found
+      return const MediaImportExecutionResult();
     }
     if (_importOperationActive) {
       debugPrint(
         'Ignored overlapping media import while another import is active',
       );
-      return;
+      return const MediaImportExecutionResult(ignoredBecauseBusy: true);
     }
     _importOperationActive = true;
     _transientImportProgressActive = false;
+    if (!skipImportSidecarWorkForTesting) {
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
 
-    // Give UI a chance to render the "Started importing" snackbar.
-    await Future.delayed(const Duration(milliseconds: 200));
-
+    String? activityBatchId;
+    final reusedIds = <String>[];
+    var failedCount = 0;
     try {
       isImporting.value = true;
       importProgress.value = 0.0;
       importStatus.value = reuseExistingItem ? "正在检查现有媒体..." : "正在准备导入文件...";
-
-      List<String> newIds = [];
+      final newIds = <String>[];
       DateTime lastNotifyTime = DateTime.now();
-
+      activityBatchId = beginImportBatch(
+        title: total == 1 ? p.basename(filePaths.first) : '导入 $total 个文件',
+        sourceKind: sourceKind,
+        targetCollectionId: parentId,
+      );
       importStatus.value = "正在添加文件...";
 
-      // Prepare for cache rescue
       Directory? tempDir;
       List<Directory>? extCacheDirs;
       try {
@@ -3032,7 +3533,6 @@ class LibraryService extends ChangeNotifier {
       for (int i = 0; i < filePaths.length; i++) {
         var path = filePaths[i];
         final id = const Uuid().v4();
-        // 使用原始标题（如果提供了），否则使用路径的文件名
         final originalTitle = resolveImportedMediaTitle(
           sourcePath: path,
           originalTitle: originalTitles != null && i < originalTitles.length
@@ -3049,12 +3549,11 @@ class LibraryService extends ChangeNotifier {
           );
           if (existingId != null) {
             await _restoreExistingVideoToTarget(existingId, parentId);
+            reusedIds.add(existingId);
             continue;
           }
         }
 
-        // 0. Cache Rescue (Copy cached files to persistent storage)
-        // 如果 useOriginalPath 为 true，则跳过缓存救援和文件复制，直接使用原始路径
         if (!useOriginalPath || copyImportedMediaToPrivateStorage) {
           bool isCached = false;
           if (allowCacheRescue) {
@@ -3078,9 +3577,6 @@ class LibraryService extends ChangeNotifier {
                 path,
                 fileNamePrefix: id,
               );
-              debugPrint(
-                "Copied video to: $path (Cached: $isCached, Forced: ${shouldCopy || copyImportedMediaToPrivateStorage})",
-              );
             } catch (e) {
               developer.log(
                 '复制导入媒体到应用私有目录失败',
@@ -3088,11 +3584,10 @@ class LibraryService extends ChangeNotifier {
                 name: 'library.import',
               );
               importStatus.value = '复制媒体失败，已跳过：$originalTitle';
+              failedCount++;
               continue;
             }
           }
-        } else {
-          debugPrint("Using original path (no copy): $path");
         }
 
         final durationMs = await _probeMediaDurationMs(path);
@@ -3107,24 +3602,28 @@ class LibraryService extends ChangeNotifier {
           type: _detectMediaType(path),
           sourceFingerprint: sourceFingerprint,
         );
-        item.chapters = await MediaChapterProbe.probe(
-          path,
-          durationMs: durationMs,
-        );
+        if (!skipImportSidecarWorkForTesting) {
+          item.chapters = await MediaChapterProbe.probe(
+            path,
+            durationMs: durationMs,
+          );
+          await _prepareCompatiblePlaybackFile(item, saveLibrary: false);
+        }
         item.hasProbedChapters = true;
-        await _prepareCompatiblePlaybackFile(item, saveLibrary: false);
-
         _videos[id] = item;
-
         if (parentId != null) {
           _collections[parentId]!.childrenIds.add(id);
         } else {
           _rootChildrenIds.add(id);
         }
-
         newIds.add(id);
-
-        // Debounce notify
+        if (activityBatchId != null) {
+          noteImportedMedia(
+            id,
+            addedAtMs: DateTime.now().millisecondsSinceEpoch,
+            batchId: activityBatchId,
+          );
+        }
         if (DateTime.now().difference(lastNotifyTime).inMilliseconds > 300) {
           notifyListeners();
           lastNotifyTime = DateTime.now();
@@ -3132,65 +3631,81 @@ class LibraryService extends ChangeNotifier {
       }
 
       if (newIds.isEmpty) {
+        if (activityBatchId != null) {
+          abortImportBatch(activityBatchId);
+          activityBatchId = null;
+        }
         importStatus.value = "没有新文件需要导入";
-        await Future.delayed(const Duration(seconds: 1));
-        return;
+        if (!skipImportSidecarWorkForTesting) {
+          await Future.delayed(const Duration(seconds: 1));
+        }
+        return MediaImportExecutionResult(
+          reusedVideoIds: List<String>.unmodifiable(reusedIds),
+          failedCount: failedCount,
+        );
       }
 
-      await _saveLibrary();
-      notifyListeners();
-
-      // Phase 2: Parallel Thumbnail Generation
-      importStatus.value = "正在生成缩略图...";
-      int current = 0;
-      total = newIds.length; // Update total to actual new items
-
-      // Process in batches to control concurrency
-      const int batchSize = 4;
-      for (int i = 0; i < newIds.length; i += batchSize) {
-        if (!isImporting.value) break;
-
-        final end = (i + batchSize < newIds.length)
-            ? i + batchSize
-            : newIds.length;
-        final batch = newIds.sublist(i, end);
-
-        await Future.wait(
-          batch.map((id) async {
-            if (!isImporting.value) return;
-            try {
-              final item = _videos[id];
-              if (item == null) return;
-
-              final thumbPath = await _generateThumbnail(
-                item.path,
-                videoId: item.id,
-              );
-              item.thumbnailPath = thumbPath;
-            } catch (e) {
-              debugPrint("Error processing metadata for $id: $e");
-            }
-          }),
+      if (activityBatchId != null) {
+        final published = await completeImportBatch(
+          activityBatchId,
+          persist: false,
         );
-
-        current += batch.length;
-        final progress = current / total;
-        importProgress.value = progress;
-        importStatus.value = "处理中: ${(progress * 100).toInt()}%";
-
-        if (DateTime.now().difference(lastNotifyTime).inMilliseconds > 300) {
-          notifyListeners();
-          lastNotifyTime = DateTime.now();
+        if (!published) {
+          abortImportBatch(activityBatchId);
+          activityBatchId = null;
         }
       }
-
       await _saveLibrary();
       notifyListeners();
+
+      if (!skipImportSidecarWorkForTesting) {
+        importStatus.value = "正在生成缩略图...";
+        var current = 0;
+        const int batchSize = 4;
+        for (int i = 0; i < newIds.length; i += batchSize) {
+          if (!isImporting.value) break;
+          final end = (i + batchSize < newIds.length)
+              ? i + batchSize
+              : newIds.length;
+          final batch = newIds.sublist(i, end);
+          await Future.wait(
+            batch.map((id) async {
+              if (!isImporting.value) return;
+              try {
+                final item = _videos[id];
+                if (item == null) return;
+                item.thumbnailPath = await _generateThumbnail(
+                  item.path,
+                  videoId: item.id,
+                );
+              } catch (e) {
+                debugPrint("Error processing metadata for $id: $e");
+              }
+            }),
+          );
+          current += batch.length;
+          final progress = current / newIds.length;
+          importProgress.value = progress;
+          importStatus.value = "处理中: ${(progress * 100).toInt()}%";
+        }
+        await _saveLibrary();
+        notifyListeners();
+      }
+
+      return MediaImportExecutionResult(
+        createdVideoIds: List<String>.unmodifiable(newIds),
+        reusedVideoIds: List<String>.unmodifiable(reusedIds),
+        failedCount: failedCount,
+        activityBatchId: activityBatchId,
+      );
     } catch (e) {
       debugPrint("Import error: $e");
       importStatus.value = "导入出错: $e";
+      if (activityBatchId != null) {
+        abortImportBatch(activityBatchId);
+      }
+      return MediaImportExecutionResult(failedCount: failedCount + 1);
     } finally {
-      // Reset
       isImporting.value = false;
       importProgress.value = 0.0;
       importStatus.value = "";
@@ -3597,6 +4112,7 @@ class LibraryService extends ChangeNotifier {
     }
 
     _collections.remove(id);
+    _purgeActivityForDeletedCollection(id);
   }
 
   void _deleteVideo(String id) {
@@ -3609,6 +4125,7 @@ class LibraryService extends ChangeNotifier {
       _rootChildrenIds.remove(id);
     }
     _videos.remove(id);
+    _purgeActivityForDeletedMedia(id);
   }
 
   // Move item to another collection (or root if targetCollectionId is null)
@@ -4258,6 +4775,13 @@ class LibraryService extends ChangeNotifier {
   }
 
   Future<int> _probeMediaDurationMs(String mediaPath) async {
+    final override = probeMediaDurationOverrideForTesting;
+    if (override != null) {
+      return override(mediaPath);
+    }
+    if (skipImportSidecarWorkForTesting) {
+      return 0;
+    }
     // Bulk imports avoid constructing a VideoPlayerController per file. The
     // native probe has its own cancellation and this outer timeout is a final
     // guard against plugin/channel failures.
@@ -5152,6 +5676,8 @@ class LibraryService extends ChangeNotifier {
     VideoItem item, {
     bool useOriginalPath = false,
     bool reuseExistingItem = false,
+    String? activityBatchId,
+    LibraryImportSourceKind sourceKind = LibraryImportSourceKind.localFile,
   }) async {
     final copyImportedMediaToPrivateStorage =
         SettingsService().copyImportedMediaToPrivateStorage;
@@ -5269,6 +5795,28 @@ class LibraryService extends ChangeNotifier {
       _rootChildrenIds.add(item.id);
     }
 
+    if (activityBatchId != null) {
+      noteImportedMedia(
+        item.id,
+        addedAtMs: DateTime.now().millisecondsSinceEpoch,
+        batchId: activityBatchId,
+      );
+    } else {
+      final ownedBatchId = beginImportBatch(
+        title: item.title,
+        sourceKind: sourceKind,
+        targetCollectionId: item.parentId,
+      );
+      if (ownedBatchId != null) {
+        noteImportedMedia(
+          item.id,
+          addedAtMs: DateTime.now().millisecondsSinceEpoch,
+          batchId: ownedBatchId,
+        );
+        await completeImportBatch(ownedBatchId, persist: false);
+      }
+    }
+
     await _saveLibrary();
     notifyListeners();
 
@@ -5288,11 +5836,12 @@ class LibraryService extends ChangeNotifier {
     // #endregion
 
     // Generate thumbnail asynchronously (video thumbnail + audio cover art)
-    if ((!isBilibiliStream &&
-            item.type == MediaType.video &&
-            (item.thumbnailPath == null ||
-                _requiresWindowsThumbnailRepair(item.thumbnailPath))) ||
-        (item.type == MediaType.audio && item.thumbnailPath == null)) {
+    if (!skipImportSidecarWorkForTesting &&
+        ((!isBilibiliStream &&
+                item.type == MediaType.video &&
+                (item.thumbnailPath == null ||
+                    _requiresWindowsThumbnailRepair(item.thumbnailPath))) ||
+            (item.type == MediaType.audio && item.thumbnailPath == null))) {
       _generateThumbnail(item.path, videoId: item.id).then((thumb) {
         // #region debug-point C:add-single-video-thumb-finished
         unawaited(
@@ -5325,6 +5874,184 @@ class LibraryService extends ChangeNotifier {
     }
 
     return item.id;
+  }
+
+  /// Rebinds [mediaId] to [pickedPath] without creating a new card or import
+  /// batch. Activity clocks stay untouched; derived playback caches are dropped.
+  Future<RelocateLocalMediaResult> relocateLocalMediaSource({
+    required String mediaId,
+    required String pickedPath,
+  }) async {
+    final item = _videos[mediaId];
+    if (item == null) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.mediaNotFound,
+      );
+    }
+    if (!canRelocateLocalMediaSource(item)) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.onlineSource,
+      );
+    }
+
+    final normalizedPicked = p.normalize(pickedPath);
+    if (!isSupportedMediaPath(normalizedPicked)) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.unsupportedType,
+      );
+    }
+    if (_detectMediaType(normalizedPicked) != item.type) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.typeMismatch,
+      );
+    }
+    if (!await File(normalizedPicked).exists()) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.missingFile,
+      );
+    }
+
+    // Persist first so a failed copy leaves the existing association intact.
+    final String storedPath;
+    try {
+      storedPath = await _persistRelocatedMediaPath(
+        mediaId: item.id,
+        pickedPath: normalizedPicked,
+      );
+    } catch (error, stackTrace) {
+      developer.log(
+        'Relocate persist failed',
+        error: error,
+        stackTrace: stackTrace,
+        name: 'library.relocate',
+      );
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.missingFile,
+      );
+    }
+    if (!await File(storedPath).exists()) {
+      return const RelocateLocalMediaResult(
+        status: RelocateLocalMediaStatus.missingFile,
+      );
+    }
+
+    await _invalidateCachesForSourceRelocate(item);
+
+    item.path = storedPath;
+    item.sourceFingerprint = await _computeSourceFingerprint(storedPath);
+    item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+    item.chapters = const <MediaChapter>[];
+    item.hasProbedChapters = false;
+
+    final probedDuration = await _probeMediaDurationMs(storedPath);
+    var positionClamped = false;
+    if (probedDuration > 0) {
+      item.durationMs = probedDuration;
+      if (item.lastPositionMs > item.durationMs) {
+        item.lastPositionMs = item.durationMs > 0 ? item.durationMs - 1 : 0;
+        positionClamped = true;
+      }
+    }
+    if (!skipImportSidecarWorkForTesting) {
+      item.chapters = await MediaChapterProbe.probe(
+        storedPath,
+        durationMs: item.durationMs,
+      );
+      item.hasProbedChapters = true;
+    }
+
+    if (!skipImportSidecarWorkForTesting &&
+        item.type == MediaType.video &&
+        item.thumbnailPath == null) {
+      unawaited(
+        _generateThumbnail(item.path, videoId: item.id).then((thumb) {
+          if (thumb == null) return;
+          final current = _videos[item.id];
+          if (current == null || current.path != item.path) return;
+          current.thumbnailPath = thumb;
+          unawaited(_saveLibrary());
+          notifyListeners();
+        }),
+      );
+    }
+
+    await _saveLibrary();
+    notifyListeners();
+    return RelocateLocalMediaResult(
+      status: RelocateLocalMediaStatus.success,
+      positionClamped: positionClamped,
+    );
+  }
+
+  Future<String> _persistRelocatedMediaPath({
+    required String mediaId,
+    required String pickedPath,
+  }) async {
+    final copyImportedMediaToPrivateStorage =
+        SettingsService().copyImportedMediaToPrivateStorage;
+    if (copyImportedMediaToPrivateStorage) {
+      return _copyImportedMediaToPrivateStorage(
+        pickedPath,
+        fileNamePrefix:
+            '${mediaId}_reloc_${DateTime.now().millisecondsSinceEpoch}',
+      );
+    }
+    final importedDir = Directory(p.join(_dataRootDir.path, 'imported_videos'));
+    // Temp/cache picks follow the same long-term path rule as import. User
+    // subtitles stay on the existing card and must not be moved here.
+    return _moveIfTemporary(pickedPath, importedDir);
+  }
+
+  Future<void> _invalidateCachesForSourceRelocate(VideoItem item) async {
+    ThumbnailCacheService().evictFromCache(item.id);
+
+    if (item.playbackPath != null && _isInternalPath(item.playbackPath!)) {
+      try {
+        final referencedElsewhere = _videos.values.any(
+          (other) =>
+              other.id != item.id &&
+              other.playbackPath != null &&
+              _samePath(other.playbackPath!, item.playbackPath!),
+        );
+        final file = File(item.playbackPath!);
+        if (!referencedElsewhere && await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        developer.log('Error deleting compatible playback file', error: e);
+      }
+    }
+    item.playbackPath = null;
+
+    final thumbnailPath = item.thumbnailPath;
+    if (thumbnailPath != null && _isInternalPath(thumbnailPath)) {
+      try {
+        final file = File(thumbnailPath);
+        if (await file.exists() &&
+            !_isThumbnailPathReferencedByOtherVideo(thumbnailPath, item.id)) {
+          await file.delete();
+        }
+      } catch (e) {
+        developer.log(
+          'Error deleting stale thumbnail after relocate',
+          error: e,
+        );
+      }
+    }
+    item.thumbnailPath = null;
+
+    try {
+      await ChapterThumbnailService.instance.deleteForVideo(item.id);
+    } catch (e) {
+      developer.log(
+        'Error deleting chapter thumbnails after relocate',
+        error: e,
+      );
+    }
+
+    item.codec = null;
+    item.bilibiliVideoShot = null;
+    item.hasAttemptedAutoEmbeddedSubtitleLoad = false;
   }
 
   /// Ensures that video and subtitle files are moved to permanent storage

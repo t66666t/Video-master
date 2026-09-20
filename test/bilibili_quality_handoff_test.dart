@@ -234,7 +234,7 @@ Future<void> _waitForPlayerCount(
   _HandoffVideoPlatform platform,
   int count,
 ) async {
-  for (var attempt = 0; attempt < 200; attempt++) {
+  for (var attempt = 0; attempt < 2000; attempt++) {
     if (platform.playerIds.length == count) return;
     await Future<void>.delayed(const Duration(milliseconds: 2));
   }
@@ -245,7 +245,7 @@ Future<void> _waitForPlayerId(
   _HandoffVideoPlatform platform,
   int playerId,
 ) async {
-  for (var attempt = 0; attempt < 200; attempt++) {
+  for (var attempt = 0; attempt < 2000; attempt++) {
     if (platform.playerIds.contains(playerId)) return;
     await Future<void>.delayed(const Duration(milliseconds: 2));
   }

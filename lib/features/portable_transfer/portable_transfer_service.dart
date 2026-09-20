@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../models/library_activity.dart';
 import '../../models/media_source_ref.dart';
 import '../../models/video_collection.dart';
 import '../../models/video_item.dart';
@@ -1006,6 +1007,11 @@ class PortableTransferService extends ChangeNotifier {
       throw const FormatException('导出包快照为空');
     }
 
+    final snapshotBatchId = library.beginImportBatch(
+      title: packageName,
+      sourceKind: LibraryImportSourceKind.fluentPack,
+    );
+
     final dataRoot = await SettingsService().resolveLargeDataRootDir();
     final retrySpec = _retrySpecs[task.id];
     final createdAssetPaths = <String>{};
@@ -1232,6 +1238,8 @@ class PortableTransferService extends ChangeNotifier {
           item,
           useOriginalPath: false,
           reuseExistingItem: false,
+          activityBatchId: snapshotBatchId,
+          sourceKind: LibraryImportSourceKind.fluentPack,
         );
         if (insertedId == null) {
           throw StateError('无法创建媒体卡片：${item.title}');
@@ -1250,8 +1258,14 @@ class PortableTransferService extends ChangeNotifier {
           ..transactionRootId = null
           ..createdAssetPaths.clear();
       }
+      if (snapshotBatchId != null) {
+        await library.completeImportBatch(snapshotBatchId);
+      }
       return importedCount;
     } catch (_) {
+      if (snapshotBatchId != null) {
+        library.abortImportBatch(snapshotBatchId);
+      }
       await library.deleteFromRecycleBin(<String>[packageRoot.id]);
       for (final assetPath in createdAssetPaths) {
         final file = File(assetPath);

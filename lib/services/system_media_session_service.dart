@@ -111,6 +111,10 @@ Duration calculateSubtitleBoundaryDelay({
 /// Matches 网易云 / VLC / 哔哩哔哩 "允许与其他应用同时播放":
 /// mix on iOS via [AVAudioSessionCategoryOptions.mixWithOthers], keep Android
 /// as a music session, and never request exclusive focus while mixing.
+///
+/// Ducking stays a duck. Mapping LOSS_TRANSIENT_CAN_DUCK onto pause made
+/// notification sounds, Dolby reroutes, and a late ExoPlayer AudioTrack start
+/// indistinguishable from a phone call.
 @visibleForTesting
 AudioSessionConfiguration buildConcurrentPlaybackAudioSessionConfiguration({
   required bool allowConcurrentPlayback,
@@ -119,18 +123,77 @@ AudioSessionConfiguration buildConcurrentPlaybackAudioSessionConfiguration({
     avAudioSessionCategoryOptions: allowConcurrentPlayback
         ? AVAudioSessionCategoryOptions.mixWithOthers
         : AVAudioSessionCategoryOptions.none,
-    androidWillPauseWhenDucked: !allowConcurrentPlayback,
+    androidWillPauseWhenDucked: false,
   );
+}
+
+/// Window after we request exclusive focus during which OEM/player-layer
+/// AUDIOFOCUS_LOSS and speaker reroutes are treated as our own AudioTrack
+/// starting, not as a real interruption.
+@visibleForTesting
+const Duration selfAudioFocusGrace = Duration(milliseconds: 1200);
+
+@visibleForTesting
+bool isWithinSelfAudioFocusGrace({
+  required DateTime? exclusiveFocusGrantedAt,
+  required DateTime now,
+}) {
+  if (exclusiveFocusGrantedAt == null) return false;
+  final elapsed = now.difference(exclusiveFocusGrantedAt);
+  return elapsed >= Duration.zero && elapsed < selfAudioFocusGrace;
 }
 
 /// Other media apps must not pause us when the user asked to mix. Phone-call
 /// routing is still handled by the OS even if this callback is ignored.
+/// Permanent LOSS that arrives while we are still taking focus is the
+/// ExoPlayer/media_kit AudioTrack requesting GAIN against this same session.
 @visibleForTesting
 bool shouldPauseForAudioInterruption({
   required bool allowConcurrentPlayback,
   required bool interruptionBegan,
+  required AudioInterruptionType type,
+  bool withinSelfFocusGrace = false,
 }) {
-  return interruptionBegan && !allowConcurrentPlayback;
+  if (!interruptionBegan || allowConcurrentPlayback) return false;
+  if (type == AudioInterruptionType.duck) return false;
+  if (withinSelfFocusGrace && type == AudioInterruptionType.unknown) {
+    return false;
+  }
+  return true;
+}
+
+@visibleForTesting
+bool shouldReclaimExclusiveFocusAfterInterruption({
+  required bool allowConcurrentPlayback,
+  required bool interruptionBegan,
+  required AudioInterruptionType type,
+  required bool desiredPlaying,
+  required bool withinSelfFocusGrace,
+}) {
+  return desiredPlaying &&
+      !allowConcurrentPlayback &&
+      interruptionBegan &&
+      withinSelfFocusGrace &&
+      type == AudioInterruptionType.unknown;
+}
+
+@visibleForTesting
+bool shouldPauseForBecomingNoisy({
+  required bool isTransportPlaying,
+  required bool withinSelfFocusGrace,
+}) {
+  return isTransportPlaying && !withinSelfFocusGrace;
+}
+
+@visibleForTesting
+bool shouldIgnoreRemotePauseAsSelfFocusLoss({
+  required bool allowConcurrentPlayback,
+  required bool desiredPlaying,
+  required bool withinSelfFocusGrace,
+}) {
+  return desiredPlaying &&
+      !allowConcurrentPlayback &&
+      withinSelfFocusGrace;
 }
 
 @visibleForTesting
@@ -179,6 +242,7 @@ class SystemMediaSessionService {
   bool? _lastAllowConcurrentPlayback;
   bool? _lastHeadsetControlEnabled;
   bool? _audioFocusHeld;
+  DateTime? _exclusiveFocusGrantedAt;
   int _publishRevision = 0;
   int _notificationVisibilityPrimeRevision = 0;
   String? _lastVisibleNotificationItemId;
@@ -223,10 +287,14 @@ class SystemMediaSessionService {
     );
     // video_player (and the media_kit adapter's platform fallback) keeps a
     // process-wide mix flag. Apply it here so a toggle takes effect before
-    // the next VideoPlayerController is created.
+    // the next VideoPlayerController is created. Android always mixes at the
+    // ExoPlayer layer; exclusive focus stays on this AudioSession.
     try {
       await VideoPlayerPlatform.instance.setMixWithOthers(
-        allowConcurrentPlayback,
+        MediaPlaybackService.platformPlayerShouldMixWithOthers(
+          isAndroid: Platform.isAndroid,
+          allowConcurrentPlayback: allowConcurrentPlayback,
+        ),
       );
     } catch (error) {
       _logMediaSessionEvent(
@@ -268,6 +336,11 @@ class SystemMediaSessionService {
         return;
       }
       _audioFocusHeld = wantExclusiveFocus;
+      if (wantExclusiveFocus) {
+        _exclusiveFocusGrantedAt = DateTime.now();
+      } else {
+        _exclusiveFocusGrantedAt = null;
+      }
       _logMediaSessionEvent(
         'audio focus synced',
         data: <String, Object?>{
@@ -343,17 +416,35 @@ class SystemMediaSessionService {
       ) {
         final allowConcurrentPlayback =
             _settingsService.allowConcurrentPlayback;
+        final withinSelfFocusGrace = isWithinSelfAudioFocusGrace(
+          exclusiveFocusGrantedAt: _exclusiveFocusGrantedAt,
+          now: DateTime.now(),
+        );
         _logMediaSessionEvent(
           'audio interruption',
           data: <String, Object?>{
             'begin': event.begin,
             'type': event.type.name,
             'allowConcurrentPlayback': allowConcurrentPlayback,
+            'withinSelfFocusGrace': withinSelfFocusGrace,
           },
         );
+        if (shouldReclaimExclusiveFocusAfterInterruption(
+          allowConcurrentPlayback: allowConcurrentPlayback,
+          interruptionBegan: event.begin,
+          type: event.type,
+          desiredPlaying: _playbackService?.desiredPlaying ?? false,
+          withinSelfFocusGrace: withinSelfFocusGrace,
+        )) {
+          _audioFocusHeld = null;
+          unawaited(_syncAudioFocusWithPlayback(desiredPlaying: true));
+          return;
+        }
         if (shouldPauseForAudioInterruption(
           allowConcurrentPlayback: allowConcurrentPlayback,
           interruptionBegan: event.begin,
+          type: event.type,
+          withinSelfFocusGrace: withinSelfFocusGrace,
         )) {
           unawaited(_playbackService?.pause());
           return;
@@ -368,8 +459,25 @@ class SystemMediaSessionService {
         }
       });
       _becomingNoisySubscription = session.becomingNoisyEventStream.listen((_) {
-        _logMediaSessionEvent('becoming noisy received');
-        unawaited(_playbackService?.pause());
+        final withinSelfFocusGrace = isWithinSelfAudioFocusGrace(
+          exclusiveFocusGrantedAt: _exclusiveFocusGrantedAt,
+          now: DateTime.now(),
+        );
+        final isTransportPlaying =
+            _playbackService?.isTransportPlaying ?? false;
+        _logMediaSessionEvent(
+          'becoming noisy received',
+          data: <String, Object?>{
+            'isTransportPlaying': isTransportPlaying,
+            'withinSelfFocusGrace': withinSelfFocusGrace,
+          },
+        );
+        if (shouldPauseForBecomingNoisy(
+          isTransportPlaying: isTransportPlaying,
+          withinSelfFocusGrace: withinSelfFocusGrace,
+        )) {
+          unawaited(_playbackService?.pause());
+        }
       });
 
       _initialized = true;
@@ -403,6 +511,7 @@ class SystemMediaSessionService {
     _playbackService = null;
     _playlistManager = null;
     _audioFocusHeld = null;
+    _exclusiveFocusGrantedAt = null;
     unawaited(_interruptionSubscription?.cancel());
     _interruptionSubscription = null;
     unawaited(_becomingNoisySubscription?.cancel());
@@ -1189,7 +1298,23 @@ class _SystemMediaAudioHandler extends audio_service.BaseAudioHandler
   @override
   Future<void> pause() async {
     if (!_shouldHandleRemoteCommand('pause')) return;
-    SystemMediaSessionService.instance._logMediaSessionEvent(
+    final session = SystemMediaSessionService.instance;
+    final withinSelfFocusGrace = isWithinSelfAudioFocusGrace(
+      exclusiveFocusGrantedAt: session._exclusiveFocusGrantedAt,
+      now: DateTime.now(),
+    );
+    if (shouldIgnoreRemotePauseAsSelfFocusLoss(
+      allowConcurrentPlayback: session._settingsService.allowConcurrentPlayback,
+      desiredPlaying: _playbackService?.desiredPlaying ?? false,
+      withinSelfFocusGrace: withinSelfFocusGrace,
+    )) {
+      session._logMediaSessionEvent(
+        'remote pause ignored during self focus grace',
+        data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
+      );
+      return;
+    }
+    session._logMediaSessionEvent(
       'remote pause command received',
       data: <String, Object?>{'itemId': _playbackService?.currentItem?.id},
     );

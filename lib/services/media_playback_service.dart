@@ -23,6 +23,7 @@ import 'app_wakelock_coordinator.dart';
 import 'audio_playback_compatibility_service.dart';
 import 'playback_timeline_clock.dart';
 import 'playback_behavior_policy.dart';
+import 'library_watch_meter.dart';
 import 'sleep_timer_controller.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../services/library_service.dart';
@@ -194,6 +195,7 @@ class MediaPlaybackService extends ChangeNotifier {
   MaterializedMediaLease? _currentMaterializedPlaybackLease;
   int _streamQualitySwitchRequestId = 0;
   bool _controllerCreatedWithoutVisiblePlaybackPage = false;
+
   /// Mini/notification opened the loopback audio URL instead of video+audio.
   bool _bilibiliAudioPrimaryPlayer = false;
   Future<bool>? _visibleVideoOutputRecovery;
@@ -204,13 +206,16 @@ class MediaPlaybackService extends ChangeNotifier {
   double _bilibiliGatewayBytesPerSecond = 0;
   bool _bilibiliStreamingListenerAttached = false;
   bool _controllerIsBuffering = false;
+
   /// Seek's Dart Future can complete while libmpv is still cache-paused.
   /// Keep the Bilibili spinner up until the clock actually moves again.
   bool _seekHoldOverlay = false;
+
   /// True from the native seek until the clock ticks, including the delay
   /// before the spinner is allowed to appear.
   bool _seekHoldPending = false;
   Timer? _seekHoldOverlayTimer;
+
   /// Native sample used as the post-seek baseline. Overlay clears only after
   /// this clock ticks — `isPlaying && !isBuffering` is not enough.
   Duration? _seekHoldLandedNative;
@@ -289,6 +294,9 @@ class MediaPlaybackService extends ChangeNotifier {
   PlaybackSessionSnapshot _session = const PlaybackSessionSnapshot.idle();
   VideoPlayerController? _sessionController;
   int? _activePlayInvocationGeneration;
+  final LibraryWatchMeter _watchMeter = LibraryWatchMeter();
+  final Map<String, int> _acceptedWatchFlushCycle = <String, int>{};
+  bool _watchHistoryStartCommitted = false;
   final List<_EpisodeNavigationCommand> _pendingEpisodeNavigation =
       <_EpisodeNavigationCommand>[];
   bool _isDrainingEpisodeNavigation = false;
@@ -588,8 +596,7 @@ class MediaPlaybackService extends ChangeNotifier {
   void _syncSeekHoldOverlayFromNative(Duration nativePosition) {
     if (!_seekHoldPending && !_seekHoldOverlay) return;
     final target = _lastRequestedSeekPosition ?? _position;
-    final nearTarget =
-        (nativePosition - target).inMilliseconds.abs() <= 450;
+    final nearTarget = (nativePosition - target).inMilliseconds.abs() <= 450;
     if (_seekHoldLandedNative == null) {
       if (nearTarget) {
         _seekHoldLandedNative = nativePosition;
@@ -701,16 +708,37 @@ class MediaPlaybackService extends ChangeNotifier {
   }) {
     final resolvedSettings = settings ?? SettingsService();
     return VideoPlayerOptions(
-      mixWithOthers: resolvedSettings.allowConcurrentPlayback,
+      mixWithOthers: platformPlayerShouldMixWithOthers(
+        isAndroid: !kIsWeb && Platform.isAndroid,
+        allowConcurrentPlayback: resolvedSettings.allowConcurrentPlayback,
+      ),
       // Keep background playback capability enabled and handle the
       // "leave app then pause" policy ourselves so toggles apply immediately.
       allowBackgroundPlayback: true,
     );
   }
 
-  /// Android ExoPlayer stores [VideoPlayerOptions.mixWithOthers] per player.
-  /// Recreate local platform players so a live toggle actually changes audio
-  /// focus. media_kit sessions follow [AudioSession] and do not need this.
+  /// Android ExoPlayer must not request AUDIOFOCUS_GAIN itself.
+  ///
+  /// [SystemMediaSessionService] already holds exclusive focus via
+  /// [AudioSession.setActive]. A second request from ExoPlayer — especially
+  /// when the audio renderer starts late (moov-at-end MP4, odd AAC timescale)
+  /// — looks like a focus LOSS to our session, which immediately pauses.
+  /// Exclusive vs mix is therefore AudioSession-only on Android. iOS still
+  /// maps the setting onto the native player's mixWithOthers flag.
+  @visibleForTesting
+  static bool platformPlayerShouldMixWithOthers({
+    required bool isAndroid,
+    required bool allowConcurrentPlayback,
+  }) {
+    if (isAndroid) return true;
+    return allowConcurrentPlayback;
+  }
+
+  /// Recreate the live player only when its native mixWithOthers flag actually
+  /// changes. Android ExoPlayer now always mixes at the player layer, so a
+  /// concurrent-playback toggle must not rebuild it. media_kit never stored
+  /// that flag on the player.
   @visibleForTesting
   static bool shouldReloadPlayerForConcurrentPlayback({
     required bool isAndroid,
@@ -720,7 +748,13 @@ class MediaPlaybackService extends ChangeNotifier {
     if (!isAndroid || sourceType != DataSourceType.file || resource == null) {
       return false;
     }
-    return !LocalPlaybackBackendPolicy.isWideCodecBackendPreferred(resource);
+    if (LocalPlaybackBackendPolicy.isWideCodecBackendPreferred(resource)) {
+      return false;
+    }
+    // Android ExoPlayer mixWithOthers is always true; see
+    // [platformPlayerShouldMixWithOthers]. Recreating would hitch for no
+    // audio-focus change.
+    return false;
   }
 
   /// Pushes the mix/exclusive flag to the platform player, then rebuilds an
@@ -729,7 +763,10 @@ class MediaPlaybackService extends ChangeNotifier {
     final allowConcurrentPlayback = SettingsService().allowConcurrentPlayback;
     try {
       await VideoPlayerPlatform.instance.setMixWithOthers(
-        allowConcurrentPlayback,
+        platformPlayerShouldMixWithOthers(
+          isAndroid: !kIsWeb && Platform.isAndroid,
+          allowConcurrentPlayback: allowConcurrentPlayback,
+        ),
       );
     } catch (error) {
       _logPlaybackEvent(
@@ -1256,6 +1293,27 @@ class MediaPlaybackService extends ChangeNotifier {
   bool get desiredPlaying => _session.desiredPlaying;
   PlaybackSessionSnapshot get session => _session;
   int get sessionGeneration => _session.generation;
+
+  @visibleForTesting
+  LibraryWatchMeter get libraryWatchMeterForTesting => _watchMeter;
+
+  @visibleForTesting
+  Future<void> flushLibraryWatchForTesting() {
+    return _commitWatchFlush(_watchMeter.flush());
+  }
+
+  @visibleForTesting
+  Future<void> commitLibraryWatchFlushForTesting(LibraryWatchFlush flush) {
+    return _commitWatchFlush(flush);
+  }
+
+  /// Hide must block unhide for the current watch cycle without stopping transport.
+  void noteLibraryMediaHidden(String mediaId) {
+    if (_watchMeter.mediaId == mediaId) {
+      _watchMeter.noteHidden();
+    }
+  }
+
   bool get isSourceMissing => _isSourceMissing;
   List<BilibiliStreamQuality> get streamQualities => _streamQualities;
   BilibiliStreamQuality? get selectedStreamQuality => _selectedStreamQuality;
@@ -1263,6 +1321,23 @@ class MediaPlaybackService extends ChangeNotifier {
   bool get isSwitchingStreamQuality => _isSwitchingStreamQuality;
   bool get isCurrentItemBilibiliStream =>
       _currentItem?.sourceRef?.kind == MediaSourceKind.bilibiliStream;
+
+  /// Test hook for the progress-bar quality capsule without a live stream.
+  @visibleForTesting
+  void debugOverrideStreamQualityChrome({
+    VideoItem? item,
+    List<BilibiliStreamQuality> qualities = const [],
+    BilibiliStreamQuality? selected,
+    bool switching = false,
+  }) {
+    _currentItem = item;
+    _streamQualities = List.unmodifiable(qualities);
+    _selectedStreamQuality =
+        selected ?? (qualities.isEmpty ? null : qualities.first);
+    _isSwitchingStreamQuality = switching;
+    notifyListeners();
+  }
+
   bool get isCurrentItemOnlineBilibiliStream =>
       isCurrentItemBilibiliStream && _currentBilibiliPlayback != null;
 
@@ -3679,6 +3754,7 @@ class MediaPlaybackService extends ChangeNotifier {
     Duration? startPosition,
     bool autoPlay = true,
     bool forceRecreate = false,
+    bool userInitiatedWatch = true,
   }) async {
     _streamQualitySwitchRequestId++;
     _isSwitchingStreamQuality = false;
@@ -3699,6 +3775,7 @@ class MediaPlaybackService extends ChangeNotifier {
       // play button does not sit on a triangle while playurl/initialize run.
       notifyListeners();
     }
+    _prepareLibraryWatchCycle(item, userInitiatedWatch: userInitiatedWatch);
     bool shouldPlayNow() => _session.generation == sessionGeneration
         ? _session.desiredPlaying
         : autoPlay;
@@ -4521,7 +4598,10 @@ class MediaPlaybackService extends ChangeNotifier {
           nativeDuration > Duration.zero &&
           (item.durationMs <= 0 ||
               nativeDuration.inMilliseconds >= item.durationMs ~/ 2)) {
-        await _progressTracker!.saveDurationImmediately(item.id, nativeDuration);
+        await _progressTracker!.saveDurationImmediately(
+          item.id,
+          nativeDuration,
+        );
         if (!_isCurrentPlayRequest(
           playRequestId,
           item.id,
@@ -4592,13 +4672,16 @@ class MediaPlaybackService extends ChangeNotifier {
       controller.addListener(_onControllerUpdate);
       _lastControllerIsPlaying = controller.value.isPlaying;
       if (shouldPlayNow()) {
-        // 乐观更新：立即设置状态为播放中。Windows Mini 在 cache-pause 下
-        // Dart isPlaying 会一直为 false；若等到 readiness 才切状态，按钮会
-        // 一直显示播放箭头，而音频其实已经开始了。
-        _state = PlaybackState.playing;
-        _syncWakelockWithState();
-        _startProgressTracking();
-        notifyListeners();
+        // Mini / notification has no page-owned video surface. Optimistic
+        // `playing` keeps the mini button in sync while media_kit reports
+        // isPlaying=false. Full video pages stay in `loading` until native
+        // play() returns so an initialized controller can mount first.
+        if (!hasRequiredVideoOutput) {
+          _state = PlaybackState.playing;
+          _syncWakelockWithState();
+          _startProgressTracking();
+          notifyListeners();
+        }
         // Mini card / notification play has no page owner. Drop the video
         // track before the clock starts so Windows does not pull video bytes.
         if (item.sourceRef?.kind == MediaSourceKind.bilibiliStream) {
@@ -4938,6 +5021,24 @@ class MediaPlaybackService extends ChangeNotifier {
     unawaited(_refreshSubtitlesForCurrentItem(item));
   }
 
+  /// Reopens the current item after a local source rebind. A late callback for
+  /// media A must not stop or replace whatever is now current.
+  Future<void> reloadAfterSourceRelocate({required String mediaId}) async {
+    _playlistManager?.reloadPlaylist();
+    _playlistManager?.refreshQueueEligibility();
+    if (_currentItem?.id != mediaId) return;
+    final item = _libraryService?.getVideo(mediaId);
+    if (item == null) return;
+    final startMs = item.lastPositionMs < 0 ? 0 : item.lastPositionMs;
+    await play(
+      item,
+      autoPlay: false,
+      forceRecreate: true,
+      userInitiatedWatch: false,
+      startPosition: Duration(milliseconds: startMs),
+    );
+  }
+
   /// 暂停播放
   Future<void> pause({
     String? expectedItemId,
@@ -4967,9 +5068,13 @@ class MediaPlaybackService extends ChangeNotifier {
         } catch (_) {}
       }
       unawaited(_saveCurrentProgress(immediate: true));
+      unawaited(_commitWatchFlush(_watchMeter.flush()));
       return;
     }
-    if (_state != PlaybackState.playing && !isTransportPlaying) return;
+    if (_state != PlaybackState.playing && !isTransportPlaying) {
+      unawaited(_commitWatchFlush(_watchMeter.flush()));
+      return;
+    }
     final controller = _controller;
     final itemId = _currentItem?.id;
     if (controller == null || itemId == null) return;
@@ -5019,6 +5124,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
       // 暂停时立即保存进度
       await _saveCurrentProgress(immediate: true);
+      await _commitWatchFlush(_watchMeter.flush());
       if (!_isCurrentPlayRequest(requestId, itemId, controller: controller)) {
         return;
       }
@@ -5457,6 +5563,7 @@ class MediaPlaybackService extends ChangeNotifier {
         !controller.value.isInitialized) {
       return;
     }
+    _watchMeter.beginSeek();
 
     final hop = SubtitleHopSeekPolicy.isHopSeekSource(source);
     if (!hop) {
@@ -5546,13 +5653,11 @@ class MediaPlaybackService extends ChangeNotifier {
         // position sampler can still lag briefly, so a bounded direct verifier
         // below owns any later correction.
         final actualPosition = clampedPosition;
+        _watchMeter.endSeek(positionMs: actualPosition.inMilliseconds);
         if (actualPosition != _position) {
           _position = actualPosition;
           // 校正插值基线，确保插值时钟从实际位置继续推进
-          _resetPlaybackTimeline(
-            _position,
-            running: _shouldTimelineRun(),
-          );
+          _resetPlaybackTimeline(_position, running: _shouldTimelineRun());
           notifyListeners();
         }
         if (_pendingSeekRequestId == requestId) {
@@ -5624,10 +5729,7 @@ class MediaPlaybackService extends ChangeNotifier {
           } else {
             _clearInitialPositionGuard();
             _position = controller.value.position;
-            _resetPlaybackTimeline(
-              _position,
-              running: _shouldTimelineRun(),
-            );
+            _resetPlaybackTimeline(_position, running: _shouldTimelineRun());
           }
           notifyListeners();
         }
@@ -5802,6 +5904,7 @@ class MediaPlaybackService extends ChangeNotifier {
     bool autoPlay = true,
     Duration? startPosition,
     bool forceFromStart = false,
+    bool userInitiatedWatch = true,
   }) {
     return _runInMediaSwitchLock(
       () => _playPlaylistItemLocked(
@@ -5809,6 +5912,7 @@ class MediaPlaybackService extends ChangeNotifier {
         autoPlay: autoPlay,
         startPosition: startPosition,
         forceFromStart: forceFromStart,
+        userInitiatedWatch: userInitiatedWatch,
       ),
     );
   }
@@ -5818,10 +5922,12 @@ class MediaPlaybackService extends ChangeNotifier {
     bool autoPlay = true,
     Duration? startPosition,
     bool forceFromStart = false,
+    bool userInitiatedWatch = true,
   }) async {
     // Disk I/O must not delay a notification skip. ExoPlayer/Bilibili also
     // persist progress off the media-switch critical path.
     unawaited(_saveCurrentProgress(immediate: true));
+    unawaited(_commitWatchFlush(_watchMeter.flush()));
 
     var frozenStartPosition = resolvePlayStartPosition(
       startPosition: startPosition,
@@ -5868,6 +5974,7 @@ class MediaPlaybackService extends ChangeNotifier {
         autoPlay: autoPlay,
         startPosition: frozenStartPosition,
         forceRecreate: attempt > 1,
+        userInitiatedWatch: userInitiatedWatch,
       );
       if (_isControllerReadyForItem(item) ||
           _isSourceMissing ||
@@ -6135,6 +6242,7 @@ class MediaPlaybackService extends ChangeNotifier {
                 item,
                 autoPlay: shouldPlay,
                 startPosition: resumePosition,
+                userInitiatedWatch: false,
               );
             }()
             .catchError((Object recoveryError, StackTrace stackTrace) {
@@ -6348,6 +6456,8 @@ class MediaPlaybackService extends ChangeNotifier {
         return;
       }
 
+      await _commitWatchFlush(_watchMeter.onConfirmedComplete());
+
       _preservePlayingStateAfterSeek = false;
       if (PlaybackBehaviorPolicy.hasReachedPlaybackEnd(
         position: confirmedPosition,
@@ -6422,6 +6532,7 @@ class MediaPlaybackService extends ChangeNotifier {
         targetItem,
         autoPlay: true,
         forceFromStart: settings.autoPlayOnCompletionFromStart,
+        userInitiatedWatch: false,
       );
     } finally {
       _isHandlingPlaybackCompletion = false;
@@ -6442,6 +6553,7 @@ class MediaPlaybackService extends ChangeNotifier {
 
     // 每5秒保存一次进度
     _progressTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      _sampleLibraryWatch(flush: true);
       _saveCurrentProgress(immediate: true);
       _savePlaybackStateSnapshot();
     });
@@ -6704,6 +6816,7 @@ class MediaPlaybackService extends ChangeNotifier {
         notifyListeners();
       }
     }
+    _sampleLibraryWatch();
   }
 
   // _updateNotificationProgress 已移除，改用事件驱动
@@ -6852,6 +6965,89 @@ class MediaPlaybackService extends ChangeNotifier {
     return true;
   }
 
+  void _prepareLibraryWatchCycle(
+    VideoItem item, {
+    required bool userInitiatedWatch,
+  }) {
+    final durationMs = item.durationMs > 0
+        ? item.durationMs
+        : (_duration.inMilliseconds > 0 ? _duration.inMilliseconds : null);
+    if (_watchMeter.hasOpenCycle && _watchMeter.mediaId == item.id) {
+      _watchMeter.setPolicy(SettingsService().continueWatchPolicy);
+      _watchMeter.retainCycle(durationMs: durationMs);
+      return;
+    }
+    unawaited(_commitWatchFlush(_watchMeter.flush()));
+    final record = _libraryService?.mediaActivity(item.id);
+    _watchHistoryStartCommitted = false;
+    _watchMeter.setPolicy(SettingsService().continueWatchPolicy);
+    _watchMeter.startCycle(
+      mediaId: item.id,
+      userInitiated: userInitiatedWatch,
+      hidden: record?.hidden == true,
+      completed: record?.completed == true,
+      durationMs: durationMs,
+    );
+  }
+
+  void _syncWatchMeterTransport() {
+    _watchMeter.setTransport(
+      playing: _state == PlaybackState.playing,
+      buffering: _controllerIsBuffering,
+      seeking: _pendingSeekRequestId != null || _initialPositionSeekInFlight,
+      missingSource:
+          _isSourceMissing ||
+          _controller == null ||
+          _state == PlaybackState.error,
+    );
+  }
+
+  void _sampleLibraryWatch({bool flush = false}) {
+    final itemId = _currentItem?.id;
+    if (itemId == null || _watchMeter.mediaId != itemId) return;
+    _watchMeter.setPolicy(SettingsService().continueWatchPolicy);
+    _syncWatchMeterTransport();
+    final crossed = _watchMeter.sample(
+      mediaId: itemId,
+      cycleId: _watchMeter.cycleId,
+      positionMs: _position.inMilliseconds,
+      durationMs: _duration.inMilliseconds,
+    );
+    if (flush ||
+        crossed ||
+        (!_watchHistoryStartCommitted && _watchMeter.hasStartedPlaying)) {
+      final snapshot = _watchMeter.flush();
+      if (snapshot.hasActivityWrite) {
+        if (snapshot.lastPlayedAtMs != null) {
+          _watchHistoryStartCommitted = true;
+        }
+        unawaited(_commitWatchFlush(snapshot));
+      }
+    }
+  }
+
+  Future<void> _commitWatchFlush(LibraryWatchFlush flush) async {
+    final mediaId = flush.mediaId;
+    final library = _libraryService;
+    if (mediaId == null || library == null || !flush.hasActivityWrite) return;
+    // Keep writes for the previous item after skip-next/mini-card changes
+    // current media. Only drop a flush superseded by a newer cycle of the
+    // same id (rewatch).
+    final accepted = _acceptedWatchFlushCycle[mediaId] ?? 0;
+    if (flush.cycleId < accepted) return;
+    _acceptedWatchFlushCycle[mediaId] = flush.cycleId;
+    await library.applyWatchFlush(
+      mediaId: mediaId,
+      deltaWatchMs: flush.deltaWatchMs,
+      lastPlayedAtMs: flush.lastPlayedAtMs,
+      enrolled: flush.enrolled,
+      uncomplete: flush.uncomplete,
+      unhide: flush.unhide,
+      completed: flush.completed,
+      completedAtMs: flush.completed ? flush.lastPlayedAtMs : null,
+    );
+  }
+
   /// 保存当前播放进度
   /// Persists the authoritative playback position for lifecycle and route
   /// transitions. Playback pages must use this instead of reading the native
@@ -6876,6 +7072,7 @@ class MediaPlaybackService extends ChangeNotifier {
         itemId,
         position.inMilliseconds,
       );
+      await _commitWatchFlush(_watchMeter.flush());
       return;
     }
     await progressTracker.saveProgressImmediately(itemId, position);
@@ -6885,6 +7082,7 @@ class MediaPlaybackService extends ChangeNotifier {
       return;
     }
     await _savePlaybackStateSnapshot();
+    await _commitWatchFlush(_watchMeter.flush());
   }
 
   Future<void> _saveCurrentProgress({bool immediate = false}) async {

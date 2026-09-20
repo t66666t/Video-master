@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/utils/incoming_share_signatures.dart';
 
@@ -76,5 +78,15 @@ void main() {
       ),
       isFalse,
     );
+  });
+
+  test('home screen does not open a second share channel', () {
+    final home = File('lib/screens/home_screen.dart').readAsStringSync();
+    expect(home, isNot(contains('com.example.video_player_app/share_intent')));
+    expect(home, isNot(contains('_setupIncomingMediaHandling')));
+    final listener = File(
+      'lib/widgets/incoming_share_listener.dart',
+    ).readAsStringSync();
+    expect(listener, contains('com.example.video_player_app/share_intent'));
   });
 }

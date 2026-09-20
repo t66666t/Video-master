@@ -106,15 +106,9 @@ class MediaLibrarySelectionDropTargets extends StatelessWidget {
                       compact: compact,
                       metrics: metrics,
                       icon: Icons.reply_all,
-                      label: compact
-                          ? DesktopMediaManagementShortcuts.buildTooltip(
-                              '上一级',
-                              DesktopMediaManagementShortcutAction.moveToParent,
-                            )
-                          : DesktopMediaManagementShortcuts.buildTooltip(
-                              '移动到上一级',
-                              DesktopMediaManagementShortcutAction.moveToParent,
-                            ),
+                      // Visible labels stay shortcut-free so compact cells
+                      // remain readable; the tooltip still shows (U).
+                      label: compact ? '上一级' : '移动到上一级',
                       tooltip: DesktopMediaManagementShortcuts.buildTooltip(
                         '移动到上一级',
                         DesktopMediaManagementShortcutAction.moveToParent,
@@ -139,14 +133,10 @@ class MediaLibrarySelectionDropTargets extends StatelessWidget {
                     icon: Icons.delete_outline,
                     // Split phone cells only have room for the short noun;
                     // a full-width root-library cell can keep the verb.
-                    label: DesktopMediaManagementShortcuts.buildTooltip(
-                      compact && showMoveToParent ? '回收站' : '移入回收站',
-                      DesktopMediaManagementShortcutAction.openRecycleBin,
-                    ),
-                    tooltip: DesktopMediaManagementShortcuts.buildTooltip(
-                      '移入回收站',
-                      DesktopMediaManagementShortcutAction.openRecycleBin,
-                    ),
+                    // Do not borrow openRecycleBin's (R) — this zone moves
+                    // items, it does not open the recycle page.
+                    label: compact && showMoveToParent ? '回收站' : '移入回收站',
+                    tooltip: '移入回收站',
                     accent: Colors.redAccent,
                     idleBackground: const Color(0xFF3A2426),
                     idleForeground: const Color(0xFFFF8A80),

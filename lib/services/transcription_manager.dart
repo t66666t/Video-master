@@ -130,7 +130,23 @@ class TranscriptionManager extends ChangeNotifier {
   int get queuedCount => _queue.length;
   int get processingCount => isProcessing ? 1 : 0;
   int get pendingCount => queuedCount + processingCount;
-  bool get canPauseAll => isProcessing || _startedMediaKeys.isNotEmpty;
+  /// Pause-all is only for work that is actually running or still queued.
+  /// Failed/completed items keep a started key so retry can resume, but the
+  /// toolbar must show Start-all in that case.
+  bool get canPauseAll {
+    if (isProcessing) return true;
+    return getQueueSnapshot().any((task) {
+      if (!task.isStarted) return false;
+      switch (task.status) {
+        case TranscriptionStatus.idle:
+        case TranscriptionStatus.completed:
+        case TranscriptionStatus.error:
+          return false;
+        default:
+          return true;
+      }
+    });
+  }
 
   bool get isProcessing =>
       _status != TranscriptionStatus.idle &&

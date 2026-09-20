@@ -21,6 +21,7 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_versi
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_request_builder.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
+import 'package:video_player_app/models/library_activity.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/models/video_item.dart';
@@ -1797,6 +1798,14 @@ class YtDlpDownloadService extends ChangeNotifier {
       return 0;
     }
 
+    final importBatchId = library.beginImportBatch(
+      title: candidates.length == 1
+          ? 'YT-DLP'
+          : 'YT-DLP ${candidates.length} 项',
+      sourceKind: LibraryImportSourceKind.ytDlp,
+      targetCollectionId: targetFolderId,
+    );
+
     final thumbnailDir = await _resolveLibraryThumbnailDirectory();
     var importedCount = 0;
     for (var ci = 0; ci < candidates.length; ci++) {
@@ -1867,7 +1876,12 @@ class YtDlpDownloadService extends ChangeNotifier {
         chapters: mediaChapters,
         hasProbedChapters: mediaChapters.isNotEmpty,
       );
-      final videoId = await library.addSingleVideo(item, useOriginalPath: true);
+      final videoId = await library.addSingleVideo(
+        item,
+        useOriginalPath: true,
+        activityBatchId: importBatchId,
+        sourceKind: LibraryImportSourceKind.ytDlp,
+      );
       if (videoId != null && videoId.isNotEmpty) {
         await _deleteExportedSubtitleSidecars(candidate, outputPath);
         importedCount += 1;
@@ -1886,6 +1900,11 @@ class YtDlpDownloadService extends ChangeNotifier {
         );
       }
       await saveTasks();
+    }
+    if (importedCount > 0 && importBatchId != null) {
+      await library.completeImportBatch(importBatchId);
+    } else if (importBatchId != null) {
+      library.abortImportBatch(importBatchId);
     }
     return importedCount;
   }

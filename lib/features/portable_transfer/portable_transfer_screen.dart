@@ -14,6 +14,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../../services/library_service.dart';
 import '../../utils/app_toast.dart';
+import '../../utils/reveal_in_file_manager.dart';
 import '../../utils/android_hardware_input_bridge.dart';
 import '../../utils/batch_tool_shortcuts.dart';
 import '../../utils/hardware_keyboard_shortcuts.dart';
@@ -213,186 +214,191 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
         autofocus: supportsNativeHardwareKeyboardShortcuts,
         onKeyEvent: (node, event) => _handleShortcutKeyEvent(event),
         child: Scaffold(
-        appBar: AppBar(
-          backgroundColor: const Color(0xFF0F1014),
-          surfaceTintColor: Colors.transparent,
-          leading: _managingTasks
-              ? IconButton(
-                  onPressed: _leaveTaskManagement,
-                  tooltip: _ptTooltip(
-                    '退出管理',
-                    PortableTransferShortcutAction.backOrExitManagement,
-                  ),
-                  icon: const Icon(Icons.close_rounded),
-                )
-              : null,
-          title: Text(
-            _managingTasks ? '已选择 ${_selectedTaskIds.length} 项' : '导入与导出',
-            style: const TextStyle(fontWeight: FontWeight.w600),
-          ),
-          actions: [
-            AnimatedBuilder(
-              animation: _service,
-              builder: (context, _) {
-                final manageable = _manageableTasks;
-                if (manageable.isEmpty) return const SizedBox.shrink();
-                if (!_managingTasks) {
-                  return IconButton(
-                    onPressed: _enterTaskManagement,
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF0F1014),
+            surfaceTintColor: Colors.transparent,
+            leading: _managingTasks
+                ? IconButton(
+                    onPressed: _leaveTaskManagement,
                     tooltip: _ptTooltip(
-                      '批量管理',
-                      PortableTransferShortcutAction.enterManagement,
+                      '退出管理',
+                      PortableTransferShortcutAction.backOrExitManagement,
                     ),
-                    icon: const Icon(Icons.checklist_rounded),
-                  );
-                }
-                final allSelected = manageable.every(
-                  (task) => _selectedTaskIds.contains(task.id),
-                );
-                return Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      onPressed: () => _toggleSelectAll(manageable),
-                      tooltip: _ptTooltip(
-                        allSelected ? '取消全选' : '全选',
-                        PortableTransferShortcutAction.selectAll,
-                      ),
-                      icon: Icon(
-                        allSelected
-                            ? Icons.deselect_rounded
-                            : Icons.select_all_rounded,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: _selectedTaskIds.isEmpty
-                          ? null
-                          : _deleteSelectedTasks,
-                      tooltip: _ptTooltip(
-                        '删除所选任务',
-                        PortableTransferShortcutAction.deleteSelected,
-                      ),
-                      icon: const Icon(Icons.delete_outline_rounded),
-                    ),
-                  ],
-                );
-              },
+                    icon: const Icon(Icons.close_rounded),
+                  )
+                : null,
+            title: Text(
+              _managingTasks ? '已选择 ${_selectedTaskIds.length} 项' : '导入与导出',
+              style: const TextStyle(fontWeight: FontWeight.w600),
             ),
-            const SizedBox(width: 8),
-          ],
-        ),
-        body: SafeArea(
-          top: false,
-          child: Column(
-            children: [
-              _buildHeader(),
-              Expanded(
-                child: AnimatedBuilder(
-                  animation: _service,
-                  builder: (context, _) {
-                    final tasks = _service.tasks
-                        .where((task) => task.kind == _tab)
-                        .toList();
-                    return AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      child: tasks.isEmpty
-                          ? _EmptyTransferState(
-                              key: ValueKey(_tab),
-                              kind: _tab,
-                              onPressed: _tab == PortableTransferKind.export
-                                  ? _startExport
-                                  : _startImport,
-                            )
-                          : ListView.separated(
-                              key: ValueKey('list-$_tab'),
-                              padding: const EdgeInsets.fromLTRB(
-                                16,
-                                12,
-                                16,
-                                120,
-                              ),
-                              itemCount: tasks.length,
-                              separatorBuilder: (_, _) =>
-                                  const SizedBox(height: 10),
-                              itemBuilder: (context, index) =>
-                                  TweenAnimationBuilder<double>(
-                                    tween: Tween(begin: 0, end: 1),
-                                    duration: Duration(
-                                      milliseconds:
-                                          180 + index.clamp(0, 4) * 45,
-                                    ),
-                                    curve: Curves.easeOutCubic,
-                                    builder: (context, value, child) => Opacity(
-                                      opacity: value,
-                                      child: Transform.translate(
-                                        offset: Offset(0, 10 * (1 - value)),
-                                        child: child,
-                                      ),
-                                    ),
-                                    child: _TransferTaskCard(
-                                      task: tasks[index],
-                                      isDesktop: _isDesktop,
-                                      selectionMode: _managingTasks,
-                                      selected: _selectedTaskIds.contains(
-                                        tasks[index].id,
-                                      ),
-                                      onCancel: () =>
-                                          _service.cancel(tasks[index].id),
-                                      onMore: () =>
-                                          _showTaskActions(tasks[index]),
-                                      onToggleSelection: () =>
-                                          _toggleTaskSelection(tasks[index]),
-                                      onLongPress: () =>
-                                          _enterTaskManagement(tasks[index]),
-                                      onOpen: () => _openTaskFile(tasks[index]),
-                                      onReveal: () =>
-                                          _revealTaskFile(tasks[index]),
-                                      onShare: () =>
-                                          _shareTaskFile(tasks[index]),
-                                    ),
-                                  ),
-                            ),
+            actions: [
+              AnimatedBuilder(
+                animation: _service,
+                builder: (context, _) {
+                  final manageable = _manageableTasks;
+                  if (manageable.isEmpty) return const SizedBox.shrink();
+                  if (!_managingTasks) {
+                    return IconButton(
+                      onPressed: _enterTaskManagement,
+                      tooltip: _ptTooltip(
+                        '批量管理',
+                        PortableTransferShortcutAction.enterManagement,
+                      ),
+                      icon: const Icon(Icons.checklist_rounded),
                     );
-                  },
-                ),
+                  }
+                  final allSelected = manageable.every(
+                    (task) => _selectedTaskIds.contains(task.id),
+                  );
+                  return Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        onPressed: () => _toggleSelectAll(manageable),
+                        tooltip: _ptTooltip(
+                          allSelected ? '取消全选' : '全选',
+                          PortableTransferShortcutAction.selectAll,
+                        ),
+                        icon: Icon(
+                          allSelected
+                              ? Icons.deselect_rounded
+                              : Icons.select_all_rounded,
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: _selectedTaskIds.isEmpty
+                            ? null
+                            : _deleteSelectedTasks,
+                        tooltip: _ptTooltip(
+                          '删除所选任务',
+                          PortableTransferShortcutAction.deleteSelected,
+                        ),
+                        icon: const Icon(Icons.delete_outline_rounded),
+                      ),
+                    ],
+                  );
+                },
               ),
+              const SizedBox(width: 8),
             ],
           ),
-        ),
-        floatingActionButton: AnimatedBuilder(
-          animation: _service,
-          builder: (context, _) {
-            final hasTasks = _service.tasks.any((task) => task.kind == _tab);
-            if (!hasTasks || _managingTasks) return const SizedBox.shrink();
-            return FloatingActionButton.extended(
-              onPressed: _picking
-                  ? null
-                  : (_tab == PortableTransferKind.export
-                        ? _startExport
-                        : _startImport),
-              icon: Icon(
-                _tab == PortableTransferKind.export
-                    ? Icons.add_rounded
-                    : Icons.file_open_outlined,
-              ),
-              label: Text(
-                _ptTooltip(
-                  _tab == PortableTransferKind.export ? '新建导出' : '选择文件',
-                  PortableTransferShortcutAction.primaryAction,
+          body: SafeArea(
+            top: false,
+            child: Column(
+              children: [
+                _buildHeader(),
+                Expanded(
+                  child: AnimatedBuilder(
+                    animation: _service,
+                    builder: (context, _) {
+                      final tasks = _service.tasks
+                          .where((task) => task.kind == _tab)
+                          .toList();
+                      return AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 220),
+                        child: tasks.isEmpty
+                            ? _EmptyTransferState(
+                                key: ValueKey(_tab),
+                                kind: _tab,
+                                onPressed: _tab == PortableTransferKind.export
+                                    ? _startExport
+                                    : _startImport,
+                              )
+                            : ListView.separated(
+                                key: ValueKey('list-$_tab'),
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  12,
+                                  16,
+                                  120,
+                                ),
+                                itemCount: tasks.length,
+                                separatorBuilder: (_, _) =>
+                                    const SizedBox(height: 10),
+                                itemBuilder: (context, index) =>
+                                    TweenAnimationBuilder<double>(
+                                      tween: Tween(begin: 0, end: 1),
+                                      duration: Duration(
+                                        milliseconds:
+                                            180 + index.clamp(0, 4) * 45,
+                                      ),
+                                      curve: Curves.easeOutCubic,
+                                      builder: (context, value, child) =>
+                                          Opacity(
+                                            opacity: value,
+                                            child: Transform.translate(
+                                              offset: Offset(
+                                                0,
+                                                10 * (1 - value),
+                                              ),
+                                              child: child,
+                                            ),
+                                          ),
+                                      child: _TransferTaskCard(
+                                        task: tasks[index],
+                                        isDesktop: _isDesktop,
+                                        selectionMode: _managingTasks,
+                                        selected: _selectedTaskIds.contains(
+                                          tasks[index].id,
+                                        ),
+                                        onCancel: () =>
+                                            _service.cancel(tasks[index].id),
+                                        onMore: () =>
+                                            _showTaskActions(tasks[index]),
+                                        onToggleSelection: () =>
+                                            _toggleTaskSelection(tasks[index]),
+                                        onLongPress: () =>
+                                            _enterTaskManagement(tasks[index]),
+                                        onOpen: () =>
+                                            _openTaskFile(tasks[index]),
+                                        onReveal: () =>
+                                            _revealTaskFile(tasks[index]),
+                                        onShare: () =>
+                                            _shareTaskFile(tasks[index]),
+                                      ),
+                                    ),
+                              ),
+                      );
+                    },
+                  ),
                 ),
-              ),
-            );
-          },
-        ),
-        bottomNavigationBar: _managingTasks
-            ? _TaskManagementBar(
-                selectedCount: _selectedTaskIds.length,
-                onDelete: _selectedTaskIds.isEmpty
+              ],
+            ),
+          ),
+          floatingActionButton: AnimatedBuilder(
+            animation: _service,
+            builder: (context, _) {
+              final hasTasks = _service.tasks.any((task) => task.kind == _tab);
+              if (!hasTasks || _managingTasks) return const SizedBox.shrink();
+              return FloatingActionButton.extended(
+                onPressed: _picking
                     ? null
-                    : _deleteSelectedTasks,
-              )
-            : null,
-      ),
+                    : (_tab == PortableTransferKind.export
+                          ? _startExport
+                          : _startImport),
+                icon: Icon(
+                  _tab == PortableTransferKind.export
+                      ? Icons.add_rounded
+                      : Icons.file_open_outlined,
+                ),
+                label: Text(
+                  _ptTooltip(
+                    _tab == PortableTransferKind.export ? '新建导出' : '选择文件',
+                    PortableTransferShortcutAction.primaryAction,
+                  ),
+                ),
+              );
+            },
+          ),
+          bottomNavigationBar: _managingTasks
+              ? _TaskManagementBar(
+                  selectedCount: _selectedTaskIds.length,
+                  onDelete: _selectedTaskIds.isEmpty
+                      ? null
+                      : _deleteSelectedTasks,
+                )
+              : null,
+        ),
       ),
     );
   }
@@ -875,13 +881,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
   Future<void> _revealTaskFile(PortableTransferTask task) async {
     final path = task.filePath;
     if (path == null) return;
-    if (Platform.isWindows) {
-      await Process.run('explorer.exe', ['/select,', p.normalize(path)]);
-    } else if (Platform.isMacOS) {
-      await Process.run('open', ['-R', path]);
-    } else if (Platform.isLinux) {
-      await Process.run('xdg-open', [p.dirname(path)]);
-    }
+    await revealInFileManager(path);
   }
 
   Future<String?> _chooseExportPath(String fileName) async {
@@ -1349,57 +1349,57 @@ class _ImportPreviewDialogState extends State<_ImportPreviewDialog> {
         autofocus: true,
         onKeyEvent: (node, event) => _handleKey(event),
         child: AlertDialog(
-        icon: const Icon(Icons.inventory_2_outlined, size: 34),
-        title: Text(
-          preview.packageName,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(fileName, style: const TextStyle(color: Colors.white54)),
-            const SizedBox(height: 18),
-            _PreviewRow(
-              icon: Icons.movie_outlined,
-              label: '媒体',
-              value: '${preview.mediaCount} 个',
+          icon: const Icon(Icons.inventory_2_outlined, size: 34),
+          title: Text(
+            preview.packageName,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(fileName, style: const TextStyle(color: Colors.white54)),
+              const SizedBox(height: 18),
+              _PreviewRow(
+                icon: Icons.movie_outlined,
+                label: '媒体',
+                value: '${preview.mediaCount} 个',
+              ),
+              _PreviewRow(
+                icon: Icons.folder_outlined,
+                label: '文件夹',
+                value: '${preview.folderCount} 个',
+              ),
+              _PreviewRow(
+                icon: Icons.data_usage_rounded,
+                label: '原始大小',
+                value: _prettyBytes(preview.totalBytes),
+              ),
+              _PreviewRow(
+                icon: preview.hasChecksums
+                    ? Icons.verified_user_outlined
+                    : Icons.gpp_maybe_outlined,
+                label: '完整性清单',
+                value: preview.hasChecksums ? '有' : '无',
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                '内容将复制到应用管理目录，原文件不会被修改。',
+                style: TextStyle(color: Colors.white60, height: 1.4),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消 (Esc)'),
             ),
-            _PreviewRow(
-              icon: Icons.folder_outlined,
-              label: '文件夹',
-              value: '${preview.folderCount} 个',
-            ),
-            _PreviewRow(
-              icon: Icons.data_usage_rounded,
-              label: '原始大小',
-              value: _prettyBytes(preview.totalBytes),
-            ),
-            _PreviewRow(
-              icon: preview.hasChecksums
-                  ? Icons.verified_user_outlined
-                  : Icons.gpp_maybe_outlined,
-              label: '完整性清单',
-              value: preview.hasChecksums ? '有' : '无',
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              '内容将复制到应用管理目录，原文件不会被修改。',
-              style: TextStyle(color: Colors.white60, height: 1.4),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('开始导入 (Enter)'),
             ),
           ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消 (Esc)'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('开始导入 (Enter)'),
-          ),
-        ],
         ),
       ),
     );

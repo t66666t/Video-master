@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
@@ -42,6 +43,15 @@ void main() {
       musicPlayerUsesCompactLandscapeLayout(const Size(1180, 820)),
       isFalse,
     );
+  });
+
+  test('music player screen hosts the missing-source relocate panel', () {
+    final source = File(
+      'lib/screens/music_player_screen.dart',
+    ).readAsStringSync();
+    expect(source, contains('MissingLocalSourcePanel'));
+    expect(source, contains('isSourceMissing'));
+    expect(source, isNot(contains('share_intent')));
   });
 
   testWidgets('phone landscape uses balanced compact player geometry', (

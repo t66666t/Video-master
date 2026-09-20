@@ -25,6 +25,35 @@ void main() {
           phone.bottomControlsHeight(hasChapterButton: false),
           lessThan(tablet.bottomControlsHeight(hasChapterButton: false)),
         );
+        expect(
+          phone.progressAreaHeight(
+            hasChapterButton: false,
+            hasQualityButton: true,
+          ),
+          phone.progressAreaHeight(hasChapterButton: true),
+        );
+        expect(
+          phone.measureProgressPillWidth(
+            labels: const ['360P', '1080P 高码率'],
+            textStyle: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+            textDirection: TextDirection.ltr,
+            textScaler: TextScaler.noScaling,
+            maxWidth: 200,
+          ),
+          phone.measureProgressPillWidth(
+            labels: const ['1080P 高码率'],
+            textStyle: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+            textDirection: TextDirection.ltr,
+            textScaler: TextScaler.noScaling,
+            maxWidth: 200,
+          ),
+        );
       },
     );
 

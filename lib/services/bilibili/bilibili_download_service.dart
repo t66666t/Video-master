@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
+import 'package:video_player_app/models/library_activity.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
@@ -3521,7 +3522,16 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
     notifyListeners();
 
+    final streamingBatchId = library.beginImportBatch(
+      title: importCandidates.length == 1
+          ? 'B站在线播放'
+          : 'B站在线 ${importCandidates.length} 项',
+      sourceKind: LibraryImportSourceKind.bilibili,
+      targetCollectionId: targetFolderId,
+    );
+
     var ownsLibraryProgress = false;
+    var publishedStreamingBatch = false;
     void reportLibraryProgress(double progress, String status) {
       if (library.hasActiveImport && !ownsLibraryProgress) {
         return;
@@ -3789,7 +3799,12 @@ class BilibiliDownloadService extends ChangeNotifier {
           );
           _setStreamingImportProgress(ep, '正在写入媒体库...');
           reportLibraryProgress(stageProgress(0.86), '正在写入媒体库...');
-          await library.addSingleVideo(item, reuseExistingItem: false);
+          await library.addSingleVideo(
+            item,
+            reuseExistingItem: false,
+            activityBatchId: streamingBatchId,
+            sourceKind: LibraryImportSourceKind.bilibili,
+          );
           ep
             ..status = DownloadStatus.completed
             ..progress = 1
@@ -3824,9 +3839,16 @@ class BilibiliDownloadService extends ChangeNotifier {
       if (count > 0 && !autoDeleteTaskAfterImport) {
         await saveTasks();
       }
+      if (count > 0 && streamingBatchId != null) {
+        await library.completeImportBatch(streamingBatchId);
+        publishedStreamingBatch = true;
+      }
       notifyListeners();
       return count;
     } finally {
+      if (!publishedStreamingBatch && streamingBatchId != null) {
+        library.abortImportBatch(streamingBatchId);
+      }
       library.clearTransientImportProgress();
     }
   }
@@ -3853,6 +3875,14 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     if (completedEpisodes.isEmpty) return 0;
+
+    final downloadBatchId = library.beginImportBatch(
+      title: completedEpisodes.length == 1
+          ? 'B站下载'
+          : 'B站下载 ${completedEpisodes.length} 项',
+      sourceKind: LibraryImportSourceKind.bilibili,
+      targetCollectionId: targetFolderId,
+    );
 
     var baseDir = await resolveDefaultImportDirectory();
     if (customDownloadPath != null && customDownloadPath!.isNotEmpty) {
@@ -4173,7 +4203,11 @@ class BilibiliDownloadService extends ChangeNotifier {
           ),
         );
         // #endregion
-        await library.addSingleVideo(item);
+        await library.addSingleVideo(
+          item,
+          activityBatchId: downloadBatchId,
+          sourceKind: LibraryImportSourceKind.bilibili,
+        );
         count++;
 
         // Update Export Status
@@ -4239,6 +4273,11 @@ class BilibiliDownloadService extends ChangeNotifier {
           libraryService != null) {
         await _processSequentialAutoImports();
       }
+    }
+    if (count > 0 && downloadBatchId != null) {
+      await library.completeImportBatch(downloadBatchId);
+    } else if (downloadBatchId != null) {
+      library.abortImportBatch(downloadBatchId);
     }
     return count;
   }

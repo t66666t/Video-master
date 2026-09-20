@@ -37,6 +37,7 @@ import '../widgets/subtitle_overlay.dart';
 import '../widgets/subtitle_display_layer.dart';
 import '../models/subtitle_display_state.dart';
 import '../widgets/bilibili_buffering_overlay.dart';
+import '../widgets/relocate_local_media_source.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/player_control_metrics.dart';
 import '../widgets/sleep_timer_dialog.dart';
@@ -499,9 +500,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             ),
           );
         }
-        return const IgnorePointer(
-          child: ColoredBox(color: Color(0xFF141414)),
-        );
+        return const IgnorePointer(child: ColoredBox(color: Color(0xFF141414)));
       },
     );
   }
@@ -585,38 +584,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     ];
 
     final chapters = _currentItem?.chapters ?? const <MediaChapter>[];
-    if (chapters.isEmpty) return rects;
-
     final Duration position = _controllerAssigned
         ? _controller.value.position
         : Duration.zero;
-    final MediaChapter chapter =
-        MediaChapter.atPosition(chapters, position) ?? chapters.first;
     final TextDirection textDirection = Directionality.of(context);
-    final TextStyle chapterTextStyle = DefaultTextStyle.of(context).style.merge(
-      TextStyle(
-        color: Colors.white,
-        fontSize: (13 * metrics.scale).clamp(10.0, 13.0).toDouble(),
-        fontWeight: FontWeight.w600,
-      ),
-    );
-    final double iconSize = (18 * metrics.scale).clamp(16.0, 18.0).toDouble();
-    final double contentGap = (5 * metrics.scale).clamp(3.0, 5.0).toDouble();
-    final double horizontalPadding = (12 * metrics.scale)
-        .clamp(9.0, 12.0)
-        .toDouble();
-    final double measurementSlack = (4 * metrics.scale)
-        .clamp(3.0, 4.0)
-        .toDouble();
-    final TextPainter painter = TextPainter(
-      text: TextSpan(text: chapter.title, style: chapterTextStyle),
-      maxLines: 1,
-      textDirection: textDirection,
-      textScaler: MediaQuery.textScalerOf(context),
-      locale: Localizations.maybeLocaleOf(context),
-      textWidthBasis: TextWidthBasis.longestLine,
-    )..layout();
-
+    final TextStyle progressPillTextStyle = DefaultTextStyle.of(context).style
+        .merge(
+          TextStyle(
+            color: Colors.white,
+            fontSize: metrics.progressPillFontSize,
+            fontWeight: FontWeight.w600,
+          ),
+        );
     final double trackInset = math.max(
       metrics.overlayRadius,
       metrics.thumbRadius,
@@ -630,14 +609,6 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           (sliderWidth - (trackInset * 2)) * metrics.chapterButtonWidthFactor,
         )
         .toDouble();
-    final double measuredButtonWidth =
-        (horizontalPadding * 2) +
-        contentGap +
-        iconSize +
-        painter.width +
-        measurementSlack;
-    final double buttonWidth = math.min(maxButtonWidth, measuredButtonWidth);
-    final double buttonLeft = metrics.bottomHorizontalPadding + trackInset;
     final double buttonTop =
         playerSize.height -
         metrics.bottomPadding -
@@ -650,14 +621,54 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         metrics.bottomPadding -
         metrics.bottomRowHeight -
         metrics.progressHitHeight;
-    rects.add(
-      Rect.fromLTRB(
-        buttonLeft,
-        buttonTop,
-        buttonLeft + buttonWidth,
-        buttonBottom,
-      ),
-    );
+
+    if (chapters.isNotEmpty) {
+      final MediaChapter chapter =
+          MediaChapter.atPosition(chapters, position) ?? chapters.first;
+      final double buttonWidth = metrics.measureProgressPillWidth(
+        labels: [chapter.title],
+        textStyle: progressPillTextStyle,
+        textDirection: textDirection,
+        textScaler: MediaQuery.textScalerOf(context),
+        locale: Localizations.maybeLocaleOf(context),
+        maxWidth: maxButtonWidth,
+      );
+      final double buttonLeft = metrics.bottomHorizontalPadding + trackInset;
+      rects.add(
+        Rect.fromLTRB(
+          buttonLeft,
+          buttonTop,
+          buttonLeft + buttonWidth,
+          buttonBottom,
+        ),
+      );
+    }
+
+    final playbackService = MediaPlaybackService();
+    if (playbackService.isCurrentItemBilibiliStream &&
+        playbackService.streamQualities.isNotEmpty) {
+      final qualityLabels = playbackService.streamQualities
+          .map((quality) => quality.label)
+          .toList(growable: false);
+      final double buttonWidth = metrics.measureProgressPillWidth(
+        labels: qualityLabels.isEmpty ? const ['清晰度'] : qualityLabels,
+        textStyle: progressPillTextStyle,
+        textDirection: textDirection,
+        textScaler: MediaQuery.textScalerOf(context),
+        locale: Localizations.maybeLocaleOf(context),
+        maxWidth: maxButtonWidth,
+      );
+      final double buttonRight =
+          playerSize.width - metrics.bottomHorizontalPadding - trackInset;
+      rects.add(
+        Rect.fromLTRB(
+          buttonRight - buttonWidth,
+          buttonTop,
+          buttonRight,
+          buttonBottom,
+        ),
+      );
+    }
     return rects;
   }
 
@@ -2114,12 +2125,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       await settings.saveLandscapeSubtitleSidebarVisible(sidebarVisible);
       final suppressRouteCleanup =
           PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
-      final shouldAutoPause = PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
-        autoPauseOnExit: settings.autoPauseOnExit && !shouldSkipAutoPause,
-        explicitExit: _explicitPlaybackExitRequested,
-        suppressRouteCleanup: suppressRouteCleanup,
-        transportPlaying: playbackService.isTransportPlaying,
-      );
+      final shouldAutoPause =
+          PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+            autoPauseOnExit: settings.autoPauseOnExit && !shouldSkipAutoPause,
+            explicitExit: _explicitPlaybackExitRequested,
+            suppressRouteCleanup: suppressRouteCleanup,
+            transportPlaying: playbackService.isTransportPlaying,
+          );
       if (exitController == null) {
         if (itemId != null) {
           if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
@@ -2250,6 +2262,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         focusContext?.widget is EditableText ||
         focusContext?.findAncestorWidgetOfExactType<EditableText>() != null;
     if (isEditingText) return KeyEventResult.ignored;
+    final KeyEventResult transcriptResult =
+        _subtitleSidebarKey.currentState?.handleTranscriptShortcut(event) ??
+        KeyEventResult.ignored;
+    if (transcriptResult != KeyEventResult.ignored) {
+      return transcriptResult;
+    }
     final controlsResult = _controlsKey.currentState?.handleKeyEvent(
       _playbackPageFocusNode,
       event,
@@ -3159,11 +3177,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                     playbackService.currentItem?.id == currentItem.id,
                 desiredPlaying: playbackService.desiredPlaying,
               ),
-              startPosition: MediaPlaybackService.startPositionForCurrentSession(
-                currentItemId: playbackService.currentItem?.id,
-                itemId: currentItem.id,
-                currentPosition: playbackService.position,
-              ),
+              startPosition:
+                  MediaPlaybackService.startPositionForCurrentSession(
+                    currentItemId: playbackService.currentItem?.id,
+                    itemId: currentItem.id,
+                    currentPosition: playbackService.position,
+                  ),
             ),
           );
         } catch (error) {
@@ -3453,10 +3472,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   Duration _subtitleLookupPosition() {
     final native = _controller.value.position;
     try {
-      final service = Provider.of<MediaPlaybackService>(
-        context,
-        listen: false,
-      );
+      final service = Provider.of<MediaPlaybackService>(context, listen: false);
       if (!identical(service.controller, _controller)) return native;
       return service.positionForSubtitleOverlay(native);
     } catch (_) {
@@ -4800,19 +4816,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                           // 1. Video Layer
                                           Center(
                                             child: _isSourceMissing
-                                                ? const ColoredBox(
-                                                    color: Colors.black,
-                                                    child: Center(
-                                                      child: Text(
-                                                        "没有原媒体",
-                                                        style: TextStyle(
-                                                          color: Colors.white70,
-                                                          fontSize: 20,
-                                                          fontWeight:
-                                                              FontWeight.w500,
-                                                        ),
-                                                      ),
-                                                    ),
+                                                ? MissingLocalSourcePanel(
+                                                    item: _currentItem,
+                                                    fontSize: 20,
                                                   )
                                                 : _fatalErrorMessage != null
                                                 ? Container(

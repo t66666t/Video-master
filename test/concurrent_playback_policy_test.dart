@@ -36,7 +36,7 @@ void main() {
         config.androidAudioFocusGainType,
         AndroidAudioFocusGainType.gain,
       );
-      expect(config.androidWillPauseWhenDucked, isTrue);
+      expect(config.androidWillPauseWhenDucked, isFalse);
     });
   });
 
@@ -46,6 +46,7 @@ void main() {
         shouldPauseForAudioInterruption(
           allowConcurrentPlayback: true,
           interruptionBegan: true,
+          type: AudioInterruptionType.pause,
         ),
         isFalse,
       );
@@ -65,6 +66,7 @@ void main() {
         shouldPauseForAudioInterruption(
           allowConcurrentPlayback: false,
           interruptionBegan: true,
+          type: AudioInterruptionType.pause,
         ),
         isTrue,
       );
@@ -74,6 +76,89 @@ void main() {
           interruptionBegan: false,
           type: AudioInterruptionType.pause,
           isPaused: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('does not pause exclusive playback for a duck', () {
+      expect(
+        shouldPauseForAudioInterruption(
+          allowConcurrentPlayback: false,
+          interruptionBegan: true,
+          type: AudioInterruptionType.duck,
+        ),
+        isFalse,
+      );
+    });
+
+    test('ignores self AUDIOFOCUS_LOSS while taking exclusive focus', () {
+      expect(
+        shouldPauseForAudioInterruption(
+          allowConcurrentPlayback: false,
+          interruptionBegan: true,
+          type: AudioInterruptionType.unknown,
+          withinSelfFocusGrace: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldReclaimExclusiveFocusAfterInterruption(
+          allowConcurrentPlayback: false,
+          interruptionBegan: true,
+          type: AudioInterruptionType.unknown,
+          desiredPlaying: true,
+          withinSelfFocusGrace: true,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldIgnoreRemotePauseAsSelfFocusLoss(
+          allowConcurrentPlayback: false,
+          desiredPlaying: true,
+          withinSelfFocusGrace: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('still pauses a real permanent loss after the grace window', () {
+      expect(
+        shouldPauseForAudioInterruption(
+          allowConcurrentPlayback: false,
+          interruptionBegan: true,
+          type: AudioInterruptionType.unknown,
+        ),
+        isTrue,
+      );
+      expect(
+        isWithinSelfAudioFocusGrace(
+          exclusiveFocusGrantedAt: DateTime(2026, 1, 1),
+          now: DateTime(2026, 1, 1, 0, 0, 2),
+        ),
+        isFalse,
+      );
+    });
+
+    test('ignores becoming-noisy from speaker reroute while taking focus', () {
+      expect(
+        shouldPauseForBecomingNoisy(
+          isTransportPlaying: true,
+          withinSelfFocusGrace: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldPauseForBecomingNoisy(
+          isTransportPlaying: false,
+          withinSelfFocusGrace: false,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldPauseForBecomingNoisy(
+          isTransportPlaying: true,
+          withinSelfFocusGrace: false,
         ),
         isTrue,
       );
@@ -92,17 +177,53 @@ void main() {
     });
   });
 
-  group('ExoPlayer reload policy', () {
+  group('ExoPlayer mix and reload policy', () {
     setUp(LocalPlaybackBackendPolicy.clearForTesting);
 
-    test('reloads Android local files that still use ExoPlayer audio focus', () {
+    test('Android ExoPlayer always mixes so AudioSession owns exclusive focus',
+        () {
+      expect(
+        MediaPlaybackService.platformPlayerShouldMixWithOthers(
+          isAndroid: true,
+          allowConcurrentPlayback: false,
+        ),
+        isTrue,
+      );
+      expect(
+        MediaPlaybackService.platformPlayerShouldMixWithOthers(
+          isAndroid: true,
+          allowConcurrentPlayback: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('iOS still maps mixWithOthers onto the native player', () {
+      expect(
+        MediaPlaybackService.platformPlayerShouldMixWithOthers(
+          isAndroid: false,
+          allowConcurrentPlayback: false,
+        ),
+        isFalse,
+      );
+      expect(
+        MediaPlaybackService.platformPlayerShouldMixWithOthers(
+          isAndroid: false,
+          allowConcurrentPlayback: true,
+        ),
+        isTrue,
+      );
+    });
+
+    test('does not reload Android ExoPlayer when concurrent playback toggles',
+        () {
       expect(
         MediaPlaybackService.shouldReloadPlayerForConcurrentPlayback(
           isAndroid: true,
           sourceType: DataSourceType.file,
           resource: '/storage/emulated/0/Movies/a.mp4',
         ),
-        isTrue,
+        isFalse,
       );
     });
 

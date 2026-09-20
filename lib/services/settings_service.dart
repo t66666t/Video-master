@@ -10,6 +10,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../models/folder_placeholder_style.dart';
+import '../models/media_library_continue_policy.dart';
 import '../models/subtitle_copy_format.dart';
 import '../models/subtitle_style.dart';
 import '../models/subtitle_output_path_strategy.dart';
@@ -245,6 +246,17 @@ class SettingsService extends ChangeNotifier {
 
   // Media manager unified view mode (0: grid, 1: list)
   int mediaLibraryViewMode = 0;
+
+  // Root entry switcher: empty until first initialized default is written.
+  String mediaLibraryRootEntry = '';
+  bool mediaLibraryRootEntryUserChosen = false;
+  String mediaLibraryRootEntryOrder = '';
+  String mediaLibraryLastFolderId = '';
+  String mediaLibraryEntryAnchors = '';
+  bool mediaLibraryLastFolderIncludeDescendants = false;
+  /// Continue tab: false = all play history; true = unfinished + watch threshold.
+  bool mediaLibraryContinueSeriousOnly = false;
+  ContinueWatchPolicy continueWatchPolicy = ContinueWatchPolicy.defaults;
 
   // Unified list mode style settings
   int mediaListCrossAxisCount = 1;
@@ -1434,6 +1446,52 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) => service.mediaLibraryViewMode = value,
       ),
       _stringSetting(
+        key: 'mediaLibraryRootEntry',
+        defaultValue: '',
+        apply: (service, value) => service.mediaLibraryRootEntry = value,
+      ),
+      _boolSetting(
+        key: 'mediaLibraryRootEntryUserChosen',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.mediaLibraryRootEntryUserChosen = value,
+      ),
+      _stringSetting(
+        key: 'mediaLibraryRootEntryOrder',
+        defaultValue: '',
+        apply: (service, value) => service.mediaLibraryRootEntryOrder = value,
+      ),
+      _stringSetting(
+        key: 'mediaLibraryLastFolderId',
+        defaultValue: '',
+        apply: (service, value) => service.mediaLibraryLastFolderId = value,
+      ),
+      _boolSetting(
+        key: 'mediaLibraryLastFolderIncludeDescendants',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.mediaLibraryLastFolderIncludeDescendants = value,
+      ),
+      _boolSetting(
+        key: 'mediaLibraryContinueSeriousOnly',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.mediaLibraryContinueSeriousOnly = value,
+      ),
+      _stringSetting(
+        key: 'mediaLibraryContinuePolicy',
+        defaultValue: ContinueWatchPolicy.defaults.toJsonString(),
+        normalize: (value) =>
+            ContinueWatchPolicy.fromJsonString(value).toJsonString(),
+        apply: (service, value) => service.continueWatchPolicy =
+            ContinueWatchPolicy.fromJsonString(value),
+      ),
+      _stringSetting(
+        key: 'mediaLibraryEntryAnchors',
+        defaultValue: '',
+        apply: (service, value) => service.mediaLibraryEntryAnchors = value,
+      ),
+      _stringSetting(
         key: 'folderPlaceholderSettings',
         defaultValue: FolderPlaceholderSettings.defaults.toJsonString(),
         normalize: (value) =>
@@ -1724,8 +1782,9 @@ class SettingsService extends ChangeNotifier {
   }
 
   Future<void> _updateRegisteredSettingsAtomically(
-    Map<String, Object> values,
-  ) async {
+    Map<String, Object> values, {
+    bool notify = true,
+  }) async {
     final persistence = <Future<void>>[];
     for (final entry in values.entries) {
       final setting = _registeredSettingByKey[entry.key];
@@ -1736,8 +1795,44 @@ class SettingsService extends ChangeNotifier {
       // related in-memory values become visible before the single notification.
       persistence.add(setting.updateValue(this, _prefs, entry.value));
     }
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    }
     await Future.wait(persistence);
+  }
+
+  /// One notification for both root-entry keys so the library shell does not
+  /// rebuild twice (and decode two thumbnail grids) on a single chip tap.
+  /// Chip taps pass [notify] false so HomeScreen is not rebuilt on the same
+  /// frame as the destination grid.
+  Future<void> saveMediaLibraryRootChoice(
+    String entry, {
+    bool notify = true,
+  }) {
+    return _updateRegisteredSettingsAtomically({
+      'mediaLibraryRootEntry': entry,
+      'mediaLibraryRootEntryUserChosen': true,
+    }, notify: notify);
+  }
+
+  /// Chip order is chrome, not library content. Skip notify so parked
+  /// grids are not rebuilt when the user rearranges titles.
+  Future<void> saveMediaLibraryRootEntryOrder(String encoded) {
+    return _updateRegisteredSetting<String>(
+      'mediaLibraryRootEntryOrder',
+      encoded,
+      notify: false,
+    );
+  }
+
+  /// Scroll anchors are restore hints, not UI. Skip notify so a tab switch is
+  /// not followed by a second full-tree rebuild.
+  Future<void> saveMediaLibraryEntryAnchors(String encoded) {
+    return _updateRegisteredSetting<String>(
+      'mediaLibraryEntryAnchors',
+      encoded,
+      notify: false,
+    );
   }
 
   Future<void> toggleFullScreen() async {
@@ -1965,6 +2060,9 @@ class SettingsService extends ChangeNotifier {
   @visibleForTesting
   void resetForTest() {
     _initialized = false;
+    mediaLibraryLastFolderIncludeDescendants = false;
+    mediaLibraryContinueSeriousOnly = false;
+    continueWatchPolicy = ContinueWatchPolicy.defaults;
   }
 
   /// 加载字幕样式 - 支持新旧格式迁移
@@ -3288,6 +3386,15 @@ class SettingsService extends ChangeNotifier {
         'homeCardTitleFontSize': homeCardTitleFontSize,
         'homeCardAspectRatio': homeCardAspectRatio,
         'mediaLibraryViewMode': mediaLibraryViewMode,
+        'mediaLibraryRootEntry': mediaLibraryRootEntry,
+        'mediaLibraryRootEntryUserChosen': mediaLibraryRootEntryUserChosen,
+        'mediaLibraryRootEntryOrder': mediaLibraryRootEntryOrder,
+        'mediaLibraryLastFolderId': mediaLibraryLastFolderId,
+        'mediaLibraryLastFolderIncludeDescendants':
+            mediaLibraryLastFolderIncludeDescendants,
+        'mediaLibraryContinueSeriousOnly': mediaLibraryContinueSeriousOnly,
+        'mediaLibraryContinuePolicy': continueWatchPolicy.toJson(),
+        'mediaLibraryEntryAnchors': mediaLibraryEntryAnchors,
         'mediaListCrossAxisCount': mediaListCrossAxisCount,
         'mediaListShowThumbnail': mediaListShowThumbnail,
         'mediaListShowIndex': mediaListShowIndex,

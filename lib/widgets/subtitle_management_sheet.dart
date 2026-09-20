@@ -4,9 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:file_picker/file_picker.dart';
-import 'package:provider/provider.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:open_filex/open_filex.dart';
+import 'package:provider/provider.dart';
 import '../services/embedded_subtitle_service.dart';
 import '../models/subtitle_source_type.dart';
 import '../models/subtitle_classification.dart';
@@ -16,6 +15,7 @@ import '../models/managed_subtitle_asset.dart';
 import '../services/subtitle_translation_service.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../utils/app_toast.dart';
+import '../utils/reveal_in_file_manager.dart';
 import '../utils/subtitle_parser.dart';
 import '../utils/subtitle_file_matcher.dart';
 import 'landscape_sidebar_layout.dart';
@@ -752,18 +752,9 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
   Future<void> _openDownloadDirectory() async {
     try {
       final dir = await _resolveDownloadTargetDir();
-      final path = dir.path;
-      if (Platform.isWindows) {
-        await Process.run('explorer', [path]);
-      } else if (Platform.isMacOS) {
-        await Process.run('open', [path]);
-      } else if (Platform.isLinux) {
-        await Process.run('xdg-open', [path]);
-      } else {
-        // Android fallback (open file manager not easily supported via Intent without plugin)
-        // Try OpenFilex if it's a directory? OpenFilex usually opens files.
-        // For now, just show toast on mobile if not supported
-        AppToast.show("已保存至: $path", type: AppToastType.info);
+      final bool opened = await revealInFileManager(dir.path);
+      if (!opened && mounted) {
+        AppToast.show("已保存至: ${dir.path}", type: AppToastType.info);
       }
     } catch (e) {
       AppToast.show("无法打开文件夹", type: AppToastType.error);
@@ -1165,25 +1156,6 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     return getApplicationDocumentsDirectory();
   }
 
-  String? _resolveMimeType(String path) {
-    final ext = p.extension(path).toLowerCase();
-    if (ext.isEmpty) return null;
-    if ([
-      '.srt',
-      '.vtt',
-      '.ass',
-      '.ssa',
-      '.lrc',
-      '.scc',
-      '.sub',
-      '.idx',
-      '.sup',
-    ].contains(ext)) {
-      return 'text/plain';
-    }
-    return null;
-  }
-
   Future<void> _downloadSubtitleFile(String path) async {
     try {
       final sourceFile = File(path);
@@ -1218,70 +1190,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         targetPath = destPath;
       }
 
-      if (Platform.isWindows) {
-        // 将 /select, 和路径合并为单个参数，避免路径含空格/特殊字符时出错
-        bool opened = false;
-        try {
-          await Process.run('explorer', ['/select,$targetPath']);
-          opened = true;
-        } catch (e) {
-          debugPrint('explorer 打开失败，尝试 OpenFilex: $e');
-        }
-        if (!opened) {
-          try {
-            await OpenFilex.open(
-              targetPath,
-              type: _resolveMimeType(targetPath),
-            );
-          } catch (e) {
-            debugPrint('OpenFilex 也失败: $e');
-          }
-        }
-        if (mounted) {
+      final bool revealed = await revealInFileManager(targetPath);
+      if (mounted) {
+        if (revealed) {
           AppToast.show("字幕已保存", type: AppToastType.success);
-        }
-      } else if (Platform.isLinux || Platform.isMacOS) {
-        // 桌面 Linux/macOS 优先用系统命令打开所在文件夹
-        bool opened = false;
-        try {
-          if (Platform.isLinux) {
-            await Process.run('xdg-open', [p.dirname(targetPath)]);
-          } else {
-            await Process.run('open', [p.dirname(targetPath)]);
-          }
-          opened = true;
-        } catch (e) {
-          debugPrint('系统命令打开失败，尝试 OpenFilex: $e');
-        }
-        if (!opened) {
-          final result = await OpenFilex.open(
-            targetPath,
-            type: _resolveMimeType(targetPath),
-          );
-          if (mounted) {
-            if (result.type == ResultType.done) {
-              AppToast.show("字幕已下载并打开", type: AppToastType.success);
-            } else {
-              AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
-            }
-          }
         } else {
-          if (mounted) {
-            AppToast.show("字幕已保存", type: AppToastType.success);
-          }
-        }
-      } else {
-        // Android/iOS 等移动平台
-        final result = await OpenFilex.open(
-          targetPath,
-          type: _resolveMimeType(targetPath),
-        );
-        if (mounted) {
-          if (result.type == ResultType.done) {
-            AppToast.show("字幕已下载并打开", type: AppToastType.success);
-          } else {
-            AppToast.show("字幕已保存，但打开失败", type: AppToastType.error);
-          }
+          AppToast.show("字幕已保存，但无法打开所在位置", type: AppToastType.error);
         }
       }
     } catch (e) {
@@ -2514,11 +2428,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         });
       }
 
-      if (Platform.isWindows) {
-        try {
-          await Process.run('explorer', ['/select,', outputPath]);
-        } catch (_) {}
-      }
+      await revealInFileManager(outputPath);
 
       if (mounted) {
         AppToast.show(

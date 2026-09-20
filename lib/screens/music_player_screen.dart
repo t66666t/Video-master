@@ -19,6 +19,7 @@ import '../widgets/music_album_cover.dart';
 import '../widgets/music_lyric_view.dart';
 import '../widgets/music_playback_controls.dart';
 import '../widgets/music_text_optical_alignment.dart';
+import '../widgets/relocate_local_media_source.dart';
 
 /// Prepares the already-blurred artwork while the source playback page is
 /// still visible. This moves image decoding and blur work out of the route's
@@ -501,6 +502,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
 
     // 空格键：播放/暂停
     if (key == LogicalKeyboardKey.space) {
+      if (mediaService.isSourceMissing) return KeyEventResult.handled;
       if (widget.onPlayPause != null) {
         widget.onPlayPause!.call();
       } else if (mediaService.isPlaying) {
@@ -692,6 +694,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
   }
 
   void _handleSeekTo(Duration position) {
+    if (_mediaService.isSourceMissing) return;
     final onSeek = widget.onSeek;
     if (onSeek != null) {
       onSeek(position);
@@ -770,6 +773,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
         subtitles: s.subtitles,
         secondarySubtitles: s.secondarySubtitles,
         isPlaying: s.isPlaying,
+        isSourceMissing: s.isSourceMissing,
         volume: s.volume,
         isMuted: s.isMuted,
       ),
@@ -834,6 +838,13 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                           );
                         },
                       ),
+                      if (snapshot.isSourceMissing)
+                        Positioned.fill(
+                          child: MissingLocalSourcePanel(
+                            item: mediaService.currentItem,
+                            fontSize: 18,
+                          ),
+                        ),
                       _buildWindowControls(),
                     ],
                   ),
@@ -1201,6 +1212,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                             onPlayPause:
                                 widget.onPlayPause ??
                                 () {
+                                  if (mediaService.isSourceMissing) return;
                                   if (mediaService.isPlaying) {
                                     mediaService.pause();
                                   } else {
@@ -1622,6 +1634,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                     onProgressChangeEnd: _handleProgressChangeEnd,
                     onPlayPause: () {
                       _onUserInteraction();
+                      if (mediaService.isSourceMissing) return;
                       if (widget.onPlayPause != null) {
                         widget.onPlayPause!.call();
                       } else {
@@ -1804,6 +1817,7 @@ class _PlayerSnapshot {
   final List<SubtitleItem> subtitles;
   final List<SubtitleItem> secondarySubtitles;
   final bool isPlaying;
+  final bool isSourceMissing;
   final double volume;
   final bool isMuted;
 
@@ -1815,6 +1829,7 @@ class _PlayerSnapshot {
     required this.subtitles,
     required this.secondarySubtitles,
     required this.isPlaying,
+    required this.isSourceMissing,
     required this.volume,
     required this.isMuted,
   });
@@ -1830,6 +1845,7 @@ class _PlayerSnapshot {
           identical(subtitles, other.subtitles) &&
           identical(secondarySubtitles, other.secondarySubtitles) &&
           isPlaying == other.isPlaying &&
+          isSourceMissing == other.isSourceMissing &&
           volume == other.volume &&
           isMuted == other.isMuted;
 
@@ -1842,6 +1858,7 @@ class _PlayerSnapshot {
     subtitles,
     secondarySubtitles,
     isPlaying,
+    isSourceMissing,
     volume,
     isMuted,
   );

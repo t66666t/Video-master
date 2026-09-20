@@ -108,6 +108,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   );
   bool _hasTextSelection = false;
   String _selectedTranscriptText = '';
+
+  /// True after Ctrl/Cmd+A or the menu's Select all. Flutter's selectAll only
+  /// covers currently mounted virtualized rows; copy/format then uses the
+  /// canonical cache instead of that partial `plainText`.
+  bool _fullTranscriptSelected = false;
   Timer? _touchSelectionEdgeScrollTimer;
   int? _touchSelectionEdgePointer;
   bool _selectionViewportCorrectionInFlight = false;
@@ -119,7 +124,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   TextSelectionToolbarAnchors? _persistentSelectionToolbarAnchors;
   OverlayEntry? _desktopSelectionToolbarEntry;
   Offset? _desktopSelectionToolbarAnchor;
-  bool _desktopSelectionToolbarInsertScheduled = false;
   OverlayEntry? _copyFormatPopoverEntry;
   Offset? _selectionShieldTapDownPosition;
   Drag? _selectionPreservingPanDrag;
@@ -532,6 +536,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     GestureBinding.instance.pointerRouter.addGlobalRoute(
       _handleGlobalSelectionPointerEvent,
     );
+    // Sidebar-owned Ctrl/Cmd chords, including a hardware keyboard on a phone.
+    // SelectionArea's own Actions only cover currently mounted virtualized rows.
+    _textSelectionFocusNode.onKeyEvent = (FocusNode node, KeyEvent event) {
+      return handleTranscriptShortcut(event);
+    };
     _invalidateDisplaySubtitlesCache();
     _checkBilingualSync();
     _rebuildTimelineResolver();
@@ -749,17 +758,42 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   void _handleTextSelectionChanged(SelectedContent? content) {
     final String nextText = content?.plainText ?? '';
     final bool hasSelection = nextText.isNotEmpty;
+
+    if (_fullTranscriptSelected) {
+      // Handle drags are a real user edit of the range. Everything else is
+      // Flutter reporting a virtualized subset or an empty selectAll result.
+      if (_selectionGestureUsesHandle && hasSelection) {
+        _fullTranscriptSelected = false;
+      } else {
+        _selectedTranscriptText = _canonicalTranscriptText;
+        if (!_hasTextSelection) {
+          setState(() => _hasTextSelection = true);
+        }
+        _persistentSelectionToolbarEntry?.markNeedsBuild();
+        _desktopSelectionToolbarEntry?.markNeedsBuild();
+        _copyFormatPopoverEntry?.markNeedsBuild();
+        return;
+      }
+    }
+
     final bool textChanged = nextText != _selectedTranscriptText;
     _selectedTranscriptText = nextText;
 
     if (hasSelection && !_hasTextSelection) {
+      _fullTranscriptSelected = false;
       final int? touchPointer = _activeTouchPointerForSelection();
       if (touchPointer != null) {
         _usesPersistentTouchSelectionToolbar = true;
         _persistentSelectionToolbarAnchor =
             _downTouchPointerPositions[touchPointer];
+      } else if (_isMobileSelectionPlatform) {
+        // iOS/Android can confirm a selection after the pointer tracking
+        // window; still take ownership so Flutter never attaches a geometry
+        // menu that later dies off-screen.
+        _usesPersistentTouchSelectionToolbar = true;
       }
       setState(() => _hasTextSelection = true);
+      _hideNativeSelectionToolbars();
       if (_usesPersistentTouchSelectionToolbar) {
         _schedulePersistentSelectionToolbar();
       }
@@ -774,7 +808,9 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     }
 
     if (hasSelection && textChanged) {
+      _hideNativeSelectionToolbars();
       _persistentSelectionToolbarEntry?.markNeedsBuild();
+      _desktopSelectionToolbarEntry?.markNeedsBuild();
       _copyFormatPopoverEntry?.markNeedsBuild();
       _tryBindCurrentSelectionHandlePointer();
       // Keep the existing pointer; the helper only rebinds when Flutter has
@@ -785,6 +821,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (hasSelection == _hasTextSelection) return;
     setState(() => _hasTextSelection = hasSelection);
     _removePersistentSelectionToolbar();
+    _removeDesktopSelectionToolbar();
     _removeCopyFormatPopover();
     _stopTouchSelectionEdgeScroll();
     _clearSelectionGesture();
@@ -807,6 +844,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       _hasTextSelection = false;
     }
     _selectedTranscriptText = '';
+    _fullTranscriptSelected = false;
     _cancelSelectionPreservingPan();
     _removePersistentSelectionToolbar();
     _removeDesktopSelectionToolbar();
@@ -830,6 +868,12 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   String get selectedTranscriptText => _selectedTranscriptText;
 
   @visibleForTesting
+  bool get isFullTranscriptSelected => _fullTranscriptSelected;
+
+  String get _canonicalTranscriptText =>
+      SubtitleCopyFormatter.joinedDisplayText(_cueCopyPartsCache);
+
+  @visibleForTesting
   bool get hasTextSelection => _hasTextSelection;
 
   @visibleForTesting
@@ -838,6 +882,11 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
 
   @visibleForTesting
   bool get isSelectionGestureActive => _selectionGesturePointer != null;
+
+  @visibleForTesting
+  bool get hasOwnedSelectionToolbar =>
+      _persistentSelectionToolbarEntry != null ||
+      _desktopSelectionToolbarEntry != null;
 
   /// Touch selection follows a text-editor model:
   ///   1. While the extending pointer stays inside the document, leave the
@@ -1081,22 +1130,26 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _touchSelectionEdgeTickCount = 0;
   }
 
+  bool get _isMobileSelectionPlatform {
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+      case TargetPlatform.fuchsia:
+        return true;
+      default:
+        return false;
+    }
+  }
+
   Widget _buildTextSelectionContextMenu(
     BuildContext context,
     SelectableRegionState selectableRegionState,
   ) {
-    // Touch uses a toolbar owned by this sidebar instead of Flutter's
-    // endpoint-anchored ContextMenuController. Flutter may tear down and
-    // recreate that toolbar as selection geometry scrolls off-screen; keeping
-    // ours in one stable overlay avoids that invalid-anchor transition.
-    if (_usesPersistentTouchSelectionToolbar) {
-      return const SizedBox.shrink();
-    }
-    // Keep this seam local to the transcript. Future actions such as dictionary
-    // lookup can be added without widening selection to timestamps or controls.
-    return AdaptiveTextSelectionToolbar.selectableRegion(
-      selectableRegionState: selectableRegionState,
-    );
+    // The sidebar owns every visible transcript menu. Flutter's geometry-
+    // anchored toolbar is what turned into ErrorWidget once virtualized
+    // glyphs scrolled off-screen; empty right-click would also open a second
+    // "Select all" menu from the ancestor SelectionArea.
+    return const SizedBox.shrink();
   }
 
   void _schedulePersistentSelectionToolbar() {
@@ -1210,40 +1263,39 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
       ContextMenuButtonItem(
         type: ContextMenuButtonType.selectAll,
         onPressed: () {
-          _textSelectionKey.currentState?.selectableRegion.selectAll(
-            SelectionChangedCause.toolbar,
-          );
-          if (!forTouch) _removeDesktopSelectionToolbar();
+          // Native desktop: Select all dismisses the menu, then Ctrl+C copies.
+          _selectEntireTranscript(cause: SelectionChangedCause.toolbar);
+          if (!forTouch) {
+            _removeDesktopSelectionToolbar();
+          }
         },
       ),
     );
-    if (_selectedTranscriptText.isNotEmpty) {
+    // Settings entry, not a copy action — always available on right-click.
+    items.add(
+      ContextMenuButtonItem(
+        type: ContextMenuButtonType.custom,
+        label: '格式',
+        onPressed: () => _openCopyFormatPopover(forTouch: forTouch),
+      ),
+    );
+    if (_selectedTranscriptText.isNotEmpty &&
+        forTouch &&
+        defaultTargetPlatform == TargetPlatform.android) {
       items.add(
         ContextMenuButtonItem(
-          type: ContextMenuButtonType.custom,
-          label: '格式',
-          onPressed: () => _openCopyFormatPopover(forTouch: forTouch),
+          type: ContextMenuButtonType.share,
+          onPressed: () {
+            final String text = _formattedSelectedTranscriptText();
+            if (text.isEmpty) return;
+            unawaited(
+              SystemChannels.platform.invokeMethod<void>('Share.invoke', text),
+            );
+            _removeCopyFormatPopover();
+            clearTextSelection();
+          },
         ),
       );
-      if (forTouch && defaultTargetPlatform == TargetPlatform.android) {
-        items.add(
-          ContextMenuButtonItem(
-            type: ContextMenuButtonType.share,
-            onPressed: () {
-              final String text = _formattedSelectedTranscriptText();
-              if (text.isEmpty) return;
-              unawaited(
-                SystemChannels.platform.invokeMethod<void>(
-                  'Share.invoke',
-                  text,
-                ),
-              );
-              _removeCopyFormatPopover();
-              clearTextSelection();
-            },
-          ),
-        );
-      }
     }
     return items;
   }
@@ -1256,14 +1308,36 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     );
   }
 
+  /// Live preview for the format popover. Uses the current selection when
+  /// there is one; otherwise the first few cues so the panel still works as
+  /// a settings entry from an empty right-click.
+  String _copyFormatPreviewText() {
+    if (_selectedTranscriptText.isNotEmpty) {
+      return _formattedSelectedTranscriptText();
+    }
+    final List<SubtitleCueCopyParts> sample = _cueCopyPartsCache
+        .take(3)
+        .toList(growable: false);
+    if (sample.isEmpty) return '';
+    return SubtitleCopyFormatter.format(
+      selectedText: SubtitleCopyFormatter.joinedDisplayText(sample),
+      cues: sample,
+      format: SettingsService().subtitleCopyFormat,
+    );
+  }
+
   @visibleForTesting
   String get formattedSelectedTranscriptText =>
       _formattedSelectedTranscriptText();
 
-  void _copySelectedTranscript({required bool forTouch}) {
+  void _copySelectedTranscript({
+    required bool forTouch,
+    bool fromShortcut = false,
+  }) {
     final String text = _formattedSelectedTranscriptText();
     if (text.isEmpty) return;
     unawaited(Clipboard.setData(ClipboardData(text: text)));
+    if (fromShortcut) return;
     _removeCopyFormatPopover();
     if (forTouch &&
         (defaultTargetPlatform == TargetPlatform.android ||
@@ -1272,6 +1346,70 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     } else if (!forTouch) {
       _removeDesktopSelectionToolbar();
     }
+  }
+
+  /// Ctrl/Cmd+A and Ctrl/Cmd+C/X, including a hardware keyboard on a phone.
+  ///
+  /// Player shortcuts ignore modifier chords, so these never reach the
+  /// SelectionArea unless the page forwards them here. The SelectionArea's
+  /// own select-all also cannot see unmounted virtualized cues.
+  KeyEventResult handleTranscriptShortcut(KeyEvent event) {
+    if (!mounted || !widget.isVisible) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final bool modifierPressed =
+        HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+    if (!modifierPressed || HardwareKeyboard.instance.isAltPressed) {
+      return KeyEventResult.ignored;
+    }
+    final LogicalKeyboardKey key = event.logicalKey;
+    if (key == LogicalKeyboardKey.keyA) {
+      _selectEntireTranscript(cause: SelectionChangedCause.keyboard);
+      return KeyEventResult.handled;
+    }
+    final bool isCopyKey =
+        key == LogicalKeyboardKey.keyC ||
+        key == LogicalKeyboardKey.keyX ||
+        key == LogicalKeyboardKey.insert;
+    if (isCopyKey) {
+      if (_selectedTranscriptText.isEmpty) return KeyEventResult.ignored;
+      _copySelectedTranscript(forTouch: false, fromShortcut: true);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _selectEntireTranscript({
+    SelectionChangedCause cause = SelectionChangedCause.keyboard,
+  }) {
+    final String full = _canonicalTranscriptText;
+    if (full.isEmpty) return;
+    _fullTranscriptSelected = true;
+    _selectedTranscriptText = full;
+    if (_isMobileSelectionPlatform) {
+      _usesPersistentTouchSelectionToolbar = true;
+    }
+    if (!_hasTextSelection) {
+      setState(() => _hasTextSelection = true);
+    } else {
+      setState(() {});
+    }
+    _hideNativeSelectionToolbars();
+    if (_usesPersistentTouchSelectionToolbar) {
+      _schedulePersistentSelectionToolbar();
+    }
+    _cancelPendingAutoScroll();
+    _invalidateLocateRequests();
+    // Focus first so Flutter's visual selectAll has a primary focus. Defer
+    // the visual pass a frame: the copy payload is already the full cache
+    // and must not wait on mounted-row geometry.
+    if (_textSelectionFocusNode.canRequestFocus) {
+      _textSelectionFocusNode.requestFocus();
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_fullTranscriptSelected) return;
+      _textSelectionKey.currentState?.selectableRegion.selectAll(cause);
+    });
   }
 
   void _persistCopyFormat(SubtitleCopyFormat format) {
@@ -1293,7 +1431,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   void _openCopyFormatPopover({required bool forTouch}) {
-    if (!_hasTextSelection || _selectedTranscriptText.isEmpty) return;
     if (_copyFormatPopoverEntry != null) {
       _removeCopyFormatPopover();
       return;
@@ -1302,34 +1439,28 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     if (!forTouch) {
       _removeDesktopSelectionToolbar();
     }
-    if (!mounted ||
-        !_hasTextSelection ||
-        _selectedTranscriptText.isEmpty ||
-        _copyFormatPopoverEntry != null) {
-      return;
-    }
+    if (!mounted || _copyFormatPopoverEntry != null) return;
     final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
     if (overlay == null) return;
     final OverlayEntry entry = OverlayEntry(
       builder: (BuildContext context) {
-        if (!mounted ||
-            !_hasTextSelection ||
-            _selectedTranscriptText.isEmpty) {
-          return const SizedBox.shrink();
-        }
-          return SizedBox.expand(
-            child: SubtitleCopyFormatPopover(
-              anchor: anchor,
-              format: SettingsService().subtitleCopyFormat,
-              previewText: _formattedSelectedTranscriptText(),
-              showBilingualOptions: _cueCopyPartsCache.any(
-                (SubtitleCueCopyParts parts) => parts.hasSecondary,
-              ),
-              onFormatChanged: _persistCopyFormat,
-              onCopy: () => _copySelectedTranscript(forTouch: forTouch),
-              onReset: () => _persistCopyFormat(SubtitleCopyFormat.defaults),
+        if (!mounted) return const SizedBox.shrink();
+        final bool canCopy = _selectedTranscriptText.isNotEmpty;
+        return SizedBox.expand(
+          child: SubtitleCopyFormatPopover(
+            anchor: anchor,
+            format: SettingsService().subtitleCopyFormat,
+            previewText: _copyFormatPreviewText(),
+            showBilingualOptions: _cueCopyPartsCache.any(
+              (SubtitleCueCopyParts parts) => parts.hasSecondary,
             ),
-          );
+            onFormatChanged: _persistCopyFormat,
+            onCopy: canCopy
+                ? () => _copySelectedTranscript(forTouch: forTouch)
+                : null,
+            onReset: () => _persistCopyFormat(SubtitleCopyFormat.defaults),
+          ),
+        );
       },
     );
     _copyFormatPopoverEntry = entry;
@@ -1352,66 +1483,78 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
     _persistentSelectionToolbarAnchors = null;
   }
 
+  void _onTranscriptContextMenuPointer(PointerDownEvent event) {
+    if (event.kind != PointerDeviceKind.mouse &&
+        event.kind != PointerDeviceKind.trackpad) {
+      return;
+    }
+    if (event.buttons != kSecondaryMouseButton) return;
+    _showDesktopSelectionToolbar(event.position);
+  }
+
   void _showDesktopSelectionToolbar(Offset anchor) {
-    if (!_hasTextSelection || _usesPersistentTouchSelectionToolbar) return;
+    if (_usesPersistentTouchSelectionToolbar) return;
+    if (!_isFiniteOffset(anchor)) return;
     _removeCopyFormatPopover();
     _desktopSelectionToolbarAnchor = anchor;
     _hideNativeSelectionToolbars();
-    if (_desktopSelectionToolbarInsertScheduled) return;
-    _desktopSelectionToolbarInsertScheduled = true;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_desktopSelectionToolbarInsertScheduled) return;
-      _desktopSelectionToolbarInsertScheduled = false;
-      if (!mounted ||
-          !_hasTextSelection ||
-          _usesPersistentTouchSelectionToolbar ||
-          _desktopSelectionToolbarAnchor == null) {
-        return;
-      }
-
-      // An ancestor SelectionArea also receives secondary-tap-down before the
-      // gesture arena has chosen the sidebar. It may therefore have opened a
-      // second, selection-less menu containing only "Select all". Run this
-      // after the pointer dispatch has finished, remove every native menu, and
-      // then leave exactly one sidebar-owned menu visible.
-      _hideNativeSelectionToolbars();
-      if (_desktopSelectionToolbarEntry != null) {
-        _desktopSelectionToolbarEntry!.markNeedsBuild();
-        return;
-      }
-      final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
-      if (overlay == null) return;
-      final OverlayEntry entry = OverlayEntry(
-        builder: (BuildContext context) {
-          if (!mounted ||
-              !_hasTextSelection ||
-              _usesPersistentTouchSelectionToolbar ||
-              _desktopSelectionToolbarAnchor == null) {
-            return const SizedBox.shrink();
-          }
-          return AdaptiveTextSelectionToolbar.buttonItems(
-            anchors: TextSelectionToolbarAnchors(
-              primaryAnchor: _desktopSelectionToolbarAnchor!,
-            ),
+    if (_desktopSelectionToolbarEntry != null) {
+      _desktopSelectionToolbarEntry!.markNeedsBuild();
+      _scheduleHideNativeSelectionToolbars();
+      return;
+    }
+    final OverlayState? overlay = Overlay.maybeOf(context, rootOverlay: true);
+    if (overlay == null) return;
+    final OverlayEntry entry = OverlayEntry(
+      builder: (BuildContext context) {
+        if (!mounted ||
+            _usesPersistentTouchSelectionToolbar ||
+            _desktopSelectionToolbarAnchor == null) {
+          return const SizedBox.shrink();
+        }
+        final Offset menuAnchor = _desktopSelectionToolbarAnchor!;
+        if (!_isFiniteOffset(menuAnchor)) {
+          return const SizedBox.shrink();
+        }
+        // Tap outside dismisses the menu without eating the click, so the
+        // selection shield and list still receive it. Flutter's geometry
+        // menu is never used — that path becomes ErrorWidget off-screen.
+        return TapRegion(
+          onTapOutside: (PointerDownEvent event) {
+            if (event.buttons == kSecondaryMouseButton) return;
+            _removeDesktopSelectionToolbar();
+          },
+          child: AdaptiveTextSelectionToolbar.buttonItems(
+            anchors: TextSelectionToolbarAnchors(primaryAnchor: menuAnchor),
             buttonItems: _buildReliableSelectionToolbarItems(forTouch: false),
-          );
-        },
-      );
-      _desktopSelectionToolbarEntry = entry;
-      overlay.insert(entry);
+          ),
+        );
+      },
+    );
+    _desktopSelectionToolbarEntry = entry;
+    overlay.insert(entry);
+    _scheduleHideNativeSelectionToolbars();
+  }
+
+  void _scheduleHideNativeSelectionToolbars() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _desktopSelectionToolbarEntry == null) return;
+      _hideNativeSelectionToolbars();
     });
-    _ensureFrameScheduled();
   }
 
   void _hideNativeSelectionToolbars() {
-    _textSelectionKey.currentState?.selectableRegion.hideToolbar();
+    // Keep selection handles. The default hideToolbar() also drops handles,
+    // which iOS needs in order to extend a selection after long-press.
+    ContextMenuController.removeAny();
+    _textSelectionKey.currentState?.selectableRegion.hideToolbar(false);
     context.visitAncestorElements((Element element) {
       if (element is StatefulElement) {
         final State<StatefulWidget> state = element.state;
         if (state is SelectableRegionState) {
-          state.hideToolbar();
+          state.hideToolbar(false);
         } else if (state is SelectionAreaState) {
-          state.selectableRegion.hideToolbar();
+          state.selectableRegion.hideToolbar(false);
         }
       }
       return true;
@@ -1419,7 +1562,6 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   }
 
   void _removeDesktopSelectionToolbar() {
-    _desktopSelectionToolbarInsertScheduled = false;
     _desktopSelectionToolbarEntry?.remove();
     _desktopSelectionToolbarEntry?.dispose();
     _desktopSelectionToolbarEntry = null;
@@ -1429,7 +1571,10 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
   void _startSelectionPreservingPan(DragStartDetails details) {
     _stopTouchSelectionEdgeScroll();
     _cancelPendingAutoScroll();
+    // Desktop context menus dismiss on scroll. Do not hand the menu back to
+    // Flutter's endpoint-anchored toolbar — that is the ErrorWidget path.
     _removeDesktopSelectionToolbar();
+    _hideNativeSelectionToolbars();
     _selectionPreservingPanDrag?.cancel();
     final ScrollableState? scrollable = _selectionScrollable;
     if (scrollable == null || !scrollable.mounted) return;
@@ -1467,6 +1612,7 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
           final ScrollableState? scrollable = _selectionScrollable;
           if (scrollable == null || !scrollable.mounted) return;
           _removeDesktopSelectionToolbar();
+          _hideNativeSelectionToolbars();
           scrollable.position.pointerScroll(event.scrollDelta.dy);
         },
         child: GestureDetector(
@@ -3736,21 +3882,26 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                         : Stack(
                             fit: StackFit.expand,
                             children: [
-                              SelectionArea(
-                                key: _textSelectionKey,
-                                focusNode: _textSelectionFocusNode,
-                                contextMenuBuilder:
-                                    _buildTextSelectionContextMenu,
-                                onSelectionChanged: _handleTextSelectionChanged,
-                                child: _SelectionStatusObserver(
-                                  onStatusChanged:
-                                      _handleSelectionRegionStatusChanged,
-                                  child: Listener(
-                                    behavior: HitTestBehavior.translucent,
-                                    onPointerDown: _onListAreaPointerDown,
-                                    child: _isArticleMode
-                                        ? _buildArticleView(isSmallScreen)
-                                        : _buildListView(isSmallScreen),
+                              Listener(
+                                behavior: HitTestBehavior.translucent,
+                                onPointerDown: _onTranscriptContextMenuPointer,
+                                child: SelectionArea(
+                                  key: _textSelectionKey,
+                                  focusNode: _textSelectionFocusNode,
+                                  contextMenuBuilder:
+                                      _buildTextSelectionContextMenu,
+                                  onSelectionChanged:
+                                      _handleTextSelectionChanged,
+                                  child: _SelectionStatusObserver(
+                                    onStatusChanged:
+                                        _handleSelectionRegionStatusChanged,
+                                    child: Listener(
+                                      behavior: HitTestBehavior.translucent,
+                                      onPointerDown: _onListAreaPointerDown,
+                                      child: _isArticleMode
+                                          ? _buildArticleView(isSmallScreen)
+                                          : _buildListView(isSmallScreen),
+                                    ),
                                   ),
                                 ),
                               ),

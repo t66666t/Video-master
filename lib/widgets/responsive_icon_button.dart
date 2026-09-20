@@ -4,6 +4,7 @@ class ResponsiveIconButton extends StatelessWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onPressed;
+  final VoidCallback? onLongPress;
   final Color? color;
 
   const ResponsiveIconButton({
@@ -11,6 +12,7 @@ class ResponsiveIconButton extends StatelessWidget {
     required this.icon,
     required this.tooltip,
     required this.onPressed,
+    this.onLongPress,
     this.color,
   });
 
@@ -30,6 +32,7 @@ class ResponsiveIconButton extends StatelessWidget {
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: onPressed,
+          onLongPress: onLongPress,
           child: Container(
             width: buttonSize,
             height: buttonSize,

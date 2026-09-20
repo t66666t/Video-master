@@ -221,6 +221,64 @@ void showMediaLibrarySettingsBottomSheet(
                     },
                   ),
                 ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
+                  child: ListTile(
+                    key: const ValueKey('clearPlaybackHistory'),
+                    title: const Text(
+                      '清除播放记录',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: Text(
+                        '只清观看时间和继续学习资格，不删文件、导入记录、置顶，以及从「继续学习」列表移除的标记。',
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                    onTap: library == null
+                        ? null
+                        : () async {
+                            final confirmed = await showDialog<bool>(
+                              context: context,
+                              builder: (dialogContext) {
+                                return AlertDialog(
+                                  title: const Text('清除播放记录？'),
+                                  content: const Text(
+                                    '继续学习和播放记录会空出来。媒体文件和最近添加不变。',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(
+                                        dialogContext,
+                                        false,
+                                      ),
+                                      child: const Text('取消'),
+                                    ),
+                                    TextButton(
+                                      onPressed: () => Navigator.pop(
+                                        dialogContext,
+                                        true,
+                                      ),
+                                      child: const Text('清除'),
+                                    ),
+                                  ],
+                                );
+                              },
+                            );
+                            if (confirmed != true) return;
+                            await library.clearPlaybackHistory();
+                            if (context.mounted) Navigator.pop(context);
+                          },
+                  ),
+                ),
                 if (streamService != null) ...[
                   const SizedBox(height: 10),
                   MediaLibraryBilibiliCacheSection(

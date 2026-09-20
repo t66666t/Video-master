@@ -31,6 +31,7 @@ import 'chapter_slider_track_shape.dart';
 import 'player_control_metrics.dart';
 import 'progress_interaction_geometry.dart';
 import 'playback_speed_dialog.dart';
+import 'stream_quality_picker.dart';
 
 const Color _danmakuControlAccent = Color(0xFFFF6699);
 
@@ -228,6 +229,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _setShowControls(bool value) {
+    // A quality/speed popover lives on a separate route. Hiding chrome while
+    // it is open looks like the menu "ate" the controls.
+    if (!value && _isControlDialogOpen) return;
     _showControls = value;
     widget.onControlsVisibilityIntent?.call(value);
     _subtitleAvoidanceReleaseTimer?.cancel();
@@ -385,6 +389,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   bool _isPlaybackSpeedDialogOpen = false;
   bool _isStreamQualityDialogOpen = false;
 
+  bool get _isControlDialogOpen =>
+      _isPlaybackSpeedDialogOpen || _isStreamQualityDialogOpen;
+  final GlobalKey _streamQualityPillKey = GlobalKey();
+  PlayerControlMetrics? _controlMetrics;
+
   String? _resolvePreviewFilePath() {
     final path = _controllerDataSource;
     String filePath = path;
@@ -407,6 +416,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   ) async {
     if (_isPlaybackSpeedDialogOpen) return;
     _isPlaybackSpeedDialogOpen = true;
+    _singleTapTimer?.cancel();
     _autoHideTimer?.cancel();
     try {
       await showPlaybackSpeedDialog(
@@ -430,54 +440,18 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       return;
     }
     _isStreamQualityDialogOpen = true;
+    _singleTapTimer?.cancel();
     _autoHideTimer?.cancel();
     try {
-      final anchorBox = anchorContext.findRenderObject() as RenderBox?;
-      final overlayBox =
-          Overlay.of(anchorContext).context.findRenderObject() as RenderBox?;
-      if (anchorBox == null || overlayBox == null) return;
-      final anchorTopLeft = anchorBox.localToGlobal(
-        Offset.zero,
-        ancestor: overlayBox,
-      );
-      final anchorRect = anchorTopLeft & anchorBox.size;
-      final selectedId = await showMenu<int>(
+      final metrics =
+          _controlMetrics ??
+          PlayerControlMetrics.fromSize(MediaQuery.sizeOf(context));
+      final selectedId = await showStreamQualityPicker(
         context: context,
-        color: const Color(0xF21D1D1F),
-        surfaceTintColor: Colors.transparent,
-        elevation: 10,
-        shadowColor: Colors.black87,
-        constraints: const BoxConstraints(minWidth: 176, maxWidth: 216),
-        menuPadding: const EdgeInsets.symmetric(vertical: 6),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(5)),
-        position: RelativeRect.fromRect(
-          anchorRect,
-          Offset.zero & overlayBox.size,
-        ),
-        initialValue: playbackService.selectedStreamQuality?.id,
-        items: [
-          for (final quality in playbackService.streamQualities)
-            PopupMenuItem<int>(
-              value: quality.id,
-              height: 42,
-              padding: const EdgeInsets.symmetric(horizontal: 18),
-              child: Text(
-                quality.label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: quality.id == playbackService.selectedStreamQuality?.id
-                      ? const Color(0xFFFF6699)
-                      : Colors.white,
-                  fontSize: 15,
-                  fontWeight:
-                      quality.id == playbackService.selectedStreamQuality?.id
-                      ? FontWeight.w600
-                      : FontWeight.w400,
-                ),
-              ),
-            ),
-        ],
+        anchorContext: _streamQualityPillKey.currentContext ?? anchorContext,
+        qualities: playbackService.streamQualities,
+        selectedId: playbackService.selectedStreamQuality?.id,
+        metrics: metrics,
       );
       if (selectedId != null &&
           selectedId != playbackService.selectedStreamQuality?.id &&
@@ -498,6 +472,132 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _isStreamQualityDialogOpen = false;
       if (mounted) _startAutoHideTimer();
     }
+  }
+
+  TextStyle _progressPillTextStyle(
+    BuildContext context,
+    PlayerControlMetrics metrics,
+  ) {
+    return DefaultTextStyle.of(context).style.merge(
+      TextStyle(
+        color: Colors.white,
+        fontSize: metrics.progressPillFontSize,
+        fontWeight: FontWeight.w600,
+      ),
+    );
+  }
+
+  Widget _buildStreamQualityProgressPill({
+    required PlayerControlMetrics controlMetrics,
+    required double maxWidth,
+    required TextDirection textDirection,
+    required MediaPlaybackService playbackService,
+  }) {
+    return Selector<
+      MediaPlaybackService,
+      ({
+        bool switching,
+        BilibiliStreamQuality? selected,
+        List<BilibiliStreamQuality> qualities,
+      })
+    >(
+      selector: (_, service) => (
+        switching: service.isSwitchingStreamQuality,
+        selected: service.selectedStreamQuality,
+        qualities: service.streamQualities,
+      ),
+      builder: (context, state, _) {
+        final qualityTextStyle = _progressPillTextStyle(
+          context,
+          controlMetrics,
+        );
+        final qualityLabels = state.qualities.isEmpty
+            ? const <String>['清晰度']
+            : [for (final quality in state.qualities) quality.label];
+        final qualityButtonWidth = controlMetrics.measureProgressPillWidth(
+          labels: qualityLabels,
+          textStyle: qualityTextStyle,
+          textDirection: textDirection,
+          textScaler: MediaQuery.textScalerOf(context),
+          locale: Localizations.maybeLocaleOf(context),
+          maxWidth: maxWidth,
+        );
+        final selectedLabel = state.selected?.label ?? '清晰度';
+        return Tooltip(
+          message: _tooltipWithShortcut(
+            '清晰度',
+            DesktopPlayerShortcutAction.openStreamQuality,
+          ),
+          child: KeyedSubtree(
+            key: const ValueKey('video-controls-quality-button'),
+            child: Material(
+              key: _streamQualityPillKey,
+              color: kStreamQualityPillFill,
+              elevation: 2,
+              shadowColor: Colors.black.withValues(alpha: 0.5),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(
+                  controlMetrics.chapterButtonHeight / 2,
+                ),
+                side: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.16),
+                  width: 0.75,
+                ),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: state.switching
+                    ? null
+                    : () {
+                        _singleTapTimer?.cancel();
+                        unawaited(
+                          _showStreamQualityPicker(playbackService, context),
+                        );
+                      },
+                child: SizedBox(
+                  width: qualityButtonWidth,
+                  height: controlMetrics.chapterButtonHeight,
+                  child: Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: controlMetrics.progressPillHorizontalPadding,
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: state.switching
+                              ? Center(
+                                  child: SizedBox(
+                                    width: controlMetrics.progressPillIconSize,
+                                    height: controlMetrics.progressPillIconSize,
+                                    child: const CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  ),
+                                )
+                              : Text(
+                                  selectedLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  textAlign: TextAlign.start,
+                                  style: qualityTextStyle,
+                                ),
+                        ),
+                        SizedBox(width: controlMetrics.progressPillContentGap),
+                        Icon(
+                          Icons.keyboard_arrow_down,
+                          color: Colors.white,
+                          size: controlMetrics.progressPillIconSize,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 
   void _warmSeekPreviewMetadata() {
@@ -1149,6 +1249,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _startAutoHideTimer() {
     _autoHideTimer?.cancel();
+    if (_isControlDialogOpen) {
+      return;
+    }
     _autoHideTimer = Timer(_autoHideDelay, () {
       if (mounted &&
           _showControls &&
@@ -2821,21 +2924,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       // Always delay single tap action to wait for potential double tap (Full Screen Sensitivity)
       _singleTapTimer?.cancel();
       _singleTapTimer = Timer(const Duration(milliseconds: 190), () {
-        if (mounted) {
-          // Clear selection when tapping anywhere in the control overlay
-          widget.onClearSelection?.call();
+        if (!mounted || _isControlDialogOpen) {
+          return;
+        }
+        // Clear selection when tapping anywhere in the control overlay
+        widget.onClearSelection?.call();
 
-          setState(() {
-            _setShowControls(!_showControls);
-            // _showVolumeSlider = false; // Removed
-          });
+        setState(() {
+          _setShowControls(!_showControls);
+        });
 
-          // Start auto-hide timer if controls are now shown
-          if (_showControls) {
-            _startAutoHideTimer();
-          } else {
-            _cancelAutoHideTimer();
-          }
+        if (_showControls) {
+          _startAutoHideTimer();
+        } else {
+          _cancelAutoHideTimer();
         }
       });
     }
@@ -2859,6 +2961,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
           Size(width, height),
           safeBottom: safeBottom,
         );
+        _controlMetrics = controlMetrics;
         final isSmallScreen = controlMetrics.isCompact;
 
         // Scale from the player's actual shortest side and available width.
@@ -2920,6 +3023,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         final double bottomBarPadding = controlMetrics.bottomHorizontalPadding;
         final bool hasChapterButton =
             widget.chapters.isNotEmpty && widget.onOpenChapters != null;
+        // Rebuild when Bilibili qualities appear so the progress area grows
+        // for the right-side capsule, matching the chapter pill.
+        final bool hasQualityButton = context
+            .select<MediaPlaybackService, bool>(
+              (service) =>
+                  service.isCurrentItemBilibiliStream &&
+                  service.streamQualities.isNotEmpty,
+            );
         final double progressTrackInset = math.max(
           controlMetrics.overlayRadius,
           controlMetrics.thumbRadius,
@@ -3853,11 +3964,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       textDirection:
                                                           progressTextDirection,
                                                       bottom:
-                                                          controlMetrics
-                                                              .progressAreaHeight(
-                                                                hasChapterButton:
-                                                                    hasChapterButton,
-                                                              ) +
+                                                          controlMetrics.progressAreaHeight(
+                                                            hasChapterButton:
+                                                                hasChapterButton,
+                                                            hasQualityButton:
+                                                                hasQualityButton,
+                                                          ) +
                                                           6,
                                                       showThumbnail:
                                                           widget
@@ -3884,51 +3996,19 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                   .chapters
                                                                   .first;
                                                           final chapterTextStyle =
-                                                              DefaultTextStyle.of(
+                                                              _progressPillTextStyle(
                                                                 context,
-                                                              ).style.merge(
-                                                                TextStyle(
-                                                                  color: Colors
-                                                                      .white,
-                                                                  fontSize:
-                                                                      (13 *
-                                                                              controlMetrics.scale)
-                                                                          .clamp(
-                                                                            10.0,
-                                                                            13.0,
-                                                                          ),
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .w600,
-                                                                ),
+                                                                controlMetrics,
                                                               );
                                                           final chapterIconSize =
-                                                              (18 *
-                                                                      controlMetrics
-                                                                          .scale)
-                                                                  .clamp(
-                                                                    16.0,
-                                                                    18.0,
-                                                                  )
-                                                                  .toDouble();
+                                                              controlMetrics
+                                                                  .progressPillIconSize;
                                                           final chapterContentGap =
-                                                              (5 *
-                                                                      controlMetrics
-                                                                          .scale)
-                                                                  .clamp(
-                                                                    3.0,
-                                                                    5.0,
-                                                                  )
-                                                                  .toDouble();
+                                                              controlMetrics
+                                                                  .progressPillContentGap;
                                                           final chapterHorizontalPadding =
-                                                              (12 *
-                                                                      controlMetrics
-                                                                          .scale)
-                                                                  .clamp(
-                                                                    9.0,
-                                                                    12.0,
-                                                                  )
-                                                                  .toDouble();
+                                                              controlMetrics
+                                                                  .progressPillHorizontalPadding;
                                                           final chapterButtonMaxWidth =
                                                               (sliderConstraints
                                                                       .maxWidth -
@@ -3936,28 +4016,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                       2)) *
                                                               controlMetrics
                                                                   .chapterButtonWidthFactor;
-                                                          final chapterFixedWidth =
-                                                              (chapterHorizontalPadding *
-                                                                  2) +
-                                                              chapterContentGap +
-                                                              chapterIconSize;
-                                                          final chapterTextMeasurementSlack =
-                                                              (4 *
-                                                                      controlMetrics
-                                                                          .scale)
-                                                                  .clamp(
-                                                                    3.0,
-                                                                    4.0,
-                                                                  )
-                                                                  .toDouble();
-                                                          final chapterTextPainter = TextPainter(
-                                                            text: TextSpan(
-                                                              text:
-                                                                  chapter.title,
-                                                              style:
-                                                                  chapterTextStyle,
-                                                            ),
-                                                            maxLines: 1,
+                                                          final chapterButtonWidth = controlMetrics.measureProgressPillWidth(
+                                                            labels: [
+                                                              chapter.title,
+                                                            ],
+                                                            textStyle:
+                                                                chapterTextStyle,
                                                             textDirection:
                                                                 progressTextDirection,
                                                             textScaler:
@@ -3968,24 +4032,15 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 Localizations.maybeLocaleOf(
                                                                   context,
                                                                 ),
-                                                            textWidthBasis:
-                                                                TextWidthBasis
-                                                                    .longestLine,
-                                                          )..layout();
-                                                          final chapterButtonWidth = math.min(
-                                                            chapterButtonMaxWidth,
-                                                            chapterFixedWidth +
-                                                                chapterTextPainter
-                                                                    .width +
-                                                                chapterTextMeasurementSlack,
+                                                            maxWidth:
+                                                                chapterButtonMaxWidth,
                                                           );
                                                           return Tooltip(
-                                                            message:
-                                                                _tooltipWithShortcut(
-                                                                  chapter.title,
-                                                                  DesktopPlayerShortcutAction
-                                                                      .openChapters,
-                                                                ),
+                                                            message: _tooltipWithShortcut(
+                                                              chapter.title,
+                                                              DesktopPlayerShortcutAction
+                                                                  .openChapters,
+                                                            ),
                                                             child: Material(
                                                               key: const ValueKey(
                                                                 'video-controls-chapter-button',
@@ -4125,22 +4180,45 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       ),
                                                     ),
 
+                                                  if (hasQualityButton)
+                                                    Positioned(
+                                                      right: trackInset,
+                                                      bottom: controlMetrics
+                                                          .chapterButtonBottom,
+                                                      child: _buildStreamQualityProgressPill(
+                                                        controlMetrics:
+                                                            controlMetrics,
+                                                        maxWidth:
+                                                            (sliderConstraints
+                                                                    .maxWidth -
+                                                                (trackInset *
+                                                                    2)) *
+                                                            controlMetrics
+                                                                .chapterButtonWidthFactor,
+                                                        textDirection:
+                                                            progressTextDirection,
+                                                        playbackService:
+                                                            playbackService,
+                                                      ),
+                                                    ),
+
                                                   Listener(
                                                     key: const ValueKey(
                                                       'video-controls-progress-interaction',
                                                     ),
                                                     behavior: HitTestBehavior
-                                                        .translucent,
+                                                        .deferToChild,
                                                     onPointerDown:
                                                         supportsPointerHover &&
                                                             isInitialized
                                                         ? (event) {
                                                             final progressAreaHeight =
-                                                                controlMetrics
-                                                                    .progressAreaHeight(
-                                                                      hasChapterButton:
-                                                                          hasChapterButton,
-                                                                    );
+                                                                controlMetrics.progressAreaHeight(
+                                                                  hasChapterButton:
+                                                                      hasChapterButton,
+                                                                  hasQualityButton:
+                                                                      hasQualityButton,
+                                                                );
                                                             final progressBandTop =
                                                                 progressAreaHeight -
                                                                 controlMetrics
@@ -4275,6 +4353,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                           .progressAreaHeight(
                                                             hasChapterButton:
                                                                 hasChapterButton,
+                                                            hasQualityButton:
+                                                                hasQualityButton,
                                                           ),
                                                       child: Align(
                                                         alignment: Alignment
@@ -5010,102 +5090,6 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                 children: [
                                                   if (!widget
                                                       .isPreviewMode) ...[
-                                                    Selector<
-                                                      MediaPlaybackService,
-                                                      ({
-                                                        bool visible,
-                                                        bool switching,
-                                                        BilibiliStreamQuality?
-                                                        selected,
-                                                      })
-                                                    >(
-                                                      selector: (_, service) => (
-                                                        visible:
-                                                            service
-                                                                .isCurrentItemBilibiliStream &&
-                                                            service
-                                                                .streamQualities
-                                                                .isNotEmpty,
-                                                        switching: service
-                                                            .isSwitchingStreamQuality,
-                                                        selected: service
-                                                            .selectedStreamQuality,
-                                                      ),
-                                                      builder: (context, state, _) {
-                                                        if (!state.visible) {
-                                                          return const SizedBox.shrink();
-                                                        }
-                                                        return Tooltip(
-                                                          message:
-                                                              _tooltipWithShortcut(
-                                                                '清晰度',
-                                                                DesktopPlayerShortcutAction
-                                                                    .openStreamQuality,
-                                                              ),
-                                                          child: InkWell(
-                                                            borderRadius:
-                                                                BorderRadius.circular(
-                                                                  8,
-                                                                ),
-                                                            onTap:
-                                                                state.switching
-                                                                ? null
-                                                                : () => unawaited(
-                                                                    _showStreamQualityPicker(
-                                                                      playbackService,
-                                                                      context,
-                                                                    ),
-                                                                  ),
-                                                            child: SizedBox(
-                                                              height: controlMetrics
-                                                                  .bottomButtonExtent,
-                                                              child: Padding(
-                                                                padding: EdgeInsets.symmetric(
-                                                                  horizontal:
-                                                                      controlMetrics
-                                                                          .controlGap,
-                                                                ),
-                                                                child: Center(
-                                                                  child:
-                                                                      state
-                                                                          .switching
-                                                                      ? SizedBox(
-                                                                          width:
-                                                                              iconSize,
-                                                                          height:
-                                                                              iconSize,
-                                                                          child: const CircularProgressIndicator(
-                                                                            strokeWidth:
-                                                                                2,
-                                                                          ),
-                                                                        )
-                                                                      : ConstrainedBox(
-                                                                          constraints: const BoxConstraints(
-                                                                            maxWidth:
-                                                                                88,
-                                                                          ),
-                                                                          child: FittedBox(
-                                                                            fit:
-                                                                                BoxFit.scaleDown,
-                                                                            child: Text(
-                                                                              state.selected?.label ??
-                                                                                  '清晰度',
-                                                                              maxLines: 1,
-                                                                              style: TextStyle(
-                                                                                color: Colors.white,
-                                                                                fontSize: controlMetrics.toolFontSize,
-                                                                                fontWeight: FontWeight.bold,
-                                                                              ),
-                                                                            ),
-                                                                          ),
-                                                                        ),
-                                                                ),
-                                                              ),
-                                                            ),
-                                                          ),
-                                                        );
-                                                      },
-                                                    ),
                                                     SubtitleDebugSpeedGateway(
                                                       builder:
                                                           (
@@ -5215,15 +5199,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                               widget
                                                                   .onOpenSleepTimer!();
                                                             },
-                                                            tooltip:
-                                                                _tooltipWithShortcut(
-                                                                  timer.isActive
-                                                                      ? timer
-                                                                            .statusText
-                                                                      : '定时关闭',
-                                                                  DesktopPlayerShortcutAction
-                                                                      .openSleepTimer,
-                                                                ),
+                                                            tooltip: _tooltipWithShortcut(
+                                                              timer.isActive
+                                                                  ? timer
+                                                                        .statusText
+                                                                  : '定时关闭',
+                                                              DesktopPlayerShortcutAction
+                                                                  .openSleepTimer,
+                                                            ),
                                                           );
                                                         },
                                                       ),

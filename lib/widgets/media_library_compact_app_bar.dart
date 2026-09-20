@@ -6,20 +6,22 @@ bool useCompactMediaLibraryTopBar(BuildContext context) {
   return MediaQuery.sizeOf(context).width < mediaLibraryCompactTopBarBreakpoint;
 }
 
+/// Noto Sans SC sits slightly low in its line box; even leading plus a 1px
+/// lift keeps titles on the same visual center as toolbar icons. A 2px lift
+/// overshoots and reads as sitting above the icon row.
 const TextStyle mediaLibraryCompactTitleStyle = TextStyle(
   fontFamily: 'Noto Sans SC',
   fontSize: 16,
-  height: 1.2,
-  // Match the media-library title weight used by the regular tablet/desktop
-  // theme while retaining the compact phone size and spacing.
+  height: 1.0,
+  leadingDistribution: TextLeadingDistribution.even,
   fontWeight: FontWeight.w300,
   letterSpacing: -0.15,
 );
 const double mediaLibraryCompactTitleOpticalOffset = -1;
 
 /// Noto Sans SC's visual glyph center sits slightly below its line box center.
-/// This optical correction aligns compact titles with adjacent toolbar icons
-/// without changing layout or touch-target geometry.
+/// This 1px optical correction aligns titles, text chips, and breadcrumbs
+/// with adjacent toolbar icons without changing layout or hit targets.
 class MediaLibraryCompactTitle extends StatelessWidget {
   const MediaLibraryCompactTitle({super.key, required this.text});
 
@@ -45,6 +47,7 @@ class MediaLibraryCompactIconButton extends StatelessWidget {
     required this.icon,
     required this.tooltip,
     required this.onPressed,
+    this.onLongPress,
     this.color,
     this.width = 40,
   });
@@ -52,6 +55,7 @@ class MediaLibraryCompactIconButton extends StatelessWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onPressed;
+  final VoidCallback? onLongPress;
   final Color? color;
   final double width;
 
@@ -59,6 +63,7 @@ class MediaLibraryCompactIconButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return IconButton(
       onPressed: onPressed,
+      onLongPress: onLongPress,
       tooltip: tooltip,
       icon: Icon(icon, color: color),
       iconSize: 21,
@@ -108,6 +113,8 @@ PopupMenuItem<VoidCallback> mediaLibraryCompactMenuItem({
           style: TextStyle(
             fontFamily: 'Noto Sans SC',
             fontSize: 14,
+            height: 1.0,
+            leadingDistribution: TextLeadingDistribution.even,
             color: itemColor,
           ),
         ),

@@ -188,3 +188,86 @@ class MediaLibraryItemInteractionWrapper extends StatelessWidget {
     );
   }
 }
+
+/// Drag payload for continue-learning pins. Distinct from folder `int` indices
+/// so a parked folders grid cannot accept a pin drop as a children reorder.
+class MediaLibraryPinnedDragData {
+  const MediaLibraryPinnedDragData(this.visibleIndex);
+
+  final int visibleIndex;
+}
+
+/// Long-press reorder limited to the pin strip. Never offers folder-move hover.
+class MediaLibraryPinnedReorderWrapper extends StatelessWidget {
+  const MediaLibraryPinnedReorderWrapper({
+    super.key,
+    required this.child,
+    required this.visibleIndex,
+    required this.dragDelay,
+    required this.onReorder,
+    this.onTap,
+    this.onDragStarted,
+  });
+
+  final Widget child;
+  final int visibleIndex;
+  final Duration dragDelay;
+  final void Function(int fromVisibleIndex, int toVisibleIndex) onReorder;
+  final VoidCallback? onTap;
+  final VoidCallback? onDragStarted;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = constraints.biggest;
+        final unit = size.shortestSide;
+        final target = DropZone<MediaLibraryPinnedDragData>(
+          data: MediaLibraryPinnedDragData(visibleIndex),
+          onWillAccept: (draggedData) =>
+              draggedData.visibleIndex != visibleIndex,
+          onAcceptWithDetails: (draggedData, _) {
+            onReorder(draggedData.visibleIndex, visibleIndex);
+          },
+          builder: (context, candidateData) {
+            if (candidateData.isEmpty) return child;
+            return Stack(
+              fit: StackFit.expand,
+              children: [
+                child,
+                IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(unit * 0.16),
+                      border: Border.all(
+                        color: Colors.blueAccent,
+                        width: unit * 0.025,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+
+        return MediaLibraryAdaptiveDraggable<MediaLibraryPinnedDragData>(
+          delay: dragDelay,
+          data: MediaLibraryPinnedDragData(visibleIndex),
+          onDragStarted: onDragStarted ?? () {},
+          onTap: onTap,
+          feedback: SizedBox(
+            width: size.width,
+            height: size.height,
+            child: Material(
+              type: MaterialType.transparency,
+              child: Opacity(opacity: 0.9, child: IgnorePointer(child: child)),
+            ),
+          ),
+          childWhenDragging: Opacity(opacity: 0.3, child: target),
+          child: target,
+        );
+      },
+    );
+  }
+}

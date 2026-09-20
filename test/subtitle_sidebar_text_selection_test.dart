@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -47,6 +48,169 @@ void main() {
       await harness.dispose(tester);
     });
   }
+
+  testWidgets('select-all shortcut covers every virtualized transcript cue', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (MethodCall methodCall) async {
+        if (methodCall.method == 'Clipboard.setData') {
+          copied =
+              (methodCall.arguments as Map<dynamic, dynamic>)['text']
+                  as String?;
+        }
+        return null;
+      },
+    );
+    try {
+      final harness = await _pumpSelectionList(
+        tester,
+        articleMode: false,
+        paragraphMode: true,
+      );
+      final String expected = List<String>.generate(
+        60,
+        (int index) => 'touch line $index',
+      ).join(' ');
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      try {
+        final KeyEventResult result = harness.key.currentState!
+            .handleTranscriptShortcut(
+              const KeyDownEvent(
+                logicalKey: LogicalKeyboardKey.keyA,
+                physicalKey: PhysicalKeyboardKey.keyA,
+                timeStamp: Duration.zero,
+              ),
+            );
+        expect(result, KeyEventResult.handled);
+        expect(harness.key.currentState!.isFullTranscriptSelected, isTrue);
+        expect(harness.key.currentState!.selectedTranscriptText, expected);
+
+        final KeyEventResult copyResult = harness.key.currentState!
+            .handleTranscriptShortcut(
+              const KeyDownEvent(
+                logicalKey: LogicalKeyboardKey.keyC,
+                physicalKey: PhysicalKeyboardKey.keyC,
+                timeStamp: Duration.zero,
+              ),
+            );
+        expect(copyResult, KeyEventResult.handled);
+        expect(copied, expected);
+        // Dispose before Control-up pumps a frame: that frame would run the
+        // deferred visual selectAll across 60 virtualized rows.
+        await tester.pumpWidget(const SizedBox.shrink());
+      } finally {
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      }
+    } finally {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      );
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('empty right-click still opens copy-format settings', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final harness = await _pumpSelectionList(
+        tester,
+        articleMode: false,
+        paragraphMode: true,
+      );
+      final Finder first = find
+          .textContaining('touch line 0', findRichText: true)
+          .first;
+      final Rect firstRect = tester.getRect(first);
+      final secondaryClick = await tester.startGesture(
+        Offset(firstRect.left + 8, firstRect.center.dy),
+        kind: PointerDeviceKind.mouse,
+        buttons: kSecondaryMouseButton,
+      );
+      await secondaryClick.up();
+      await tester.pump();
+      await tester.pump();
+      final AdaptiveTextSelectionToolbar toolbar = tester.widget(
+        find.byType(AdaptiveTextSelectionToolbar),
+      );
+      final ContextMenuButtonItem format = toolbar.buttonItems!.firstWhere(
+        (ContextMenuButtonItem item) => item.label == '格式',
+      );
+      format.onPressed!();
+      await tester.pump();
+      expect(find.text('复制格式'), findsOneWidget);
+      expect(find.text('复制'), findsNothing);
+      expect(harness.key.currentState!.hasTextSelection, isFalse);
+      await tester.pumpWidget(const SizedBox.shrink());
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('menu select-all uses the canonical full transcript', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final harness = await _pumpSelectionList(
+        tester,
+        articleMode: false,
+        paragraphMode: true,
+      );
+      final Finder first = find
+          .textContaining('touch line 0', findRichText: true)
+          .first;
+      final Rect firstRect = tester.getRect(first);
+      final secondaryClick = await tester.startGesture(
+        Offset(firstRect.left + 8, firstRect.center.dy),
+        kind: PointerDeviceKind.mouse,
+        buttons: kSecondaryMouseButton,
+      );
+      await secondaryClick.up();
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(AdaptiveTextSelectionToolbar), findsOneWidget);
+      final AdaptiveTextSelectionToolbar toolbar = tester.widget(
+        find.byType(AdaptiveTextSelectionToolbar),
+      );
+      expect(
+        toolbar.buttonItems!.map((ContextMenuButtonItem item) => item.type),
+        containsAll(<ContextMenuButtonType>[
+          ContextMenuButtonType.selectAll,
+          ContextMenuButtonType.custom,
+        ]),
+      );
+      expect(
+        toolbar.buttonItems!
+            .firstWhere(
+              (ContextMenuButtonItem item) =>
+                  item.type == ContextMenuButtonType.custom,
+            )
+            .label,
+        '格式',
+      );
+      final ContextMenuButtonItem selectAll = toolbar.buttonItems!.firstWhere(
+        (ContextMenuButtonItem item) =>
+            item.type == ContextMenuButtonType.selectAll,
+      );
+      selectAll.onPressed!();
+      expect(harness.key.currentState!.isFullTranscriptSelected, isTrue);
+      expect(
+        harness.key.currentState!.selectedTranscriptText,
+        List<String>.generate(60, (int index) => 'touch line $index').join(' '),
+      );
+      expect(harness.key.currentState!.hasOwnedSelectionToolbar, isFalse);
+      await tester.pumpWidget(const SizedBox.shrink());
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
 
   testWidgets('touch long press selects article text without seeking', (
     tester,
@@ -438,6 +602,32 @@ void main() {
       debugDefaultTargetPlatformOverride = null;
     }
   });
+
+  for (final TargetPlatform platform in <TargetPlatform>[
+    TargetPlatform.windows,
+    TargetPlatform.macOS,
+    TargetPlatform.linux,
+  ]) {
+    testWidgets(
+      '${platform.name} right-click menu survives scrolling selected text off-screen',
+      (tester) async {
+        await _verifyDesktopContextMenuSurvivesOffscreenScroll(
+          tester,
+          platform: platform,
+        );
+      },
+    );
+  }
+
+  testWidgets(
+    'iOS selection toolbar survives scrolling selected text off-screen',
+    (tester) async {
+      await _verifyTouchContextMenuSurvivesOffscreenScroll(
+        tester,
+        platform: TargetPlatform.iOS,
+      );
+    },
+  );
 
   for (final TargetPlatform platform in <TargetPlatform>[
     TargetPlatform.iOS,
@@ -895,6 +1085,115 @@ Future<void> _verifyTouchSelectionScrollsUp(
     await gesture.up();
     await tester.pump();
     expect(harness.key.currentState!.isTouchSelectionEdgeScrolling, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+  } finally {
+    debugDefaultTargetPlatformOverride = null;
+  }
+}
+
+Future<void> _verifyDesktopContextMenuSurvivesOffscreenScroll(
+  WidgetTester tester, {
+  required TargetPlatform platform,
+}) async {
+  debugDefaultTargetPlatformOverride = platform;
+  try {
+    final _SelectionListHarness harness = await _pumpSelectionList(
+      tester,
+      articleMode: false,
+      paragraphMode: true,
+    );
+    final Finder first = find
+        .textContaining('touch line 0', findRichText: true)
+        .first;
+    final Finder second = find
+        .textContaining('touch line 1', findRichText: true)
+        .first;
+    final firstRect = tester.getRect(first);
+    final secondRect = tester.getRect(second);
+    final gesture = await tester.startGesture(
+      Offset(firstRect.left + 4, firstRect.center.dy),
+      kind: PointerDeviceKind.mouse,
+    );
+    await gesture.moveTo(Offset(secondRect.center.dx, secondRect.center.dy));
+    await gesture.up();
+    await tester.pump();
+    expect(harness.key.currentState!.hasTextSelection, isTrue);
+
+    final Finder shield = find.byKey(
+      const ValueKey('subtitle-selection-scroll-shield'),
+    );
+    expect(shield, findsOneWidget);
+    final Rect shieldRect = tester.getRect(shield);
+    final secondaryClick = await tester.startGesture(
+      shieldRect.center,
+      kind: PointerDeviceKind.mouse,
+      buttons: kSecondaryMouseButton,
+    );
+    await secondaryClick.up();
+    await tester.pump();
+    await tester.pump();
+    expect(find.byType(AdaptiveTextSelectionToolbar), findsOneWidget);
+    expect(harness.key.currentState!.hasOwnedSelectionToolbar, isTrue);
+
+    // Scroll far enough that the originally selected rows leave the viewport.
+    // Flutter's endpoint-anchored menu used to rebuild with non-finite anchors
+    // here and replace the right-click menu with ErrorWidget.
+    await tester.drag(shield, const Offset(0, -900));
+    for (int frame = 0; frame < 24; frame++) {
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(tester.takeException(), isNull);
+    }
+
+    expect(harness.key.currentState!.hasTextSelection, isTrue);
+    expect(tester.takeException(), isNull);
+    expect(find.byType(ErrorWidget), findsNothing);
+    // Desktop menus dismiss on scroll; Flutter must not resurrect a crashing
+    // geometry-anchored replacement.
+    expect(harness.key.currentState!.hasOwnedSelectionToolbar, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+  } finally {
+    debugDefaultTargetPlatformOverride = null;
+  }
+}
+
+Future<void> _verifyTouchContextMenuSurvivesOffscreenScroll(
+  WidgetTester tester, {
+  required TargetPlatform platform,
+}) async {
+  debugDefaultTargetPlatformOverride = platform;
+  try {
+    final _SelectionListHarness harness = await _pumpSelectionList(
+      tester,
+      articleMode: false,
+      paragraphMode: true,
+    );
+    final Finder first = find
+        .textContaining('touch line 0', findRichText: true)
+        .first;
+    final Rect firstRect = tester.getRect(first);
+    final longPress = await tester.startGesture(
+      Offset(firstRect.left + 18, firstRect.center.dy),
+      kind: PointerDeviceKind.touch,
+    );
+    await tester.pump(kLongPressTimeout + const Duration(milliseconds: 80));
+    expect(harness.key.currentState!.hasTextSelection, isTrue);
+    await longPress.up();
+    await tester.pump();
+    expect(find.byType(AdaptiveTextSelectionToolbar), findsOneWidget);
+
+    final Finder shield = find.byKey(
+      const ValueKey('subtitle-selection-scroll-shield'),
+    );
+    expect(shield, findsOneWidget);
+    await tester.drag(shield, const Offset(0, -900));
+    for (int frame = 0; frame < 24; frame++) {
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(tester.takeException(), isNull);
+    }
+
+    expect(harness.key.currentState!.hasTextSelection, isTrue);
+    expect(find.byType(AdaptiveTextSelectionToolbar), findsOneWidget);
+    expect(find.byType(ErrorWidget), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
   } finally {
     debugDefaultTargetPlatformOverride = null;

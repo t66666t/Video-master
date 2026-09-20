@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -10,6 +8,8 @@ import 'cached_thumbnail_widget.dart';
 import 'folder_placeholder_cover.dart';
 import 'media_list_layout_metrics.dart';
 import 'media_library_locate_button.dart';
+import 'media_library_activity_menu.dart';
+import 'media_library_action_dock.dart';
 
 /// Shared, information-dense row used by both media-library screens.
 class MediaLibraryListTile extends StatelessWidget {
@@ -32,6 +32,9 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onSelectionLongPressMoveUpdate,
     this.onSelectionLongPressEnd,
     this.onShowInParentFolder,
+    this.showActivityMenu = false,
+    this.allowHide = false,
+    this.relativePath,
   }) : _video = item,
        _collection = null;
 
@@ -54,6 +57,9 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onSelectionLongPressMoveUpdate,
     this.onSelectionLongPressEnd,
     this.onShowInParentFolder,
+    this.showActivityMenu = false,
+    this.allowHide = false,
+    this.relativePath,
   }) : _collection = collection,
        _video = null;
 
@@ -77,78 +83,11 @@ class MediaLibraryListTile extends StatelessWidget {
   final GestureLongPressMoveUpdateCallback? onSelectionLongPressMoveUpdate;
   final GestureLongPressEndCallback? onSelectionLongPressEnd;
   final VoidCallback? onShowInParentFolder;
+  final bool showActivityMenu;
+  final bool allowHide;
+  final String? relativePath;
 
   bool get _isCollection => _collection != null;
-
-  double _resolveLocateButtonHeight({
-    required BuildContext context,
-    required BoxConstraints constraints,
-    required MediaListLayoutMetrics metrics,
-    required double thumbnailExtent,
-  }) {
-    final leadingWidth = showThumbnail
-        ? thumbnailExtent + metrics.thumbnailInset * 2
-        : showIndex
-        ? metrics.indexWidth
-        : 0.0;
-    final informationWidth = math.max(0.0, constraints.maxWidth - leadingWidth);
-    final titleWidth = math.max(
-      0.0,
-      informationWidth -
-          (showThumbnail ? 0 : metrics.horizontalPadding) -
-          metrics.horizontalPadding,
-    );
-    final titlePainter = TextPainter(
-      text: TextSpan(
-        text: _isCollection ? _collection!.name : _video!.title,
-        style: DefaultTextStyle.of(context).style.merge(
-          TextStyle(
-            fontSize: metrics.titleSize,
-            height: 1.08,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ),
-      maxLines: 2,
-      ellipsis: '…',
-      textDirection: Directionality.of(context),
-      textScaler: MediaQuery.textScalerOf(context),
-    )..layout(maxWidth: titleWidth);
-
-    final metadataHeight = math.max(
-      metrics.metadataSize,
-      metrics.metadataIconSize,
-    );
-    final innerHeight = math.max(
-      0.0,
-      constraints.maxHeight - metrics.verticalPadding * 2,
-    );
-    final maximumTitleHeight = math.max(
-      0.0,
-      innerHeight - metrics.informationGap - metadataHeight,
-    );
-    final renderedTitleHeight = math.min(
-      titlePainter.height,
-      maximumTitleHeight,
-    );
-    final usedInformationHeight =
-        renderedTitleHeight + metrics.informationGap + metadataHeight;
-    final centeredTopSpace = math.max(
-      0.0,
-      (innerHeight - usedInformationHeight) / 2,
-    );
-    final titleBottom =
-        metrics.verticalPadding + centeredTopSpace + renderedTitleHeight;
-    final availableBelowTitle = math.max(
-      0.0,
-      constraints.maxHeight - titleBottom,
-    );
-    final minimumMetadataBand =
-        metrics.verticalPadding + metrics.informationGap + metadataHeight;
-    final desiredHeight = constraints.maxHeight * 0.50;
-    final safeMaximum = math.max(minimumMetadataBand, availableBelowTitle);
-    return math.min(safeMaximum, math.max(desiredHeight, minimumMetadataBand));
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -164,19 +103,16 @@ class MediaLibraryListTile extends StatelessWidget {
         final thumbnailExtent = metrics.thumbnailExtent(constraints.maxWidth);
         final showLocateButton =
             onShowInParentFolder != null && !isSelectionMode;
-        final locateButtonHeight = _resolveLocateButtonHeight(
-          context: context,
-          constraints: constraints,
-          metrics: metrics,
-          thumbnailExtent: thumbnailExtent,
+        final showMenu = showActivityMenu && !isSelectionMode;
+        final chipSize = MediaLibraryActionDockMetrics.listChipSize(
+          constraints.maxHeight,
         );
-        final locateButtonWidth = math.min(
-          constraints.maxWidth * 0.24,
-          math.max(locateButtonHeight * 2.15, metrics.visualShortSide * 0.78),
+        final textInset = MediaLibraryActionDockMetrics.textInset(
+          chipSize: chipSize,
+          showMore: showMenu,
+          showLocate: showLocateButton,
+          existingPadding: metrics.horizontalPadding,
         );
-        final metadataTrailingPadding = showLocateButton
-            ? math.max(0.0, locateButtonWidth - metrics.horizontalPadding)
-            : 0.0;
 
         return Material(
           key: const ValueKey('media-list-card'),
@@ -254,63 +190,71 @@ class MediaLibraryListTile extends StatelessWidget {
                         ),
                         child: _buildInformation(
                           metrics,
-                          metadataTrailingPadding: metadataTrailingPadding,
+                          textInset: textInset,
                         ),
                       ),
                     ),
-                    if (!showLocateButton)
+                    if (isSelectionMode)
                       Padding(
                         padding: EdgeInsets.only(
                           right: metrics.trailingPadding,
                         ),
-                        child: AnimatedSwitcher(
-                          duration: const Duration(milliseconds: 160),
-                          child: isSelectionMode
-                              ? GestureDetector(
-                                  key: const ValueKey(
-                                    'media-list-selection-handle',
-                                  ),
-                                  behavior: HitTestBehavior.opaque,
-                                  onTap: onSelectionTap,
-                                  onPanStart: onSelectionPanStart,
-                                  onPanUpdate: onSelectionPanUpdate,
-                                  onPanEnd: onSelectionPanEnd,
-                                  onLongPressStart: onSelectionLongPressStart,
-                                  onLongPressMoveUpdate:
-                                      onSelectionLongPressMoveUpdate,
-                                  onLongPressEnd: onSelectionLongPressEnd,
-                                  child: Icon(
-                                    isSelected
-                                        ? Icons.check_circle_rounded
-                                        : Icons.radio_button_unchecked_rounded,
-                                    key: ValueKey(isSelected),
-                                    color: isSelected ? accent : Colors.white30,
-                                    size: metrics.trailingSize,
-                                  ),
-                                )
-                              : Icon(
-                                  _isCollection
-                                      ? Icons.chevron_right_rounded
-                                      : Icons.play_arrow_rounded,
-                                  key: ValueKey(_isCollection),
-                                  color: Colors.white38,
-                                  size: metrics.trailingSize,
-                                ),
+                        child: GestureDetector(
+                          key: const ValueKey(
+                            'media-list-selection-handle',
+                          ),
+                          behavior: HitTestBehavior.opaque,
+                          onTap: onSelectionTap,
+                          onPanStart: onSelectionPanStart,
+                          onPanUpdate: onSelectionPanUpdate,
+                          onPanEnd: onSelectionPanEnd,
+                          onLongPressStart: onSelectionLongPressStart,
+                          onLongPressMoveUpdate:
+                              onSelectionLongPressMoveUpdate,
+                          onLongPressEnd: onSelectionLongPressEnd,
+                          child: Icon(
+                            isSelected
+                                ? Icons.check_circle_rounded
+                                : Icons.radio_button_unchecked_rounded,
+                            key: ValueKey(isSelected),
+                            color: isSelected ? accent : Colors.white30,
+                            size: metrics.trailingSize,
+                          ),
+                        ),
+                      )
+                    else if (!showLocateButton && !showMenu)
+                      Padding(
+                        padding: EdgeInsets.only(
+                          right: metrics.trailingPadding,
+                        ),
+                        child: Icon(
+                          _isCollection
+                              ? Icons.chevron_right_rounded
+                              : Icons.play_arrow_rounded,
+                          key: ValueKey(_isCollection),
+                          color: Colors.white38,
+                          size: metrics.trailingSize,
                         ),
                       ),
                   ],
                 ),
-                if (showLocateButton)
-                  Positioned(
-                    right: 0,
-                    bottom: 0,
-                    child: MediaLibraryLocateButton(
-                      cardWidth: constraints.maxWidth,
-                      width: locateButtonWidth,
-                      height: locateButtonHeight,
-                      iconSize: locateButtonHeight * 0.60,
-                      onPressed: onShowInParentFolder!,
-                    ),
+                if (showMenu || showLocateButton)
+                  MediaLibraryActionDock(
+                    chipSize: chipSize,
+                    more: showMenu
+                        ? MediaLibraryActivityMenuButton(
+                            targetId: _video?.id ?? _collection!.id,
+                            isCollection: _isCollection,
+                            allowHide: allowHide && !_isCollection,
+                            onLocate: onShowInParentFolder,
+                            fillSlot: true,
+                          )
+                        : null,
+                    locate: showLocateButton
+                        ? MediaLibraryLocateButton(
+                            onPressed: onShowInParentFolder!,
+                          )
+                        : null,
                   ),
               ],
             ),
@@ -444,7 +388,7 @@ class MediaLibraryListTile extends StatelessWidget {
 
   Widget _buildInformation(
     MediaListLayoutMetrics metrics, {
-    double metadataTrailingPadding = 0,
+    double textInset = 0,
   }) {
     final title = _isCollection ? _collection!.name : _video!.title;
     return Column(
@@ -453,23 +397,41 @@ class MediaLibraryListTile extends StatelessWidget {
       children: [
         Flexible(
           fit: FlexFit.loose,
-          child: Text(
-            title,
-            key: const ValueKey('media-list-title'),
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.94),
-              fontSize: metrics.titleSize,
-              height: 1.08,
-              fontWeight: FontWeight.w600,
+          child: Padding(
+            padding: EdgeInsets.only(right: textInset),
+            child: Text(
+              title,
+              key: const ValueKey('media-list-title'),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.94),
+                fontSize: metrics.titleSize,
+                height: 1.08,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
         ),
+        if (relativePath != null && relativePath!.isNotEmpty) ...[
+          SizedBox(height: metrics.informationGap),
+          Padding(
+            padding: EdgeInsets.only(right: textInset),
+            child: Text(
+              relativePath!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white38,
+                fontSize: metrics.metadataSize,
+              ),
+            ),
+          ),
+        ],
         SizedBox(height: metrics.informationGap),
         if (_isCollection)
           Padding(
-            padding: EdgeInsets.only(right: metadataTrailingPadding),
+            padding: EdgeInsets.only(right: textInset),
             child: _buildMetaLine(
               icon: Icons.folder_open_rounded,
               label: '${_collection!.childrenIds.length} 个项目',
@@ -481,7 +443,7 @@ class MediaLibraryListTile extends StatelessWidget {
           _VideoMetaLine(
             video: _video!,
             metrics: metrics,
-            trailingPadding: metadataTrailingPadding,
+            trailingPadding: textInset,
           ),
       ],
     );

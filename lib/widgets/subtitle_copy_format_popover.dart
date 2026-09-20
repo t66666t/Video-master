@@ -17,7 +17,7 @@ class SubtitleCopyFormatPopover extends StatelessWidget {
     required this.previewText,
     required this.showBilingualOptions,
     required this.onFormatChanged,
-    required this.onCopy,
+    this.onCopy,
     required this.onReset,
   });
 
@@ -26,7 +26,7 @@ class SubtitleCopyFormatPopover extends StatelessWidget {
   final String previewText;
   final bool showBilingualOptions;
   final ValueChanged<SubtitleCopyFormat> onFormatChanged;
-  final VoidCallback onCopy;
+  final VoidCallback? onCopy;
   final VoidCallback onReset;
 
   @override
@@ -111,7 +111,7 @@ class _SubtitleCopyFormatCard extends StatefulWidget {
     required this.previewText,
     required this.showBilingualOptions,
     required this.onFormatChanged,
-    required this.onCopy,
+    this.onCopy,
     required this.onReset,
   });
 
@@ -119,7 +119,7 @@ class _SubtitleCopyFormatCard extends StatefulWidget {
   final String previewText;
   final bool showBilingualOptions;
   final ValueChanged<SubtitleCopyFormat> onFormatChanged;
-  final VoidCallback onCopy;
+  final VoidCallback? onCopy;
   final VoidCallback onReset;
 
   @override
@@ -343,17 +343,18 @@ class _SubtitleCopyFormatCardState extends State<_SubtitleCopyFormatCard> {
                     child: const Text('重置', style: TextStyle(fontSize: 12)),
                   ),
                   const Spacer(),
-                  TextButton(
-                    onPressed: widget.onCopy,
-                    style: TextButton.styleFrom(
-                      foregroundColor: Colors.blueAccent,
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      minimumSize: const Size(0, 32),
-                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  if (widget.onCopy != null)
+                    TextButton(
+                      onPressed: widget.onCopy,
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.blueAccent,
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      child: const Text('复制', style: TextStyle(fontSize: 12)),
                     ),
-                    child: const Text('复制', style: TextStyle(fontSize: 12)),
-                  ),
                 ],
               ),
             ],

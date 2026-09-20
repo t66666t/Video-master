@@ -26,6 +26,7 @@ import 'package:video_player_app/utils/page_shortcut_keys.dart';
 
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 import 'package:video_player_app/widgets/adaptive_settings_dialog.dart';
+import 'package:video_player_app/widgets/media_library_recent_intent.dart';
 
 class BilibiliDownloadScreen extends StatefulWidget {
   final String? initialInput;
@@ -1101,7 +1102,11 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
       await importToast.dismiss();
 
       if (count > 0) {
-        AppToast.show("已导入 $count 个视频", type: AppToastType.success);
+        showLibraryImportAddedToast(
+          library: library,
+          message: "已导入 $count 个视频",
+          type: AppToastType.success,
+        );
       } else {
         AppToast.show("导入失败或无已完成任务", type: AppToastType.error);
       }

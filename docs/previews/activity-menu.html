@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>媒体库卡片 · 更多菜单位置预览</title>
+  <style>
+    :root {
+      --bg: #111;
+      --card: #2c2c2c;
+      --muted: #9a9a9a;
+      --chip: #202328;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", sans-serif;
+      background: var(--bg);
+      color: #eee;
+    }
+    header {
+      padding: 16px 16px 8px;
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 18px; font-weight: 650; margin: 0 0 6px; }
+    p { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0 0 10px; }
+    .toolbar { font-size: 13px; margin: 8px 0; }
+    .stage { padding: 8px 16px 40px; max-width: 720px; margin: 0 auto; }
+    .device {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      padding: 10px;
+      margin: 0 0 16px;
+    }
+    .device h2 {
+      font-size: 12px;
+      font-weight: 600;
+      color: #bbb;
+      margin: 0 0 8px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 10px;
+      overflow: hidden;
+      aspect-ratio: 1 / 1.39;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .cover { width: 100%; aspect-ratio: 16 / 9; flex: 0 0 auto; }
+    .info {
+      flex: 1;
+      min-height: 0;
+      padding: 5px 0 4px 6px;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .title {
+      flex: 1;
+      min-width: 0;
+      font-size: 11px;
+      font-weight: 500;
+      line-height: 1.25;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+    }
+    .meta {
+      font-size: 10px;
+      color: #888;
+      margin-top: 2px;
+      line-height: 1.2;
+    }
+
+    /* 三个几何圆点，避免「⋯」字形偏心 */
+    .dots {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.4px;
+      pointer-events: none;
+    }
+    .dots i {
+      width: 2.2px;
+      height: 2.2px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.92);
+      display: block;
+    }
+
+    /* 普通卡片：正方形切角，贴齐右下 */
+    .corner {
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      width: 19%;
+      aspect-ratio: 1;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      color: inherit;
+      background: var(--chip);
+      border-top-left-radius: 8px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+    }
+    .hit {
+      display: none;
+      position: absolute;
+      inset: 0;
+      border: 1px dashed #4eb2ff;
+      pointer-events: none;
+    }
+    .corner .hit { border-top-left-radius: 8px; }
+
+    /* 搜索：先在整条深色底栏里均分两个图标（左、中、右空隙相等），再叠热区 */
+    .dock {
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      width: 38%;
+      aspect-ratio: 2 / 1;
+      margin: 0;
+      padding: 0;
+      background: var(--chip);
+      border-top-left-radius: 8px;
+      overflow: hidden;
+    }
+    .dock .glyphs {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-evenly;
+      pointer-events: none;
+      z-index: 1;
+    }
+    .dock .glyphs svg {
+      height: 50%;
+      width: auto;
+      aspect-ratio: 1;
+      fill: none;
+      stroke: rgba(255, 255, 255, 0.88);
+      stroke-width: 1.9;
+    }
+    .dock .hits {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      z-index: 2;
+    }
+    .dock .hits button {
+      flex: 1 1 50%;
+      width: 50%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      position: relative;
+    }
+    .dock .hits .more .hit { border-top-left-radius: 8px; }
+
+    .card.search .title { padding-right: 4px; }
+    .card.search .meta { padding-right: 40%; }
+    .card.regular .title { padding-right: 4px; }
+    .card.regular .meta { padding-right: 22%; }
+
+    /* 列表：行很宽，切角按行高缩放，不能按行宽 19%/38% 否则会撑满半行 */
+    .list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .row {
+      position: relative;
+      display: flex;
+      align-items: stretch;
+      background: #272a2f;
+      border: 1px solid rgba(255, 255, 255, 0.075);
+      border-radius: 10px;
+      overflow: hidden;
+      height: 68px;
+    }
+    .row .thumb {
+      flex: 0 0 auto;
+      width: 56px;
+      height: 56px;
+      margin: 6px;
+      border-radius: 8px;
+    }
+    .row .info {
+      flex: 1;
+      min-width: 0;
+      padding: 8px 8px 8px 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .row .title {
+      flex: 0 1 auto;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.15;
+      -webkit-line-clamp: 2;
+    }
+    .row .meta {
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .row .corner {
+      width: auto;
+      height: 47%;
+      aspect-ratio: 1;
+    }
+    .row .dock {
+      width: auto;
+      height: 47%;
+      aspect-ratio: 2 / 1;
+    }
+    .row.regular .title,
+    .row.regular .meta { padding-right: 40px; }
+    .row.search .title,
+    .row.search .meta { padding-right: 72px; }
+
+    body.show-hit .hit { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>网格与列表 · 更多 / 定位</h1>
+    <p>
+      普通：右下正方形切角，三点居中。<br />
+      搜索：同一条深色底栏里两点均匀分布（左、中、右空隙相等），热区对半切。<br />
+      列表行很宽，切角按<strong>行高</strong>缩放，避免文件夹再占掉半行。
+    </p>
+    <div class="toolbar">
+      <label><input type="checkbox" id="showHit" checked /> 显示点击热区</label>
+    </div>
+  </header>
+  <div class="stage" id="stage"></div>
+  <script>
+    const covers = [
+      ["#f4f1ea", "浅色"],
+      ["#1b1b1b", "深色"],
+      ["#c43c3c", "红"],
+      ["#e6c84a", "黄"],
+      ["#2f6bdc", "蓝"],
+    ];
+    const dots = `<span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>`;
+    const folder = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7.5h6l2 2H21v8.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18V7.5z"/></svg>`;
+
+    function regular(cover, label) {
+      return `
+        <article class="card regular">
+          <div class="cover" style="background:${cover}"></div>
+          <div class="info">
+            <div class="title">${label} · 普通卡片标题折两行</div>
+            <div class="meta">12:08</div>
+          </div>
+          <button class="corner" type="button" aria-label="更多">
+            ${dots}<span class="hit"></span>
+          </button>
+        </article>`;
+    }
+    function search(cover, label) {
+      return `
+        <article class="card search">
+          <div class="cover" style="background:${cover}"></div>
+          <div class="info">
+            <div class="title">${label} · 搜索结果标题折行</div>
+            <div class="meta">12:08</div>
+          </div>
+          <div class="dock">
+            <div class="glyphs">${dots}${folder}</div>
+            <div class="hits">
+              <button class="more" type="button" aria-label="更多"><span class="hit"></span></button>
+              <button class="folder" type="button" aria-label="显示所在目录"><span class="hit"></span></button>
+            </div>
+          </div>
+        </article>`;
+    }
+    function regularRow(cover, label) {
+      return `
+        <article class="row regular">
+          <div class="thumb" style="background:${cover}"></div>
+          <div class="info">
+            <div class="title">${label} · 普通列表标题写长一点好观察折行会不会顶到切角</div>
+            <div class="meta">视频  ·  12:08</div>
+          </div>
+          <button class="corner" type="button" aria-label="更多">
+            ${dots}<span class="hit"></span>
+          </button>
+        </article>`;
+    }
+    function searchRow(cover, label) {
+      return `
+        <article class="row search">
+          <div class="thumb" style="background:${cover}"></div>
+          <div class="info">
+            <div class="title">${label} · 搜索列表标题写长一点好观察折行会不会顶到底栏</div>
+            <div class="meta">视频  ·  12:08</div>
+          </div>
+          <div class="dock">
+            <div class="glyphs">${dots}${folder}</div>
+            <div class="hits">
+              <button class="more" type="button" aria-label="更多"><span class="hit"></span></button>
+              <button class="folder" type="button" aria-label="显示所在目录"><span class="hit"></span></button>
+            </div>
+          </div>
+        </article>`;
+    }
+    function block(title, factory) {
+      return `<section class="device"><h2>${title}</h2><div class="grid">${
+        covers.map(([c, n]) => factory(c, n)).join("")
+      }</div></section>`;
+    }
+    function listBlock(title, factory) {
+      return `<section class="device"><h2>${title}</h2><div class="list">${
+        covers.map(([c, n]) => factory(c, n)).join("")
+      }</div></section>`;
+    }
+    document.getElementById("stage").innerHTML =
+      block("网格 · 普通卡片", regular) +
+      block("网格 · 搜索结果", search) +
+      listBlock("列表 · 普通", regularRow) +
+      listBlock("列表 · 搜索结果", searchRow);
+    document.getElementById("showHit").addEventListener("change", (e) => {
+      document.body.classList.toggle("show-hit", e.target.checked);
+    });
+    document.body.classList.add("show-hit");
+  </script>
+</body>
+</html>

@@ -5,7 +5,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
-import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
@@ -15,7 +14,10 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_downl
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_input_url_extractor.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_version.dart';
+import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/utils/reveal_in_file_manager.dart';
+import 'package:video_player_app/widgets/media_library_recent_intent.dart';
 import 'package:video_player_app/utils/android_hardware_input_bridge.dart';
 import 'package:video_player_app/utils/hardware_keyboard_shortcuts.dart';
 import 'package:video_player_app/utils/link_download_shortcuts.dart';
@@ -222,7 +224,11 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       }
       // show() 会自动替换当前的 loading toast，无需额外 dismiss
       if (count > 0) {
-        AppToast.show('已导出 $count 个视频到媒体库', type: AppToastType.success);
+        showLibraryImportAddedToast(
+          library: Provider.of<LibraryService>(context, listen: false),
+          message: '已导出 $count 个视频到媒体库',
+          type: AppToastType.success,
+        );
       } else {
         AppToast.show('没有可导出的已完成任务', type: AppToastType.error);
       }
@@ -239,9 +245,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
 
   Future<void> _openOutputLocation(String path) async {
     final normalized = p.normalize(path);
-    final file = File(normalized);
-    final directory = Directory(normalized);
-    final exists = await file.exists() || await directory.exists();
+    final bool exists =
+        await File(normalized).exists() || await Directory(normalized).exists();
     if (!exists) {
       if (!mounted) return;
       AppToast.show('目标路径不存在', type: AppToastType.error);
@@ -249,20 +254,9 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     }
 
     try {
-      if (Platform.isWindows) {
-        if (await file.exists()) {
-          await Process.run('explorer', ['/select,', normalized]);
-        } else {
-          await Process.run('explorer', [normalized]);
-        }
-      } else {
-        final openTarget = await directory.exists()
-            ? normalized
-            : p.dirname(normalized);
-        final result = await OpenFilex.open(openTarget);
-        if (result.type != ResultType.done && mounted) {
-          AppToast.show('打开位置失败', type: AppToastType.error);
-        }
+      final bool opened = await revealInFileManager(normalized);
+      if (!opened && mounted) {
+        AppToast.show('打开位置失败', type: AppToastType.error);
       }
     } catch (_) {
       if (!mounted) return;
@@ -1659,7 +1653,8 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                           : Text(
                                               _dlTooltip(
                                                 '解析',
-                                                LinkDownloadShortcutAction.parse,
+                                                LinkDownloadShortcutAction
+                                                    .parse,
                                               ),
                                             ),
                                     );

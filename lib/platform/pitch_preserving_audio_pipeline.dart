@@ -86,6 +86,13 @@ abstract final class PitchPreservingAudioPipeline {
         waitForInitialization: false,
       ),
       platform.setProperty('framedrop', 'vo', waitForInitialization: false),
+      // WASAPI exclusive (and OEM Android AudioTrack exclusive paths) would
+      // request a second AUDIOFOCUS_GAIN against AudioSession.
+      platform.setProperty(
+        'audio-exclusive',
+        'no',
+        waitForInitialization: false,
+      ),
     ]);
 
     final configuredValues = await Future.wait<String>(<Future<String>>[

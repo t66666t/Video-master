@@ -12,7 +12,11 @@ import 'video_action_buttons.dart';
 
 /// App-wide listener for Android/iOS share and "open with" payloads.
 ///
-/// Lives above individual screens so a buried [HomeScreen] cannot cancel the
+/// This is the only subscriber to the share Method/Event channels. Screens
+/// such as [HomeScreen] must not open a second listener: two in-memory
+/// dedupe sets would both accept the same payload.
+///
+/// Lives above individual screens so a buried home route cannot cancel the
 /// event channel, and so archive import dialogs can use the root navigator.
 class IncomingShareListener extends StatefulWidget {
   final Widget child;

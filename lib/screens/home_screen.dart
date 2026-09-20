@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:provider/provider.dart';
@@ -23,12 +24,22 @@ import '../widgets/library_rename_dialog.dart';
 import '../widgets/media_library_list_tile.dart';
 import '../widgets/media_library_item_interaction_wrapper.dart';
 import '../widgets/media_library_grid_card.dart';
+import '../widgets/media_library_activity_menu.dart';
+import '../widgets/media_library_action_dock.dart';
 import '../widgets/media_library_layout_profile.dart';
 import '../widgets/media_library_style_sheet.dart';
 import '../widgets/media_list_layout_metrics.dart';
 import '../widgets/media_library_settings_sheet.dart';
 import '../widgets/media_library_search_prompt.dart';
 import '../widgets/media_library_compact_app_bar.dart';
+import '../widgets/media_library_entry_switcher.dart';
+import '../widgets/media_library_recent_intent.dart';
+import '../widgets/media_library_recent_view.dart';
+import '../widgets/media_library_continue_view.dart';
+import '../widgets/media_library_root_surface_host.dart';
+import '../models/media_library_root_entry.dart';
+import '../models/media_library_root_entry_order.dart';
+import '../services/media_library_navigation.dart';
 import '../widgets/media_library_selection_bottom_bar.dart';
 import '../widgets/media_library_selection_drop_targets.dart';
 import '../widgets/media_library_top_bar_import_progress.dart';
@@ -131,12 +142,6 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  static const MethodChannel _shareIntentChannel = MethodChannel(
-    'com.example.video_player_app/share_intent',
-  );
-  static const EventChannel _shareIntentEventChannel = EventChannel(
-    'com.example.video_player_app/share_intent_events',
-  );
   bool _isSelectionMode = false;
   final Set<String> _selectedIds = {};
   final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
@@ -175,16 +180,33 @@ class _HomeScreenState extends State<HomeScreen>
   bool _hasPendingPlaybackState = false;
   double _stablePlaybackBottomInset = 0.0;
   bool _showExportSettingsButton = false;
-  DateTime? _lastTitleTapAt;
-  int _titleTapCount = 0;
   final FocusNode _shortcutFocusNode = FocusNode();
   bool? _lastIsFullScreen;
   bool _bilibiliLoginCheckQueued = false;
-  StreamSubscription<dynamic>? _shareIntentSubscription;
-  final Set<String> _handledIncomingMediaSignatures = {};
   late final AnimationController _revealHighlightController;
   Timer? _revealHighlightTimer;
   bool _didScheduleReveal = false;
+  bool _didPersistRootEntryDefault = false;
+  bool _didRestoreLastFolderRoute = false;
+  bool _libraryNavigationScheduled = false;
+  final ScrollController _recentScrollController = ScrollController();
+  final ScrollController _continueScrollController = ScrollController();
+  final ValueNotifier<MediaLibraryRootEntry?> _rootEntryOverride =
+      ValueNotifier<MediaLibraryRootEntry?>(null);
+  final ValueNotifier<double> _rootSwipeHighlight = ValueNotifier<double>(0);
+  final ValueNotifier<bool> _rootSwipeSettled = ValueNotifier<bool>(true);
+  final ValueNotifier<List<MediaLibraryRootEntry>> _rootEntryOrder =
+      ValueNotifier<List<MediaLibraryRootEntry>>(
+        List<MediaLibraryRootEntry>.of(MediaLibraryRootEntryOrder.defaults),
+      );
+  final GlobalKey _rootSurfaceHostKey = GlobalKey();
+  String? _pendingRecentBatchId;
+
+  static const Set<MediaLibraryRootEntry> _mountedRootEntries = {
+    MediaLibraryRootEntry.continueLearning,
+    MediaLibraryRootEntry.recent,
+    MediaLibraryRootEntry.folders,
+  };
 
   Future<void> _openSearch() async {
     final query = await showMediaLibrarySearchPrompt(context);
@@ -312,6 +334,9 @@ class _HomeScreenState extends State<HomeScreen>
           '回收站',
           DesktopMediaManagementShortcutAction.openRecycleBin,
         ),
+        // Long-press is the hidden export-settings toggle; a short tap still
+        // opens the recycle bin so everyday navigation cannot unlock it.
+        onLongPress: _toggleExportButtonVisibility,
         onPressed: () {
           Navigator.of(
             context,
@@ -676,6 +701,14 @@ class _HomeScreenState extends State<HomeScreen>
     required int pointerCount,
     required Offset globalPos,
   }) {
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final plan = _rootNavigationPlan(library, settings);
+    if (!plan.forceFoldersForLocate &&
+        (plan.displayedEntry == MediaLibraryRootEntry.recent ||
+            plan.displayedEntry == MediaLibraryRootEntry.continueLearning)) {
+      return false;
+    }
     if (!MediaLibraryRangeSelection.isMouseBoxGesture(
       pointerKind: _activePointerKind,
       pointerCount: pointerCount,
@@ -850,6 +883,7 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
+  /// Hidden entry: long-press the recycle-bin icon on the media-library app bar.
   Future<void> _toggleExportButtonVisibility() async {
     final newValue = !_showExportSettingsButton;
     final prefs = await SharedPreferences.getInstance();
@@ -863,20 +897,6 @@ class _HomeScreenState extends State<HomeScreen>
 
   void _openPortableTransfer() {
     unawaited(PortableTransferNavigation.open(context));
-  }
-
-  void _handleTitleTap() {
-    final now = DateTime.now();
-    if (_lastTitleTapAt == null ||
-        now.difference(_lastTitleTapAt!).inMilliseconds > 1200) {
-      _titleTapCount = 0;
-    }
-    _lastTitleTapAt = now;
-    _titleTapCount += 1;
-    if (_titleTapCount >= 5) {
-      _titleTapCount = 0;
-      _toggleExportButtonVisibility();
-    }
   }
 
   Future<void> _exportSettingsSnapshot() async {
@@ -957,6 +977,9 @@ class _HomeScreenState extends State<HomeScreen>
     super.initState();
     AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
     HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
+    MediaLibraryRecentIntent.pendingBatchId.addListener(
+      _onRecentBatchViewRequested,
+    );
     _revealHighlightController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 360),
@@ -979,7 +1002,6 @@ class _HomeScreenState extends State<HomeScreen>
         _checkBilibiliLogin();
         _checkClipboard();
         _checkPendingPlaybackState();
-        _setupIncomingMediaHandling();
       }
     });
 
@@ -1007,7 +1029,6 @@ class _HomeScreenState extends State<HomeScreen>
     if (!widget.returnToSearchResults) {
       playbackService.removeListener(_onPlaybackServiceChanged);
     }
-    _shareIntentSubscription?.cancel();
     AndroidHardwareInputBridge.removeKeyListener(
       _handleAndroidHardwareKeyEvent,
     );
@@ -1015,79 +1036,17 @@ class _HomeScreenState extends State<HomeScreen>
     _revealHighlightTimer?.cancel();
     _revealHighlightController.dispose();
     _shortcutFocusNode.dispose();
+    _recentScrollController.dispose();
+    _continueScrollController.dispose();
+    _rootEntryOverride.dispose();
+    _rootSwipeHighlight.dispose();
+    _rootSwipeSettled.dispose();
+    _rootEntryOrder.dispose();
+    MediaLibraryRecentIntent.pendingBatchId.removeListener(
+      _onRecentBatchViewRequested,
+    );
     _selectionAutoScroller?.dispose();
     super.dispose();
-  }
-
-  Future<void> _setupIncomingMediaHandling() async {
-    if (!(Platform.isAndroid || Platform.isIOS)) return;
-
-    _shareIntentSubscription?.cancel();
-    _shareIntentSubscription = _shareIntentEventChannel
-        .receiveBroadcastStream()
-        .listen((dynamic event) async {
-          if (!mounted || event is! List) return;
-          await _importIncomingSharedItems(event);
-        });
-
-    try {
-      final initial = await _shareIntentChannel.invokeMethod<List<dynamic>>(
-        'getInitialSharedMedia',
-      );
-      if (!mounted) return;
-      await _importIncomingSharedItems(initial ?? const []);
-    } catch (e) {
-      debugPrint('接收系统分享媒体失败: $e');
-    }
-  }
-
-  Future<void> _importIncomingSharedItems(List<dynamic> items) async {
-    if (!mounted || items.isEmpty) return;
-    final signatures = <String>[];
-    for (final item in items) {
-      if (item is String) {
-        final normalized = item.trim();
-        if (normalized.isNotEmpty) {
-          signatures.add('media:${normalized.toLowerCase()}');
-        }
-        continue;
-      }
-      if (item is! Map) {
-        continue;
-      }
-
-      final kind = (item['kind'] as String?)?.trim().toLowerCase() ?? 'media';
-      if (kind == 'archive') {
-        final path = (item['path'] as String?)?.trim();
-        final uri = (item['uri'] as String?)?.trim();
-        final displayName = (item['displayName'] as String?)?.trim();
-        final key = path?.isNotEmpty == true
-            ? path!.toLowerCase()
-            : (uri?.isNotEmpty == true
-                  ? uri!
-                  : (displayName?.isNotEmpty == true
-                        ? displayName!
-                        : 'archive'));
-        signatures.add('archive:$key');
-        continue;
-      }
-
-      final path = (item['path'] as String?)?.trim();
-      if (path != null && path.isNotEmpty) {
-        signatures.add('media:${path.toLowerCase()}');
-      }
-    }
-    if (signatures.isEmpty) return;
-    final canonical = signatures.toList()..sort();
-    final signature = canonical.join('||');
-    if (_handledIncomingMediaSignatures.contains(signature)) return;
-    _handledIncomingMediaSignatures.add(signature);
-    if (_handledIncomingMediaSignatures.length > 100) {
-      _handledIncomingMediaSignatures.remove(
-        _handledIncomingMediaSignatures.first,
-      );
-    }
-    await VideoActionButtons.processIncomingSharedItems(context, items, null);
   }
 
   bool get _supportsDesktopManagementShortcuts {
@@ -1139,6 +1098,190 @@ class _HomeScreenState extends State<HomeScreen>
       _boxCurrentPos = null;
       _capturedIds.clear();
     });
+  }
+
+  MediaLibraryNavigationPlan _rootNavigationPlan(
+    LibraryService library,
+    SettingsService settings,
+  ) {
+    return MediaLibraryNavigation.plan(
+      libraryInitialized: library.isInitialized,
+      hasExistingLibraryContent: library.hasExistingLibraryContent,
+      storedEntry: settings.mediaLibraryRootEntry,
+      userChosen: settings.mediaLibraryRootEntryUserChosen,
+      lastFolderId: settings.mediaLibraryLastFolderId,
+      availableEntries: _mountedRootEntries,
+      revealItemId: widget.revealItemId,
+      returnToSearchResults: widget.returnToSearchResults,
+      isActiveFolder: (id) {
+        final collection = library.getCollection(id);
+        return collection != null && !collection.isRecycled;
+      },
+      parentIdOf: (id) => library.getCollection(id)?.parentId,
+    );
+  }
+
+  void _persistScrollForEntry(
+    MediaLibraryRootEntry displayed,
+    SettingsService settings,
+  ) {
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final visibleIds = library
+        .getContents(null)
+        .map((item) => (item as dynamic).id as String)
+        .toSet();
+    final previous = Map<MediaLibraryRootEntry, MediaLibraryScrollAnchor>.from(
+      MediaLibraryNavigation.decodeAnchors(settings.mediaLibraryEntryAnchors),
+    );
+    final previousAnchor =
+        previous[displayed] ?? const MediaLibraryScrollAnchor();
+    final sanitized = MediaLibraryNavigation.sanitizeAnchor(
+      anchor: previousAnchor,
+      visibleItemIds: visibleIds,
+    );
+    final controller = _scrollControllerFor(displayed);
+    final offset = controller.hasClients
+        ? controller.offset
+        : sanitized.offset;
+    previous[displayed] = MediaLibraryScrollAnchor(
+      itemId:
+          sanitized.itemId ?? (visibleIds.isEmpty ? null : visibleIds.first),
+      offset: offset,
+    );
+    unawaited(
+      settings.saveMediaLibraryEntryAnchors(
+        MediaLibraryNavigation.encodeAnchors(previous),
+      ),
+    );
+  }
+
+  ScrollController _scrollControllerFor(MediaLibraryRootEntry entry) {
+    switch (entry) {
+      case MediaLibraryRootEntry.continueLearning:
+        return _continueScrollController;
+      case MediaLibraryRootEntry.recent:
+        return _recentScrollController;
+      case MediaLibraryRootEntry.folders:
+        return _scrollController;
+    }
+  }
+
+  MediaLibraryRootEntry _effectiveRootEntry(MediaLibraryNavigationPlan plan) {
+    if (plan.forceFoldersForLocate) return MediaLibraryRootEntry.folders;
+    return _rootEntryOverride.value ?? plan.displayedEntry;
+  }
+
+  void _syncRootEntryOrder(SettingsService settings) {
+    final parsed = MediaLibraryRootEntryOrder.parse(
+      settings.mediaLibraryRootEntryOrder,
+    );
+    if (listEquals(_rootEntryOrder.value, parsed)) return;
+    _rootEntryOrder.value = parsed;
+  }
+
+  void _onRootEntryReorder(
+    int oldIndex,
+    int newIndex,
+    SettingsService settings,
+    MediaLibraryNavigationPlan plan,
+  ) {
+    if (!_rootSwipeSettled.value) return;
+    final next = MediaLibraryRootEntryOrder.moved(
+      _rootEntryOrder.value,
+      oldIndex: oldIndex,
+      newIndex: newIndex,
+    );
+    if (listEquals(next, _rootEntryOrder.value)) return;
+    _rootEntryOrder.value = next;
+    final selected = _effectiveRootEntry(plan);
+    final index = next.indexOf(selected);
+    if (index >= 0) {
+      _rootSwipeHighlight.value = index.toDouble();
+    }
+    unawaited(
+      settings.saveMediaLibraryRootEntryOrder(
+        MediaLibraryRootEntryOrder.encode(next),
+      ),
+    );
+  }
+
+  void _selectRootEntry(MediaLibraryRootEntry entry, SettingsService settings) {
+    if (!_mountedRootEntries.contains(entry)) return;
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final plan = _rootNavigationPlan(library, settings);
+    final leaving = _effectiveRootEntry(plan);
+    if (leaving == entry) return;
+    if (_isSelectionMode) {
+      _exitSelectionMode();
+    }
+    _rootEntryOverride.value = entry;
+    final orderIndex = _rootEntryOrder.value.indexOf(entry);
+    _rootSwipeHighlight.value = (orderIndex < 0 ? entry.index : orderIndex)
+        .toDouble();
+    unawaited(
+      settings.saveMediaLibraryRootChoice(entry.storageValue, notify: false),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _persistScrollForEntry(leaving, settings);
+    });
+  }
+
+  void _onRecentBatchViewRequested() {
+    final batchId = MediaLibraryRecentIntent.pendingBatchId.value;
+    if (batchId == null || !mounted) return;
+    MediaLibraryRecentIntent.pendingBatchId.value = null;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    setState(() => _pendingRecentBatchId = batchId);
+    _selectRootEntry(MediaLibraryRootEntry.recent, settings);
+  }
+
+  void _locateLibraryItem(VideoItem item) {
+    final parentId = item.parentId;
+    final Widget page = parentId == null
+        ? HomeScreen(revealItemId: item.id, returnToSearchResults: true)
+        : CollectionScreen(
+            collectionId: parentId,
+            revealItemId: item.id,
+            returnToSearchResults: true,
+          );
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
+  }
+
+  void _applyLibraryNavigationAfterInit(
+    LibraryService library,
+    SettingsService settings,
+  ) {
+    final plan = _rootNavigationPlan(library, settings);
+    if (plan.persistPreferred && !_didPersistRootEntryDefault) {
+      _didPersistRootEntryDefault = true;
+      unawaited(
+        settings.updateSetting(
+          'mediaLibraryRootEntry',
+          plan.preferredEntry.storageValue,
+        ),
+      );
+    }
+    if (_didRestoreLastFolderRoute) return;
+    _didRestoreLastFolderRoute = true;
+    final folderId = plan.folderToOpen;
+    if (folderId == null ||
+        widget.revealItemId != null ||
+        widget.returnToSearchResults) {
+      return;
+    }
+    unawaited(
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute<void>(
+              builder: (context) => CollectionScreen(collectionId: folderId),
+            ),
+          )
+          .then((_) {
+            if (!mounted) return;
+            unawaited(settings.updateSetting('mediaLibraryLastFolderId', ''));
+          }),
+    );
   }
 
   /// Root library has no parent folder, so drop-target payload is recycle-only.
@@ -1302,9 +1445,7 @@ class _HomeScreenState extends State<HomeScreen>
           _selectedIds.clear();
           _isSelectionMode = false;
         });
-        unawaited(
-          PortableTransferNavigation.openExportSettings(context, ids),
-        );
+        unawaited(PortableTransferNavigation.openExportSettings(context, ids));
         return KeyEventResult.handled;
     }
   }
@@ -2236,7 +2377,17 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     final settings = Provider.of<SettingsService>(context);
+    final library = Provider.of<LibraryService>(context);
+    _syncRootEntryOrder(settings);
     final useCompactTopBar = useCompactMediaLibraryTopBar(context);
+    final rootNavPlan = _rootNavigationPlan(library, settings);
+    if (library.isInitialized && !_libraryNavigationScheduled) {
+      _libraryNavigationScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _applyLibraryNavigationAfterInit(library, settings);
+      });
+    }
     _stablePlaybackBottomInset =
         PlaybackCardOverlayLayout.resolveStableBottomInset(
           MediaQuery.of(context),
@@ -2282,8 +2433,8 @@ class _HomeScreenState extends State<HomeScreen>
         extendBody: true,
         appBar: AppBar(
           toolbarHeight: useCompactTopBar ? 50 : kToolbarHeight,
-          leadingWidth: useCompactTopBar ? 40 : null,
-          titleSpacing: useCompactTopBar ? 3 : NavigationToolbar.kMiddleSpacing,
+          leadingWidth: useCompactTopBar ? 40 : 44,
+          titleSpacing: useCompactTopBar ? 3 : 8,
           title: _isSelectionMode
               ? MediaLibrarySelectionDropTargets(
                   hasSelectedItems: _selectedIds.isNotEmpty,
@@ -2293,11 +2444,45 @@ class _HomeScreenState extends State<HomeScreen>
                     );
                   },
                 )
-              : GestureDetector(
-                  onTap: _handleTitleTap,
-                  child: useCompactTopBar
-                      ? const MediaLibraryCompactTitle(text: '我的媒体库')
-                      : const Text('我的媒体库'),
+              : rootNavPlan.hideSwitcher
+              ? const MediaLibraryCompactTitle(text: '我的媒体库')
+              : ValueListenableBuilder<MediaLibraryRootEntry?>(
+                  valueListenable: _rootEntryOverride,
+                  builder: (context, selectedOverride, child) {
+                    return ValueListenableBuilder<List<MediaLibraryRootEntry>>(
+                      valueListenable: _rootEntryOrder,
+                      builder: (context, order, child) {
+                        return ValueListenableBuilder<bool>(
+                          valueListenable: _rootSwipeSettled,
+                          builder: (context, settled, child) {
+                            return ValueListenableBuilder<double>(
+                              valueListenable: _rootSwipeHighlight,
+                              builder: (context, highlight, child) {
+                                return MediaLibraryEntrySwitcher(
+                                  selected: _effectiveRootEntry(rootNavPlan),
+                                  highlightIndex: highlight,
+                                  entries: order,
+                                  availableEntries: _mountedRootEntries,
+                                  compact: useCompactTopBar,
+                                  reorderEnabled:
+                                      settled && !_isSelectionMode,
+                                  onReorder: (oldIndex, newIndex) =>
+                                      _onRootEntryReorder(
+                                        oldIndex,
+                                        newIndex,
+                                        settings,
+                                        rootNavPlan,
+                                      ),
+                                  onSelected: (entry) =>
+                                      _selectRootEntry(entry, settings),
+                                );
+                              },
+                            );
+                          },
+                        );
+                      },
+                    );
+                  },
                 ),
           centerTitle: false,
           leading: _isSelectionMode
@@ -2468,6 +2653,7 @@ class _HomeScreenState extends State<HomeScreen>
                             "回收站",
                             DesktopMediaManagementShortcutAction.openRecycleBin,
                           ),
+                          onLongPress: _toggleExportButtonVisibility,
                           onPressed: () {
                             Navigator.of(context).push(
                               MaterialPageRoute(
@@ -2568,9 +2754,16 @@ class _HomeScreenState extends State<HomeScreen>
                     },
                     onDragExited: (_) =>
                         setState(() => _isDraggingFiles = false),
-                    child: Stack(
+                    child: ValueListenableBuilder<MediaLibraryRootEntry?>(
+                      valueListenable: _rootEntryOverride,
+                      builder: (context, selectedOverride, child) {
+                        final displayed = _effectiveRootEntry(rootNavPlan);
+                        final showingVirtual =
+                            !rootNavPlan.forceFoldersForLocate &&
+                            displayed != MediaLibraryRootEntry.folders;
+                        return Stack(
                       children: [
-                        if (contents.isEmpty)
+                        if (!showingVirtual && contents.isEmpty)
                           Center(
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
@@ -2593,103 +2786,208 @@ class _HomeScreenState extends State<HomeScreen>
                             onPointerDown: (event) {
                               _activePointerKind = event.kind;
                             },
-                            child: GestureDetector(
-                            onScaleStart: (details) {
-                              if (_tryStartMouseBoxSelection(
-                                pointerCount: details.pointerCount,
-                                globalPos: details.focalPoint,
-                              )) {
-                                return;
-                              }
-                              _baseCrossAxisCount =
-                                  settings.mediaLibraryViewMode == 1
-                                  ? _listStyle().crossAxisCount
-                                  : _homeCardStyle().crossAxisCount;
-                            },
-                            onScaleUpdate: (details) {
-                              if (_isBoxSelecting) {
-                                _applyMouseBoxSelectionAt(details.focalPoint);
-                                _syncSelectionAutoScroll(details.focalPoint);
-                                return;
-                              }
+                            child: RawGestureDetector(
+                              gestures: {
+                                _MouseOrPinchScaleRecognizer:
+                                    GestureRecognizerFactoryWithHandlers<
+                                      _MouseOrPinchScaleRecognizer
+                                    >(
+                                      () => _MouseOrPinchScaleRecognizer(),
+                                      (recognizer) {
+                                        recognizer
+                                          ..onStart = (details) {
+                                            if (_tryStartMouseBoxSelection(
+                                              pointerCount: details.pointerCount,
+                                              globalPos: details.focalPoint,
+                                            )) {
+                                              return;
+                                            }
+                                            _baseCrossAxisCount =
+                                                settings.mediaLibraryViewMode ==
+                                                    1
+                                                ? _listStyle().crossAxisCount
+                                                : _homeCardStyle()
+                                                      .crossAxisCount;
+                                          }
+                                          ..onUpdate = (details) {
+                                            if (_isBoxSelecting) {
+                                              _applyMouseBoxSelectionAt(
+                                                details.focalPoint,
+                                              );
+                                              _syncSelectionAutoScroll(
+                                                details.focalPoint,
+                                              );
+                                              return;
+                                            }
+                                            if (details.pointerCount < 2) {
+                                              return;
+                                            }
 
-                              // Pinch to Zoom Logic
-                              // We use a sensitivity factor to make it feel more "natural"
-                              // Scale > 1 means zooming in (fewer columns)
-                              // Scale < 1 means zooming out (more columns)
+                                            double newScale = details.scale;
+                                            int newCount = _baseCrossAxisCount;
 
-                              double newScale = details.scale;
-                              int newCount = _baseCrossAxisCount;
+                                            if (newScale > 1.3) {
+                                              newCount =
+                                                  (_baseCrossAxisCount - 1)
+                                                      .clamp(1, 20);
+                                            } else if (newScale < 0.7) {
+                                              newCount =
+                                                  (_baseCrossAxisCount + 1)
+                                                      .clamp(1, 20);
+                                            }
 
-                              if (newScale > 1.3) {
-                                newCount = (_baseCrossAxisCount - 1).clamp(
-                                  1,
-                                  20,
-                                );
-                              } else if (newScale < 0.7) {
-                                newCount = (_baseCrossAxisCount + 1).clamp(
-                                  1,
-                                  20,
-                                );
-                              }
-
-                              // Only update if changed to avoid unnecessary rebuilds
-                              final currentCount =
-                                  settings.mediaLibraryViewMode == 1
-                                  ? _listStyle().crossAxisCount
-                                  : _homeCardStyle().crossAxisCount;
-                              if (newCount != currentCount) {
-                                final size = MediaQuery.sizeOf(context);
-                                if (settings.mediaLibraryViewMode == 1) {
-                                  unawaited(
-                                    settings.updateListStyleFor(
-                                      size,
-                                      crossAxisCount: newCount,
+                                            final currentCount =
+                                                settings.mediaLibraryViewMode ==
+                                                    1
+                                                ? _listStyle().crossAxisCount
+                                                : _homeCardStyle()
+                                                      .crossAxisCount;
+                                            if (newCount != currentCount) {
+                                              final size = MediaQuery.sizeOf(
+                                                context,
+                                              );
+                                              if (settings
+                                                      .mediaLibraryViewMode ==
+                                                  1) {
+                                                unawaited(
+                                                  settings.updateListStyleFor(
+                                                    size,
+                                                    crossAxisCount: newCount,
+                                                  ),
+                                                );
+                                              } else {
+                                                unawaited(
+                                                  settings
+                                                      .updateHomeCardStyleFor(
+                                                    size,
+                                                    crossAxisCount: newCount,
+                                                  ),
+                                                );
+                                              }
+                                            }
+                                          }
+                                          ..onEnd = (details) {
+                                            if (_isBoxSelecting) {
+                                              _finishMouseBoxSelection();
+                                            }
+                                          };
+                                      },
                                     ),
-                                  );
-                                } else {
-                                  unawaited(
-                                    settings.updateHomeCardStyleFor(
-                                      size,
-                                      crossAxisCount: newCount,
-                                    ),
-                                  );
-                                }
-                              }
-                            },
-                            onScaleEnd: (details) {
-                              if (_isBoxSelecting) {
-                                _finishMouseBoxSelection();
-                                return;
-                              }
-                            },
-                            child: Consumer<MediaPlaybackService>(
-                              builder: (context, playbackService, child) {
-                                final isCardVisible =
-                                    playbackService.shouldShowMiniPlaybackCard;
-
-                                double cardBottomPadding = 0.0;
-                                if (isCardVisible || _hasPendingPlaybackState) {
-                                  final cardHeight =
-                                      PlaybackCardLayout.calculate(
-                                        context,
-                                      ).height;
-                                  cardBottomPadding =
-                                      playbackCardBottom + cardHeight;
-                                }
-
-                                return _buildMediaGridOrList(
-                                  context: context,
-                                  library: library,
-                                  settings: settings,
-                                  contents: contents,
-                                  cardBottomPadding: cardBottomPadding,
-                                );
                               },
+                              child: Selector<MediaPlaybackService, bool>(
+                                selector: (_, playbackService) =>
+                                    playbackService.shouldShowMiniPlaybackCard,
+                                builder: (context, isCardVisible, child) {
+
+                                  double cardBottomPadding = 0.0;
+                                  if (isCardVisible ||
+                                      _hasPendingPlaybackState) {
+                                    final cardHeight =
+                                        PlaybackCardLayout.calculate(
+                                          context,
+                                        ).height;
+                                    cardBottomPadding =
+                                        playbackCardBottom + cardHeight;
+                                  }
+
+                                  return ValueListenableBuilder<
+                                    List<MediaLibraryRootEntry>
+                                  >(
+                                    valueListenable: _rootEntryOrder,
+                                    builder: (context, order, child) {
+                                      return MediaLibraryRootSurfaceHost(
+                                    key: _rootSurfaceHostKey,
+                                    displayedEntry: displayed,
+                                    entryOrder: order,
+                                    swipeEnabled: !_isSelectionMode,
+                                    swipeHighlightIndex: _rootSwipeHighlight,
+                                    swipeSettled: _rootSwipeSettled,
+                                    onUserSwipe: (entry) =>
+                                        _selectRootEntry(entry, settings),
+                                    continueBuilder: (context, active) {
+                                      return MediaLibraryContinueView(
+                                        isActive: active,
+                                        scrollController:
+                                            _continueScrollController,
+                                        cardBottomPadding: cardBottomPadding,
+                                        onOpenMedia: (item) {
+                                          final playback =
+                                              Provider.of<
+                                                MediaPlaybackService
+                                              >(context, listen: false);
+                                          final controller =
+                                              playback.currentItem?.id ==
+                                                  item.id
+                                              ? playback.controller
+                                              : null;
+                                          _openPlaybackScreen(
+                                            item,
+                                            existingController: controller,
+                                          );
+                                        },
+                                        onOpenFolder: (collection) {
+                                          Navigator.of(context).push(
+                                            MaterialPageRoute<void>(
+                                              builder: (_) => CollectionScreen(
+                                                collectionId: collection.id,
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                        onLocateMedia: _locateLibraryItem,
+                                        onGoRecent: () => _selectRootEntry(
+                                          MediaLibraryRootEntry.recent,
+                                          settings,
+                                        ),
+                                        onGoFolders: () => _selectRootEntry(
+                                          MediaLibraryRootEntry.folders,
+                                          settings,
+                                        ),
+                                      );
+                                    },
+                                    recentBuilder: (context, active) {
+                                      return MediaLibraryRecentView(
+                                        isActive: active,
+                                        scrollController:
+                                            _recentScrollController,
+                                        cardBottomPadding: cardBottomPadding,
+                                        expandBatchId: _pendingRecentBatchId,
+                                        onOpenMedia: (item) {
+                                          final playback =
+                                              Provider.of<
+                                                MediaPlaybackService
+                                              >(context, listen: false);
+                                          final controller =
+                                              playback.currentItem?.id ==
+                                                  item.id
+                                              ? playback.controller
+                                              : null;
+                                          _openPlaybackScreen(
+                                            item,
+                                            existingController: controller,
+                                          );
+                                        },
+                                        onLocateMedia: _locateLibraryItem,
+                                      );
+                                    },
+                                    foldersBuilder: (context, active) {
+                                      return _buildMediaGridOrList(
+                                        context: context,
+                                        library: library,
+                                        settings: settings,
+                                        contents: contents,
+                                        cardBottomPadding: cardBottomPadding,
+                                        isActive: active,
+                                      );
+                                    },
+                                  );
+                                    },
+                                  );
+                                },
+                              ),
                             ),
                           ),
-                          ),
-                          if (contents.length < 20)
+                          if (!showingVirtual && contents.length < 20)
                             Positioned.fill(
                               key: MediaLibraryOverlayKeys.emptySpaceHitTarget,
                               child: Listener(
@@ -2697,7 +2995,8 @@ class _HomeScreenState extends State<HomeScreen>
                                 onPointerDown: (_) {},
                               ),
                             ),
-                          if (_isBoxSelecting &&
+                          if (!showingVirtual &&
+                              _isBoxSelecting &&
                               _boxStartPos != null &&
                               _boxCurrentPos != null)
                             Positioned.fill(
@@ -2719,11 +3018,11 @@ class _HomeScreenState extends State<HomeScreen>
                             right: 0,
                             bottom: 0,
                             child: Consumer<MediaPlaybackService>(
-                            builder: (context, playbackService, child) {
-                              final isVisible =
-                                  playbackService.shouldShowMiniPlaybackCard;
-                              if (!isVisible) return const SizedBox.shrink();
-                              return IgnorePointer(
+                              builder: (context, playbackService, child) {
+                                final isVisible =
+                                    playbackService.shouldShowMiniPlaybackCard;
+                                if (!isVisible) return const SizedBox.shrink();
+                                return IgnorePointer(
                                   ignoring: true,
                                   child: Container(
                                     height: playbackCardBottom,
@@ -2790,6 +3089,8 @@ class _HomeScreenState extends State<HomeScreen>
                             ),
                           ),
                       ],
+                    );
+                      },
                     ),
                   );
                 },
@@ -2845,10 +3146,7 @@ class _HomeScreenState extends State<HomeScreen>
                     _isSelectionMode = false;
                   });
                   unawaited(
-                    PortableTransferNavigation.openExportSettings(
-                      context,
-                      ids,
-                    ),
+                    PortableTransferNavigation.openExportSettings(context, ids),
                   );
                 },
                 onRename: _selectedIds.length == 1
@@ -2876,13 +3174,16 @@ class _HomeScreenState extends State<HomeScreen>
     required SettingsService settings,
     required List<dynamic> contents,
     required double cardBottomPadding,
+    required bool isActive,
   }) {
     if (settings.mediaLibraryViewMode == 0) {
       final metrics = MediaLibraryLayoutDefaults.cardGrid(
         screenSize: MediaQuery.sizeOf(context),
         style: settings.homeCardStyleFor(MediaQuery.sizeOf(context)),
       );
-      return GridView.builder(
+      return MediaLibraryFrozenWhenInactive(
+        active: isActive,
+        child: GridView.builder(
         controller: _scrollController,
         padding: EdgeInsets.only(
           left: metrics.outerPadding,
@@ -2919,10 +3220,13 @@ class _HomeScreenState extends State<HomeScreen>
           }
           return const SizedBox.shrink();
         },
-      );
+      ),
+    );
     }
 
-    return LayoutBuilder(
+    return MediaLibraryFrozenWhenInactive(
+      active: isActive,
+      child: LayoutBuilder(
       builder: (context, constraints) {
         final listStyle = settings.listStyleFor(MediaQuery.sizeOf(context));
         final metrics = MediaListLayoutMetrics.forGrid(
@@ -2981,6 +3285,7 @@ class _HomeScreenState extends State<HomeScreen>
           },
         );
       },
+      ),
     );
   }
 
@@ -3003,11 +3308,22 @@ class _HomeScreenState extends State<HomeScreen>
           }
         });
       } else {
-        Navigator.of(context).push(
-          MaterialPageRoute(
-            builder: (context) => CollectionScreen(collectionId: collection.id),
-          ),
-        );
+        Navigator.of(context)
+            .push(
+              MaterialPageRoute(
+                builder: (context) =>
+                    CollectionScreen(collectionId: collection.id),
+              ),
+            )
+            .then((_) {
+              if (!mounted) return;
+              unawaited(
+                Provider.of<SettingsService>(
+                  context,
+                  listen: false,
+                ).updateSetting('mediaLibraryLastFolderId', ''),
+              );
+            });
       }
     }
 
@@ -3041,6 +3357,7 @@ class _HomeScreenState extends State<HomeScreen>
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
+      showActivityMenu: !_isSelectionMode,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -3121,6 +3438,7 @@ class _HomeScreenState extends State<HomeScreen>
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(item.id),
+      showActivityMenu: !_isSelectionMode,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -3254,13 +3572,21 @@ class _HomeScreenState extends State<HomeScreen>
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
+        final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
+        final showMenu = !_isSelectionMode;
+        final textInset = MediaLibraryActionDockMetrics.textInset(
+          chipSize: chipSize,
+          showMore: showMenu,
+          showLocate: false,
+          existingPadding:
+              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+        );
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.homeCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
-
         final isSelected = _selectedIds.contains(collection.id);
         final thumbnailPath = collection.thumbnailPath;
         final hasThumbnail = thumbnailPath != null && thumbnailPath.isNotEmpty;
@@ -3352,11 +3678,14 @@ class _HomeScreenState extends State<HomeScreen>
                       ),
                     ),
                     const SizedBox(height: 2),
-                    Text(
-                      "${collection.childrenIds.length} 个项目",
-                      style: TextStyle(
-                        fontSize: metaFontSize,
-                        color: Colors.white54,
+                    Padding(
+                      padding: EdgeInsets.only(right: textInset),
+                      child: Text(
+                        "${collection.childrenIds.length} 个项目",
+                        style: TextStyle(
+                          fontSize: metaFontSize,
+                          color: Colors.white54,
+                        ),
                       ),
                     ),
                   ],
@@ -3377,12 +3706,22 @@ class _HomeScreenState extends State<HomeScreen>
               }
             });
           } else {
-            Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (context) =>
-                    CollectionScreen(collectionId: collection.id),
-              ),
-            );
+            Navigator.of(context)
+                .push(
+                  MaterialPageRoute(
+                    builder: (context) =>
+                        CollectionScreen(collectionId: collection.id),
+                  ),
+                )
+                .then((_) {
+                  if (!mounted) return;
+                  unawaited(
+                    Provider.of<SettingsService>(
+                      context,
+                      listen: false,
+                    ).updateSetting('mediaLibraryLastFolderId', ''),
+                  );
+                });
           }
         }
 
@@ -3392,7 +3731,23 @@ class _HomeScreenState extends State<HomeScreen>
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
           elevation: isSelected ? 3 : 0,
-          child: cardVisual,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              cardVisual,
+              MediaLibraryActionDock(
+                chipSize: chipSize,
+                more: showMenu
+                    ? MediaLibraryActivityMenuButton(
+                        targetId: collection.id,
+                        isCollection: true,
+                        allowHide: false,
+                        fillSlot: true,
+                      )
+                    : null,
+              ),
+            ],
+          ),
         );
 
         return Stack(
@@ -3587,13 +3942,21 @@ class _HomeScreenState extends State<HomeScreen>
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
+        final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
+        final showMenu = !_isSelectionMode;
+        final textInset = MediaLibraryActionDockMetrics.textInset(
+          chipSize: chipSize,
+          showMore: showMenu,
+          showLocate: false,
+          existingPadding:
+              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+        );
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.homeCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
-
         final isSelected = _selectedIds.contains(item.id);
 
         // 1. Visual Content
@@ -3739,18 +4102,15 @@ class _HomeScreenState extends State<HomeScreen>
                     ),
                     if (item.durationMs > 0) ...[
                       const SizedBox(height: 4),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
-                              style: TextStyle(
-                                fontSize: metaFontSize,
-                                color: Colors.white54,
-                              ),
-                            ),
+                      Padding(
+                        padding: EdgeInsets.only(right: textInset),
+                        child: Text(
+                          "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
+                          style: TextStyle(
+                            fontSize: metaFontSize,
+                            color: Colors.white54,
                           ),
-                        ],
+                        ),
                       ),
                     ],
                   ],
@@ -3794,7 +4154,22 @@ class _HomeScreenState extends State<HomeScreen>
           isSelected: isSelected,
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(item.id),
-          child: cardVisual,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              cardVisual,
+              MediaLibraryActionDock(
+                chipSize: chipSize,
+                more: showMenu
+                    ? MediaLibraryActivityMenuButton(
+                        targetId: item.id,
+                        isCollection: false,
+                        fillSlot: true,
+                      )
+                    : null,
+              ),
+            ],
+          ),
         );
 
         return Stack(
@@ -4077,5 +4452,45 @@ class _HomeScreenState extends State<HomeScreen>
         ),
       ),
     );
+  }
+}
+
+/// One-finger touch must not become a scale pan: that would steal vertical
+/// scrolling and the adjacent-tab swipe. Mouse still uses one pointer for
+/// box select; pinch still needs two fingers.
+class _MouseOrPinchScaleRecognizer extends ScaleGestureRecognizer {
+  int _touchPointers = 0;
+
+  bool _isTouchLike(PointerDeviceKind kind) {
+    return kind == PointerDeviceKind.touch || kind == PointerDeviceKind.stylus;
+  }
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    if (_isTouchLike(event.kind)) {
+      _touchPointers++;
+    }
+    super.addAllowedPointer(event);
+  }
+
+  @override
+  void handleEvent(PointerEvent event) {
+    if (_isTouchLike(event.kind) &&
+        (event is PointerUpEvent || event is PointerCancelEvent) &&
+        _touchPointers > 0) {
+      _touchPointers--;
+    }
+    if (event is PointerMoveEvent &&
+        _isTouchLike(event.kind) &&
+        _touchPointers < 2) {
+      return;
+    }
+    super.handleEvent(event);
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {
+    _touchPointers = 0;
+    super.didStopTrackingLastPointer(pointer);
   }
 }

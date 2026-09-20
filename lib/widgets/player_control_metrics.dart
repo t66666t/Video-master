@@ -116,14 +116,69 @@ class PlayerControlMetrics {
     );
   }
 
-  double progressAreaHeight({required bool hasChapterButton}) {
-    if (!hasChapterButton) return progressHitHeight;
+  /// Shared chrome for the chapter / quality capsules above the progress bar.
+  double get progressPillFontSize => (13 * scale).clamp(10.0, 13.0).toDouble();
+
+  double get progressPillIconSize => (18 * scale).clamp(16.0, 18.0).toDouble();
+
+  double get progressPillContentGap => (5 * scale).clamp(3.0, 5.0).toDouble();
+
+  double get progressPillHorizontalPadding =>
+      (12 * scale).clamp(9.0, 12.0).toDouble();
+
+  double get progressPillTextMeasurementSlack =>
+      (4 * scale).clamp(3.0, 4.0).toDouble();
+
+  double get progressPillChromeWidth =>
+      (progressPillHorizontalPadding * 2) +
+      progressPillContentGap +
+      progressPillIconSize;
+
+  /// Width that can show every [labels] value without resizing when the
+  /// selected label changes. Still capped by [maxWidth] on narrow players.
+  double measureProgressPillWidth({
+    required Iterable<String> labels,
+    required TextStyle textStyle,
+    required TextDirection textDirection,
+    required TextScaler textScaler,
+    Locale? locale,
+    required double maxWidth,
+  }) {
+    var maxTextWidth = 0.0;
+    for (final label in labels) {
+      final painter = TextPainter(
+        text: TextSpan(text: label, style: textStyle),
+        maxLines: 1,
+        textDirection: textDirection,
+        textScaler: textScaler,
+        locale: locale,
+        textWidthBasis: TextWidthBasis.longestLine,
+      )..layout();
+      maxTextWidth = math.max(maxTextWidth, painter.width);
+    }
+    return math.min(
+      maxWidth,
+      progressPillChromeWidth + maxTextWidth + progressPillTextMeasurementSlack,
+    );
+  }
+
+  double progressAreaHeight({
+    required bool hasChapterButton,
+    bool hasQualityButton = false,
+  }) {
+    if (!hasChapterButton && !hasQualityButton) return progressHitHeight;
     return progressHitHeight + chapterButtonHeight + (4 * scale);
   }
 
-  double bottomControlsHeight({required bool hasChapterButton}) {
+  double bottomControlsHeight({
+    required bool hasChapterButton,
+    bool hasQualityButton = false,
+  }) {
     return bottomPadding +
         bottomRowHeight +
-        progressAreaHeight(hasChapterButton: hasChapterButton);
+        progressAreaHeight(
+          hasChapterButton: hasChapterButton,
+          hasQualityButton: hasQualityButton,
+        );
   }
 }

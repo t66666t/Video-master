@@ -7,6 +7,7 @@ import 'package:video_player_app/services/bilibili/bilibili_download_service.dar
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'tooltip_finders.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -45,7 +46,7 @@ void main() {
     final host = await pumpDownloadScreen(tester);
     expect(host.service.downloadDanmaku, isTrue);
 
-    await tester.tap(find.byTooltip('下载设置'));
+    await tester.tap(findTooltipLabeled('下载设置'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('下载弹幕'));
     await tester.pump();
@@ -62,7 +63,7 @@ void main() {
     final host = await pumpDownloadScreen(tester);
     host.service.customDownloadPath = r'D:\custom-downloads';
 
-    await tester.tap(find.byTooltip('下载设置'));
+    await tester.tap(findTooltipLabeled('下载设置'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('使用默认'));
     await tester.pump();

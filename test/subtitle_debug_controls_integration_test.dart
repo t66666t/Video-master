@@ -11,6 +11,7 @@ import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/subtitle_debug_session.dart';
 import 'package:video_player_app/widgets/subtitle_settings_sheet.dart';
 import 'package:video_player_app/widgets/video_controls_overlay.dart';
+import 'tooltip_finders.dart';
 
 void main() {
   final session = SubtitleDebugSession.instance;
@@ -73,7 +74,7 @@ void main() {
         ),
       );
       await tester.pump(const Duration(milliseconds: 200));
-      final speed = find.byTooltip('倍速');
+      final speed = findTooltipLabeled('倍速');
       expect(speed, findsOneWidget);
       for (final kind in [PointerDeviceKind.touch, PointerDeviceKind.mouse]) {
         for (int i = 0; i < 3; i++) {

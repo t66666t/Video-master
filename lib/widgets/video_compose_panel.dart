@@ -17,6 +17,7 @@ import '../services/settings_service.dart';
 import '../services/video_compose_manager.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
+import '../utils/reveal_in_file_manager.dart';
 import 'media_materialization_progress_card.dart';
 import 'package:intl/intl.dart';
 import '../screens/simple_video_player_screen.dart';
@@ -1822,24 +1823,10 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
       AppToast.show('文件不存在，无法打开', type: AppToastType.error);
       return;
     }
-    if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
-      try {
-        final ProcessResult result;
-        if (Platform.isWindows) {
-          result = await Process.run('explorer.exe', <String>[
-            '/select,',
-            path,
-          ]);
-        } else if (Platform.isMacOS) {
-          result = await Process.run('open', <String>['-R', path]);
-        } else {
-          result = await Process.run('xdg-open', <String>[p.dirname(path)]);
-        }
-        if (result.exitCode == 0) return;
-      } catch (_) {
-        // Fall through to the platform's default file opener.
-      }
-    }
+    try {
+      final bool revealed = await revealInFileManager(path);
+      if (revealed) return;
+    } catch (_) {}
     String openPath = path;
     try {
       openPath = await _prepareExternalOpenPath(path);

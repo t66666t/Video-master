@@ -22,6 +22,7 @@ import '../screens/bilibili_download_screen.dart';
 import '../screens/batch_subtitle_screen.dart';
 import '../utils/android_hardware_input_bridge.dart';
 import '../utils/app_toast.dart';
+import '../widgets/media_library_recent_intent.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
 import '../utils/hardware_keyboard_shortcuts.dart';
 import '../utils/import_sheet_shortcuts.dart';
@@ -622,10 +623,15 @@ class VideoActionButtons extends StatefulWidget {
       )) {
         return;
       }
-      _showTopBanner(
-        context,
-        "压缩包导入完成：新增 ${resultSummary.importedMediaCount} 个媒体，创建 ${resultSummary.createdFolderCount} 个文件夹",
-        autoHideDuration: const Duration(milliseconds: 1200),
+      if (library.hasPersistenceFailure) {
+        return;
+      }
+      showLibraryImportAddedToast(
+        library: library,
+        message:
+            "压缩包导入完成：新增 ${resultSummary.importedMediaCount} 个媒体，创建 ${resultSummary.createdFolderCount} 个文件夹",
+        batchId: resultSummary.activityBatchId,
+        duration: const Duration(milliseconds: 1200),
       );
     } catch (e) {
       await _cleanupTemporaryArchiveSelection(selection.resolvedPath);
@@ -685,10 +691,15 @@ class VideoActionButtons extends StatefulWidget {
       );
       if (!context.mounted) return;
       if (ModalRoute.of(context)?.isCurrent != true) return;
-      _showTopBanner(
-        context,
-        "文件夹导入完成：新增 ${resultSummary.importedMediaCount} 个媒体，创建 ${resultSummary.createdFolderCount} 个文件夹",
-        autoHideDuration: const Duration(milliseconds: 1200),
+      if (library.hasPersistenceFailure) {
+        return;
+      }
+      showLibraryImportAddedToast(
+        library: library,
+        message:
+            "文件夹导入完成：新增 ${resultSummary.importedMediaCount} 个媒体，创建 ${resultSummary.createdFolderCount} 个文件夹",
+        batchId: resultSummary.activityBatchId,
+        duration: const Duration(milliseconds: 1200),
       );
     } catch (e) {
       if (context.mounted) {

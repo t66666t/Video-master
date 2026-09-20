@@ -1,50 +1,41 @@
 # Cursor 阶段交接
 
-计划已按 4.4 源码核对更新；尚未开始功能实现。此文件由执行 AI 更新，不要把计划作者的静态阅读写成已完成实现。
+对照基线 `61018752`；HEAD `0dd61c40`。S00–S10 实现已完成。保留未提交改动。平台人工验收未完成。
 
 ## 当前阶段
 
-- 首个未完成：S00
-- 工作区基线：HEAD `61018752`（Fluent player 4.4）；计划更新时工作区干净。实施时若出现新的未提交修改，必须保留。
-- 编写/更新计划时验证：只核对源码和文档结构；未运行应用或 Flutter 测试。
-- 已核实的重要变化（源码确认，测试仍待运行）：
-  - 4.4 共享布局/封面/选择操作/搜索提示/导入表/FluentPack 已存在，不要重建。
-  - 搜索默认原目录队列已走 `PlaylistManager.prepareLibraryPlayback`。
-  - 无活动元数据、无三个入口、无面包屑、无“包含子文件夹”、无本地源重定位 API。
-  - 原 S09「操作入口整理」因 4.4 chrome 已落地而取消。
+- 首个未完成：无
+- S10 验证：`validation/S10.md`。指定回归 +231 −5；全量 +1116 ~13 −15。
+- 结论：实现完成，平台验收未完成。
 
 | 阶段 | 状态 | 验证记录 |
 |---|---|---|
-| S00 | pending | — |
-| S01 | pending | — |
-| S02 | pending | — |
-| S03 | pending | — |
-| S04 | pending | — |
-| S05 | pending | — |
-| S06 | pending | — |
-| S07 | pending | — |
-| S08 | pending | — |
-| S09 | pending | — |
-| S10 | pending | — |
+| S00 | done | validation/S00.md |
+| S01 | done | validation/S01.md |
+| S02 | done | validation/S02.md |
+| S03 | done | validation/S03.md |
+| S04 | done | validation/S04.md |
+| S05 | done | validation/S05.md |
+| S06 | done | validation/S06.md |
+| S07 | done | validation/S07.md |
+| S08 | done | validation/S08.md |
+| S09 | done | validation/S09.md |
+| S10 | done | validation/S10.md |
 
-## 实际模块与接口定位（实现后填写）
+## 实际模块与接口定位
 
-- 活动模型与版本：
-- 保存/迁移入口：
-- 导入批次生命周期与结果类型：
-- 投影查询入口及变更通知：
-- 导航/返回状态入口：
-- 播放活动采样、完成、隐藏处理：
-- 固定/隐藏 API：
-- 本地文件重新定位 API：
+- 活动/保存：`library.json` `activity` v1，写入口仍 `LibraryService`
+- 投影：`recentAddedEntries()` / `continueLearningSections()` / `mediaInFolderTree()`
+- 导航壳：三入口均已挂载，打开走 `prepareLibraryPlayback`
+- 播放采样：`LibraryWatchMeter` → `applyWatchFlush`
+- 重定位：`relocateLocalMediaSource`
 
 ## 下一阶段只需要知道
 
-- 已完成的用户行为：
-- 当前阶段内断点：
-- 下一步读哪些函数：
-- 本轮修改文件：
-- 既有失败与当前新增失败：
-- 仍未运行的人工/设备验证：
+- 计划阶段已结束。未 commit/push。
+- 既有失败：race mountable-while-loading。投放区四文案已修（可见标签不再带错误快捷键）。
+- 全量另有 10 项「归因待核实」（B站设置弹窗、画质交接、字幕调试、任务队列表）。
+- 音乐页缺失态未接。分享双监听去重仍不共享。
+- NOT RUN：真机文件选择/导入/分享/旋转/后台播放。
 
-维护方式：此文件保持简短，建议不超过约 1000 中文字；记录定位和结论，不粘贴源码、长日志或整个聊天。详细证据写 validation/Sxx.md。
+维护方式：此文件保持简短；详细证据写 validation/Sxx.md。

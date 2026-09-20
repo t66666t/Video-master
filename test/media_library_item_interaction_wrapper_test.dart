@@ -42,9 +42,7 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('桌面端原地长按不会触发卡片 InkWell 点击从而取消选中', (
-    tester,
-  ) async {
+  testWidgets('桌面端原地长按不会触发卡片 InkWell 点击从而取消选中', (tester) async {
     var selectionMode = false;
     final selected = <int>{};
     var dragStarts = 0;
@@ -520,6 +518,112 @@ void main() {
 
     expect(taps, 0);
     expect(dragStarts, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('置顶拖拽使用独立数据类型并按可见索引排序', (tester) async {
+    int? fromIndex;
+    int? toIndex;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Row(
+          children: [
+            SizedBox(
+              width: 120,
+              height: 48,
+              child: MediaLibraryPinnedReorderWrapper(
+                key: const ValueKey('pin-source'),
+                visibleIndex: 0,
+                dragDelay: const Duration(milliseconds: 50),
+                onReorder: (_, _) {},
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+            SizedBox(
+              width: 120,
+              height: 48,
+              child: MediaLibraryPinnedReorderWrapper(
+                key: const ValueKey('pin-target'),
+                visibleIndex: 1,
+                dragDelay: const Duration(milliseconds: 50),
+                onReorder: (from, to) {
+                  fromIndex = from;
+                  toIndex = to;
+                },
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('pin-source'))),
+    );
+    await tester.pump(const Duration(milliseconds: 70));
+    await gesture.moveTo(
+      tester.getCenter(find.byKey(const ValueKey('pin-target'))),
+    );
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(fromIndex, 0);
+    expect(toIndex, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('文件夹卡片不会接收置顶拖拽', (tester) async {
+    var folderReorder = 0;
+    var pinReorder = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Row(
+          children: [
+            SizedBox(
+              width: 120,
+              height: 48,
+              child: MediaLibraryPinnedReorderWrapper(
+                key: const ValueKey('pin-only-source'),
+                visibleIndex: 0,
+                dragDelay: const Duration(milliseconds: 50),
+                onReorder: (_, _) => pinReorder++,
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+            SizedBox(
+              width: 120,
+              height: 48,
+              child: MediaLibraryItemInteractionWrapper(
+                key: const ValueKey('folder-int-target'),
+                index: 1,
+                dragDelay: const Duration(milliseconds: 50),
+                isSelected: false,
+                selectedCount: 0,
+                onDragStarted: () {},
+                onReorder: (_, _) => folderReorder++,
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('pin-only-source'))),
+    );
+    await tester.pump(const Duration(milliseconds: 70));
+    await gesture.moveTo(
+      tester.getCenter(find.byKey(const ValueKey('folder-int-target'))),
+    );
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(pinReorder, 0);
+    expect(folderReorder, 0);
     expect(tester.takeException(), isNull);
   });
 }

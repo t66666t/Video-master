@@ -27,6 +27,7 @@ import '../services/playlist_manager.dart';
 import '../widgets/subtitle_sidebar.dart';
 import '../widgets/subtitle_settings_sheet.dart';
 import '../widgets/bilibili_buffering_overlay.dart';
+import '../widgets/relocate_local_media_source.dart';
 import '../widgets/video_controls_overlay.dart';
 import '../widgets/playback_speed_dialog.dart';
 import '../widgets/sleep_timer_dialog.dart';
@@ -145,9 +146,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
             ),
           );
         }
-        return const IgnorePointer(
-          child: ColoredBox(color: Color(0xFF141414)),
-        );
+        return const IgnorePointer(child: ColoredBox(color: Color(0xFF141414)));
       },
     );
   }
@@ -1376,10 +1375,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   Duration _subtitleLookupPosition() {
     final native = _controller.value.position;
     try {
-      final service = Provider.of<MediaPlaybackService>(
-        context,
-        listen: false,
-      );
+      final service = Provider.of<MediaPlaybackService>(context, listen: false);
       if (!identical(service.controller, _controller)) return native;
       return service.positionForSubtitleOverlay(native);
     } catch (_) {
@@ -2454,12 +2450,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       final exitControllerOwner = _isControllerOwner;
       final suppressRouteCleanup =
           PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
-      final shouldAutoPause = PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
-        autoPauseOnExit: settings.autoPauseOnExit,
-        explicitExit: _explicitPlaybackExitRequested,
-        suppressRouteCleanup: suppressRouteCleanup,
-        transportPlaying: playbackService.isTransportPlaying,
-      );
+      final shouldAutoPause =
+          PlaybackBehaviorPolicy.shouldPauseOnPlaybackPageExit(
+            autoPauseOnExit: settings.autoPauseOnExit,
+            explicitExit: _explicitPlaybackExitRequested,
+            suppressRouteCleanup: suppressRouteCleanup,
+            transportPlaying: playbackService.isTransportPlaying,
+          );
       if (exitController == null) {
         if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
           await playbackService.pause(expectedItemId: itemId);
@@ -2674,6 +2671,12 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         focusContext?.widget is EditableText ||
         focusContext?.findAncestorWidgetOfExactType<EditableText>() != null;
     if (isEditingText) return KeyEventResult.ignored;
+    final KeyEventResult transcriptResult =
+        _subtitleSidebarKey.currentState?.handleTranscriptShortcut(event) ??
+        KeyEventResult.ignored;
+    if (transcriptResult != KeyEventResult.ignored) {
+      return transcriptResult;
+    }
     return _controlsKey.currentState?.handleKeyEvent(
           _playbackPageFocusNode,
           event,
@@ -4318,20 +4321,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                 fit: StackFit.expand,
                                                 children: [
                                                   if (_isSourceMissing)
-                                                    const ColoredBox(
-                                                      color: Colors.black,
-                                                      child: Center(
-                                                        child: Text(
-                                                          "没有原媒体",
-                                                          style: TextStyle(
-                                                            color:
-                                                                Colors.white70,
-                                                            fontSize: 18,
-                                                            fontWeight:
-                                                                FontWeight.w500,
-                                                          ),
-                                                        ),
-                                                      ),
+                                                    MissingLocalSourcePanel(
+                                                      item: _currentItem,
+                                                      fontSize: 18,
                                                     )
                                                   else if (_shouldKeepVideoSurface)
                                                     if (_isAudio)
@@ -4398,12 +4390,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
                                                       )
                                                     else
                                                       Center(
-                                                        child: CircularProgressIndicator(
-                                                          color: Colors.white
-                                                              .withValues(
-                                                                alpha: 0.5,
-                                                              ),
-                                                        ),
+                                                        child:
+                                                            CircularProgressIndicator(
+                                                              color: Colors
+                                                                  .white
+                                                                  .withValues(
+                                                                    alpha: 0.5,
+                                                                  ),
+                                                            ),
                                                       ),
                                                   ],
                                                   if (_isDraggingProgress &&

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:file_picker/file_picker.dart';
@@ -17,6 +16,7 @@ import '../services/settings_service.dart';
 import '../services/app_haptics.dart';
 import '../models/video_collection.dart';
 import '../models/video_item.dart';
+import '../models/media_library_root_entry.dart';
 import '../widgets/folder_drop_target.dart';
 import '../widgets/cached_thumbnail_widget.dart';
 import '../widgets/folder_placeholder_cover.dart';
@@ -24,6 +24,8 @@ import '../widgets/library_rename_dialog.dart';
 import '../widgets/media_library_list_tile.dart';
 import '../widgets/media_library_item_interaction_wrapper.dart';
 import '../widgets/media_library_grid_card.dart';
+import '../widgets/media_library_activity_menu.dart';
+import '../widgets/media_library_action_dock.dart';
 import '../widgets/media_library_layout_profile.dart';
 import '../widgets/media_library_style_sheet.dart';
 import '../widgets/media_list_layout_metrics.dart';
@@ -34,6 +36,8 @@ import '../widgets/media_library_selection_bottom_bar.dart';
 import '../widgets/media_library_selection_drop_targets.dart';
 import '../widgets/media_library_top_bar_import_progress.dart';
 import '../widgets/media_library_locate_button.dart';
+import '../widgets/media_library_folder_breadcrumb.dart';
+import '../services/media_library_folder_walk.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../services/thumbnail_preload_manager.dart';
 import '../widgets/mini_playback_card.dart';
@@ -123,10 +127,100 @@ class _CollectionScreenState extends State<CollectionScreen>
   bool _didScheduleReveal = false;
   bool get _isSearchResults => widget.searchQuery != null;
 
+  bool _includeDescendantsNow() {
+    if (_isSearchResults || widget.collectionId.isEmpty) return false;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    return MediaLibraryFolderBrowseMemory.includeFor(
+      folderId: widget.collectionId,
+      lastFolderId: settings.mediaLibraryLastFolderId,
+      persistedLast: settings.mediaLibraryLastFolderIncludeDescendants,
+    );
+  }
+
+  bool _allowsFolderReorder() =>
+      !_isSearchResults && !_includeDescendantsNow();
+
+  bool _showParentLocate() =>
+      _isSearchResults || _includeDescendantsNow();
+
   List<dynamic> _visibleContents(LibraryService library) {
-    return _isSearchResults
-        ? library.searchContents(widget.searchQuery!)
-        : library.getContents(widget.collectionId);
+    if (_isSearchResults) {
+      return library.searchContents(widget.searchQuery!);
+    }
+    if (_includeDescendantsNow()) {
+      return library.mediaInFolderTree(widget.collectionId);
+    }
+    return library.getContents(widget.collectionId);
+  }
+
+  String? _relativePathFor(LibraryService library, VideoItem item) {
+    if (!_includeDescendantsNow()) return null;
+    final path = library.relativeFolderPath(widget.collectionId, item.parentId);
+    return path.isEmpty ? null : path;
+  }
+
+  Future<void> _toggleIncludeDescendants() async {
+    if (_isSearchResults || widget.collectionId.isEmpty) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final next = !_includeDescendantsNow();
+    MediaLibraryFolderBrowseMemory.remember(widget.collectionId, next);
+    if (widget.collectionId == settings.mediaLibraryLastFolderId ||
+        settings.mediaLibraryLastFolderId.isEmpty) {
+      await settings.updateSetting(
+        'mediaLibraryLastFolderIncludeDescendants',
+        next,
+      );
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _openBreadcrumbTarget(String? folderId) {
+    if (folderId == widget.collectionId) return;
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    if (folderId == null) {
+      unawaited(
+        settings.updateSetting(
+          'mediaLibraryRootEntry',
+          MediaLibraryRootEntry.folders.storageValue,
+        ),
+      );
+      unawaited(
+        settings.updateSetting('mediaLibraryRootEntryUserChosen', true),
+      );
+      Navigator.of(context).popUntil((route) => route.isFirst);
+      return;
+    }
+    final current = Provider.of<LibraryService>(
+      context,
+      listen: false,
+    ).getCollection(widget.collectionId);
+    Navigator.of(context).pushReplacement(
+      _buildDirectoryLocationRoute(
+        CollectionScreen(
+          collectionId: folderId,
+          revealItemId: current?.id,
+          returnToSearchResults: widget.returnToSearchResults,
+        ),
+      ),
+    );
+  }
+
+  List<MediaLibraryBreadcrumbCrumb> _folderCrumbs(LibraryService library) {
+    final trail = <MediaLibraryBreadcrumbCrumb>[];
+    final visited = <String>{};
+    var id = widget.collectionId;
+    while (id.isNotEmpty && visited.add(id)) {
+      final folder = library.getCollection(id);
+      if (folder == null) break;
+      trail.add(
+        MediaLibraryBreadcrumbCrumb(folderId: folder.id, label: folder.name),
+      );
+      id = folder.parentId ?? '';
+    }
+    return [
+      const MediaLibraryBreadcrumbCrumb(folderId: null, label: '媒体库'),
+      ...trail.reversed,
+    ];
   }
 
   Future<void> _openSearch() async {
@@ -319,6 +413,7 @@ class _CollectionScreenState extends State<CollectionScreen>
           '回收站',
           DesktopMediaManagementShortcutAction.openRecycleBin,
         ),
+        onLongPress: _toggleExportButtonVisibility,
         onPressed: () {
           Navigator.of(
             context,
@@ -330,6 +425,18 @@ class _CollectionScreenState extends State<CollectionScreen>
         height: 48,
         child: MediaLibraryCompactMoreButton(
           itemBuilder: (menuContext) => [
+            if (!_isSearchResults)
+              mediaLibraryCompactMenuItem(
+                icon: _includeDescendantsNow()
+                    ? Icons.account_tree
+                    : Icons.account_tree_outlined,
+                label: _includeDescendantsNow()
+                    ? '仅显示当前目录'
+                    : '包含子文件夹内容',
+                onSelected: () {
+                  unawaited(_toggleIncludeDescendants());
+                },
+              ),
             mediaLibraryCompactMenuItem(
               icon: settings.mediaLibraryViewMode == 0
                   ? Icons.view_list_rounded
@@ -424,44 +531,6 @@ class _CollectionScreenState extends State<CollectionScreen>
       context,
       listen: false,
     ).listStyleFor(MediaQuery.sizeOf(context));
-  }
-
-  double _resolveGridLocateButtonHeight({
-    required BuildContext context,
-    required BoxConstraints constraints,
-    required double cardWidth,
-    required String title,
-    required double titleFontSize,
-    required double metaFontSize,
-    required double informationGap,
-    required FontWeight titleWeight,
-  }) {
-    // Grid cards no longer keep a 4px Card margin; use the full cell so the
-    // locate button can grow up to the rendered title, but never cover it.
-    final innerWidth = math.max(0.0, cardWidth);
-    final innerHeight = math.max(0.0, constraints.maxHeight);
-    final informationHeight = math.max(0.0, innerHeight - innerWidth * 0.75);
-    final titlePainter = TextPainter(
-      text: TextSpan(
-        text: title,
-        style: DefaultTextStyle.of(context).style.merge(
-          TextStyle(fontSize: titleFontSize, fontWeight: titleWeight),
-        ),
-      ),
-      maxLines: 10,
-      ellipsis: '…',
-      textDirection: Directionality.of(context),
-      textScaler: MediaQuery.textScalerOf(context),
-    )..layout(maxWidth: math.max(0.0, innerWidth - 20.0));
-
-    final metadataHeight = metaFontSize * 1.2;
-    final minimumMetadataBand = 6.0 + informationGap + metadataHeight;
-    final availableBelowTitle = math.max(
-      minimumMetadataBand,
-      informationHeight - 6.0 - titlePainter.height,
-    );
-    final desiredHeight = math.max(cardWidth * 0.19, minimumMetadataBand);
-    return math.min(desiredHeight, availableBelowTitle);
   }
 
   Duration get _mediaCardLongPressDelay {
@@ -932,6 +1001,17 @@ class _CollectionScreenState extends State<CollectionScreen>
     _scrollController.addListener(_onScroll);
     _startInitialPreload();
     _loadExportButtonPreference();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.searchQuery != null) return;
+      final settings = Provider.of<SettingsService>(context, listen: false);
+      unawaited(
+        settings.updateSetting(
+          'mediaLibraryLastFolderId',
+          widget.collectionId,
+        ),
+      );
+    });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _startInitialDecodePrecache();
@@ -1452,11 +1532,10 @@ class _CollectionScreenState extends State<CollectionScreen>
               // underneath the IME to avoid a full card-grid relayout.
               resizeToAvoidBottomInset: false,
               appBar: AppBar(
+                clipBehavior: Clip.hardEdge,
                 toolbarHeight: useCompactTopBar ? 50 : kToolbarHeight,
-                leadingWidth: useCompactTopBar ? 40 : null,
-                titleSpacing: useCompactTopBar
-                    ? 3
-                    : NavigationToolbar.kMiddleSpacing,
+                leadingWidth: useCompactTopBar ? 40 : 44,
+                titleSpacing: useCompactTopBar ? 3 : 8,
                 title: _isSelectionMode
                     ? (_isSearchResults
                           ? (useCompactTopBar
@@ -1485,7 +1564,13 @@ class _CollectionScreenState extends State<CollectionScreen>
                               },
                             ))
                     : useCompactTopBar
-                    ? MediaLibraryCompactTitle(text: collection.name)
+                    ? (_isSearchResults
+                          ? MediaLibraryCompactTitle(text: collection.name)
+                          : MediaLibraryFolderBreadcrumb(
+                              crumbs: _folderCrumbs(library),
+                              compact: true,
+                              onSelected: _openBreadcrumbTarget,
+                            ))
                     : Row(
                         children: [
                           IconButton(
@@ -1527,16 +1612,18 @@ class _CollectionScreenState extends State<CollectionScreen>
                           Expanded(
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: [
                                 Align(
-                                  alignment: _isSearchResults
-                                      ? Alignment.centerLeft
-                                      : Alignment.center,
-                                  child: Text(
-                                    collection.name,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
+                                  alignment: Alignment.centerLeft,
+                                  child: _isSearchResults
+                                      ? MediaLibraryCompactTitle(
+                                          text: collection.name,
+                                        )
+                                      : MediaLibraryFolderBreadcrumb(
+                                          crumbs: _folderCrumbs(library),
+                                          onSelected: _openBreadcrumbTarget,
+                                        ),
                                 ),
                                 if (!_isSearchResults)
                                   ValueListenableBuilder<bool>(
@@ -1548,13 +1635,19 @@ class _CollectionScreenState extends State<CollectionScreen>
                                       return ValueListenableBuilder<String>(
                                         valueListenable: library.importStatus,
                                         builder: (context, status, _) {
-                                          return Text(
-                                            status,
-                                            style: const TextStyle(
-                                              fontSize: 10,
-                                              color: Colors.white70,
+                                          return Align(
+                                            alignment: Alignment.centerLeft,
+                                            child: Text(
+                                              status,
+                                              style: const TextStyle(
+                                                fontSize: 10,
+                                                color: Colors.white70,
+                                                height: 1.0,
+                                                leadingDistribution:
+                                                    TextLeadingDistribution.even,
+                                              ),
+                                              overflow: TextOverflow.ellipsis,
                                             ),
-                                            overflow: TextOverflow.ellipsis,
                                           );
                                         },
                                       );
@@ -1658,6 +1751,18 @@ class _CollectionScreenState extends State<CollectionScreen>
                                   onPressed: () =>
                                       _openParentDirectory(collection),
                                 ),
+                              if (!_isSearchResults)
+                                ResponsiveIconButton(
+                                  icon: _includeDescendantsNow()
+                                      ? Icons.account_tree
+                                      : Icons.account_tree_outlined,
+                                  tooltip: _includeDescendantsNow()
+                                      ? '仅显示当前目录'
+                                      : '包含子文件夹内容',
+                                  onPressed: () {
+                                    unawaited(_toggleIncludeDescendants());
+                                  },
+                                ),
                               ResponsiveIconButton(
                                 icon: Icons.search_rounded,
                                 tooltip: _managementTooltip(
@@ -1674,6 +1779,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                                   DesktopMediaManagementShortcutAction
                                       .openRecycleBin,
                                 ),
+                                onLongPress: _toggleExportButtonVisibility,
                                 onPressed: () {
                                   Navigator.of(context).push(
                                     MaterialPageRoute(
@@ -2260,6 +2366,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
+      showActivityMenu: !_isSelectionMode,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2268,9 +2375,9 @@ class _CollectionScreenState extends State<CollectionScreen>
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(collection.id),
       onTap: handleTap,
-      allowReorder: !_isSearchResults,
+      allowReorder: _allowsFolderReorder(),
       onReorder: (oldIndex, newIndex) {
-        if (_isSearchResults) return;
+        if (!_allowsFolderReorder()) return;
         _reorderMediaItems(
           library,
           contents,
@@ -2327,7 +2434,8 @@ class _CollectionScreenState extends State<CollectionScreen>
       isSelected: isSelected,
       isSelectionMode: _isSelectionMode,
       titleScale: listStyle.titleScale,
-      onShowInParentFolder: _isSearchResults
+      relativePath: _relativePathFor(library, item),
+      onShowInParentFolder: _showParentLocate()
           ? () => _showInParentDirectory(item)
           : null,
       onSelectionTap: () => _toggleListSelection(item.id),
@@ -2345,6 +2453,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       onSelectionLongPressEnd: (_) => _endListSelectionGesture(),
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(item.id),
+      showActivityMenu: !_isSelectionMode,
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2353,9 +2462,9 @@ class _CollectionScreenState extends State<CollectionScreen>
       selectedCount: _selectedIds.length,
       onDragStarted: () => _enterSelectionFromDrag(item.id),
       onTap: handleTap,
-      allowReorder: !_isSearchResults,
+      allowReorder: _allowsFolderReorder(),
       onReorder: (oldIndex, newIndex) {
-        if (_isSearchResults) return;
+        if (!_allowsFolderReorder()) return;
         _reorderMediaItems(
           library,
           contents,
@@ -2439,6 +2548,7 @@ class _CollectionScreenState extends State<CollectionScreen>
     int oldIndex,
     int newIndex,
   ) {
+    if (!_allowsFolderReorder()) return;
     if (oldIndex < 0 || oldIndex >= contents.length) return;
     final draggedId = (contents[oldIndex] as dynamic).id as String;
     if (_selectedIds.contains(draggedId)) {
@@ -2487,23 +2597,22 @@ class _CollectionScreenState extends State<CollectionScreen>
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
-        final double locateButtonWidth = cardWidth * 0.23;
+        final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
+        final showMenu = !_isSelectionMode;
+        final showLocate = _isSearchResults && !_isSelectionMode;
+        final textInset = MediaLibraryActionDockMetrics.textInset(
+          chipSize: chipSize,
+          showMore: showMenu,
+          showLocate: showLocate,
+          existingPadding:
+              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+        );
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.collectionCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
-        final double locateButtonHeight = _resolveGridLocateButtonHeight(
-          context: context,
-          constraints: constraints,
-          cardWidth: cardWidth,
-          title: collection.name,
-          titleFontSize: titleFontSize,
-          metaFontSize: metaFontSize,
-          informationGap: 2.0,
-          titleWeight: FontWeight.w600,
-        );
 
         final isSelected = _selectedIds.contains(collection.id);
         final thumbnailPath = collection.thumbnailPath;
@@ -2597,9 +2706,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                     ),
                     const SizedBox(height: 2),
                     Padding(
-                      padding: EdgeInsets.only(
-                        right: _isSearchResults ? locateButtonWidth : 0,
-                      ),
+                      padding: EdgeInsets.only(right: textInset),
                       child: Text(
                         "${collection.childrenIds.length} 个项目",
                         style: TextStyle(
@@ -2639,17 +2746,22 @@ class _CollectionScreenState extends State<CollectionScreen>
             fit: StackFit.expand,
             children: [
               cardVisual,
-              if (_isSearchResults && !_isSelectionMode)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: MediaLibraryLocateButton(
-                    cardWidth: cardWidth,
-                    width: locateButtonWidth,
-                    height: locateButtonHeight,
-                    onPressed: () => _showInParentDirectory(collection),
-                  ),
-                ),
+              MediaLibraryActionDock(
+                chipSize: chipSize,
+                more: showMenu
+                    ? MediaLibraryActivityMenuButton(
+                        targetId: collection.id,
+                        isCollection: true,
+                        allowHide: false,
+                        fillSlot: true,
+                      )
+                    : null,
+                locate: showLocate
+                    ? MediaLibraryLocateButton(
+                        onPressed: () => _showInParentDirectory(collection),
+                      )
+                    : null,
+              ),
             ],
           ),
         );
@@ -2712,7 +2824,7 @@ class _CollectionScreenState extends State<CollectionScreen>
               child: FolderDropTarget(
                 folderId: collection.id,
                 index: index,
-                allowReorder: !_isSearchResults,
+                allowReorder: _allowsFolderReorder(),
                 onMoveToFolder: (draggedIndex, targetId) async {
                   if (draggedIndex >= 0 && draggedIndex < contents.length) {
                     final draggedItem = contents[draggedIndex];
@@ -2741,7 +2853,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                   }
                 },
                 onReorder: (oldIndex, newIndex) {
-                  if (_isSearchResults) return;
+                  if (!_allowsFolderReorder()) return;
                   final draggedItem = contents[oldIndex];
                   final draggedId = (draggedItem as dynamic).id;
 
@@ -2845,23 +2957,24 @@ class _CollectionScreenState extends State<CollectionScreen>
     return LayoutBuilder(
       builder: (context, constraints) {
         final double cardWidth = constraints.maxWidth;
-        final double locateButtonWidth = cardWidth * 0.23;
+        final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
+        final showMenu = !_isSelectionMode;
+        final showLocate = _showParentLocate() && !_isSelectionMode;
+        final textInset = MediaLibraryActionDockMetrics.textInset(
+          chipSize: chipSize,
+          showMore: showMenu,
+          showLocate: showLocate,
+          existingPadding:
+              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+        );
         final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
           settings.collectionCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
-        final double locateButtonHeight = _resolveGridLocateButtonHeight(
-          context: context,
-          constraints: constraints,
-          cardWidth: cardWidth,
-          title: item.title,
-          titleFontSize: titleFontSize,
-          metaFontSize: metaFontSize,
-          informationGap: item.durationMs > 0 ? 4.0 : 0.0,
-          titleWeight: FontWeight.w500,
-        );
+        final library = Provider.of<LibraryService>(context, listen: false);
+        final relativePath = _relativePathFor(library, item);
 
         final isSelected = _selectedIds.contains(item.id);
 
@@ -3006,24 +3119,29 @@ class _CollectionScreenState extends State<CollectionScreen>
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
+                    if (relativePath != null)
+                      Padding(
+                        padding: EdgeInsets.only(right: textInset),
+                        child: Text(
+                          relativePath,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: metaFontSize,
+                            color: Colors.white38,
+                          ),
+                        ),
+                      ),
                     if (item.durationMs > 0) ...[
                       const SizedBox(height: 4),
                       Padding(
-                        padding: EdgeInsets.only(
-                          right: _isSearchResults ? locateButtonWidth : 0,
-                        ),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
-                                style: TextStyle(
-                                  fontSize: metaFontSize,
-                                  color: Colors.white54,
-                                ),
-                              ),
-                            ),
-                          ],
+                        padding: EdgeInsets.only(right: textInset),
+                        child: Text(
+                          "${(item.durationMs / 1000 / 60).floor()}:${((item.durationMs / 1000) % 60).floor().toString().padLeft(2, '0')}",
+                          style: TextStyle(
+                            fontSize: metaFontSize,
+                            color: Colors.white54,
+                          ),
                         ),
                       ),
                     ],
@@ -3062,17 +3180,21 @@ class _CollectionScreenState extends State<CollectionScreen>
             fit: StackFit.expand,
             children: [
               cardVisual,
-              if (_isSearchResults && !_isSelectionMode)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: MediaLibraryLocateButton(
-                    cardWidth: cardWidth,
-                    width: locateButtonWidth,
-                    height: locateButtonHeight,
-                    onPressed: () => _showInParentDirectory(item),
-                  ),
-                ),
+              MediaLibraryActionDock(
+                chipSize: chipSize,
+                more: showMenu
+                    ? MediaLibraryActivityMenuButton(
+                        targetId: item.id,
+                        isCollection: false,
+                        fillSlot: true,
+                      )
+                    : null,
+                locate: showLocate
+                    ? MediaLibraryLocateButton(
+                        onPressed: () => _showInParentDirectory(item),
+                      )
+                    : null,
+              ),
             ],
           ),
         );
@@ -3116,9 +3238,9 @@ class _CollectionScreenState extends State<CollectionScreen>
               childWhenDragging: Opacity(opacity: 0.3, child: interactiveCard),
               child: DragTarget<int>(
                 onWillAcceptWithDetails: (details) =>
-                    !_isSearchResults && details.data != index,
+                    _allowsFolderReorder() && details.data != index,
                 onAcceptWithDetails: (details) {
-                  if (_isSearchResults) return;
+                  if (!_allowsFolderReorder()) return;
                   final oldIndex = details.data;
                   final library = Provider.of<LibraryService>(
                     context,
@@ -3242,6 +3364,18 @@ class _CollectionScreenState extends State<CollectionScreen>
     setState(() {
       _showExportSettingsButton = value;
     });
+  }
+
+  /// Hidden entry: long-press the recycle-bin icon on the collection app bar.
+  Future<void> _toggleExportButtonVisibility() async {
+    final newValue = !_showExportSettingsButton;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('show_export_settings_button', newValue);
+    if (!mounted) return;
+    setState(() {
+      _showExportSettingsButton = newValue;
+    });
+    AppToast.show(newValue ? "导出按钮已显示" : "导出按钮已隐藏", type: AppToastType.info);
   }
 
   Future<void> _exportSettingsSnapshot() async {
