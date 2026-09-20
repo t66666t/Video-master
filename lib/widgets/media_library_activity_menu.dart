@@ -1,18 +1,24 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../models/video_item.dart';
 import '../services/library_service.dart';
 import '../services/media_playback_service.dart';
+import '../utils/app_toast.dart';
+import '../utils/reveal_in_file_manager.dart';
 import 'media_library_anchor_menu.dart';
 
-/// Pin / hide / locate overflow for library cards. Hide never stops playback.
+/// Pin / hide / locate / OS-reveal overflow for library cards.
 ///
-/// The visible ⋯ lives on the bottom-right action dock, not on the cover.
+/// Hide never stops playback. The visible ⋯ lives on the bottom-right action
+/// dock, not on the cover.
 class MediaLibraryActivityMenuMetrics {
   /// Visible "⋯" size. Tracks card width so a 3-column phone stays small.
   static double glyphSize(double cardWidth) =>
@@ -142,6 +148,12 @@ class _MediaLibraryActivityMenuButtonState
     }
     final origin = box.localToGlobal(Offset.zero, ancestor: overlay);
     final anchor = origin & box.size;
+    final VideoItem? localMedia = !widget.isCollection
+        ? library.getVideo(widget.targetId)
+        : null;
+    final bool canRevealInOs = localMedia != null &&
+        library.canRelocateLocalMediaSource(localMedia) &&
+        _supportsOsFileManagerReveal;
     final items = <MediaLibraryAnchorMenuEntry>[
       MediaLibraryAnchorMenuEntry(
         value: pinned ? 'unpin' : 'pin',
@@ -160,6 +172,13 @@ class _MediaLibraryActivityMenuButtonState
           label: '显示所在目录',
           icon: CupertinoIcons.folder,
         ),
+      if (canRevealInOs)
+        const MediaLibraryAnchorMenuEntry(
+          value: 'reveal_os',
+          label: '在文件管理器中显示',
+          icon: CupertinoIcons.folder_open,
+          key: ValueKey('reveal-in-file-manager-menu'),
+        ),
     ];
     try {
       HapticFeedback.selectionClick();
@@ -169,13 +188,22 @@ class _MediaLibraryActivityMenuButtonState
         items: items,
       );
       if (!mounted || action == null) return;
-      await _onSelected(library, action);
+      await _onSelected(library, action, localMedia: localMedia);
     } finally {
       _opening = false;
     }
   }
 
-  Future<void> _onSelected(LibraryService library, String value) async {
+  static bool get _supportsOsFileManagerReveal {
+    if (kIsWeb) return false;
+    return Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+  }
+
+  Future<void> _onSelected(
+    LibraryService library,
+    String value, {
+    VideoItem? localMedia,
+  }) async {
     switch (value) {
       case 'pin':
         await library.pinLibraryItem(widget.targetId);
@@ -186,12 +214,27 @@ class _MediaLibraryActivityMenuButtonState
       case 'locate':
         widget.onLocate?.call();
         return;
+      case 'reveal_os':
+        await _revealLocalMedia(localMedia);
+        return;
       case 'hide':
         // Block the current watch cycle from immediately undoing hide.
         MediaPlaybackService().noteLibraryMediaHidden(widget.targetId);
         await library.hideLibraryMedia(widget.targetId);
         widget.onHidden?.call();
         return;
+    }
+  }
+
+  Future<void> _revealLocalMedia(VideoItem? item) async {
+    final path = item?.path.trim() ?? '';
+    if (path.isEmpty) {
+      AppToast.show('无法定位本地文件', type: AppToastType.error);
+      return;
+    }
+    final bool opened = await revealInFileManager(path);
+    if (!opened) {
+      AppToast.show('无法在文件管理器中显示', type: AppToastType.error);
     }
   }
 }

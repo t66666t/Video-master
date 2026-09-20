@@ -59,6 +59,12 @@ void main() {
     expect(find.text('置顶到「继续学习」'), findsOneWidget);
     expect(find.text('从本页移除'), findsOneWidget);
     expect(find.text('显示所在目录'), findsOneWidget);
+    // Local library media on desktop also offers OS file-manager reveal (L3).
+    expect(find.text('在文件管理器中显示'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('reveal-in-file-manager-menu')),
+      findsOneWidget,
+    );
 
     final menu = tester.getRect(find.text('置顶到「继续学习」'));
     final screen = tester.getRect(find.byType(MaterialApp));

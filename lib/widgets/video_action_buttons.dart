@@ -7,6 +7,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:wechat_assets_picker/wechat_assets_picker.dart';
 import 'package:path/path.dart' as p;
+import '../utils/local_filesystem_path.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player_app/features/youtube_download/presentation/pages/yt_dlp_download_screen.dart';
 
@@ -192,6 +193,8 @@ class VideoActionButtons extends StatefulWidget {
     const validExtensions = LibraryService.supportedMediaExtensions;
 
     final validPaths = paths
+        .map(normalizeLocalFilesystemPath)
+        .whereType<String>()
         .where(
           (path) => validExtensions.contains(p.extension(path).toLowerCase()),
         )
@@ -255,9 +258,8 @@ class VideoActionButtons extends StatefulWidget {
     final normalizedPaths = <String>[];
     final seen = <String>{};
     for (final rawPath in paths) {
-      final trimmed = rawPath.trim();
-      if (trimmed.isEmpty) continue;
-      final normalized = p.normalize(trimmed);
+      final normalized = normalizeLocalFilesystemPath(rawPath);
+      if (normalized == null) continue;
       final dedupeKey = Platform.isWindows
           ? normalized.toLowerCase()
           : normalized;
@@ -1869,8 +1871,8 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
       }
 
       final paths = result.files
-          .where((f) => f.path != null)
-          .map((f) => f.path!)
+          .map((f) => normalizeLocalFilesystemPath(f.path))
+          .whereType<String>()
           .toList();
       if (paths.isEmpty) {
         if (context.mounted) {
@@ -1936,7 +1938,9 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         withData: false,
         withReadStream: false,
       );
-      archivePath = result?.files.singleOrNull?.path;
+      archivePath = normalizeLocalFilesystemPath(
+        result?.files.singleOrNull?.path,
+      );
       if (archivePath == null || archivePath.isEmpty) {
         if (context.mounted) {
           VideoActionButtons._showTopBanner(context, "未选择压缩包");
@@ -1974,8 +1978,10 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         return;
       }
 
-      final folderPath = await FilePicker.platform.getDirectoryPath(
-        dialogTitle: '选择要导入的文件夹',
+      final folderPath = normalizeLocalFilesystemPath(
+        await FilePicker.platform.getDirectoryPath(
+          dialogTitle: '选择要导入的文件夹',
+        ),
       );
       if (folderPath == null || folderPath.isEmpty) {
         if (context.mounted) {

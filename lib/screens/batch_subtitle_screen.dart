@@ -371,7 +371,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
         }
       },
       itemBuilder: (context) => [
-        if (Platform.isWindows)
+        if (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
           PopupMenuItem(
             value: _BatchOverflowAction.pickExternal,
             child: _PopupMenuLabel(
@@ -454,7 +454,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
               fontSize: metrics.fontSize,
               onPressed: () => _showInternalVideoPicker(context),
             ),
-            if (Platform.isWindows)
+            if (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
               _buildActionButton(
                 context: context,
                 label: '选择外部文件',
@@ -523,7 +523,7 @@ class _BatchSubtitleScreenState extends State<BatchSubtitleScreen> {
             fontSize: metrics.fontSize,
             onPressed: () => _showInternalVideoPicker(context),
           ),
-          if (Platform.isWindows)
+          if (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
             _buildActionButton(
               context: context,
               label: '选择外部文件',
