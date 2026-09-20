@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -467,6 +468,37 @@ void main() {
         clockAfter: const Duration(milliseconds: 12080),
       ),
       const Duration(milliseconds: 12080),
+    );
+  });
+
+
+  test('missing audio device errors are recoverable without fatal forward', () {
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Could not open/initialize audio device -> no sound.',
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        PlatformException(
+          code: 'media_kit_error',
+          message: 'COULD NOT OPEN/INITIALIZE AUDIO DEVICE -> NO SOUND.',
+        ),
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Failed to open video decoder',
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Network timeout while buffering',
+      ),
+      isFalse,
     );
   });
 

@@ -392,6 +392,17 @@ class NativeVideoPlayerMediaKit {
     return duration <= Duration.zero && !hasUsableMediaTrack;
   }
 
+
+  /// Hosts without an ALSA/Pulse sound card make libmpv report
+  /// "Could not open/initialize audio device -> no sound." That is not a
+  /// fatal video failure: L3 requires silent degrade while video continues.
+  @visibleForTesting
+  static bool isRecoverableMissingAudioDeviceError(Object error) {
+    final message = '$error'.toLowerCase();
+    return message.contains('could not open/initialize audio device') ||
+        message.contains('no sound');
+  }
+
   /// Identifies sources whose visual track can only be embedded cover art.
   /// Disabling that track before the controller becomes usable keeps libmpv's
   /// seek clock anchored to audio instead of a one-frame attached picture.
@@ -1059,6 +1070,21 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
         _readyVideoOutputs.add(textureId);
       }
 
+      // Linux hosts without a sound card must keep video playing (silent).
+      // Prefer libmpv's null AO fallback before opening media so AO init
+      // failure does not abort the graph; the error listener still ignores
+      // residual "no sound" logs as non-fatal.
+      if (UniversalPlatform.isLinux) {
+        final platform = player.platform;
+        if (platform is NativePlayer) {
+          await platform.setProperty(
+            'audio-fallback-to-null',
+            'yes',
+            waitForInitialization: false,
+          );
+        }
+      }
+
       // Install the latency, clock, and pitch pipeline before opening media so
       // the first decoded frame enters the final graph. Replacing `af` after open
       // is inaudible while paused, but still needlessly rebuilds the native graph.
@@ -1569,6 +1595,15 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
       );
       streamSubscriptions.add(
         player.stream.error.listen((event) {
+          if (NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+            event,
+          )) {
+            debugPrint(
+              'MediaKit ignored missing audio device (video continues silently): '
+              '$event',
+            );
+            return;
+          }
           final state = decoderFallbackState;
           if (state != null && state.knownAudioOnly && !completer.isCompleted) {
             state.lastError = event;

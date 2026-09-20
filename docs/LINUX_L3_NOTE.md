@@ -29,5 +29,6 @@ flutter test test/reveal_in_file_manager_test.dart \
 ## Residual risks
 - Headless / no DBus session: ShowItems fails; xdg-open parent should still work if a file manager is installed.
 - ALSA “no sound card” warnings are environment noise, not a playback crash.
+  See `docs/LINUX_L3_AUDIO_NOTE.md` (`audio-fallback-to-null` + ignored error).
 - Large-data **migrate** intentionally stays Windows-only (`resolveLargeDataRootDir` ignores custom root on Linux).
 - Full GUI cold-start → import → play still needs a manual Debug pass on a display session.
