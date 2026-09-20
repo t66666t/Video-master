@@ -36,6 +36,7 @@ import 'temporary_storage_cleanup_models.dart';
 import 'media_materialization_service.dart';
 import '../utils/ffmpeg_utils.dart';
 import '../utils/media_duration_probe.dart';
+import '../utils/thumbnail_seek.dart';
 import '../utils/media_chapter_probe.dart';
 import '../utils/serial_task_queue.dart';
 import '../utils/subtitle_file_matcher.dart';
@@ -4556,19 +4557,15 @@ class LibraryService extends ChangeNotifier {
         return outPath;
       }
 
-      // Use FFmpeg to extract first frame
-      // -y: Overwrite output file
-      // -i: Input file
-      // -ss 00:00:01: Seek to 1 second (avoid black frames at start)
-      // -vframes 1: Extract only 1 frame
-      // -vf scale=-1:200: Resize to height 200px maintaining aspect ratio
-      // -q:v 2: High quality JPEG
+      // Seek ~15% in (min 5s) to avoid black intros; see thumbnailSeekSeconds.
+      final durationMs = await _probeMediaDurationMs(videoPath);
+      final seekSec = thumbnailSeekSeconds(durationMs: durationMs);
       final session = await _executeFfmpegWithTimeout(<String>[
         '-y',
+        '-ss',
+        seekSec.toStringAsFixed(3),
         '-i',
         videoPath,
-        '-ss',
-        '00:00:01',
         '-vframes',
         '1',
         '-vf',
@@ -4806,13 +4803,15 @@ class LibraryService extends ChangeNotifier {
         // Continue to fallback
       }
 
-      // 2. Fallback: Extract first frame
+      // 2. Fallback: frame at ~15% duration (min 5s) to avoid black intros
+      final durationMs = await _probeMediaDurationMs(videoPath);
+      final seekSec = thumbnailSeekSeconds(durationMs: durationMs);
       await _runCliProcessWithTimeout(ffmpegPath, [
         '-y',
+        '-ss',
+        seekSec.toStringAsFixed(3),
         '-i',
         videoPath,
-        '-ss',
-        '0',
         '-vframes',
         '1',
         '-vf',
@@ -4824,6 +4823,25 @@ class LibraryService extends ChangeNotifier {
 
       if (await File(outPath).exists() && await File(outPath).length() > 0) {
         return outPath;
+      }
+
+      // Short / odd files: last resort at t=0
+      if (seekSec > 0) {
+        await _runCliProcessWithTimeout(ffmpegPath, [
+          '-y',
+          '-i',
+          videoPath,
+          '-vframes',
+          '1',
+          '-vf',
+          'scale=-1:200',
+          '-q:v',
+          '2',
+          outPath,
+        ], const Duration(seconds: 15));
+        if (await File(outPath).exists() && await File(outPath).length() > 0) {
+          return outPath;
+        }
       }
     } catch (e) {
       developer.log('Windows Thumbnail error', error: e);
