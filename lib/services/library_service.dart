@@ -8,6 +8,7 @@ import 'package:archive/archive_io.dart';
 import 'package:flutter/foundation.dart';
 import 'package:lpinyin/lpinyin.dart';
 import 'package:path_provider/path_provider.dart';
+import '../utils/app_data_paths.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:crypto/crypto.dart';
@@ -1093,7 +1094,7 @@ class LibraryService extends ChangeNotifier {
   // Initialize and load data
   Future<void> init() async {
     if (_initialized) return;
-    final appDocDir = await getApplicationDocumentsDirectory();
+    final appDocDir = await resolveAppDataDirectory();
     Directory targetDir = appDocDir;
     if (Platform.isWindows) {
       final settings = SettingsService();

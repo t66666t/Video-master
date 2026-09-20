@@ -7,7 +7,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:path_provider/path_provider.dart';
+import '../utils/app_data_paths.dart';
 import 'package:path/path.dart' as p;
 import '../models/folder_placeholder_style.dart';
 import '../models/media_library_continue_policy.dart';
@@ -3463,13 +3463,14 @@ class SettingsService extends ChangeNotifier {
       final exeDir = p.dirname(Platform.resolvedExecutable);
       return p.join(exeDir, 'VideoPlayerData');
     }
-    final appDocDir = await getApplicationDocumentsDirectory();
+    final appDocDir = await resolveAppDataDirectory();
     return appDocDir.path;
   }
 
   Future<Directory> resolveLargeDataRootDir() async {
     if (!Platform.isWindows) {
-      return getApplicationDocumentsDirectory();
+      // Linux: support/XDG fallback; other platforms: documents-first compat.
+      return resolveAppDataDirectory();
     }
     final defaultPath = await getDefaultLargeDataRootPath();
     final targetPath =

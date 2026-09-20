@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:path_provider/path_provider.dart';
+import '../../utils/app_data_paths.dart';
 import '../../models/bilibili_download_task.dart';
 
 /// 后台 Isolate 中执行的 JSON 编码 + 文件写入
@@ -26,7 +26,7 @@ class BilibiliDownloadStateManager {
   static Future<void> _saveQueue = Future<void>.value();
 
   static Future<String> _getFilePath() async {
-    final directory = await getApplicationDocumentsDirectory();
+    final directory = await resolveAppDataDirectory();
     return '${directory.path}/$_fileName';
   }
 

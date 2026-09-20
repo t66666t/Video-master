@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import '../utils/app_data_paths.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
@@ -255,7 +256,7 @@ class TranscriptionManager extends ChangeNotifier {
 
   Future<void> _initPersistenceDir() async {
     try {
-      final appDir = await getApplicationDocumentsDirectory();
+      final appDir = await resolveAppDataDirectory();
       _persistenceDirPath = appDir.path;
     } catch (e) {
       debugPrint('初始化持久化目录失败: $e');

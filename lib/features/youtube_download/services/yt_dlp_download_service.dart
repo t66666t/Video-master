@@ -8,6 +8,7 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:video_player_app/utils/app_data_paths.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
@@ -1914,7 +1915,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   ]) async {
     final effectiveConfig = config ?? _sessionConfig;
     if (Platform.isAndroid) {
-      final docDir = await getApplicationDocumentsDirectory();
+      final docDir = await resolveAppDataDirectory();
       final dir = Directory(p.join(docDir.path, 'yt_dlp_downloads'));
       if (!await dir.exists()) {
         await dir.create(recursive: true);
@@ -1939,7 +1940,7 @@ class YtDlpDownloadService extends ChangeNotifier {
       return dir;
     }
 
-    final docDir = await getApplicationDocumentsDirectory();
+    final docDir = await resolveAppDataDirectory();
     final dir = Directory(p.join(docDir.path, 'yt_dlp_downloads'));
     if (!await dir.exists()) {
       await dir.create(recursive: true);
@@ -1957,7 +1958,7 @@ class YtDlpDownloadService extends ChangeNotifier {
       return dir;
     }
 
-    final docDir = await getApplicationDocumentsDirectory();
+    final docDir = await resolveAppDataDirectory();
     final dir = Directory(p.join(docDir.path, 'yt_dlp_cookies'));
     if (!await dir.exists()) {
       await dir.create(recursive: true);
