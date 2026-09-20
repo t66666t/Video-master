@@ -11,9 +11,22 @@
 
 ## 0. 产品目标
 
-在 Linux 桌面（GTK）上可安装、可冷启、可导入测试片、可播放中英样片，核心媒体库/播放/字幕路径可用；桌面布局不是手机壳硬拉。
+在 Linux 桌面（GTK）上可安装、可冷启、可导入测试片、可播放中英样片，核心媒体库/播放/字幕路径可用。
 
-**非目标（本轮可不做完）**：完整 B 站/YouTube 下载全链路、云同步、无声卡环境下的真实听感验收（ALSA 无设备记为环境噪声）。
+### 硬收口（用户补充，2026-09-20）
+
+**改完后所有功能都要能在 Linux 用**，尤其对齐 Windows 已完善的能力：
+
+1. **导入**：单文件 / 多文件 / 文件夹导入、拖放导入（`desktop_drop`）、批量导入相关入口
+2. **打开目录**：选目录对话框（`FilePicker.getDirectoryPath`）、下载保存目录、库内「打开所在文件夹」
+3. **文件管理**：`revealInFileManager`（Linux：FileManager1.ShowItems → `xdg-open`）、在文件管理器中显示、缓存/导出目录可达
+
+效仿 Windows 行为与入口，不要求像素级 UI 一致；缺能力就补 Linux 分支，禁止 `if (Platform.isWindows)` 把 Linux 永久挡在外（除非上游无 API，则给明确降级提示）。
+
+**非目标（可降级但需说明）**：无声卡听感；部分依赖系统包（`ffmpeg`）的高级转码在未安装时的友好提示。
+
+---
+
 
 ---
 
@@ -109,9 +122,15 @@
 3. 修 Linux 上阻塞导入/播放的路径、URI、权限问题
 4. 冒烟清单写入 `docs/` 或更新 `LINUX_KNOWN_ISSUES.md`「已修复」节
 
+**额外（导入 / 目录，对齐 Windows）**
+1. 文件夹导入、文件导入、拖放导入在 Linux 均可完成（用 test videos）
+2. 凡 Windows 有「选择目录」的设置/下载/导出入口，Linux 同样可弹出并写回路径
+3. 「在文件管理器中显示」对库内本地文件可用（选中或至少打开父目录）
+
 **验收**（调试）
 - `flutter build linux --release` 成功
-- 冷启 → 导入 → 列表可见 → 打开播放 en/zh 各至少 1 个
+- 冷启 → 文件夹导入 test videos → 列表可见 → 打开播放 en/zh 各至少 1 个
+- 至少一条「打开所在目录 / 在文件管理器显示」路径跑通
 - analyze 无新 error
 
 ---
@@ -131,12 +150,13 @@
 ## 8. Phase L5 — 次要能力与打包
 
 **要做**
-1. `reveal_in_file_manager` Linux（xdg-open / 文件管理器）再验
-2. yt-dlp 资源路径与 CMake install 在 release bundle 自检（本阶段不要求下载全绿）
-3. AppData / 缓存目录说明写入 README 或 docs
-4. 清理 Linux 启动日志里的致命噪声（ALSA 无卡除外）
+1. 对照 Windows：扫全部 `Platform.isWindows` 挡掉的导入/目录/文件管理分支，能开 Linux 的打开（缩略图可走 ffmpeg 回退，勿只留 Windows 专用）
+2. `revealInFileManager` 全入口回归（库、字幕、下载完成、便携传输等）
+3. yt-dlp 资源路径与 CMake install 在 release bundle 自检（本阶段不要求下载全绿）
+4. AppData / 缓存 / 导出目录说明写入 docs
+5. 清理 Linux 启动日志里的致命噪声（ALSA 无卡除外）
 
-**验收**：bundle 目录结构完整；次要入口不崩；已知问题文档更新。
+**验收**：bundle 完整；导入与文件管理主路径与 Windows 对等可用；已知问题文档更新。
 
 ---
 
