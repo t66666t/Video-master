@@ -62,6 +62,7 @@ import '../services/ocr_subtitle_manager.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
+import '../utils/linux_audio_device.dart';
 import '../utils/playback_page_visibility.dart';
 import '../utils/subtitle_drag_snap.dart';
 import '../utils/subtitle_file_picker.dart';
@@ -1437,6 +1438,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         : SidebarType.none;
     if (Platform.isAndroid) {
       unawaited(_requestNotificationPermissionForMediaSession());
+    }
+    if (Platform.isLinux) {
+      unawaited(LinuxAudioDevice.maybeShowNoAudioDeviceHint());
     }
 
     _initVideo();

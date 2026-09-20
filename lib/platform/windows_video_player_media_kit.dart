@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:collection';
 import 'dart:math' as math;
 
@@ -286,13 +287,38 @@ class NativeVideoPlayerMediaKit {
   /// when it can reject an unsupported decoder up front. Some Android codec
   /// implementations fail only after MediaCodec has been selected, so the
   /// platform wrapper also performs one explicit software retry in that case.
+  /// Linux GPU-less / broken CUDA hosts blue-screen when media_kit keeps HW
+  /// VO + Impeller GLES. Prefer software decode (`hwdec=no`) on Linux always.
   @visibleForTesting
   static String decoderOptionFor({
     required bool useHardwareDecoding,
     required String operatingSystem,
   }) {
-    if (!useHardwareDecoding) return 'no';
+    if (!useHardwareDecoding || operatingSystem == 'linux') return 'no';
     return operatingSystem == 'android' ? 'auto-safe' : 'auto';
+  }
+
+  /// Whether media_kit should enable GPU texture output (`enableHardwareAcceleration`).
+  /// Always false on Linux; also false when `/dev/dri` is missing (injectable).
+  @visibleForTesting
+  static bool shouldEnableHardwareVideoOutput(
+    String operatingSystem, {
+    bool? hasDriDevices,
+  }) {
+    if (operatingSystem == 'linux') return false;
+    if (hasDriDevices == false) return false;
+    return true;
+  }
+
+  /// Detects DRM render nodes. Only meaningful on Linux; injectable for tests.
+  @visibleForTesting
+  static bool linuxHasDriDevices({bool Function()? directoryExists}) {
+    final exists = directoryExists ?? () => Directory('/dev/dri').existsSync();
+    try {
+      return exists();
+    } catch (_) {
+      return false;
+    }
   }
 
   @visibleForTesting
@@ -541,15 +567,26 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
   }
 
   VideoController _createVideoController(Player player) {
+    final operatingSystem = UniversalPlatform.operatingSystem;
+    final useHardwareDecoding = SettingsService().useHardwareVideoDecoding;
+    final hasDri = operatingSystem == 'linux'
+        ? NativeVideoPlayerMediaKit.linuxHasDriDevices()
+        : null;
+    final enableHardwareOutput =
+        NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput(
+      operatingSystem,
+      hasDriDevices: hasDri,
+    );
     return VideoController(
       player,
       configuration: VideoControllerConfiguration(
         hwdec: NativeVideoPlayerMediaKit.decoderOptionFor(
-          useHardwareDecoding: SettingsService().useHardwareVideoDecoding,
-          operatingSystem: UniversalPlatform.operatingSystem,
+          useHardwareDecoding: useHardwareDecoding && enableHardwareOutput,
+          operatingSystem: operatingSystem,
         ),
-        // This controls GPU texture rendering independently of decoder choice.
-        enableHardwareAcceleration: true,
+        // GPU texture VO is independent of decoder choice. Force software on
+        // Linux (and when /dev/dri is absent) to avoid solid/blue frames.
+        enableHardwareAcceleration: enableHardwareOutput,
       ),
     );
   }
