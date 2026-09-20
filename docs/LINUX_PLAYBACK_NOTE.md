@@ -51,3 +51,18 @@ Hooked from player screen open and first `MediaPlaybackService.play`.
 
 GPU-less VMs may still be limited (CPU decode cost, Impeller residual, missing
 ALSA → silent audio by design after L3 degrade).
+
+## Library covers / seek thumbnails
+
+`video_thumbnail` has **no Linux implementation** (`MissingPluginException` on
+`plugins.justsoft.xyz/video_thumbnail`). On Linux (and whenever
+`FFmpegUtils.preferSystemFfmpeg`):
+
+- Library covers (`LibraryService._generateThumbnail`) skip the plugin and use
+  system `ffmpeg` via the Process path (`_generateThumbnailWindows`).
+- Seek/scrub previews (`VideoPreviewService`) prefer system ffmpeg first
+  (accurate + simple `-ss` extract) so logs are not flooded with MissingPlugin.
+- OCR preview frames already used native thumbnail only on Android/iOS and
+  system ffmpeg on desktop.
+
+Requires a working system `ffmpeg` on `PATH` (same L2 binary expectation).

@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:archive/archive_io.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:lpinyin/lpinyin.dart';
 import 'package:path_provider/path_provider.dart';
 import '../utils/app_data_paths.dart';
@@ -4424,8 +4425,8 @@ class LibraryService extends ChangeNotifier {
       return await _extractAudioCoverArt(videoPath, videoId: videoId);
     }
 
-    // Desktop Process ffmpeg (Windows + Linux; Kit unavailable on Linux)
-    if (FFmpegUtils.preferSystemFfmpeg) {
+    // Desktop Process ffmpeg (Windows + Linux; video_thumbnail has no Linux plugin)
+    if (FFmpegUtils.preferSystemFfmpeg || Platform.isLinux) {
       return await _generateThumbnailWindows(videoPath, videoId: videoId);
     }
 
@@ -4437,7 +4438,7 @@ class LibraryService extends ChangeNotifier {
     // Android and other platforms: use the system thumbnail path first. Some
     // Android MediaMetadataRetriever implementations advertise AV1 support but
     // fail while extracting a 4K frame, so Android gets a software FFmpeg
-    // fallback below.
+    // fallback below. Also catch MissingPluginException on any platform.
     try {
       final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
@@ -4479,6 +4480,13 @@ class LibraryService extends ChangeNotifier {
         } catch (_) {}
       }
       return outPath;
+    } on MissingPluginException catch (e) {
+      developer.log(
+        'Thumbnail MissingPluginException, falling back to ffmpeg',
+        error: e,
+        name: 'library.thumbnail',
+      );
+      return await _generateThumbnailFFmpeg(videoPath, videoId: videoId);
     } catch (e) {
       developer.log('Thumbnail error', error: e);
       if (Platform.isAndroid) {
@@ -4530,6 +4538,10 @@ class LibraryService extends ChangeNotifier {
     String videoPath, {
     String? videoId,
   }) async {
+    // Linux/Windows: FFmpegKit unavailable or prefer Process — reuse CLI path.
+    if (FFmpegUtils.preferSystemFfmpeg || Platform.isLinux) {
+      return await _generateThumbnailWindows(videoPath, videoId: videoId);
+    }
     try {
       final thumbDir = Directory(p.join(_dataRootDir.path, 'thumbnails'));
       if (!await thumbDir.exists()) {
