@@ -401,7 +401,7 @@ class _HomeScreenState extends State<HomeScreen>
               ),
               onSelected: () {
                 if (!mounted) return;
-                setState(() => _isSelectionMode = true);
+                _enterSelectionMode();
               },
             ),
           ],
@@ -852,6 +852,8 @@ class _HomeScreenState extends State<HomeScreen>
     VideoPlayerController? existingController,
     bool useRootNavigator = false,
   }) {
+    // Safety net: selection mode must never navigate into the player.
+    if (_isSelectionMode) return;
     _preparePlaybackQueue(item);
     final playbackService = Provider.of<MediaPlaybackService>(
       context,
@@ -1406,9 +1408,7 @@ class _HomeScreenState extends State<HomeScreen>
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.enterSelectionMode:
         if (_isSelectionMode) return KeyEventResult.handled;
-        setState(() {
-          _isSelectionMode = true;
-        });
+        _enterSelectionMode();
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.toggleSelectAll:
         if (!_isSelectionMode) return KeyEventResult.handled;
@@ -2759,9 +2759,7 @@ class _HomeScreenState extends State<HomeScreen>
                                 .enterSelectionMode,
                           ),
                           onPressed: () {
-                            setState(() {
-                              _isSelectionMode = true;
-                            });
+                            _enterSelectionMode();
                           },
                         ),
                       ] else ...[
@@ -2987,6 +2985,12 @@ class _HomeScreenState extends State<HomeScreen>
                                                 cardBottomPadding:
                                                     cardBottomPadding,
                                                 onOpenMedia: (item) {
+                                                  if (_isSelectionMode) {
+                                                    _toggleListSelection(
+                                                      item.id,
+                                                    );
+                                                    return;
+                                                  }
                                                   final playback =
                                                       Provider.of<
                                                         MediaPlaybackService
@@ -3005,6 +3009,12 @@ class _HomeScreenState extends State<HomeScreen>
                                                   );
                                                 },
                                                 onOpenFolder: (collection) {
+                                                  if (_isSelectionMode) {
+                                                    _toggleListSelection(
+                                                      collection.id,
+                                                    );
+                                                    return;
+                                                  }
                                                   Navigator.of(context).push(
                                                     buildMediaLibraryFolderRoute<
                                                       void
@@ -3050,6 +3060,12 @@ class _HomeScreenState extends State<HomeScreen>
                                                 expandBatchId:
                                                     _pendingRecentBatchId,
                                                 onOpenMedia: (item) {
+                                                  if (_isSelectionMode) {
+                                                    _toggleListSelection(
+                                                      item.id,
+                                                    );
+                                                    return;
+                                                  }
                                                   final playback =
                                                       Provider.of<
                                                         MediaPlaybackService
@@ -3561,6 +3577,44 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+
+  void _enterSelectionMode({String? initialId}) {
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final plan = _rootNavigationPlan(library, settings);
+    final current = _effectiveRootEntry(plan);
+    setState(() {
+      _isSelectionMode = true;
+      if (initialId != null) {
+        _selectedIds.add(initialId);
+      }
+    });
+    // Batch ops live on the folders surface; continue/recent cards do not
+    // show selection chrome. Park there when entering from the app bar /
+    // shortcut. Do not call _selectRootEntry — it exits selection on tab change.
+    if (current != MediaLibraryRootEntry.folders) {
+      final leavingController = _scrollControllerFor(current);
+      final capturedOffset = leavingController.hasClients
+          ? leavingController.offset
+          : null;
+      _rootEntryOverride.value = MediaLibraryRootEntry.folders;
+      unawaited(
+        Future<void>.delayed(kMediaLibraryRootFadeDuration, () {
+          if (!mounted) return;
+          settings.saveMediaLibraryRootChoice(
+            MediaLibraryRootEntry.folders.storageValue,
+            notify: false,
+          );
+          _persistScrollForEntry(
+            current,
+            settings,
+            capturedOffset: capturedOffset,
+          );
+        }),
+      );
+    }
+  }
+
   void _toggleListSelection(String itemId) {
     setState(() {
       if (_selectedIds.contains(itemId)) {
@@ -3841,6 +3895,8 @@ class _HomeScreenState extends State<HomeScreen>
           isSelected: isSelected,
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
+          isSelectionMode: _isSelectionMode,
+          onSelectionTap: () => _toggleListSelection(collection.id),
           elevation: isSelected ? 3 : 0,
           child: Stack(
             fit: StackFit.expand,
@@ -4268,6 +4324,8 @@ class _HomeScreenState extends State<HomeScreen>
           isSelected: isSelected,
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(item.id),
+          isSelectionMode: _isSelectionMode,
+          onSelectionTap: () => _toggleListSelection(item.id),
           child: Stack(
             fit: StackFit.expand,
             children: [

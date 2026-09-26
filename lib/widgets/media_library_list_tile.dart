@@ -135,7 +135,12 @@ class MediaLibraryListTile extends StatelessWidget {
           ),
           clipBehavior: Clip.antiAlias,
           child: InkWell(
-            onTap: onTap,
+            // Selection mode: whole-row tap must toggle selection, never open/play.
+            onTap: isSelectionMode
+                ? () {
+                    onSelectionTap?.call();
+                  }
+                : onTap,
             onSecondaryTap: onSecondaryTap,
             hoverColor: Colors.white.withValues(alpha: 0.045),
             splashColor: accent.withValues(alpha: 0.12),

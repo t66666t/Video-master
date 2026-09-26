@@ -979,6 +979,8 @@ class _CollectionScreenState extends State<CollectionScreen>
     VideoPlayerController? existingController,
     bool useRootNavigator = false,
   }) {
+    // Safety net: selection mode must never navigate into the player.
+    if (_isSelectionMode) return;
     _preparePlaybackQueue(item);
     final playbackService = Provider.of<MediaPlaybackService>(
       context,
@@ -2758,6 +2760,8 @@ class _CollectionScreenState extends State<CollectionScreen>
           isSelected: isSelected,
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
+          isSelectionMode: _isSelectionMode,
+          onSelectionTap: () => _toggleListSelection(collection.id),
           elevation: isSelected ? 3 : 0,
           child: Stack(
             fit: StackFit.expand,
@@ -3199,6 +3203,8 @@ class _CollectionScreenState extends State<CollectionScreen>
           isSelected: isSelected,
           onTap: handleTap,
           onSecondaryTap: () => _handleCardSecondaryTap(item.id),
+          isSelectionMode: _isSelectionMode,
+          onSelectionTap: () => _toggleListSelection(item.id),
           child: Stack(
             fit: StackFit.expand,
             children: [

@@ -15,6 +15,8 @@ class MediaLibraryGridCard extends StatelessWidget {
     required this.onTap,
     required this.child,
     this.onSecondaryTap,
+    this.isSelectionMode = false,
+    this.onSelectionTap,
     this.elevation,
   });
 
@@ -24,6 +26,10 @@ class MediaLibraryGridCard extends StatelessWidget {
 
   /// 键鼠右击：进入选择并选中/取消该项，不走左键打开或播放。
   final VoidCallback? onSecondaryTap;
+
+  /// When true, [onTap] is ignored and [onSelectionTap] toggles selection.
+  final bool isSelectionMode;
+  final VoidCallback? onSelectionTap;
   final Widget child;
   final double? elevation;
 
@@ -43,7 +49,11 @@ class MediaLibraryGridCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(radius),
       ),
       child: InkWell(
-        onTap: onTap,
+        onTap: isSelectionMode
+            ? () {
+                onSelectionTap?.call();
+              }
+            : onTap,
         onSecondaryTap: onSecondaryTap,
         splashFactory: NoSplash.splashFactory,
         overlayColor: _noOverlay,
