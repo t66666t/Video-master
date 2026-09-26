@@ -38,6 +38,11 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
 
   static const Duration _tooltipWaitDuration = Duration(milliseconds: 450);
 
+  /// 点按高亮会跟着路由 ticker 走。播放页盖住媒体库后 ticker 停住，
+  /// 返回时才把没播完的高亮淡掉，卡片就会从亮闪回暗色。
+  static const WidgetStateProperty<Color?> _noTapOverlay =
+      WidgetStatePropertyAll<Color?>(Colors.transparent);
+
   @override
   void initState() {
     super.initState();
@@ -141,6 +146,9 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   @override
   void didPushNext() {
     _routeIsCurrent = false;
+    // 盖住之后滑入动画也不会再 tick。停在半路的话，返回时会接着滑。
+    // 先收到当前可见性对应的终点，返回后卡片保持静止。
+    _slideController.value = widget.isVisible ? 1.0 : 0.0;
     _syncMiniPlaybackVisibility();
   }
 
@@ -199,6 +207,12 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                 color: Colors.transparent,
                 child: InkWell(
                   onTap: widget.onTap,
+                  splashFactory: NoSplash.splashFactory,
+                  overlayColor: _noTapOverlay,
+                  splashColor: Colors.transparent,
+                  highlightColor: Colors.transparent,
+                  hoverColor: Colors.transparent,
+                  focusColor: Colors.transparent,
                   borderRadius: const BorderRadius.vertical(
                     top: Radius.circular(16.0),
                   ),

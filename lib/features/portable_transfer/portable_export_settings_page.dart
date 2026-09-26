@@ -40,9 +40,10 @@ class _PortableExportSettingsPageState extends State<PortableExportSettingsPage>
   var _sidecars = true;
   var _checksums = true;
   var _includeDanmaku = false;
+  var _embedSubtitles = true;
+  var _externalSubtitles = false;
   var _starting = false;
   PortableCompression _compression = PortableCompression.fast;
-  ZipSubtitleMode _subtitleMode = ZipSubtitleMode.embed;
 
   bool get _zip => widget.format == PortableExportFormatChoice.zip;
 
@@ -80,14 +81,15 @@ class _PortableExportSettingsPageState extends State<PortableExportSettingsPage>
         outputPath: outputPath,
         options: PortableExportOptions(
           packageName: packageName,
-          wrapInFolder: _zip || _wrap,
+          wrapInFolder: _zip ? false : _wrap,
           includeSidecars: _zip ? false : _sidecars,
           verifyChecksums: _zip ? false : _checksums,
           compression: _compression,
           format: _zip
               ? PortableExportFormat.zip
               : PortableExportFormat.fluentPack,
-          zipSubtitleMode: _subtitleMode,
+          zipEmbedSubtitles: _embedSubtitles,
+          zipExternalSubtitles: _externalSubtitles,
           includeDanmaku: _includeDanmaku,
         ),
       );
@@ -130,7 +132,7 @@ class _PortableExportSettingsPageState extends State<PortableExportSettingsPage>
                     ? Icons.folder_zip_outlined
                     : Icons.cloud_done_outlined,
                 text: _zip
-                    ? '视频按卡片标题命名，重名会自动加上序号。解压后放在一个文件夹里，文件夹名就是下面的导出包名称。软字幕、封面和章节只在需要时写入，不会重新编码。需要写入时会占用大约等于这些视频大小的临时空间，完成后会删掉。在线卡片会跳过。'
+                    ? '视频按卡片标题命名，同一层重名会自动加上序号。文件夹只保留选中媒体之间需要的层级，不再额外套一层导出包名称。软字幕和外挂字幕可以同时打开。封面和章节只在需要时写入，不会重新编码。需要写入时会占用大约等于这些视频大小的临时空间，完成后会删掉。在线卡片会跳过。'
                     : 'Bilibili 在线卡片会保留来源、封面、字幕、弹幕和预览图，不携带视频分片、转录音频或物化媒体缓存。',
               ),
               if (mobile) ...[
@@ -180,37 +182,26 @@ class _PortableExportSettingsPageState extends State<PortableExportSettingsPage>
                 const Text('字幕', style: TextStyle(fontWeight: FontWeight.w600)),
                 const SizedBox(height: 4),
                 const Text(
-                  '范围是这张卡片上已经关联的全部字幕。文件里原来就有的字幕会保留，从成片里拆出来的副本不会再嵌一遍。',
+                  '范围是这张卡片上已经关联的全部字幕。两个都可以打开。文件里原来就有的字幕会保留，从成片里拆出来的副本不会再嵌一遍。',
                   style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.4),
                 ),
-                RadioGroup<ZipSubtitleMode>(
-                  groupValue: _subtitleMode,
-                  onChanged: (value) {
-                    if (_starting || value == null) return;
-                    setState(() => _subtitleMode = value);
-                  },
-                  child: const Column(
-                    children: [
-                      RadioListTile<ZipSubtitleMode>(
-                        contentPadding: EdgeInsets.zero,
-                        value: ZipSubtitleMode.embed,
-                        title: Text('软字幕内嵌'),
-                        subtitle: Text('写进视频，播放器里可以切换。多数播放器一次显示一条。'),
-                      ),
-                      RadioListTile<ZipSubtitleMode>(
-                        contentPadding: EdgeInsets.zero,
-                        value: ZipSubtitleMode.external,
-                        title: Text('外挂字幕'),
-                        subtitle: Text('视频保持原文件，字幕放在旁边。只有一条时使用同名文件。'),
-                      ),
-                      RadioListTile<ZipSubtitleMode>(
-                        contentPadding: EdgeInsets.zero,
-                        value: ZipSubtitleMode.none,
-                        title: Text('不带字幕'),
-                        subtitle: Text('不导出卡片关联的字幕。封面和章节仍会在需要时写入。'),
-                      ),
-                    ],
-                  ),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  value: _embedSubtitles,
+                  onChanged: _starting
+                      ? null
+                      : (value) => setState(() => _embedSubtitles = value),
+                  title: const Text('软字幕内嵌'),
+                  subtitle: const Text('写进视频，播放器里可以切换。多数播放器一次显示一条。'),
+                ),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  value: _externalSubtitles,
+                  onChanged: _starting
+                      ? null
+                      : (value) => setState(() => _externalSubtitles = value),
+                  title: const Text('外挂字幕'),
+                  subtitle: const Text('在视频旁边再放一份字幕文件。只有一条时使用同名文件。'),
                 ),
                 SwitchListTile.adaptive(
                   contentPadding: EdgeInsets.zero,
@@ -219,11 +210,7 @@ class _PortableExportSettingsPageState extends State<PortableExportSettingsPage>
                       ? null
                       : (value) => setState(() => _includeDanmaku = value),
                   title: const Text('包含弹幕'),
-                  subtitle: Text(
-                    _subtitleMode == ZipSubtitleMode.external
-                        ? '保存为旁边的「标题.弹幕.ass」。'
-                        : '作为一条不自动打开的软字幕嵌进视频。支持 ASS 的播放器里可以手动打开，看到滚动弹幕。',
-                  ),
+                  subtitle: Text(_danmakuSubtitle(_embedSubtitles, _externalSubtitles)),
                 ),
               ] else ...[
                 SwitchListTile.adaptive(
@@ -302,6 +289,14 @@ Widget _note({
       ],
     ),
   );
+}
+
+String _danmakuSubtitle(bool embed, bool external) {
+  if (embed && external) {
+    return '嵌进视频，并另存为旁边的「标题.弹幕.ass」。播放器里需要手动打开那条轨道。';
+  }
+  if (external) return '保存为旁边的「标题.弹幕.ass」。';
+  return '作为一条不自动打开的软字幕嵌进视频。支持 ASS 的播放器里可以手动打开，看到滚动弹幕。';
 }
 
 String _summary(int mediaCount, int folderCount) {

@@ -516,7 +516,8 @@ class AppDelegate: FlutterAppDelegate {
           task.etaText = eta.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         task.status = "downloading"
-        task.message = "Downloading"
+        // Keep the raw progress line so Dart can average real bytes.
+        task.message = trimmed
         eventPayload = [
           "taskId": task.taskId,
           "type": "task_progress",

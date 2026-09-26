@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
+import '../models/import_card_placement.dart';
 import '../models/media_library_root_entry.dart';
 import '../models/video_item.dart';
 import '../services/library_service.dart';
@@ -228,6 +230,11 @@ void showMediaLibrarySettingsBottomSheet(
                       );
                     },
                   ),
+                ),
+                const SizedBox(height: 10),
+                _ImportCardPlacementSection(
+                  settings: settings,
+                  library: library,
                 ),
                 const SizedBox(height: 10),
                 Material(
@@ -802,6 +809,188 @@ class _CollapsingCacheRow extends StatelessWidget {
               ? const SizedBox(width: double.infinity, height: 0)
               : child,
         ),
+      ),
+    );
+  }
+}
+
+class _ImportCardPlacementSection extends StatefulWidget {
+  final SettingsService settings;
+  final LibraryService? library;
+
+  const _ImportCardPlacementSection({
+    required this.settings,
+    required this.library,
+  });
+
+  @override
+  State<_ImportCardPlacementSection> createState() =>
+      _ImportCardPlacementSectionState();
+}
+
+class _ImportCardPlacementSectionState
+    extends State<_ImportCardPlacementSection> {
+  late ImportCardPlacement _placement;
+  bool _closing = false;
+  late final Map<ImportCardFeature, TextEditingController> _controllers;
+  late final Map<ImportCardFeature, FocusNode> _focusNodes;
+
+  @override
+  void initState() {
+    super.initState();
+    _placement = widget.settings.importCardPlacementMode;
+    _controllers = <ImportCardFeature, TextEditingController>{
+      for (final feature in ImportCardFeature.values)
+        feature: TextEditingController(text: _initialName(feature)),
+    };
+    _focusNodes = <ImportCardFeature, FocusNode>{
+      for (final feature in ImportCardFeature.values)
+        feature: FocusNode()
+          ..addListener(() {
+            if (!_focusNodes[feature]!.hasFocus) {
+              unawaited(_commitName(feature));
+            }
+          }),
+    };
+  }
+
+  @override
+  void dispose() {
+    _closing = true;
+    for (final controller in _controllers.values) {
+      controller.dispose();
+    }
+    for (final node in _focusNodes.values) {
+      node.dispose();
+    }
+    super.dispose();
+  }
+
+  String _initialName(ImportCardFeature feature) {
+    final id = widget.settings.importSourceFolderId(feature);
+    final liveName = id == null
+        ? null
+        : widget.library?.getCollection(id)?.name.trim();
+    if (liveName != null && liveName.isNotEmpty) return liveName;
+    return widget.settings.importSourceFolderName(feature);
+  }
+
+  Future<void> _select(ImportCardPlacement placement) async {
+    setState(() => _placement = placement);
+    await widget.settings.updateSetting(
+      'importCardPlacement',
+      placement.storageValue,
+    );
+  }
+
+  Future<void> _commitName(ImportCardFeature feature) async {
+    final controller = _controllers[feature];
+    if (_closing || controller == null || !mounted) return;
+    final name = ImportSourceFolders.sanitizeFolderName(
+      controller.text,
+      fallback: feature.defaultFolderName,
+    );
+    if (controller.text != name) {
+      controller.value = TextEditingValue(
+        text: name,
+        selection: TextSelection.collapsed(offset: name.length),
+      );
+    }
+    final names = Map<String, String>.from(
+      widget.settings.importSourceFolderNames,
+    );
+    if (names[feature.storageValue] != name) {
+      names[feature.storageValue] = name;
+      await widget.settings.updateSetting(
+        ImportSourceFolders.namesKey,
+        jsonEncode(names),
+      );
+    }
+    final library = widget.library;
+    final id = widget.settings.importSourceFolderId(feature);
+    if (library == null || id == null) return;
+    final collection = library.getCollection(id);
+    if (collection != null && collection.name != name) {
+      await library.renameItem(id, name);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF292929),
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(14, 12, 14, 0),
+            child: Text(
+              '导入卡片放在哪',
+              style: TextStyle(color: Colors.white, fontSize: 15),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 6, 14, 4),
+            child: Text(
+              _placement.description,
+              style: const TextStyle(
+                color: Colors.white60,
+                fontSize: 12,
+                height: 1.4,
+              ),
+            ),
+          ),
+          for (final placement in ImportCardPlacement.values)
+            ListTile(
+              key: ValueKey('importCardPlacement-${placement.storageValue}'),
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+              title: Text(
+                placement.label,
+                style: const TextStyle(color: Colors.white, fontSize: 15),
+              ),
+              trailing: _placement == placement
+                  ? const Icon(Icons.check_rounded, color: Colors.blueAccent)
+                  : null,
+              onTap: () => unawaited(_select(placement)),
+            ),
+          if (_placement == ImportCardPlacement.sourceFolder)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 4, 14, 12),
+              child: Column(
+                children: [
+                  for (final feature in ImportCardFeature.values)
+                    TextField(
+                      key: ValueKey(
+                        'importSourceFolder-${feature.storageValue}',
+                      ),
+                      controller: _controllers[feature],
+                      focusNode: _focusNodes[feature],
+                      style: const TextStyle(color: Colors.white, fontSize: 14),
+                      textInputAction: TextInputAction.done,
+                      decoration: InputDecoration(
+                        isDense: true,
+                        labelText: feature.label,
+                        labelStyle: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                        ),
+                        enabledBorder: const UnderlineInputBorder(
+                          borderSide: BorderSide(color: Colors.white24),
+                        ),
+                        focusedBorder: const UnderlineInputBorder(
+                          borderSide: BorderSide(color: Colors.blueAccent),
+                        ),
+                      ),
+                      onSubmitted: (_) => unawaited(_commitName(feature)),
+                    ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }

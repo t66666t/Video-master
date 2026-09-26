@@ -104,7 +104,8 @@ bool _isMaterializedCacheFileName(String name) {
 /// Rolling throughput estimate for one gateway item while bytes stream through
 /// the loopback proxy.
 class _GatewayTransferMeter {
-  final List<({DateTime at, int bytes})> _samples = <({DateTime at, int bytes})>[];
+  final List<({DateTime at, int bytes})> _samples =
+      <({DateTime at, int bytes})>[];
 
   void record(int bytes) {
     if (bytes <= 0) return;
@@ -287,10 +288,12 @@ class BilibiliStreamingService extends ChangeNotifier {
   final _uuid = const Uuid();
   final _playUrlCache =
       <String, ({BilibiliStreamInfo info, DateTime obtainedAt})>{};
+
   /// Next/previous episodes pre-built so a notification skip does not wait on
   /// playurl. Spotify/YouTube/Bilibili all warm the adjacent item this way.
   final _warmPlaybacks = <String, BilibiliPreparedPlayback>{};
   final _warmPrepareFutures = <String, Future<BilibiliPreparedPlayback>>{};
+
   /// Shared CDN client so episode switches reuse TLS instead of handshaking
   /// bilivideo.com again. Per-session clients made every skip look like a
   /// cold download even on gigabit LAN.
@@ -323,6 +326,12 @@ class BilibiliStreamingService extends ChangeNotifier {
   @visibleForTesting
   int get activePlaybackSessionCount => _sessions.length;
 
+  /// Bytes copied from a CDN body to a player. Tests use this to see that a
+  /// disconnected player stops the read, not merely that the kernel buffer
+  /// stopped accepting writes.
+  @visibleForTesting
+  int relayedBodyBytes = 0;
+
   /// Rolling download speed for the active gateway session of [itemId].
   double gatewayBytesPerSecondFor(String? itemId) {
     if (itemId == null || itemId.isEmpty) return 0;
@@ -331,6 +340,7 @@ class BilibiliStreamingService extends ChangeNotifier {
 
   void _recordGatewayTransfer(String itemId, int bytes) {
     if (bytes <= 0 || itemId.isEmpty) return;
+    relayedBodyBytes += bytes;
     final meter = _gatewayTransferMeters.putIfAbsent(
       itemId,
       () => _GatewayTransferMeter(),
@@ -380,7 +390,9 @@ class BilibiliStreamingService extends ChangeNotifier {
 
   Future<BilibiliPreparedPlayback> _warmPrepare(VideoItem item) {
     final existing = _warmPlaybacks[item.id];
-    if (existing != null) return Future<BilibiliPreparedPlayback>.value(existing);
+    if (existing != null) {
+      return Future<BilibiliPreparedPlayback>.value(existing);
+    }
     return _warmPrepareFutures[item.id] ??= () async {
       try {
         final playback = await prepare(item, allowWarmReuse: false);
@@ -492,10 +504,7 @@ class BilibiliStreamingService extends ChangeNotifier {
 
   String _playUrlCacheKey(String bvid, int cid) => '$bvid:$cid';
 
-  BilibiliPreparedPlayback? _takeWarmPlayback(
-    String itemId, {
-    int? qualityId,
-  }) {
+  BilibiliPreparedPlayback? _takeWarmPlayback(String itemId, {int? qualityId}) {
     final warm = _warmPlaybacks[itemId];
     if (warm == null) return null;
     if (qualityId != null && warm.selectedQuality.id != qualityId) {
@@ -516,21 +525,29 @@ class BilibiliStreamingService extends ChangeNotifier {
     return _sessions[segments[1]];
   }
 
+  /// Starts the CDN handshake for a playback that is about to be opened.
+  ///
+  /// Safe to call more than once. The body is only the init+index range and
+  /// is discarded, so it never writes the track cache. A short cached prefix
+  /// would make the player's open-ended Range return a truncated 206 and end
+  /// the audio or video track.
+  void primeCdnConnections(BilibiliPreparedPlayback playback) {
+    unawaited(_warmCdnConnections(playback));
+  }
+
   /// Pull the DASH init+sidx bytes so the next skip's first Range is a
   /// connection reuse, not a TLS handshake to bilivideo.com.
   Future<void> _warmCdnConnections(BilibiliPreparedPlayback playback) async {
     final session = _sessionForPlayback(playback);
-    if (session == null || session.isClosed) return;
+    if (session == null || session.isClosed || session.cdnWarmStarted) return;
+    session.cdnWarmStarted = true;
     await Future.wait<void>([
       _warmCdnTrack(session, session.selectedAudio),
       _warmCdnTrack(session, session.selectedVideo),
     ]);
   }
 
-  Future<void> _warmCdnTrack(
-    _GatewaySession session,
-    StreamItem track,
-  ) async {
+  Future<void> _warmCdnTrack(_GatewaySession session, StreamItem track) async {
     final uri = () {
       for (final candidate in <String>[track.baseUrl, ...track.backupUrls]) {
         final parsed = Uri.tryParse(candidate);
@@ -539,8 +556,11 @@ class BilibiliStreamingService extends ChangeNotifier {
       return null;
     }();
     if (uri == null) return;
+    HttpClientRequest? request;
+    void Function()? unbindAbort;
     try {
-      final request = await session.mediaClient.getUrl(uri);
+      if (session.isClosed) return;
+      request = await session.mediaClient.getUrl(uri);
       request.headers.set(HttpHeaders.userAgentHeader, _userAgent);
       request.headers.set(HttpHeaders.refererHeader, _referer);
       request.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
@@ -551,8 +571,42 @@ class BilibiliStreamingService extends ChangeNotifier {
       final response = await request.close().timeout(
         const Duration(seconds: 4),
       );
-      await response.drain<void>().timeout(const Duration(seconds: 4));
-    } catch (_) {}
+      final done = Completer<void>();
+      late final StreamSubscription<List<int>> subscription;
+      var cancelled = false;
+      var finished = false;
+      void abort() {
+        if (cancelled) return;
+        cancelled = true;
+        // A finished body already returned its socket to the keep-alive pool.
+        // Cancelling again would destroy that pooled connection.
+        if (!finished) unawaited(subscription.cancel());
+        if (!done.isCompleted) done.complete();
+      }
+
+      subscription = response.listen(
+        (_) {},
+        onError: (Object _) {
+          if (!done.isCompleted) done.complete();
+        },
+        onDone: () {
+          finished = true;
+          if (!done.isCompleted) done.complete();
+        },
+        cancelOnError: true,
+      );
+      unbindAbort = session.bindTransferAbort(abort);
+      try {
+        await done.future.timeout(const Duration(seconds: 4));
+      } catch (_) {
+        // Leave the keep-alive connection alone when the small range
+        // finished. Only tear it down if it is still running.
+        abort();
+      }
+    } catch (_) {
+    } finally {
+      unbindAbort?.call();
+    }
   }
 
   int _warmRangeEnd(StreamItem track) {
@@ -1533,16 +1587,84 @@ class BilibiliStreamingService extends ChangeNotifier {
       } catch (_) {}
     }
     try {
-      await for (final bytes in upstream) {
-        downstream.response.add(bytes);
-        if (!cacheDisabled) sink?.add(bytes);
-        _recordGatewayTransfer(session.itemId, bytes.length);
-      }
+      await _relayUpstreamBody(
+        downstream: downstream,
+        upstream: upstream,
+        session: session,
+        onBytes: (bytes) {
+          if (!cacheDisabled) sink?.add(bytes);
+          _recordGatewayTransfer(session.itemId, bytes.length);
+        },
+      );
     } finally {
       session.unregisterCacheWriter(disableCacheWriter);
       await closeCache(delete: false);
-      await downstream.response.close();
+      try {
+        await downstream.response.close();
+      } catch (_) {}
       _notifyCacheChanged(session.itemId);
+    }
+  }
+
+  /// Forwards CDN bytes only as fast as libmpv reads them, and stops the CDN
+  /// socket when the player disconnects or the session is released.
+  ///
+  /// A cancelled body is not a failed playback. [_commitTrackCacheSegment]
+  /// drops the temp file unless its length is the full advertised range, so
+  /// the next open cannot be served a short 206 that ends the track.
+  Future<void> _relayUpstreamBody({
+    required HttpRequest downstream,
+    required HttpClientResponse upstream,
+    required _GatewaySession session,
+    required void Function(List<int> bytes) onBytes,
+  }) async {
+    Object? upstreamError;
+    StreamSubscription<List<int>>? subscription;
+    var cancelled = false;
+    late final StreamController<List<int>> controller;
+
+    Future<void> cancelUpstream() {
+      if (cancelled) return Future<void>.value();
+      cancelled = true;
+      return subscription?.cancel() ?? Future<void>.value();
+    }
+
+    void abort() {
+      unawaited(cancelUpstream());
+      if (!controller.isClosed) controller.close();
+    }
+
+    controller = StreamController<List<int>>(
+      onPause: () => subscription?.pause(),
+      onResume: () => subscription?.resume(),
+      onCancel: cancelUpstream,
+    );
+    subscription = upstream.listen(
+      (bytes) {
+        if (controller.isClosed) return;
+        onBytes(bytes);
+        if (!controller.isClosed) controller.add(bytes);
+      },
+      onError: (Object error, StackTrace stack) {
+        upstreamError ??= error;
+        if (!controller.isClosed) controller.addError(error, stack);
+      },
+      onDone: () {
+        if (!controller.isClosed) controller.close();
+      },
+      cancelOnError: false,
+    );
+    final unbindAbort = session.bindTransferAbort(abort);
+    try {
+      await downstream.response.addStream(controller.stream);
+    } catch (error) {
+      // Player seek/switch closes the loopback socket. That is not a CDN
+      // failure; the replacement Range is a new request.
+      if (upstreamError != null && !session.isClosed) rethrow;
+    } finally {
+      unbindAbort();
+      await cancelUpstream();
+      if (!controller.isClosed) await controller.close();
     }
   }
 
@@ -1775,20 +1897,29 @@ class BilibiliStreamingService extends ChangeNotifier {
       return true;
     }
     final raf = await plan.file.open();
+    var stop = false;
+    final unbindAbort = session.bindTransferAbort(() => stop = true);
     try {
       await raf.setPosition(plan.sliceStart);
       var remaining = plan.sliceLength;
-      while (remaining > 0) {
-        final chunkSize = remaining < 64 * 1024 ? remaining : 64 * 1024;
-        final chunk = await raf.read(chunkSize);
-        if (chunk.isEmpty) break;
-        downstream.response.add(chunk);
-        remaining -= chunk.length;
-      }
+      await downstream.response.addStream(() async* {
+        while (remaining > 0 && !stop) {
+          final chunkSize = remaining < 64 * 1024 ? remaining : 64 * 1024;
+          final chunk = await raf.read(chunkSize);
+          if (chunk.isEmpty || stop) break;
+          remaining -= chunk.length;
+          yield chunk;
+        }
+      }());
+    } catch (_) {
+      // The player closed the socket. Leave the on-disk range intact.
     } finally {
+      unbindAbort();
       await raf.close();
+      try {
+        await downstream.response.close();
+      } catch (_) {}
     }
-    await downstream.response.close();
     return true;
   }
 
@@ -1895,11 +2026,7 @@ class BilibiliStreamingService extends ChangeNotifier {
       final start = int.parse(match.group(1)!);
       final endExclusive = int.parse(match.group(2)!);
       if (!index.covers(start, endExclusive)) {
-        await _writeBytesIntoTrackFile(
-          trackFile,
-          start: start,
-          source: entity,
-        );
+        await _writeBytesIntoTrackFile(trackFile, start: start, source: entity);
         index.addRange(start, endExclusive);
       }
       try {
@@ -2026,9 +2153,11 @@ class _GatewaySession {
   bool didRefreshAfterFailure = false;
   bool _closed = false;
   bool _cachingEnabled = false;
+  bool cdnWarmStarted = false;
   int _activeTransfers = 0;
   Completer<void>? _idleCompleter;
   final Set<Future<void> Function()> _cacheWriters = {};
+  final List<void Function()> _transferAborts = [];
 
   bool get isClosed => _closed;
   bool get isCachingEnabled => _cachingEnabled;
@@ -2087,10 +2216,32 @@ class _GatewaySession {
     await Future.wait<void>([for (final disable in writers) disable()]);
   }
 
+  /// Runs [abort] when the session is released. If it is already closed, runs
+  /// it immediately so a late transfer cannot keep the CDN socket.
+  void Function() bindTransferAbort(void Function() abort) {
+    if (_closed) {
+      abort();
+      return () {};
+    }
+    _transferAborts.add(abort);
+    return () {
+      _transferAborts.remove(abort);
+    };
+  }
+
   void close() {
     if (_closed) return;
     _closed = true;
     // The shared CDN client outlives a single episode so the next skip can
-    // reuse TLS. Only close a client that this session uniquely owns.
+    // reuse TLS. Stop this session's sockets now; otherwise a disconnected
+    // player keeps downloading until the Range ends and the next episode
+    // waits for a free connection.
+    final aborts = List<void Function()>.of(_transferAborts);
+    _transferAborts.clear();
+    for (final abort in aborts) {
+      try {
+        abort();
+      } catch (_) {}
+    }
   }
 }

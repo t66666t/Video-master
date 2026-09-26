@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import '../debug/developer_log.dart' as developer;
@@ -22,6 +22,7 @@ import '../models/video_collection.dart';
 import '../utils/media_library_search_query.dart';
 import '../utils/imported_media_title.dart';
 import '../models/video_item.dart';
+import '../models/import_card_placement.dart';
 import '../models/library_activity.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/media_chapter.dart';
@@ -418,6 +419,8 @@ class LibraryService extends ChangeNotifier {
 
   // Root level structure (IDs of collections and videos at root)
   List<String> _rootChildrenIds = [];
+  final Map<ImportCardFeature, Future<String>> _importSourceFolderInflight =
+      <ImportCardFeature, Future<String>>{};
   final Map<String, int> _itemSizeCache = {};
   final Map<String, Future<int>> _itemSizeInFlight = {};
   final List<Completer<void>> _sizeCalculationWaitQueue = [];
@@ -2028,6 +2031,71 @@ class LibraryService extends ChangeNotifier {
     return results;
   }
 
+  /// Resolves the library folder that should receive a new import.
+  ///
+  /// [openedFromFolderId] is the folder that was open when the import started.
+  /// Null means the media library root. Source-folder mode reuses one stable
+  /// folder per feature and does not record that folder as part of the import.
+  Future<String?> resolveImportCardParentId({
+    required ImportCardFeature feature,
+    required String? openedFromFolderId,
+  }) async {
+    switch (SettingsService().importCardPlacementMode) {
+      case ImportCardPlacement.libraryRoot:
+        return null;
+      case ImportCardPlacement.currentFolder:
+        if (openedFromFolderId == null) return null;
+        if (!_collections.containsKey(openedFromFolderId)) return null;
+        return openedFromFolderId;
+      case ImportCardPlacement.sourceFolder:
+        return _ensureImportSourceFolder(feature);
+    }
+  }
+
+  Future<String> _ensureImportSourceFolder(ImportCardFeature feature) {
+    final inFlight = _importSourceFolderInflight[feature];
+    if (inFlight != null) return inFlight;
+    final future = _ensureImportSourceFolderBody(feature);
+    _importSourceFolderInflight[feature] = future;
+    return future.whenComplete(() {
+      if (identical(_importSourceFolderInflight[feature], future)) {
+        _importSourceFolderInflight.remove(feature);
+      }
+    });
+  }
+
+  Future<String> _ensureImportSourceFolderBody(
+    ImportCardFeature feature,
+  ) async {
+    final settings = SettingsService();
+    final storedId = settings.importSourceFolderId(feature);
+    if (storedId != null && _collections.containsKey(storedId)) {
+      return storedId;
+    }
+    final name = settings.importSourceFolderName(feature);
+    for (final id in _rootChildrenIds) {
+      final collection = _collections[id];
+      if (collection != null && collection.name == name) {
+        await _rememberImportSourceFolderId(feature, collection.id);
+        return collection.id;
+      }
+    }
+    final created = await createCollection(name, null);
+    await _rememberImportSourceFolderId(feature, created.id);
+    return created.id;
+  }
+
+  Future<void> _rememberImportSourceFolderId(
+    ImportCardFeature feature,
+    String id,
+  ) async {
+    final settings = SettingsService();
+    if (settings.importSourceFolderId(feature) == id) return;
+    final ids = Map<String, String>.from(settings.importSourceFolderIds);
+    ids[feature.storageValue] = id;
+    await settings.updateSetting(ImportSourceFolders.idsKey, jsonEncode(ids));
+  }
+
   Future<VideoCollection> createCollection(
     String name,
     String? parentId, {
@@ -2161,11 +2229,15 @@ class LibraryService extends ChangeNotifier {
       if (!await rootDir.exists()) {
         throw FileSystemException('目录不存在', folderPath);
       }
+      final destinationParentId = await resolveImportCardParentId(
+        feature: ImportCardFeature.folder,
+        openedFromFolderId: parentId,
+      );
       final rootName = p.basename(p.normalize(rootDir.path));
       return _importDirectoryTreeIntoLibrary(
         sourceDir: rootDir,
         rootCollectionName: rootName,
-        parentId: parentId,
+        parentId: destinationParentId,
         sortOptions: sortOptions,
         importLabel: '文件夹',
         copyImportedFilesToLibrary: copyImportedFilesToLibrary,
@@ -2184,19 +2256,24 @@ class LibraryService extends ChangeNotifier {
     required String rootCollectionName,
     required int mediaEntriesHint,
     required StructuredImportSortOptions sortOptions,
+    String? openedFromFolderId,
   }) {
     return _runExclusiveImport(() async {
       final rootDir = Directory(folderPath);
       if (!await rootDir.exists()) {
         throw FileSystemException('导入包临时目录不存在', folderPath);
       }
+      final destinationParentId = await resolveImportCardParentId(
+        feature: ImportCardFeature.fluentPack,
+        openedFromFolderId: openedFromFolderId,
+      );
       isImporting.value = true;
       await _setImportProgress(progress: 0.34, status: '正在写入媒体库…');
       try {
         return await _importDirectoryTreeIntoLibrary(
           sourceDir: rootDir,
           rootCollectionName: rootCollectionName,
-          parentId: null,
+          parentId: destinationParentId,
           sortOptions: sortOptions,
           importLabel: '导出包',
           moveImportedFilesToLibrary: true,
@@ -2335,10 +2412,14 @@ class LibraryService extends ChangeNotifier {
         progress: 0.34,
         status: '解压完成，检测到 $extractedMediaEntries 个媒体，正在导入...',
       );
+      final destinationParentId = await resolveImportCardParentId(
+        feature: ImportCardFeature.archive,
+        openedFromFolderId: parentId,
+      );
       return await _importDirectoryTreeIntoLibrary(
         sourceDir: importRootDir,
         rootCollectionName: archiveRootCollectionName(archivePath),
-        parentId: parentId,
+        parentId: destinationParentId,
         sortOptions: sortOptions,
         importLabel: '压缩包',
         moveImportedFilesToLibrary: true,
@@ -2844,10 +2925,7 @@ class LibraryService extends ChangeNotifier {
     );
     _collections[collection.id] = collection;
     accumulator.newCollectionIds.add(collection.id);
-    noteImportedCollection(
-      collection.id,
-      batchId: accumulator.activityBatchId,
-    );
+    noteImportedCollection(collection.id, batchId: accumulator.activityBatchId);
     if (parentId != null && _collections.containsKey(parentId)) {
       _collections[parentId]!.childrenIds.add(collection.id);
     } else {
@@ -3502,9 +3580,6 @@ class LibraryService extends ChangeNotifier {
     final copyImportedMediaToPrivateStorage =
         SettingsService().copyImportedMediaToPrivateStorage;
 
-    if (parentId != null && !_collections.containsKey(parentId)) {
-      return const MediaImportExecutionResult();
-    }
     if (_importOperationActive) {
       debugPrint(
         'Ignored overlapping media import while another import is active',
@@ -3521,6 +3596,13 @@ class LibraryService extends ChangeNotifier {
     final reusedIds = <String>[];
     var failedCount = 0;
     try {
+      parentId = await resolveImportCardParentId(
+        feature: ImportCardFeatureX.fromSourceKind(sourceKind),
+        openedFromFolderId: parentId,
+      );
+      if (parentId != null && !_collections.containsKey(parentId)) {
+        return const MediaImportExecutionResult();
+      }
       isImporting.value = true;
       importProgress.value = 0.0;
       importStatus.value = reuseExistingItem ? "正在检查现有媒体..." : "正在准备导入文件...";

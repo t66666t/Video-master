@@ -2420,7 +2420,11 @@ class _HomeScreenState extends State<HomeScreen>
         listen: false,
       );
       final library = Provider.of<LibraryService>(context, listen: false);
-      await service.importParsedStreamingTaskToLibrary(library, scopedTask);
+      await service.importParsedStreamingTaskToLibrary(
+        library,
+        scopedTask,
+        folderExplicit: true,
+      );
     } catch (error) {
       debugPrint('剪贴板 Bilibili 在线播放卡片添加失败: $error');
     } finally {

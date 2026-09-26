@@ -1659,7 +1659,9 @@ void FlutterWindow::HandleYtDlpOutput(
         task->eta_text = Trim(match[1].str());
       }
       task->status = "downloading";
-      task->message = "Downloading";
+      // Keep the raw progress line so Dart can average real bytes. The
+      // download page replaces this text and does not show it as a stage.
+      task->message = trimmed;
       const auto now = std::chrono::steady_clock::now();
       const auto emit_due_to_time =
           task->last_progress_emit_at.time_since_epoch().count() == 0 ||

@@ -69,6 +69,34 @@ def configure_runtime(archive_path=None):
         raise
 
 
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _browser_impersonation_available():
+    try:
+        import curl_cffi  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _apply_embedded_http_identity(ydl_opts):
+    """Use a browser User-Agent when browser TLS impersonation is unavailable."""
+    if _browser_impersonation_available():
+        return
+    try:
+        from yt_dlp.utils.networking import std_headers
+        std_headers["User-Agent"] = _BROWSER_USER_AGENT
+    except Exception:
+        pass
+    headers = dict(ydl_opts.get("http_headers") or {})
+    headers["User-Agent"] = _BROWSER_USER_AGENT
+    ydl_opts["http_headers"] = headers
+
+
 def get_yt_dlp_version():
     return getattr(yt_dlp, "__version__", None) or getattr(yt_dlp.version, "__version__", None)
 
@@ -83,6 +111,7 @@ def resolve_meta(url, session_config_json=None):
     ydl_opts["skip_download"] = True
     ydl_opts["quiet"] = True
     ydl_opts["no_warnings"] = True
+    _apply_embedded_http_identity(ydl_opts)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -116,6 +145,7 @@ def download(request_json, callback=None):
     ydl_opts["skip_download"] = False
     ydl_opts["simulate"] = False
     ydl_opts["logger"] = logger
+    _apply_embedded_http_identity(ydl_opts)
 
     with _redirect_streams(forwarder):
         try:

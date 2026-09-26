@@ -23,11 +23,18 @@ void main() {
     );
   });
 
-  test('attempts the public endpoint only after a missing-video failure', () {
+  test('attempts the public endpoint after an X resolve failure', () {
     expect(
       XPostMediaFallback.shouldAttempt(
         pageUrl,
         Exception('[twitter] $statusId: No video could be found in this tweet'),
+      ),
+      isTrue,
+    );
+    expect(
+      XPostMediaFallback.shouldAttempt(
+        pageUrl,
+        Exception('HTTP Error 404: Not Found'),
       ),
       isTrue,
     );
@@ -39,7 +46,7 @@ void main() {
       isFalse,
     );
     expect(
-      XPostMediaFallback.shouldAttempt(pageUrl, Exception('timed out')),
+      XPostMediaFallback.shouldAttempt(pageUrl, Exception('cancelled by user')),
       isFalse,
     );
   });

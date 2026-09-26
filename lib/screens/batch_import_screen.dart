@@ -17,6 +17,7 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 import 'package:linked_scroll_controller/linked_scroll_controller.dart';
+import '../models/import_card_placement.dart';
 import '../models/video_item.dart';
 import '../models/video_item.dart' as vi;
 import '../utils/app_toast.dart';
@@ -395,13 +396,17 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
     final batch = Provider.of<BatchImportService>(context, listen: false);
 
     final id = Uuid().v4();
+    final parentId = await library.resolveImportCardParentId(
+      feature: ImportCardFeature.localFile,
+      openedFromFolderId: widget.folderId,
+    );
     final item = VideoItem(
       id: id,
       path: videoPath,
       title: title ?? p.basename(videoPath),
       durationMs: 0,
       lastUpdated: DateTime.now().millisecondsSinceEpoch,
-      parentId: widget.folderId,
+      parentId: parentId,
       subtitlePath: subtitlePath,
       type: _detectMediaType(videoPath),
     );

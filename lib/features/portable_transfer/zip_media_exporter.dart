@@ -102,7 +102,6 @@ class ZipMediaExporter {
       final draft = enumerateZipCandidates(
         library: library,
         rootIds: rootIds,
-        packageName: options.packageName,
       );
       if (draft.candidates.isEmpty) {
         throw StateError('所选项目中没有可导出的本地文件');
@@ -119,7 +118,8 @@ class ZipMediaExporter {
           resolveZipCandidate(
             candidate: candidate,
             names: draft.names,
-            subtitleMode: options.zipSubtitleMode,
+            embedSubtitles: options.zipEmbedSubtitles,
+            externalSubtitles: options.zipExternalSubtitles,
             includeDanmaku: options.includeDanmaku,
             facts:
                 facts[candidate.item.id] ??
@@ -128,7 +128,8 @@ class ZipMediaExporter {
                       embedTracks: zipEmbedTracks(
                         associated: collectAssociatedSubtitles(candidate.item),
                         danmaku: collectDanmakuTrack(candidate.item),
-                        mode: options.zipSubtitleMode,
+                        embedSubtitles: options.zipEmbedSubtitles,
+                        externalSubtitles: options.zipExternalSubtitles,
                         includeDanmaku: options.includeDanmaku,
                       ),
                     )
@@ -276,7 +277,8 @@ class ZipMediaExporter {
       final embedTracks = zipEmbedTracks(
         associated: collectAssociatedSubtitles(item),
         danmaku: collectDanmakuTrack(item),
-        mode: options.zipSubtitleMode,
+        embedSubtitles: options.zipEmbedSubtitles,
+        externalSubtitles: options.zipExternalSubtitles,
         includeDanmaku: options.includeDanmaku,
       );
       if (!zipCandidateNeedsProbe(item: item, embedTracks: embedTracks)) {

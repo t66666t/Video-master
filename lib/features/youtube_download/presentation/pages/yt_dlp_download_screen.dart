@@ -55,6 +55,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
     AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
     HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
     _service = context.read<YtDlpDownloadService>();
+    _service.rememberImportFolder(widget.targetFolderId);
     if (widget.initialInput != null) {
       _inputController.text = widget.initialInput!;
     }
@@ -217,6 +218,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       final count = await service.importToLibrary(
         task: task,
         targetFolderId: widget.targetFolderId,
+        folderExplicit: true,
       );
       if (!mounted) {
         await exportToast.dismiss(immediate: true);

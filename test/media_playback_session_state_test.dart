@@ -148,99 +148,166 @@ void main() {
     );
   });
 
-  test('restored session preview shows Mini chrome without a controller', () async {
-    final service = MediaPlaybackService();
-    await service.stop();
-    addTearDown(service.stop);
-    final item = VideoItem(
-      id: 'online-preview',
-      path: 'bilibili://stream/BV1xx411c7mD?cid=1',
-      title: 'Online',
-      durationMs: 120000,
-      lastUpdated: 0,
-      sourceRef: const MediaSourceRef(
-        value: 'BV1xx411c7mD',
-        kind: MediaSourceKind.bilibiliStream,
-        bvid: 'BV1xx411c7mD',
-        cid: 1,
-      ),
-    );
-    service.publishRestoredSessionPreview(item, const Duration(seconds: 42));
-    expect(service.shouldShowMiniPlaybackCard, isTrue);
-    expect(service.state, PlaybackState.paused);
-    expect(service.controller, isNull);
-    expect(service.currentItem?.id, item.id);
-    expect(service.position, const Duration(seconds: 42));
-  });
+  test(
+    'restored session preview shows Mini chrome without a controller',
+    () async {
+      final service = MediaPlaybackService();
+      await service.stop();
+      addTearDown(service.stop);
+      final item = VideoItem(
+        id: 'online-preview',
+        path: 'bilibili://stream/BV1xx411c7mD?cid=1',
+        title: 'Online',
+        durationMs: 120000,
+        lastUpdated: 0,
+        sourceRef: const MediaSourceRef(
+          value: 'BV1xx411c7mD',
+          kind: MediaSourceKind.bilibiliStream,
+          bvid: 'BV1xx411c7mD',
+          cid: 1,
+        ),
+      );
+      service.publishRestoredSessionPreview(item, const Duration(seconds: 42));
+      expect(service.shouldShowMiniPlaybackCard, isTrue);
+      expect(service.state, PlaybackState.paused);
+      expect(service.controller, isNull);
+      expect(service.currentItem?.id, item.id);
+      expect(service.position, const Duration(seconds: 42));
+    },
+  );
 
-  test('play() keeps restored preview progress when startPosition is omitted', () {
-    expect(
-      MediaPlaybackService.resolvePlayStartPosition(
-        startPosition: null,
-        currentItemId: 'online-preview',
-        itemId: 'online-preview',
-        currentPosition: const Duration(seconds: 42),
-        trackedProgress: null,
-        lastPositionMs: 0,
-      ),
-      const Duration(seconds: 42),
-    );
-    expect(
-      MediaPlaybackService.resolvePlayStartPosition(
-        startPosition: null,
-        currentItemId: 'online-preview',
-        itemId: 'online-preview',
-        currentPosition: Duration.zero,
-        trackedProgress: null,
-        lastPositionMs: 90000,
-      ),
-      const Duration(milliseconds: 90000),
-    );
-    expect(
-      MediaPlaybackService.startPositionForCurrentSession(
-        currentItemId: 'online-preview',
-        itemId: 'online-preview',
-        currentPosition: Duration.zero,
-      ),
-      isNull,
-    );
-    expect(
-      MediaPlaybackService.startPositionForCurrentSession(
-        currentItemId: 'online-preview',
-        itemId: 'online-preview',
-        currentPosition: const Duration(seconds: 42),
-      ),
-      const Duration(seconds: 42),
-    );
-    expect(
-      MediaPlaybackService.resolvePlayStartPosition(
-        startPosition: Duration.zero,
-        currentItemId: 'online-preview',
-        itemId: 'online-preview',
-        currentPosition: const Duration(seconds: 42),
-        trackedProgress: null,
-        lastPositionMs: 90000,
-      ),
-      Duration.zero,
-    );
-  });
+  test(
+    'failed restore warm keeps the Mini bookmark and its position',
+    () async {
+      final service = MediaPlaybackService();
+      await service.stop();
+      addTearDown(service.stop);
+      final item = VideoItem(
+        id: 'online-preview',
+        path: 'bilibili://stream/BV1xx411c7mD?cid=1',
+        title: 'Online',
+        durationMs: 120000,
+        lastUpdated: 0,
+        sourceRef: const MediaSourceRef(
+          value: 'BV1xx411c7mD',
+          kind: MediaSourceKind.bilibiliStream,
+          bvid: 'BV1xx411c7mD',
+          cid: 1,
+        ),
+      );
+      service.publishRestoredSessionPreview(item, const Duration(seconds: 42));
+      await service.warmRestoredOnlinePlayback(
+        item,
+        const Duration(seconds: 42),
+      );
+      expect(service.shouldShowMiniPlaybackCard, isTrue);
+      expect(service.state, PlaybackState.paused);
+      expect(service.controller, isNull);
+      expect(service.position, const Duration(seconds: 42));
+    },
+  );
 
-  test('non-zero resume always seeks even if Dart position already matches', () {
-    expect(
-      shouldSkipRedundantInitialSeek(
-        target: const Duration(minutes: 5),
-        actual: const Duration(minutes: 5),
-      ),
-      isFalse,
-    );
-    expect(
-      shouldSkipRedundantInitialSeek(
-        target: Duration.zero,
-        actual: Duration.zero,
-      ),
-      isTrue,
-    );
-  });
+  test(
+    'mini-card open does not start a second play while restore is loading',
+    () {
+      expect(
+        MediaPlaybackService.shouldStartPlayWhenOpeningMiniSession(
+          hasController: false,
+          state: PlaybackState.loading,
+        ),
+        isFalse,
+      );
+      expect(
+        MediaPlaybackService.shouldStartPlayWhenOpeningMiniSession(
+          hasController: false,
+          state: PlaybackState.paused,
+        ),
+        isTrue,
+      );
+      expect(
+        MediaPlaybackService.shouldStartPlayWhenOpeningMiniSession(
+          hasController: true,
+          state: PlaybackState.paused,
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'play() keeps restored preview progress when startPosition is omitted',
+    () {
+      expect(
+        MediaPlaybackService.resolvePlayStartPosition(
+          startPosition: null,
+          currentItemId: 'online-preview',
+          itemId: 'online-preview',
+          currentPosition: const Duration(seconds: 42),
+          trackedProgress: null,
+          lastPositionMs: 0,
+        ),
+        const Duration(seconds: 42),
+      );
+      expect(
+        MediaPlaybackService.resolvePlayStartPosition(
+          startPosition: null,
+          currentItemId: 'online-preview',
+          itemId: 'online-preview',
+          currentPosition: Duration.zero,
+          trackedProgress: null,
+          lastPositionMs: 90000,
+        ),
+        const Duration(milliseconds: 90000),
+      );
+      expect(
+        MediaPlaybackService.startPositionForCurrentSession(
+          currentItemId: 'online-preview',
+          itemId: 'online-preview',
+          currentPosition: Duration.zero,
+        ),
+        isNull,
+      );
+      expect(
+        MediaPlaybackService.startPositionForCurrentSession(
+          currentItemId: 'online-preview',
+          itemId: 'online-preview',
+          currentPosition: const Duration(seconds: 42),
+        ),
+        const Duration(seconds: 42),
+      );
+      expect(
+        MediaPlaybackService.resolvePlayStartPosition(
+          startPosition: Duration.zero,
+          currentItemId: 'online-preview',
+          itemId: 'online-preview',
+          currentPosition: const Duration(seconds: 42),
+          trackedProgress: null,
+          lastPositionMs: 90000,
+        ),
+        Duration.zero,
+      );
+    },
+  );
+
+  test(
+    'non-zero resume always seeks even if Dart position already matches',
+    () {
+      expect(
+        shouldSkipRedundantInitialSeek(
+          target: const Duration(minutes: 5),
+          actual: const Duration(minutes: 5),
+        ),
+        isFalse,
+      );
+      expect(
+        shouldSkipRedundantInitialSeek(
+          target: Duration.zero,
+          actual: Duration.zero,
+        ),
+        isTrue,
+      );
+    },
+  );
 
   test('online Bilibili clock resyncs a sudden byte-zero sample', () {
     expect(
@@ -361,25 +428,22 @@ void main() {
     },
   );
 
-  test(
-    'Bilibili audio-only policy is applied on every native platform',
-    () {
-      final source = File(
-        'lib/services/media_playback_service.dart',
-      ).readAsStringSync();
-      final start = source.indexOf('void _syncBilibiliVideoTrackPolicy()');
-      final end = source.indexOf(
-        'static bool shouldEnableBilibiliVideoTrack',
-        start,
-      );
-      expect(start, greaterThanOrEqualTo(0));
-      expect(end, greaterThan(start));
-      final method = source.substring(start, end);
-      expect(method, isNot(contains('Platform.isAndroid')));
-      expect(method, isNot(contains('Platform.isIOS')));
-      expect(method, contains('MediaSourceKind.bilibiliStream'));
-    },
-  );
+  test('Bilibili audio-only policy is applied on every native platform', () {
+    final source = File(
+      'lib/services/media_playback_service.dart',
+    ).readAsStringSync();
+    final start = source.indexOf('void _syncBilibiliVideoTrackPolicy()');
+    final end = source.indexOf(
+      'static bool shouldEnableBilibiliVideoTrack',
+      start,
+    );
+    expect(start, greaterThanOrEqualTo(0));
+    expect(end, greaterThan(start));
+    final method = source.substring(start, end);
+    expect(method, isNot(contains('Platform.isAndroid')));
+    expect(method, isNot(contains('Platform.isIOS')));
+    expect(method, contains('MediaSourceKind.bilibiliStream'));
+  });
 
   test(
     'Mini/notification Bilibili sessions open the audio URL as primary media',
@@ -417,27 +481,30 @@ void main() {
     },
   );
 
-  test('Mini Bilibili sessions keep the video URL and defer the video track', () {
-    final playback = File(
-      'lib/services/media_playback_service.dart',
-    ).readAsStringSync();
-    expect(
-      playback,
-      isNot(contains('bilibiliAudioPrimary = !_hasVisiblePlaybackPage')),
-    );
-    expect(playback, contains('shouldDeferBilibiliVideoOnOpen('));
-    expect(
-      playback,
-      contains('NativeVideoPlayerMediaKit.deferVideoStreamHeader'),
-    );
-    final kit = File(
-      'lib/platform/windows_video_player_media_kit.dart',
-    ).readAsStringSync();
-    expect(kit, contains('deferVideoStreamHeader'));
-    expect(kit, contains('startWithoutVideo: audioPrimary || deferVideo'));
-    expect(kit, contains("toStringAsFixed(3)"));
-    expect(kit, contains('startPositionMsHeader'));
-  });
+  test(
+    'Mini Bilibili sessions keep the video URL and defer the video track',
+    () {
+      final playback = File(
+        'lib/services/media_playback_service.dart',
+      ).readAsStringSync();
+      expect(
+        playback,
+        isNot(contains('bilibiliAudioPrimary = !_hasVisiblePlaybackPage')),
+      );
+      expect(playback, contains('shouldDeferBilibiliVideoOnOpen('));
+      expect(
+        playback,
+        contains('NativeVideoPlayerMediaKit.deferVideoStreamHeader'),
+      );
+      final kit = File(
+        'lib/platform/windows_video_player_media_kit.dart',
+      ).readAsStringSync();
+      expect(kit, contains('deferVideoStreamHeader'));
+      expect(kit, contains('startWithoutVideo: audioPrimary || deferVideo'));
+      expect(kit, contains("toStringAsFixed(3)"));
+      expect(kit, contains('startPositionMsHeader'));
+    },
+  );
 
   test('desktop Bilibili skips the conservative 2s cache-pause-initial', () {
     final source = File(
@@ -462,10 +529,7 @@ void main() {
       'lib/services/media_playback_service.dart',
     ).readAsStringSync();
     final start = source.indexOf('Future<void> _seekInitialPositionImpl');
-    final end = source.indexOf(
-      'void _trackMobileControllerRelease',
-      start,
-    );
+    final end = source.indexOf('void _trackMobileControllerRelease', start);
     expect(start, greaterThanOrEqualTo(0));
     expect(end, greaterThan(start));
     final method = source.substring(start, end);
@@ -480,56 +544,71 @@ void main() {
     final source = File(
       'lib/services/media_playback_service.dart',
     ).readAsStringSync();
-    expect(source, contains('void _prefetchNeighborBilibiliStreams()'));
+    expect(
+      source,
+      contains(
+        'void _prefetchNeighborBilibiliStreams({bool replaceStale = true})',
+      ),
+    );
     expect(source, contains('streaming.prefetch(item)'));
-    expect(source, contains('unawaited(_saveCurrentProgress(immediate: true))'));
+    expect(
+      source,
+      contains('unawaited(_saveCurrentProgress(immediate: true))'),
+    );
   });
 
-  test('Mini to playback page keeps visibility while promoting audio-primary', () {
-    final navigation = File(
-      'lib/services/playback_navigation_service.dart',
-    ).readAsStringSync();
-    expect(navigation, contains('maxAttempts: 1800'));
-    expect(
-      navigation,
-      contains('unawaited(playbackService.ensureVisibleVideoOutput(item.id))'),
-    );
-    expect(
-      navigation,
-      isNot(contains('_waitForPresentableSession(playbackService, item.id)')),
-    );
-    final playback = File(
-      'lib/services/media_playback_service.dart',
-    ).readAsStringSync();
-    expect(playback, contains('_armSeekHoldOverlay()'));
-    expect(
-      playback,
-      contains('item.sourceRef?.kind == MediaSourceKind.bilibiliStream'),
-    );
-    expect(playback, contains('_syncSeekHoldOverlayFromNative'));
-    expect(playback, contains('_coverUntilNextVisibleVideoFrame()'));
-    expect(playback, contains('bool get isTransportPlaying'));
-    final mini = File('lib/widgets/mini_playback_card.dart').readAsStringSync();
-    expect(mini, contains('isTransportPlaying'));
-    final kit = File(
-      'lib/platform/windows_video_player_media_kit.dart',
-    ).readAsStringSync();
-    expect(kit, contains('player.state.position'));
-    expect(kit, contains('_prepareVideoTrackJoinPreservingAudio'));
-    expect(kit, contains("'cache-pause',\n        'no'"));
-    expect(kit, contains("'hr-seek',\n        'yes'"));
-    expect(kit, contains('liveClockAfterVideoTrackEnable'));
-    expect(kit, isNot(contains('_resyncVideoToClockPreservingAudio')));
-    expect(kit, contains('startPosition: startMs'));
-    expect(kit, contains('await player.seek(startPosition)'));
-    expect(playback, isNot(contains('if (_state != PlaybackState.paused')));
-    expect(playback, contains('shouldResumeOnPageAdopt'));
-    expect(playback, contains('resolvePlayStartPosition('));
-    expect(playback, contains('shouldPauseWhenAppBackgrounded('));
-    expect(navigation, contains('startPositionForCurrentSession('));
-    expect(navigation, contains('resolvePlaybackPageEntryAutoPlay('));
-    expect(kit, contains('shouldRepairClockAfterExternalVideoTrackEnable'));
-  });
+  test(
+    'Mini to playback page keeps visibility while promoting audio-primary',
+    () {
+      final navigation = File(
+        'lib/services/playback_navigation_service.dart',
+      ).readAsStringSync();
+      expect(navigation, contains('maxAttempts: 1800'));
+      expect(
+        navigation,
+        contains(
+          'unawaited(playbackService.ensureVisibleVideoOutput(item.id))',
+        ),
+      );
+      expect(
+        navigation,
+        isNot(contains('_waitForPresentableSession(playbackService, item.id)')),
+      );
+      final playback = File(
+        'lib/services/media_playback_service.dart',
+      ).readAsStringSync();
+      expect(playback, contains('_armSeekHoldOverlay()'));
+      expect(
+        playback,
+        contains('item.sourceRef?.kind == MediaSourceKind.bilibiliStream'),
+      );
+      expect(playback, contains('_syncSeekHoldOverlayFromNative'));
+      expect(playback, contains('_coverUntilNextVisibleVideoFrame()'));
+      expect(playback, contains('bool get isTransportPlaying'));
+      final mini = File(
+        'lib/widgets/mini_playback_card.dart',
+      ).readAsStringSync();
+      expect(mini, contains('isTransportPlaying'));
+      final kit = File(
+        'lib/platform/windows_video_player_media_kit.dart',
+      ).readAsStringSync();
+      expect(kit, contains('player.state.position'));
+      expect(kit, contains('_prepareVideoTrackJoinPreservingAudio'));
+      expect(kit, contains("'cache-pause',\n        'no'"));
+      expect(kit, contains("'hr-seek',\n        'yes'"));
+      expect(kit, contains('liveClockAfterVideoTrackEnable'));
+      expect(kit, isNot(contains('_resyncVideoToClockPreservingAudio')));
+      expect(kit, contains('startPosition: startMs'));
+      expect(kit, contains('await player.seek(startPosition)'));
+      expect(playback, isNot(contains('if (_state != PlaybackState.paused')));
+      expect(playback, contains('shouldResumeOnPageAdopt'));
+      expect(playback, contains('resolvePlayStartPosition('));
+      expect(playback, contains('shouldPauseWhenAppBackgrounded('));
+      expect(navigation, contains('startPositionForCurrentSession('));
+      expect(navigation, contains('resolvePlaybackPageEntryAutoPlay('));
+      expect(kit, contains('shouldRepairClockAfterExternalVideoTrackEnable'));
+    },
+  );
 
   test('page adopt does not resume a live Mini or notification clock', () {
     expect(

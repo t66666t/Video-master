@@ -77,6 +77,18 @@ class PlaybackNavigationService {
     );
   }
 
+  /// 通知栏点击与媒体卡片使用同一入口页：默认竖屏，开启「跳过竖屏播放页」
+  /// 时直接进入横屏。不传入自动播放参数，已在播的会话保持当前播放状态。
+  Route<void> buildNotificationPlaybackRoute(VideoItem item) {
+    if (entrySkipsPortraitPlayer) {
+      return buildPlaybackPageRoute<void>(
+        settings: landscapeRouteSettings(item),
+        builder: (context) => VideoPlayerScreen(videoItem: item),
+      );
+    }
+    return buildPortraitRoute(item);
+  }
+
   /// 桌面端以及开启"跳过竖屏播放页"的移动端，直接进入横屏播放页。
   static bool get entrySkipsPortraitPlayer {
     if (kIsWeb) return true;
@@ -160,9 +172,14 @@ class PlaybackNavigationService {
       // it after one frame used to deselect Bilibili's video track while the
       // route was still mounting, painting a black texture over a ready stream.
       _holdPlaybackPageVisibleUntilOwned(playbackService, maxAttempts: 1800);
-      if (playbackService.controller == null) {
+      if (MediaPlaybackService.shouldStartPlayWhenOpeningMiniSession(
+        hasController: playbackService.controller != null,
+        state: playbackService.state,
+      )) {
         // Restored Mini chrome has metadata only. Start prepare now so the
         // playback page does not wait 25s for a player that was never created.
+        // Skip this when restore is already preparing the same item at its
+        // saved position.
         unawaited(
           playbackService.play(
             item,
@@ -337,13 +354,18 @@ class PlaybackNavigationService {
         topRoute != null &&
         isPlaybackRouteName(topRoute.settings.name) &&
         topRoute.settings.arguments == item.id;
+    final String notificationRouteName = entrySkipsPortraitPlayer
+        ? landscapeRouteName
+        : portraitRouteName;
     // A notification entry has one canonical mobile back stack: media library
-    // root -> current portrait player. Merely finding the target player on top
-    // is insufficient because a stale MusicPlayerScreen may still sit below it.
+    // root -> the page selected by "skip portrait player". Merely finding the
+    // target item on top is insufficient, because a stale MusicPlayerScreen
+    // may still sit below it, or the page may be the other orientation.
     final bool hasCanonicalNotificationStack =
         notificationEntry &&
         trackedRoutes.length == 2 &&
         alreadyOnTargetPlayback &&
+        topRoute?.settings.name == notificationRouteName &&
         trackedRoutes.first.isFirst;
     if ((!notificationEntry && alreadyOnTargetPlayback) ||
         hasCanonicalNotificationStack) {
@@ -359,11 +381,12 @@ class PlaybackNavigationService {
         navigator.removeRoute(route);
       }
 
-      // iOS and Android notification taps always enter the portrait playback
-      // page, independent of the normal "skip portrait player" preference.
-      // Popping it therefore returns directly to the media-management root.
+      // Notification taps use the same page as media cards. With "skip
+      // portrait player" on, that is the landscape page; otherwise portrait.
+      // The stack is reset to the media-library root first, so popping the
+      // player returns there.
       final route = notificationEntry
-          ? buildPortraitRoute(item)
+          ? buildNotificationPlaybackRoute(item)
           : buildPlaybackEntryRoute(item);
       unawaited(navigator.push(route));
     } finally {

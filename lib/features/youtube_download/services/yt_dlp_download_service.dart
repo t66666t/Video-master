@@ -22,7 +22,9 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_request_builder.dart';
 import 'package:video_player_app/features/youtube_download/services/x_post_media_fallback.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_site_urls.dart';
+import 'package:video_player_app/features/youtube_download/services/yt_dlp_speed_meter.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
+import 'package:video_player_app/models/import_card_placement.dart';
 import 'package:video_player_app/models/library_activity.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/media_chapter.dart';
@@ -174,6 +176,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   static const String _selectedContainerPrefsKey =
       'yt_dlp_last_output_container';
   static const String _audioOnlyPrefsKey = 'yt_dlp_last_audio_only';
+  static const String _importFolderPrefsKey = 'yt_dlp_import_folder_id';
   static const int _maxFallbackAttempts = 2;
   static const Duration _thumbnailRequestTimeout = Duration(seconds: 8);
   static const Duration _thumbnailResponseTimeout = Duration(seconds: 12);
@@ -196,6 +199,9 @@ class YtDlpDownloadService extends ChangeNotifier {
   // 缓存的任务 ID 列表，仅在任务结构变更时更新，避免 Selector 每次 notify 都重建列表
   List<String> _cachedTaskIds = const [];
 
+  String? _openedFromFolderId;
+  bool _importFolderExplicitlySet = false;
+
   Future<void>? _initFuture;
   Future<void>? _runtimePrepareFuture;
   StreamSubscription<DownloadTaskEvent>? _taskEventSub;
@@ -212,6 +218,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   YtDlpBinaryLocationSettings? _binaryLocationSettings;
   YtDlpBinaryReleaseInfo? _latestYtDlpRelease;
   final Map<String, DateTime> _lastTaskEventAt = <String, DateTime>{};
+  final Map<String, YtDlpSpeedMeter> _speedMeters = <String, YtDlpSpeedMeter>{};
   final Set<String> _pauseRequestedTaskIds = <String>{};
   final Map<String, Completer<void>> _pauseConfirmationCompleters =
       <String, Completer<void>>{};
@@ -342,6 +349,12 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
     keepScreenAwakeDuringProcessing =
         prefs.getBool('yt_dlp_keep_screen_awake_during_processing') ?? false;
+    if (!_importFolderExplicitlySet) {
+      final storedFolder = prefs.getString(_importFolderPrefsKey)?.trim();
+      _openedFromFolderId = (storedFolder == null || storedFolder.isEmpty)
+          ? null
+          : storedFolder;
+    }
     await _loadPersistedState(prefs);
     _isInitialized = true;
     await _syncTaskEventBinding();
@@ -1295,7 +1308,10 @@ class YtDlpDownloadService extends ChangeNotifier {
     _setResolvingTaskMessage(taskId, message);
     _metricsDirty = true;
     notifyListeners();
-    final rawInfo = await XPostMediaFallback.fetchInfo(pageUrl);
+    final rawInfo = await XPostMediaFallback.fetchInfo(
+      pageUrl,
+      proxy: _sessionConfig.useProxy ? _sessionConfig.proxy : null,
+    );
     if (rawInfo == null || _indexOfTask(taskId) < 0) {
       return null;
     }
@@ -1374,11 +1390,22 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 
   Future<VideoMeta> _parseResolvedMeta(Map<String, dynamic> rawPayload) async {
-    final rawInfo = _extractRawInfo(rawPayload);
-    if (rawInfo.isEmpty) {
+    final rawInfoPath = rawPayload['rawInfoPath']?.toString().trim() ?? '';
+    if (rawInfoPath.isEmpty && _extractRawInfo(rawPayload).isEmpty) {
       throw Exception('yt-dlp 返回了空或不可解析的元数据，请检查日志或调整会话设置');
     }
-    return compute(_parseResolvedMetaOnWorker, rawPayload);
+    try {
+      return await compute(_parseResolvedMetaOnWorker, rawPayload);
+    } finally {
+      if (rawInfoPath.isNotEmpty) {
+        try {
+          final file = File(rawInfoPath);
+          if (await file.exists()) {
+            await file.delete();
+          }
+        } catch (_) {}
+      }
+    }
   }
 
   Future<DownloadSelection> _applyMetaRecommendationsInBackground(
@@ -1547,6 +1574,7 @@ class YtDlpDownloadService extends ChangeNotifier {
 
     final generation = (_executionGenerations[taskId] ?? 0) + 1;
     _executionGenerations[taskId] = generation;
+    _speedMeters.remove(taskId);
     final started = await _nativeBridge.startYoutubeDownload(
       launchRequest,
       generation: generation,
@@ -1780,6 +1808,7 @@ class YtDlpDownloadService extends ChangeNotifier {
     }
     await _deleteTaskThumbnailArtifact(task.localThumbnailPath);
     tasks.removeWhere((item) => item.taskId == task.taskId);
+    _speedMeters.remove(task.taskId);
     await saveTasks();
     if (isProcessing) {
       await _tryStartNextQueuedTask(excludingTaskId: task.taskId);
@@ -2076,12 +2105,35 @@ class YtDlpDownloadService extends ChangeNotifier {
     return id.isEmpty ? title : id;
   }
 
+  void rememberImportFolder(String? folderId) {
+    final normalized = folderId?.trim();
+    _openedFromFolderId = (normalized == null || normalized.isEmpty)
+        ? null
+        : normalized;
+    _importFolderExplicitlySet = true;
+    unawaited(_persistImportFolder(_openedFromFolderId));
+  }
+
+  Future<void> _persistImportFolder(String? folderId) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (folderId == null || folderId.isEmpty) {
+      await prefs.remove(_importFolderPrefsKey);
+    } else {
+      await prefs.setString(_importFolderPrefsKey, folderId);
+    }
+  }
+
   Future<int> importToLibrary({
     YtDlpTaskRecord? task,
     String? targetFolderId,
+    bool folderExplicit = false,
   }) async {
     final library = LibraryService();
     await library.init();
+    targetFolderId = await library.resolveImportCardParentId(
+      feature: ImportCardFeature.ytDlp,
+      openedFromFolderId: folderExplicit ? targetFolderId : _openedFromFolderId,
+    );
     final importedTaskIds = <String>{};
     final candidates = task == null
         ? tasks
@@ -2411,6 +2463,19 @@ class YtDlpDownloadService extends ChangeNotifier {
       // a newly resumed generation of the same task.
       return;
     }
+    final parsedProgress = event.type == 'task_progress'
+        ? parseYtDlpProgressAmounts(event.message ?? '')
+        : null;
+    final progressDownloadedBytes =
+        event.downloadedBytes ?? parsedProgress?.downloadedBytes;
+    final progressTotalBytes = event.totalBytes ?? parsedProgress?.totalBytes;
+    final measuredSpeedText = event.type == 'task_progress'
+        ? _measuredDownloadSpeed(
+            taskId: event.taskId,
+            downloadedBytes: progressDownloadedBytes,
+            reportedSpeedText: event.speedText,
+          )
+        : null;
     final normalizedStatusMessage = _normalizeTaskStatusMessage(event);
     final updatedStepMessages = _appendTaskStepMessage(
       current.stepMessages,
@@ -2428,9 +2493,15 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (isPauseTransition && isLateActiveEvent) {
       tasks[index] = current.copyWith(
         progress: event.progress ?? current.progress,
-        downloadedBytes: event.downloadedBytes ?? current.downloadedBytes,
-        totalBytes: event.totalBytes ?? current.totalBytes,
-        speedText: event.speedText ?? current.speedText,
+        downloadedBytes: event.type == 'task_progress'
+            ? (progressDownloadedBytes ?? current.downloadedBytes)
+            : (event.downloadedBytes ?? current.downloadedBytes),
+        totalBytes: event.type == 'task_progress'
+            ? (progressTotalBytes ?? current.totalBytes)
+            : (event.totalBytes ?? current.totalBytes),
+        speedText: event.type == 'task_progress'
+            ? measuredSpeedText
+            : (event.speedText ?? current.speedText),
         etaText: event.etaText ?? current.etaText,
         outputPath: event.outputPath ?? current.outputPath,
         statusMessage: normalizedStatusMessage ?? current.statusMessage,
@@ -2450,9 +2521,15 @@ class YtDlpDownloadService extends ChangeNotifier {
     final updated = current.copyWith(
       status: nextStatus,
       progress: event.progress ?? current.progress,
-      downloadedBytes: event.downloadedBytes ?? current.downloadedBytes,
-      totalBytes: event.totalBytes ?? current.totalBytes,
-      speedText: event.speedText ?? current.speedText,
+      downloadedBytes: event.type == 'task_progress'
+          ? (progressDownloadedBytes ?? current.downloadedBytes)
+          : (event.downloadedBytes ?? current.downloadedBytes),
+      totalBytes: event.type == 'task_progress'
+          ? (progressTotalBytes ?? current.totalBytes)
+          : (event.totalBytes ?? current.totalBytes),
+      speedText: event.type == 'task_progress'
+          ? measuredSpeedText
+          : (event.speedText ?? current.speedText),
       etaText: event.etaText ?? current.etaText,
       outputPath: event.outputPath ?? current.outputPath,
       producedPaths: _orderedUniqueStrings([
@@ -2665,7 +2742,7 @@ class YtDlpDownloadService extends ChangeNotifier {
 
   Map<String, dynamic> _extractRawInfo(Map<String, dynamic> payload) {
     final structured = payload['rawInfo'];
-    if (structured is Map) {
+    if (structured is Map && structured.isNotEmpty) {
       return Map<String, dynamic>.from(structured);
     }
     final rawJson = payload['rawInfoJson']?.toString();
@@ -2930,9 +3007,31 @@ class YtDlpDownloadService extends ChangeNotifier {
     return false;
   }
 
+  String? _measuredDownloadSpeed({
+    required String taskId,
+    required int? downloadedBytes,
+    required String? reportedSpeedText,
+  }) {
+    final bytesPerSecond = _speedMeters
+        .putIfAbsent(taskId, YtDlpSpeedMeter.new)
+        .record(
+          downloadedBytes: downloadedBytes,
+          reportedSpeedText: reportedSpeedText,
+          now: DateTime.now(),
+        );
+    if (bytesPerSecond == null) return null;
+    return formatYtDlpBytesPerSecond(bytesPerSecond);
+  }
+
   String? _normalizeTaskStatusMessage(DownloadTaskEvent event) {
     final raw = event.message?.trim();
-    String? message = raw;
+    final hideRawProgressLine =
+        event.type == 'task_progress' &&
+        raw != null &&
+        raw.startsWith('[download]') &&
+        (raw.contains('Destination:') ||
+            parseYtDlpProgressAmounts(raw) != null);
+    String? message = hideRawProgressLine ? 'Downloading' : raw;
     switch (event.type) {
       case 'task_queued':
         message ??= '已加入下载队列';
@@ -5909,25 +6008,39 @@ class YtDlpDownloadService extends ChangeNotifier {
   }
 }
 
-VideoMeta _parseResolvedMetaOnWorker(Map<String, dynamic> rawPayload) {
-  final structured = rawPayload['rawInfo'];
-  Map<String, dynamic> rawInfo;
-  if (structured is Map) {
-    rawInfo = Map<String, dynamic>.from(structured);
-  } else {
-    final rawJson = rawPayload['rawInfoJson']?.toString();
-    if (rawJson == null || rawJson.isEmpty) {
-      throw Exception('yt-dlp 返回了空或不可解析的元数据，请检查日志或调整会话设置');
-    }
+Map<String, dynamic> _readResolvedRawInfo(Map<String, dynamic> rawPayload) {
+  final rawInfoPath = rawPayload['rawInfoPath']?.toString().trim() ?? '';
+  if (rawInfoPath.isNotEmpty) {
     try {
-      rawInfo = Map<String, dynamic>.from(jsonDecode(rawJson) as Map);
+      final decoded = jsonDecode(File(rawInfoPath).readAsStringSync());
+      if (decoded is Map && decoded.isNotEmpty) {
+        return Map<String, dynamic>.from(decoded);
+      }
+    } catch (_) {
+      throw Exception('yt-dlp 返回的元数据无法解析，请检查日志或调整会话设置');
+    }
+    throw Exception('yt-dlp 返回了空或不可解析的元数据，请检查日志或调整会话设置');
+  }
+  final structured = rawPayload['rawInfo'];
+  if (structured is Map && structured.isNotEmpty) {
+    return Map<String, dynamic>.from(structured);
+  }
+  final rawJson = rawPayload['rawInfoJson']?.toString();
+  if (rawJson != null && rawJson.isNotEmpty) {
+    try {
+      final decoded = jsonDecode(rawJson);
+      if (decoded is Map && decoded.isNotEmpty) {
+        return Map<String, dynamic>.from(decoded);
+      }
     } catch (_) {
       throw Exception('yt-dlp 返回的元数据无法解析，请检查日志或调整会话设置');
     }
   }
-  if (rawInfo.isEmpty) {
-    throw Exception('yt-dlp 返回了空或不可解析的元数据，请检查日志或调整会话设置');
-  }
+  throw Exception('yt-dlp 返回了空或不可解析的元数据，请检查日志或调整会话设置');
+}
+
+VideoMeta _parseResolvedMetaOnWorker(Map<String, dynamic> rawPayload) {
+  final rawInfo = _readResolvedRawInfo(rawPayload);
   final resolvedThumbnailUrl = rawPayload['thumbnailUrl']?.toString().trim();
   if (resolvedThumbnailUrl != null && resolvedThumbnailUrl.isNotEmpty) {
     rawInfo['thumbnail'] = resolvedThumbnailUrl;

@@ -5,6 +5,13 @@ import 'package:video_player_app/services/clipboard_parse_repeat.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/widgets/media_library_settings_sheet.dart';
 
+void useTallSettingsSurface(WidgetTester tester) {
+  tester.view.physicalSize = const Size(800, 2400);
+  tester.view.devicePixelRatio = 1;
+  addTearDown(tester.view.resetPhysicalSize);
+  addTearDown(tester.view.resetDevicePixelRatio);
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -74,6 +81,7 @@ void main() {
   });
 
   testWidgets('媒体库设置弹窗可即时切换私有目录导入', (tester) async {
+    useTallSettingsSurface(tester);
     final settings = SettingsService();
     await settings.init();
     await tester.pumpWidget(
@@ -139,6 +147,7 @@ void main() {
   });
 
   testWidgets('媒体库设置弹窗可即时切换搜索结果播放队列', (tester) async {
+    useTallSettingsSurface(tester);
     final settings = SettingsService();
     await settings.init();
     await tester.pumpWidget(
@@ -187,6 +196,7 @@ void main() {
   });
 
   testWidgets('媒体库设置弹窗可即时切换哔哩哔哩后台只加载音频', (tester) async {
+    useTallSettingsSurface(tester);
     final settings = SettingsService();
     await settings.init();
     await tester.pumpWidget(
@@ -307,6 +317,7 @@ void main() {
   });
 
   testWidgets('媒体库设置弹窗可关闭相同剪贴板只识别一次', (tester) async {
+    useTallSettingsSurface(tester);
     final settings = SettingsService();
     await settings.init();
     await tester.pumpWidget(

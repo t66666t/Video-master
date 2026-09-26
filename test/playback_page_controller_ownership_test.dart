@@ -161,6 +161,10 @@ void main() {
       File('lib/main.dart').readAsStringSync(),
       contains('shouldPrepareNativePlayerOnRestore('),
     );
+    expect(
+      File('lib/main.dart').readAsStringSync(),
+      contains('warmRestoredOnlinePlayback('),
+    );
     final home = File('lib/screens/home_screen.dart').readAsStringSync();
     final miniCardRegion = home.substring(
       home.indexOf('MediaLibraryOverlayKeys.miniPlaybackCard'),

@@ -49,7 +49,8 @@ void main() {
       options: const PortableExportOptions(
         packageName: '我的导出',
         format: PortableExportFormat.zip,
-        zipSubtitleMode: ZipSubtitleMode.none,
+        zipEmbedSubtitles: false,
+        zipExternalSubtitles: false,
       ),
     );
     final deadline = DateTime.now().add(const Duration(seconds: 20));
@@ -61,7 +62,7 @@ void main() {
     final archive = ZipDecoder().decodeBytes(await File(output).readAsBytes());
     expect(
       archive.files.map((file) => file.name),
-      contains('我的导出/卡片名.mp4'),
+      contains('卡片名.mp4'),
     );
     expect(archive.files.single.content, 'video-bytes'.codeUnits);
     expect(

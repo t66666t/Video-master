@@ -59,4 +59,46 @@ void main() {
     final slider = tester.renderObject<RenderBox>(find.byType(Slider));
     expect(slider.size.height, lessThanOrEqualTo(27));
   });
+
+  testWidgets('mini card tap does not start a splash that can resume later', (
+    tester,
+  ) async {
+    final playback = MediaPlaybackService();
+    playback.publishRestoredSessionPreview(
+      VideoItem(
+        id: 'clip',
+        path: 'clip.mp4',
+        title: 'clip',
+        durationMs: 330000,
+        lastUpdated: 0,
+      ),
+      const Duration(seconds: 196),
+    );
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<MediaPlaybackService>.value(
+        value: playback,
+        child: MaterialApp(
+          theme: ThemeData(brightness: Brightness.dark, useMaterial3: true),
+          home: const Scaffold(
+            body: Align(
+              alignment: Alignment.bottomCenter,
+              child: MiniPlaybackCard(isVisible: true),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final inkWell = tester.widget<InkWell>(find.byType(InkWell));
+    expect(inkWell.splashFactory, NoSplash.splashFactory);
+    expect(inkWell.highlightColor, Colors.transparent);
+    expect(inkWell.splashColor, Colors.transparent);
+    expect(inkWell.hoverColor, Colors.transparent);
+    expect(
+      inkWell.overlayColor?.resolve(<WidgetState>{}),
+      Colors.transparent,
+    );
+  });
 }

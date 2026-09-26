@@ -877,12 +877,18 @@ Future<void> _restorePlaybackState({
     mediaPlaybackService.publishRestoredSessionPreview(videoItem, position);
 
     if (MediaPlaybackService.shouldPrepareNativePlayerOnRestore(videoItem)) {
-      // Local files can warm a paused controller. Online Bilibili Mini chrome
-      // only needs library metadata; playurl waits until the user presses play.
+      // Local files can warm a paused controller before Mini chrome is useful.
       await mediaPlaybackService.play(
         videoItem,
         startPosition: position,
         autoPlay: false,
+      );
+    } else {
+      // Online Bilibili: the card is already visible. Prepare the paused
+      // player at the saved position without blocking startup. Opening the
+      // card then mounts that player instead of waiting on a cold playurl.
+      unawaited(
+        mediaPlaybackService.warmRestoredOnlinePlayback(videoItem, position),
       );
     }
     await SystemMediaSessionService.instance.refreshNow(

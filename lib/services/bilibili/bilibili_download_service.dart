@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_player_app/models/library_activity.dart';
+import 'package:video_player_app/models/import_card_placement.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
@@ -108,6 +109,9 @@ class BilibiliDownloadService extends ChangeNotifier {
   bool sequentialExport = false;
   bool keepScreenAwakeDuringProcessing = false;
   String? customDownloadPath;
+  String? _openedFromFolderId;
+  bool _importFolderExplicitlySet = false;
+  static const String _importFolderPrefsKey = 'bilibili_import_folder_id';
   LibraryService? libraryService;
   final List<BilibiliDownloadEpisode> _downloadQueue = [];
   final Set<String> _importingEpisodeKeys = <String>{};
@@ -655,7 +659,47 @@ class BilibiliDownloadService extends ChangeNotifier {
     customDownloadPath = _sanitizeCustomDownloadPath(
       prefs.getString('bilibili_custom_download_path'),
     );
+    if (!_importFolderExplicitlySet) {
+      final storedFolder = prefs.getString(_importFolderPrefsKey)?.trim();
+      _openedFromFolderId = (storedFolder == null || storedFolder.isEmpty)
+          ? null
+          : storedFolder;
+    }
     notifyListeners();
+  }
+
+  /// Remembers the library folder that was open when the download page opened.
+  /// Auto-import uses it when placement follows the current folder.
+  void rememberImportFolder(String? folderId) {
+    final normalized = folderId?.trim();
+    _openedFromFolderId = (normalized == null || normalized.isEmpty)
+        ? null
+        : normalized;
+    _importFolderExplicitlySet = true;
+    unawaited(_persistImportFolder(_openedFromFolderId));
+  }
+
+  Future<void> _persistImportFolder(String? folderId) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (folderId == null || folderId.isEmpty) {
+      await prefs.remove(_importFolderPrefsKey);
+    } else {
+      await prefs.setString(_importFolderPrefsKey, folderId);
+    }
+  }
+
+  Future<String?> _resolveOpenedImportFolder({
+    required LibraryService library,
+    required ImportCardFeature feature,
+    required String? explicitFolderId,
+    required bool folderExplicit,
+  }) {
+    return library.resolveImportCardParentId(
+      feature: feature,
+      openedFromFolderId: folderExplicit
+          ? explicitFolderId
+          : _openedFromFolderId,
+    );
   }
 
   @visibleForTesting
@@ -3448,10 +3492,12 @@ class BilibiliDownloadService extends ChangeNotifier {
     LibraryService library, {
     BilibiliDownloadEpisode? episode,
     String? targetFolderId,
+    bool folderExplicit = false,
   }) => _importStreamingToLibrary(
     library,
     episode: episode,
     targetFolderId: targetFolderId,
+    folderExplicit: folderExplicit,
   );
 
   /// Clipboard online-card import: put the same task on the Bilibili online
@@ -3461,6 +3507,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     LibraryService library,
     BilibiliDownloadTask parsedTask, {
     String? targetFolderId,
+    bool folderExplicit = false,
   }) async {
     parsedTask.isStreamingImport = true;
     _attachStreamingTaskToParseList(parsedTask);
@@ -3469,6 +3516,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       library,
       parsedTask: parsedTask,
       targetFolderId: targetFolderId,
+      folderExplicit: folderExplicit,
     );
   }
 
@@ -3490,6 +3538,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     BilibiliDownloadTask? parsedTask,
     BilibiliDownloadEpisode? episode,
     String? targetFolderId,
+    bool folderExplicit = false,
   }) async {
     final candidates = parsedTask != null
         ? parsedTask.videos
@@ -3505,6 +3554,13 @@ class BilibiliDownloadService extends ChangeNotifier {
               .where((item) => item.isSelected)
               .toList();
     if (candidates.isEmpty) return 0;
+
+    targetFolderId = await _resolveOpenedImportFolder(
+      library: library,
+      feature: ImportCardFeature.bilibiliOnline,
+      explicitFolderId: targetFolderId,
+      folderExplicit: folderExplicit,
+    );
 
     final importCandidates = candidates
         .where(_streamingImportingEpisodes.add)
@@ -3671,10 +3727,7 @@ class BilibiliDownloadService extends ChangeNotifier {
                 video.videoInfo.pic,
               );
             }
-            library.noteImportedCollection(
-              folderId,
-              batchId: streamingBatchId,
-            );
+            library.noteImportedCollection(folderId, batchId: streamingBatchId);
           }
 
           final uuid = _uuid.v4();
@@ -3865,6 +3918,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     LibraryService library, {
     BilibiliDownloadEpisode? episode,
     String? targetFolderId,
+    bool folderExplicit = false,
     bool suppressSequentialPump = false,
   }) async {
     List<BilibiliDownloadEpisode> completedEpisodes;
@@ -3883,6 +3937,13 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     if (completedEpisodes.isEmpty) return 0;
+
+    targetFolderId = await _resolveOpenedImportFolder(
+      library: library,
+      feature: ImportCardFeature.bilibiliDownload,
+      explicitFolderId: targetFolderId,
+      folderExplicit: folderExplicit,
+    );
 
     final downloadBatchId = library.beginImportBatch(
       title: completedEpisodes.length == 1

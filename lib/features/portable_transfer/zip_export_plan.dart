@@ -9,7 +9,6 @@ import '../../models/video_collection.dart';
 import '../../models/video_item.dart';
 import '../../services/library_service.dart';
 import 'portable_media_selection.dart';
-import 'portable_transfer_models.dart';
 
 const _windowsReservedNames = <String>{
   'con',
@@ -393,16 +392,15 @@ ZipSubtitleTrack? collectDanmakuTrack(VideoItem item) {
 List<ZipSubtitleTrack> zipEmbedTracks({
   required List<ZipSubtitleTrack> associated,
   required ZipSubtitleTrack? danmaku,
-  required ZipSubtitleMode mode,
+  required bool embedSubtitles,
+  required bool externalSubtitles,
   required bool includeDanmaku,
 }) {
   final tracks = <ZipSubtitleTrack>[];
-  if (mode == ZipSubtitleMode.embed) {
-    tracks.addAll(associated);
-  }
+  if (embedSubtitles) tracks.addAll(associated);
   if (includeDanmaku &&
       danmaku != null &&
-      mode != ZipSubtitleMode.external) {
+      (embedSubtitles || !externalSubtitles)) {
     tracks.add(danmaku);
   }
   return tracks;
@@ -451,13 +449,8 @@ class ZipCandidateSet {
 ZipCandidateSet enumerateZipCandidates({
   required LibraryService library,
   required List<String> rootIds,
-  required String packageName,
 }) {
   final names = ZipNameAllocator();
-  final packageFolder = names.allocate(
-    '',
-    sanitizeZipName(packageName.trim().isEmpty ? '未命名导出' : packageName),
-  );
   final inclusion = PortableMediaSelection(
     rootIds,
   ).resolveAgainstLibrary(library);
@@ -502,10 +495,10 @@ ZipCandidateSet enumerateZipCandidates({
 
   for (final item in library.getContents(null)) {
     final id = item is VideoCollection ? item.id : (item as VideoItem).id;
-    walk(id, packageFolder);
+    walk(id, '');
   }
   for (final id in <String>[...inclusion.collectionIds, ...inclusion.videoIds]) {
-    if (!visited.contains(id)) walk(id, packageFolder);
+    if (!visited.contains(id)) walk(id, '');
   }
   return ZipCandidateSet(
     candidates: candidates,
@@ -518,22 +511,19 @@ ZipCandidateSet enumerateZipCandidates({
 ZipExportLayout buildZipExportLayout({
   required LibraryService library,
   required List<String> rootIds,
-  required String packageName,
-  required ZipSubtitleMode subtitleMode,
+  required bool embedSubtitles,
+  required bool externalSubtitles,
   required bool includeDanmaku,
   ZipSourceFacts Function(VideoItem item)? factsFor,
 }) {
-  final draft = enumerateZipCandidates(
-    library: library,
-    rootIds: rootIds,
-    packageName: packageName,
-  );
+  final draft = enumerateZipCandidates(library: library, rootIds: rootIds);
   final media = <ZipResolvedMedia>[
     for (final candidate in draft.candidates)
       resolveZipCandidate(
         candidate: candidate,
         names: draft.names,
-        subtitleMode: subtitleMode,
+        embedSubtitles: embedSubtitles,
+        externalSubtitles: externalSubtitles,
         includeDanmaku: includeDanmaku,
         facts: factsFor?.call(candidate.item) ?? const ZipSourceFacts(),
       ),
@@ -549,7 +539,8 @@ ZipExportLayout buildZipExportLayout({
 ZipResolvedMedia resolveZipCandidate({
   required ZipCandidate candidate,
   required ZipNameAllocator names,
-  required ZipSubtitleMode subtitleMode,
+  required bool embedSubtitles,
+  required bool externalSubtitles,
   required bool includeDanmaku,
   required ZipSourceFacts facts,
 }) {
@@ -559,7 +550,8 @@ ZipResolvedMedia resolveZipCandidate({
   final embedTracks = zipEmbedTracks(
     associated: associated,
     danmaku: danmaku,
-    mode: subtitleMode,
+    embedSubtitles: embedSubtitles,
+    externalSubtitles: externalSubtitles,
     includeDanmaku: includeDanmaku,
   );
   final thumbnail = item.thumbnailPath?.trim() ?? '';
@@ -581,11 +573,8 @@ ZipResolvedMedia resolveZipCandidate({
     '$stem$extension',
   );
   final sidecarTracks = <ZipSubtitleTrack>[
-    if (subtitleMode == ZipSubtitleMode.external) ...associated,
-    if (includeDanmaku &&
-        danmaku != null &&
-        subtitleMode == ZipSubtitleMode.external)
-      danmaku,
+    if (externalSubtitles) ...associated,
+    if (includeDanmaku && danmaku != null && externalSubtitles) danmaku,
   ];
   return ZipResolvedMedia(
     title: stem,

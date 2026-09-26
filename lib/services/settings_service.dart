@@ -10,6 +10,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../models/folder_placeholder_style.dart';
+import '../models/import_card_placement.dart';
 import '../models/media_library_root_entry.dart';
 import '../models/media_library_continue_policy.dart';
 import '../models/subtitle_copy_format.dart';
@@ -781,6 +782,28 @@ class SettingsService extends ChangeNotifier {
   /// This is intentionally opt-in. Import operations snapshot the value when
   /// they start so a multi-file import can never end up with mixed semantics.
   bool copyImportedMediaToPrivateStorage = false;
+
+  /// Where new import cards are placed. Default follows the folder that was
+  /// open when the import started.
+  String importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
+  String importSourceFolderNamesJson = '{}';
+  String importSourceFolderIdsJson = '{}';
+
+  ImportCardPlacement get importCardPlacementMode =>
+      ImportCardPlacementX.fromStorage(importCardPlacement);
+
+  Map<String, String> get importSourceFolderNames =>
+      ImportSourceFolders.decodeNames(importSourceFolderNamesJson);
+
+  Map<String, String> get importSourceFolderIds =>
+      ImportSourceFolders.decodeIds(importSourceFolderIdsJson);
+
+  String importSourceFolderName(ImportCardFeature feature) =>
+      importSourceFolderNames[feature.storageValue] ??
+      feature.defaultFolderName;
+
+  String? importSourceFolderId(ImportCardFeature feature) =>
+      importSourceFolderIds[feature.storageValue];
 
   /// When true, opening a video from search uses the search listing as the
   /// playback queue. Default is false so next/previous stay in the original
@@ -1589,6 +1612,25 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) =>
             service.copyImportedMediaToPrivateStorage = value,
       ),
+      _stringSetting(
+        key: 'importCardPlacement',
+        defaultValue: ImportCardPlacement.currentFolder.storageValue,
+        normalize: (value) =>
+            ImportCardPlacementX.fromStorage(value).storageValue,
+        apply: (service, value) => service.importCardPlacement = value,
+      ),
+      _stringSetting(
+        key: ImportSourceFolders.namesKey,
+        defaultValue: '{}',
+        normalize: ImportSourceFolders.normalizeNamesJson,
+        apply: (service, value) => service.importSourceFolderNamesJson = value,
+      ),
+      _stringSetting(
+        key: ImportSourceFolders.idsKey,
+        defaultValue: '{}',
+        normalize: ImportSourceFolders.normalizeIdsJson,
+        apply: (service, value) => service.importSourceFolderIdsJson = value,
+      ),
       _boolSetting(
         key: 'useSearchResultsAsPlaybackQueue',
         defaultValue: false,
@@ -2107,6 +2149,9 @@ class SettingsService extends ChangeNotifier {
     mediaLibraryContinueSeriousOnly = false;
     continueWatchPolicy = ContinueWatchPolicy.defaults;
     clipboardLastHandledText = null;
+    importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
+    importSourceFolderNamesJson = '{}';
+    importSourceFolderIdsJson = '{}';
   }
 
   void _loadClipboardLastHandledText() {
@@ -3478,6 +3523,9 @@ class SettingsService extends ChangeNotifier {
         'mediaListCoverOffset': mediaListCoverOffset,
         'folderPlaceholderSettings': folderPlaceholderSettings.toJson(),
         'copyImportedMediaToPrivateStorage': copyImportedMediaToPrivateStorage,
+        'importCardPlacement': importCardPlacement,
+        'importSourceFolderNames': importSourceFolderNames,
+        'importSourceFolderIds': importSourceFolderIds,
         'useSearchResultsAsPlaybackQueue': useSearchResultsAsPlaybackQueue,
         'bilibiliBackgroundAudioOnly': bilibiliBackgroundAudioOnly,
         'skipRepeatedClipboardText': skipRepeatedClipboardText,

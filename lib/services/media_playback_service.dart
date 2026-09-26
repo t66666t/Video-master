@@ -1546,10 +1546,43 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   /// Online Bilibili restore only needs library metadata for Mini chrome.
-  /// Native prepare / playurl waits until the user actually presses play.
+  /// The native player is warmed afterwards without blocking that chrome.
   @visibleForTesting
   static bool shouldPrepareNativePlayerOnRestore(VideoItem item) {
     return item.sourceRef?.kind != MediaSourceKind.bilibiliStream;
+  }
+
+  /// Opens a restored online item in the background, paused at [position].
+  ///
+  /// Mini chrome is already on screen. Doing this work at launch means opening
+  /// the card does not wait on playurl, TLS and a cold decoder. Failure leaves
+  /// the bookmark in place so the card can retry.
+  Future<void> warmRestoredOnlinePlayback(VideoItem item, Duration position) {
+    if (item.sourceRef?.kind != MediaSourceKind.bilibiliStream) {
+      return Future<void>.value();
+    }
+    if (_currentItem?.id != item.id || _controller != null) {
+      return Future<void>.value();
+    }
+    return play(
+      item,
+      startPosition: position,
+      autoPlay: false,
+      userInitiatedWatch: false,
+      keepBookmarkOnFailure: true,
+    );
+  }
+
+  /// A Mini-card open must not start a second play while restore is already
+  /// preparing this item. That second call cancels the in-flight open and can
+  /// drop the saved position.
+  @visibleForTesting
+  static bool shouldStartPlayWhenOpeningMiniSession({
+    required bool hasController,
+    required PlaybackState state,
+  }) {
+    if (hasController) return false;
+    return state != PlaybackState.loading;
   }
 
   void _transitionPlaybackSession(
@@ -3753,6 +3786,7 @@ class MediaPlaybackService extends ChangeNotifier {
     bool autoPlay = true,
     bool forceRecreate = false,
     bool userInitiatedWatch = true,
+    bool keepBookmarkOnFailure = false,
   }) async {
     _streamQualitySwitchRequestId++;
     _isSwitchingStreamQuality = false;
@@ -4073,7 +4107,12 @@ class MediaPlaybackService extends ChangeNotifier {
           if (streaming == null) {
             throw StateError('Bilibili streaming service is not initialized');
           }
-          return (materialized: null, online: await streaming.prepare(item));
+          final playback = await streaming.prepare(item);
+          // Handshake with the CDN while the player is still being built.
+          // This does not write the track cache and does not change the
+          // resume position applied later by start= / seek.
+          streaming.primeCdnConnections(playback);
+          return (materialized: null, online: playback);
         }();
       }
 
@@ -4168,6 +4207,12 @@ class MediaPlaybackService extends ChangeNotifier {
         } else {
           _playlistManager!.loadFolderPlaylist(item.parentId, item.id);
         }
+      }
+      if (isBilibiliStream) {
+        // Overlap the neighbor playurl with this episode's open. Do not
+        // retain yet: this play() may still be adopting a warm session, and
+        // retain would release it out from under prepare().
+        _prefetchNeighborBilibiliStreams(replaceStale: false);
       }
 
       // 重置预加载触发标志（新视频开始时重新计数）
@@ -4470,6 +4515,9 @@ class MediaPlaybackService extends ChangeNotifier {
       if (isBilibiliStream &&
           requestMaterializedLease == null &&
           preparedStream != null) {
+        _bilibiliStreamingService?.primeCdnConnections(preparedStream);
+        // prepare() has adopted the warm session, so stale neighbors can go.
+        _prefetchNeighborBilibiliStreams();
         // Same Player as the playback page. Background audio-only deselects
         // video after open; otherwise Mini/notification keep decoding video so
         // a later page entry mounts the live picture without re-enabling vid.
@@ -4886,15 +4934,28 @@ class MediaPlaybackService extends ChangeNotifier {
           !await File(item.path).exists();
       _isSourceMissing = sourceMissing;
       if (sourceMissing) _playlistManager?.reloadPlaylist();
-      _state = sourceMissing ? PlaybackState.paused : PlaybackState.error;
-      _transitionPlaybackSession(
-        sessionGeneration,
-        sourceMissing
-            ? PlaybackSessionPhase.missing
-            : PlaybackSessionPhase.failed,
-        desiredPlaying: false,
-        error: sourceMissing ? null : e.toString(),
-      );
+      if (keepBookmarkOnFailure && !sourceMissing) {
+        // Speculative restore failed. Leave the Mini bookmark paused at the
+        // saved position so a later tap can retry, instead of hiding the card
+        // behind an error or reopening the file at t=0.
+        _state = PlaybackState.paused;
+        _setDesiredPlaying(false);
+        _transitionPlaybackSession(
+          sessionGeneration,
+          PlaybackSessionPhase.resolving,
+          desiredPlaying: false,
+        );
+      } else {
+        _state = sourceMissing ? PlaybackState.paused : PlaybackState.error;
+        _transitionPlaybackSession(
+          sessionGeneration,
+          sourceMissing
+              ? PlaybackSessionPhase.missing
+              : PlaybackSessionPhase.failed,
+          desiredPlaying: false,
+          error: sourceMissing ? null : e.toString(),
+        );
+      }
       _syncWakelockWithState();
       notifyListeners();
       if (sourceMissing) {
@@ -5644,8 +5705,7 @@ class MediaPlaybackService extends ChangeNotifier {
     _pendingSeekRequestId = requestId;
     // Seek-hold waits for the native clock to move. A paused subtitle hop
     // never does, so arming it only flashes a spinner over a still frame.
-    if (isCurrentItemStreamingBilibiliCard &&
-        _state == PlaybackState.playing) {
+    if (isCurrentItemStreamingBilibiliCard && _state == PlaybackState.playing) {
       _armSeekHoldOverlay();
     }
     final awaitAck = SubtitleHopSeekPolicy.shouldAwaitNativeSeekAck(
@@ -6857,14 +6917,20 @@ class MediaPlaybackService extends ChangeNotifier {
 
   /// Spotify/YouTube/Bilibili prefetch the adjacent episode's playurl so a
   /// notification skip is a player open, not an API round-trip.
-  void _prefetchNeighborBilibiliStreams() {
+  ///
+  /// [replaceStale] drops warm sessions that are no longer neighbors. The
+  /// call that runs before the current prepare() finishes must pass false:
+  /// retaining then would release the session this switch is about to play.
+  void _prefetchNeighborBilibiliStreams({bool replaceStale = true}) {
     final streaming = _bilibiliStreamingService;
     if (streaming == null) return;
     final neighbors = <VideoItem>[
       if (nextPlayableItem != null) nextPlayableItem!,
       if (previousPlayableItem != null) previousPlayableItem!,
     ].where((item) => item.sourceRef?.kind == MediaSourceKind.bilibiliStream);
-    streaming.retainWarmPlaybacks({for (final item in neighbors) item.id});
+    if (replaceStale) {
+      streaming.retainWarmPlaybacks({for (final item in neighbors) item.id});
+    }
     for (final item in neighbors) {
       unawaited(streaming.prefetch(item));
     }
@@ -7145,6 +7211,13 @@ class MediaPlaybackService extends ChangeNotifier {
     _bilibiliAudioPrimaryPlayer = false;
     _requestedBilibiliVideoTrackEnabled = null;
     _bilibiliVideoTrackPolicyRevision++;
+    // Drop the previous episode's CDN sockets before native dispose. Waiting
+    // for libmpv to tear down left those downloads holding the connection
+    // pool, so the next episode's first Range sat behind them.
+    final gatewayRelease = bilibiliPlayback == null
+        ? Future<void>.value()
+        : (_bilibiliStreamingService?.releasePlayback(bilibiliPlayback) ??
+              Future<void>.value());
     if (controller != null) {
       _invalidatePlaybackSpeedCommands();
       _logPlaybackEvent(
@@ -7166,11 +7239,13 @@ class MediaPlaybackService extends ChangeNotifier {
           disposeController: shouldDisposeController,
           pauseIfPlaying: true,
         );
+        await gatewayRelease;
         await _releasePlaybackResources(
           materializedLease: materializedLease,
           bilibiliPlayback: bilibiliPlayback,
         );
       } else {
+        unawaited(gatewayRelease);
         // play() 路径：非阻塞释放，不等待 pause/dispose 完成
         // listener 移除是同步的，防止后台 dispose 触发回调
         try {
@@ -7219,6 +7294,7 @@ class MediaPlaybackService extends ChangeNotifier {
         }
       }
     } else {
+      await gatewayRelease;
       await _releasePlaybackResources(
         materializedLease: materializedLease,
         bilibiliPlayback: bilibiliPlayback,

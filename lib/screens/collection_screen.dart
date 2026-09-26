@@ -241,7 +241,12 @@ class _CollectionScreenState extends State<CollectionScreen>
   }
 
   void _openPortableTransfer() {
-    unawaited(PortableTransferNavigation.open(context));
+    unawaited(
+      PortableTransferNavigation.open(
+        context,
+        libraryFolderId: widget.collectionId,
+      ),
+    );
   }
 
   Route<void> _buildDirectoryLocationRoute(Widget page) {
@@ -1194,7 +1199,10 @@ class _CollectionScreenState extends State<CollectionScreen>
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.openYtDlpDownload:
         if (_isSelectionMode) return KeyEventResult.handled;
-        VideoActionButtons.openYtDlpDownloadPage(context);
+        VideoActionButtons.openYtDlpDownloadPage(
+          context,
+          collectionId: widget.collectionId,
+        );
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.openBatchSubtitle:
         if (_isSelectionMode) return KeyEventResult.handled;

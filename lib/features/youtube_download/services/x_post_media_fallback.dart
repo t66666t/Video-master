@@ -28,23 +28,48 @@ class XPostMediaFallback {
       return false;
     }
     final text = error.toString().toLowerCase();
-    return text.contains('no video could be found') ||
-        text.contains('no video formats') ||
-        text.contains('没有可用格式');
+    return !text.contains('cancelled') && !text.contains('interrupted');
   }
 
-  static Future<Map<String, dynamic>?> fetchInfo(String pageUrl) async {
+  static Future<Map<String, dynamic>?> fetchInfo(
+    String pageUrl, {
+    String? proxy,
+  }) async {
     final statusId = statusIdFromUrl(pageUrl);
     if (statusId == null) {
       return null;
     }
+    const hosts = <String>['api.fxtwitter.com', 'api.fixupx.com'];
+    for (final host in hosts) {
+      final info = await _fetchFromHost(host, statusId, pageUrl, proxy);
+      if (info != null) {
+        return info;
+      }
+    }
+    return null;
+  }
+
+  static Future<Map<String, dynamic>?> _fetchFromHost(
+    String host,
+    String statusId,
+    String pageUrl,
+    String? proxy,
+  ) async {
     final client = HttpClient();
     client.connectionTimeout = const Duration(seconds: 20);
+    final proxyConfig = _proxyDirective(proxy);
+    if (proxyConfig != null) {
+      client.findProxy = (uri) => proxyConfig;
+    }
     try {
       final request = await client
-          .getUrl(Uri.https('api.fxtwitter.com', '/status/$statusId'))
+          .getUrl(Uri.https(host, '/status/$statusId'))
           .timeout(const Duration(seconds: 20));
-      request.headers.set(HttpHeaders.userAgentHeader, 'Mozilla/5.0');
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        'Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+      );
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       final response = await request.close().timeout(
         const Duration(seconds: 20),
@@ -68,6 +93,20 @@ class XPostMediaFallback {
     } finally {
       client.close(force: true);
     }
+  }
+
+  static String? _proxyDirective(String? proxy) {
+    final raw = proxy?.trim() ?? '';
+    if (raw.isEmpty) {
+      return null;
+    }
+    final withScheme = raw.contains('://') ? raw : 'http://$raw';
+    final uri = Uri.tryParse(withScheme);
+    if (uri == null || uri.host.isEmpty) {
+      return null;
+    }
+    final port = uri.hasPort ? uri.port : 80;
+    return 'PROXY ${uri.host}:$port';
   }
 
   static Map<String, dynamic>? infoFromPayload(

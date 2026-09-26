@@ -1,5 +1,6 @@
-import 'dart:io';
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -309,23 +310,25 @@ void main() {
     expect(api.fetchPlayUrlCalls, 1);
   });
 
-  test('prefetch warms a session that prepare consumes without a second playurl',
-      () async {
-    SharedPreferences.setMockInitialValues({});
-    final api = _CountingFakeBilibiliApiService();
-    final service = BilibiliStreamingService(api);
-    addTearDown(service.shutdown);
-    final item = _streamItem('warm-neighbor');
+  test(
+    'prefetch warms a session that prepare consumes without a second playurl',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final api = _CountingFakeBilibiliApiService();
+      final service = BilibiliStreamingService(api);
+      addTearDown(service.shutdown);
+      final item = _streamItem('warm-neighbor');
 
-    await service.prefetch(item);
-    expect(api.fetchPlayUrlCalls, 1);
-    expect(service.activePlaybackSessionCount, 1);
+      await service.prefetch(item);
+      expect(api.fetchPlayUrlCalls, 1);
+      expect(service.activePlaybackSessionCount, 1);
 
-    final prepared = await service.prepare(item);
-    expect(prepared.audioUri.path, contains('/audio'));
-    expect(api.fetchPlayUrlCalls, 1);
-    expect(service.activePlaybackSessionCount, 1);
-  });
+      final prepared = await service.prepare(item);
+      expect(prepared.audioUri.path, contains('/audio'));
+      expect(api.fetchPlayUrlCalls, 1);
+      expect(service.activePlaybackSessionCount, 1);
+    },
+  );
 
   test(
     'missing preferred quality falls back to the highest lower quality',
@@ -587,8 +590,10 @@ void main() {
     final warm = await client.getUrl(prepared.videoUri);
     warm.headers.set(HttpHeaders.rangeHeader, 'bytes=32-1023');
     final warmResponse = await warm.close();
-    expect(await warmResponse.fold<List<int>>(<int>[], (b, c) => b..addAll(c)),
-        videoBytes.sublist(32, 1024));
+    expect(
+      await warmResponse.fold<List<int>>(<int>[], (b, c) => b..addAll(c)),
+      videoBytes.sublist(32, 1024),
+    );
     expect(videoRangeGets, 1);
     await first.shutdown();
 
@@ -613,4 +618,144 @@ void main() {
     expect(replayPayload, videoBytes.sublist(100, 501));
     expect(videoRangeGets, 1);
   });
+
+  test('player disconnect stops the CDN body before the file ends', () async {
+    final videoBytes = List<int>.generate(1024 * 1024, (index) => index % 251);
+    final upstream = await _slowUpstream(videoBytes, onSent: (_) {});
+    addTearDown(() => upstream.close(force: true));
+    final service = await _gatewayService(upstream);
+    addTearDown(service.shutdown);
+    final prepared = await service.prepare(_streamItem('abort-on-disconnect'));
+    final client = HttpClient();
+    addTearDown(() => client.close(force: true));
+
+    final request = await client.getUrl(prepared.videoUri);
+    request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+    final response = await request.close();
+    final subscription = response.listen((_) {});
+    final started = DateTime.now();
+    while (service.relayedBodyBytes == 0 &&
+        DateTime.now().difference(started) < const Duration(seconds: 2)) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    expect(service.relayedBodyBytes, greaterThan(0));
+    await subscription.cancel();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    final afterCancel = service.relayedBodyBytes;
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+
+    expect(service.relayedBodyBytes, lessThan(videoBytes.length));
+    expect(service.relayedBodyBytes - afterCancel, lessThan(64 * 1024));
+
+    final retry = await client.getUrl(prepared.videoUri);
+    retry.headers.set(HttpHeaders.rangeHeader, 'bytes=100-115');
+    final retryResponse = await retry.close();
+    final retryPayload = await retryResponse.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    expect(retryResponse.statusCode, HttpStatus.partialContent);
+    expect(retryPayload, videoBytes.sublist(100, 116));
+  });
+
+  test(
+    'releasing the session stops the CDN body while the player socket is open',
+    () async {
+      final videoBytes = List<int>.generate(
+        1024 * 1024,
+        (index) => index % 251,
+      );
+      final upstream = await _slowUpstream(videoBytes, onSent: (_) {});
+      addTearDown(() => upstream.close(force: true));
+      final service = await _gatewayService(upstream);
+      addTearDown(service.shutdown);
+      final prepared = await service.prepare(_streamItem('abort-on-release'));
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+
+      final request = await client.getUrl(prepared.videoUri);
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-');
+      final response = await request.close();
+      final subscription = response.listen((_) {});
+      addTearDown(subscription.cancel);
+      final started = DateTime.now();
+      while (service.relayedBodyBytes == 0 &&
+          DateTime.now().difference(started) < const Duration(seconds: 2)) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(service.relayedBodyBytes, greaterThan(0));
+
+      await service
+          .releasePlayback(prepared)
+          .timeout(const Duration(seconds: 2));
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      final afterRelease = service.relayedBodyBytes;
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(service.relayedBodyBytes, lessThan(videoBytes.length));
+      expect(service.relayedBodyBytes - afterRelease, lessThan(64 * 1024));
+    },
+  );
+}
+
+Future<HttpServer> _slowUpstream(
+  List<int> videoBytes, {
+  required void Function(int sent) onSent,
+}) async {
+  final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  unawaited(() async {
+    await for (final request in upstream) {
+      final range = request.headers.value(HttpHeaders.rangeHeader);
+      var start = 0;
+      var end = videoBytes.length - 1;
+      if (range != null) {
+        final match = RegExp(r'^bytes=(\d+)-(\d*)$').firstMatch(range);
+        if (match != null) {
+          start = int.parse(match.group(1)!);
+          if (match.group(2)!.isNotEmpty) {
+            end = int.parse(match.group(2)!);
+          }
+          end = end.clamp(start, videoBytes.length - 1);
+          request.response.statusCode = HttpStatus.partialContent;
+          request.response.headers.set(
+            HttpHeaders.contentRangeHeader,
+            'bytes $start-$end/${videoBytes.length}',
+          );
+        }
+      }
+      final selected = videoBytes.sublist(start, end + 1);
+      request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+      request.response.contentLength = selected.length;
+      try {
+        const chunkSize = 8 * 1024;
+        for (var offset = 0; offset < selected.length; offset += chunkSize) {
+          final chunkEnd = (offset + chunkSize).clamp(0, selected.length);
+          request.response.add(selected.sublist(offset, chunkEnd));
+          await request.response.flush();
+          onSent(start + chunkEnd);
+          if (selected.length > chunkSize) {
+            await Future<void>.delayed(const Duration(milliseconds: 8));
+          }
+        }
+        await request.response.close();
+      } catch (_) {}
+    }
+  }());
+  return upstream;
+}
+
+Future<BilibiliStreamingService> _gatewayService(HttpServer upstream) async {
+  final tempCache = await Directory.systemTemp.createTemp(
+    'bilibili-stream-abort-',
+  );
+  addTearDown(() => tempCache.delete(recursive: true));
+  final origin = Uri(
+    scheme: 'http',
+    host: InternetAddress.loopbackIPv4.address,
+    port: upstream.port,
+  );
+  return BilibiliStreamingService(
+    _FakeBilibiliApiService(mediaOrigin: origin),
+    mediaUriValidator: (uri) => uri.host == origin.host,
+    cacheDirectory: tempCache,
+  );
 }

@@ -114,17 +114,22 @@ class VideoActionButtons extends StatefulWidget {
           initialStreamingMode: streamingMode,
         ),
         settings: RouteSettings(
-          name: streamingMode ? '/bilibili_stream_import' : '/bilibili_download',
+          name: streamingMode
+              ? '/bilibili_stream_import'
+              : '/bilibili_download',
         ),
       ),
     );
   }
 
-  static void openYtDlpDownloadPage(BuildContext context) {
+  static void openYtDlpDownloadPage(
+    BuildContext context, {
+    String? collectionId,
+  }) {
     Navigator.push(
       context,
       AppMaterialPageRoute(
-        builder: (_) => const YtDlpDownloadScreen(),
+        builder: (_) => YtDlpDownloadScreen(targetFolderId: collectionId),
         settings: const RouteSettings(name: '/yt_dlp_download'),
       ),
     );
@@ -285,6 +290,7 @@ class VideoActionButtons extends StatefulWidget {
     if (await PortableTransferNavigation.handleDroppedPaths(
       context,
       normalizedPaths,
+      libraryFolderId: collectionId,
     )) {
       return;
     }
@@ -422,7 +428,11 @@ class VideoActionButtons extends StatefulWidget {
         );
         return;
       }
-      await PortableTransferNavigation.openAndImportPackages(context, sources);
+      await PortableTransferNavigation.openAndImportPackages(
+        context,
+        sources,
+        libraryFolderId: collectionId,
+      );
       return;
     }
 
@@ -470,8 +480,7 @@ class VideoActionButtons extends StatefulWidget {
     for (final item in items) {
       final displayName = item['displayName']?.toString().trim();
       final rawPath = item['path']?.toString().trim() ?? '';
-      final owned =
-          item['ownedTemporaryCopy'] == true || item['owned'] == true;
+      final owned = item['ownedTemporaryCopy'] == true || item['owned'] == true;
       if (rawPath.isNotEmpty && await File(rawPath).exists()) {
         addSource(
           PortableImportSource(
@@ -489,10 +498,7 @@ class VideoActionButtons extends StatefulWidget {
       try {
         final materialized = await _fileManagerChannel.invokeMethod<String>(
           'materializeFluentPackForImport',
-          {
-            'uri': uri,
-            'displayName': displayName ?? 'package.fluentpack',
-          },
+          {'uri': uri, 'displayName': displayName ?? 'package.fluentpack'},
         );
         if (materialized == null || materialized.isEmpty) continue;
         addSource(
@@ -839,154 +845,154 @@ class VideoActionButtons extends StatefulWidget {
       return await showDialog<_StructuredImportDialogAction>(
         context: context,
         useRootNavigator: true,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setState) {
-            Future<void> updateSortSetting({
-              String? field,
-              String? direction,
-            }) async {
-              if (field != null && direction != null) {
-                await settings.saveStructuredImportSort(
-                  field: field,
-                  direction: direction,
-                );
-              } else if (field != null) {
-                await settings.saveStructuredImportSortField(field);
-              } else if (direction != null) {
-                await settings.saveStructuredImportSortDirection(direction);
-              } else {
-                return;
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setState) {
+              Future<void> updateSortSetting({
+                String? field,
+                String? direction,
+              }) async {
+                if (field != null && direction != null) {
+                  await settings.saveStructuredImportSort(
+                    field: field,
+                    direction: direction,
+                  );
+                } else if (field != null) {
+                  await settings.saveStructuredImportSortField(field);
+                } else if (direction != null) {
+                  await settings.saveStructuredImportSortDirection(direction);
+                } else {
+                  return;
+                }
+                if (!dialogContext.mounted) {
+                  return;
+                }
+                setState(() {
+                  sortField = field ?? sortField;
+                  sortDirection = direction ?? sortDirection;
+                });
               }
-              if (!dialogContext.mounted) {
-                return;
-              }
-              setState(() {
-                sortField = field ?? sortField;
-                sortDirection = direction ?? sortDirection;
-              });
-            }
 
-            return AlertDialog(
-              title: Text(summary.isArchive ? '确认导入压缩包' : '确认导入文件夹'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('名称：${summary.sourceName}'),
-                    const SizedBox(height: 8),
-                    Text(
-                      summary.isArchive
-                          ? '导入后外层文件夹名称：${summary.rootCollectionName}'
-                          : '最外层文件夹名称：${summary.rootCollectionName}',
-                    ),
-                    const SizedBox(height: 8),
-                    Text('位置：${summary.sourcePath}'),
-                    const SizedBox(height: 12),
-                    if (summary.detailsDeferred)
-                      const Text(
-                        '压缩包将在点击“直接导入”后再解析与解压，当前不会触发解压操作。',
-                        style: TextStyle(fontSize: 12, color: Colors.white70),
-                      )
-                    else
+              return AlertDialog(
+                title: Text(summary.isArchive ? '确认导入压缩包' : '确认导入文件夹'),
+                content: SizedBox(
+                  width: 420,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('名称：${summary.sourceName}'),
+                      const SizedBox(height: 8),
                       Text(
-                        '检测到 ${summary.folderCount} 个文件夹，${summary.mediaFileCount} 个可导入媒体文件。',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white70,
-                        ),
+                        summary.isArchive
+                            ? '导入后外层文件夹名称：${summary.rootCollectionName}'
+                            : '最外层文件夹名称：${summary.rootCollectionName}',
                       ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      '导入顺序',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      initialValue: sortField,
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'fileName',
-                          child: Text('按文件名排序'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'modifiedTime',
-                          child: Text('按修改时间排序'),
-                        ),
-                      ],
-                      onChanged: (value) {
-                        if (value == null) return;
-                        updateSortSetting(field: value);
-                      },
-                      decoration: const InputDecoration(labelText: '排序方式'),
-                    ),
-                    const SizedBox(height: 8),
-                    DropdownButtonFormField<String>(
-                      initialValue: sortDirection,
-                      items: [
-                        DropdownMenuItem(
-                          value: 'ascending',
-                          child: Text(
-                            sortField == 'modifiedTime' ? '从旧到新' : '正序',
+                      const SizedBox(height: 8),
+                      Text('位置：${summary.sourcePath}'),
+                      const SizedBox(height: 12),
+                      if (summary.detailsDeferred)
+                        const Text(
+                          '压缩包将在点击“直接导入”后再解析与解压，当前不会触发解压操作。',
+                          style: TextStyle(fontSize: 12, color: Colors.white70),
+                        )
+                      else
+                        Text(
+                          '检测到 ${summary.folderCount} 个文件夹，${summary.mediaFileCount} 个可导入媒体文件。',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
                           ),
                         ),
-                        DropdownMenuItem(
-                          value: 'descending',
-                          child: Text(
-                            sortField == 'modifiedTime' ? '从新到旧' : '倒序',
+                      const SizedBox(height: 16),
+                      const Text(
+                        '导入顺序',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButtonFormField<String>(
+                        initialValue: sortField,
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'fileName',
+                            child: Text('按文件名排序'),
                           ),
-                        ),
-                      ],
-                      onChanged: (value) {
-                        if (value == null) return;
-                        updateSortSetting(direction: value);
-                      },
-                      decoration: const InputDecoration(labelText: '顺序方向'),
-                    ),
-                    const SizedBox(height: 10),
-                    const Text(
-                      '以上排序会永久保存，下次导入时会自动沿用。',
-                      style: TextStyle(fontSize: 12, color: Colors.white70),
-                    ),
-                  ],
+                          DropdownMenuItem(
+                            value: 'modifiedTime',
+                            child: Text('按修改时间排序'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          updateSortSetting(field: value);
+                        },
+                        decoration: const InputDecoration(labelText: '排序方式'),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButtonFormField<String>(
+                        initialValue: sortDirection,
+                        items: [
+                          DropdownMenuItem(
+                            value: 'ascending',
+                            child: Text(
+                              sortField == 'modifiedTime' ? '从旧到新' : '正序',
+                            ),
+                          ),
+                          DropdownMenuItem(
+                            value: 'descending',
+                            child: Text(
+                              sortField == 'modifiedTime' ? '从新到旧' : '倒序',
+                            ),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          updateSortSetting(direction: value);
+                        },
+                        decoration: const InputDecoration(labelText: '顺序方向'),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        '以上排序会永久保存，下次导入时会自动沿用。',
+                        style: TextStyle(fontSize: 12, color: Colors.white70),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(
-                      dialogContext,
-                      _StructuredImportDialogAction.cancel,
-                    );
-                  },
-                  child: const Text('取消导入'),
-                ),
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(
-                      dialogContext,
-                      _StructuredImportDialogAction.preview,
-                    );
-                  },
-                  child: const Text('预览'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    Navigator.pop(
-                      dialogContext,
-                      _StructuredImportDialogAction.confirm,
-                    );
-                  },
-                  child: const Text('直接导入'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(
+                        dialogContext,
+                        _StructuredImportDialogAction.cancel,
+                      );
+                    },
+                    child: const Text('取消导入'),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(
+                        dialogContext,
+                        _StructuredImportDialogAction.preview,
+                      );
+                    },
+                    child: const Text('预览'),
+                  ),
+                  FilledButton(
+                    onPressed: () {
+                      Navigator.pop(
+                        dialogContext,
+                        _StructuredImportDialogAction.confirm,
+                      );
+                    },
+                    child: const Text('直接导入'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
     } finally {
       _structuredImportDialogCount--;
     }
@@ -1303,7 +1309,8 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
             onPressed: () => Navigator.push(
               context,
               AppMaterialPageRoute(
-                builder: (_) => const YtDlpDownloadScreen(),
+                builder: (_) =>
+                    YtDlpDownloadScreen(targetFolderId: widget.collectionId),
                 settings: const RouteSettings(name: '/yt_dlp_download'),
               ),
             ),
@@ -1340,147 +1347,149 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                   : Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                          _railButton(
-                            size: buttonSize,
-                            tooltip: _fabTooltip(
-                              "批量字幕生成",
-                              DesktopMediaManagementShortcutAction
-                                  .openBatchSubtitle,
-                            ),
-                            icon: Icons.closed_caption,
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                AppMaterialPageRoute(
-                                  builder: (_) => BatchSubtitleScreen(
-                                    collectionId: widget.collectionId,
-                                  ),
-                                  settings: const RouteSettings(
-                                    name: '/batch_subtitle',
-                                  ),
-                                ),
-                              );
-                            },
+                        _railButton(
+                          size: buttonSize,
+                          tooltip: _fabTooltip(
+                            "批量字幕生成",
+                            DesktopMediaManagementShortcutAction
+                                .openBatchSubtitle,
                           ),
-                          const SizedBox(height: _buttonGap),
-                          _railButton(
-                            size: buttonSize,
-                            tooltip: _fabTooltip(
-                              "新建合集",
-                              DesktopMediaManagementShortcutAction
-                                  .createCollection,
-                            ),
-                            icon: Icons.create_new_folder,
-                            onPressed: () => showCreateCollectionDialog(
+                          icon: Icons.closed_caption,
+                          onPressed: () {
+                            Navigator.push(
                               context,
+                              AppMaterialPageRoute(
+                                builder: (_) => BatchSubtitleScreen(
+                                  collectionId: widget.collectionId,
+                                ),
+                                settings: const RouteSettings(
+                                  name: '/batch_subtitle',
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        const SizedBox(height: _buttonGap),
+                        _railButton(
+                          size: buttonSize,
+                          tooltip: _fabTooltip(
+                            "新建合集",
+                            DesktopMediaManagementShortcutAction
+                                .createCollection,
+                          ),
+                          icon: Icons.create_new_folder,
+                          onPressed: () => showCreateCollectionDialog(
+                            context,
+                            widget.collectionId,
+                          ),
+                        ),
+                        const SizedBox(height: _buttonGap),
+                        _railButton(
+                          size: buttonSize,
+                          tooltip: _fabTooltip(
+                            "导入视频或音频",
+                            DesktopMediaManagementShortcutAction.importMedia,
+                          ),
+                          icon: Icons.video_call,
+                          onPressed: () =>
+                              importVideos(context, widget.collectionId),
+                        ),
+                        const SizedBox(height: _buttonGap),
+                        _railButton(
+                          size: buttonSize,
+                          tooltip: _fabTooltip(
+                            "B站视频下载",
+                            DesktopMediaManagementShortcutAction
+                                .openBilibiliDownload,
+                          ),
+                          icon: Icons.tv,
+                          color: AppTokens.brandBilibili,
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              AppMaterialPageRoute(
+                                builder: (_) => BilibiliDownloadScreen(
+                                  targetFolderId: widget.collectionId,
+                                ),
+                                settings: const RouteSettings(
+                                  name: '/bilibili_download',
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        const SizedBox(height: _buttonGap),
+                        _railButton(
+                          size: buttonSize,
+                          tooltip: _fabTooltip(
+                            "YT-DLP 视频下载",
+                            DesktopMediaManagementShortcutAction
+                                .openYtDlpDownload,
+                          ),
+                          icon: Icons.ondemand_video,
+                          color: AppTokens.brandYtDlp,
+                          onPressed: () {
+                            Navigator.push(
+                              context,
+                              AppMaterialPageRoute(
+                                builder: (_) => YtDlpDownloadScreen(
+                                  targetFolderId: widget.collectionId,
+                                ),
+                                settings: const RouteSettings(
+                                  name: '/yt_dlp_download',
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                        const SizedBox(height: _buttonGap),
+                        Consumer<BatchImportService>(
+                          builder: (context, batch, _) {
+                            final count = batch.getPendingCount(
                               widget.collectionId,
-                            ),
-                          ),
-                          const SizedBox(height: _buttonGap),
-                          _railButton(
-                            size: buttonSize,
-                            tooltip: _fabTooltip(
-                              "导入视频或音频",
-                              DesktopMediaManagementShortcutAction.importMedia,
-                            ),
-                            icon: Icons.video_call,
-                            onPressed: () =>
-                                importVideos(context, widget.collectionId),
-                          ),
-                          const SizedBox(height: _buttonGap),
-                          _railButton(
-                            size: buttonSize,
-                            tooltip: _fabTooltip(
-                              "B站视频下载",
-                              DesktopMediaManagementShortcutAction
-                                  .openBilibiliDownload,
-                            ),
-                            icon: Icons.tv,
-                            color: AppTokens.brandBilibili,
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                AppMaterialPageRoute(
-                                  builder: (_) => BilibiliDownloadScreen(
-                                    targetFolderId: widget.collectionId,
+                            );
+                            return Stack(
+                              clipBehavior: Clip.none,
+                              alignment: Alignment.topRight,
+                              children: [
+                                _railButton(
+                                  size: buttonSize,
+                                  tooltip: _fabTooltip(
+                                    "批量导入媒体及对应字幕",
+                                    DesktopMediaManagementShortcutAction
+                                        .openBatchImport,
                                   ),
-                                  settings: const RouteSettings(
-                                    name: '/bilibili_download',
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(height: _buttonGap),
-                          _railButton(
-                            size: buttonSize,
-                            tooltip: _fabTooltip(
-                              "YT-DLP 视频下载",
-                              DesktopMediaManagementShortcutAction
-                                  .openYtDlpDownload,
-                            ),
-                            icon: Icons.ondemand_video,
-                            color: AppTokens.brandYtDlp,
-                            onPressed: () {
-                              Navigator.push(
-                                context,
-                                AppMaterialPageRoute(
-                                  builder: (_) => const YtDlpDownloadScreen(),
-                                  settings: const RouteSettings(
-                                    name: '/yt_dlp_download',
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                          const SizedBox(height: _buttonGap),
-                          Consumer<BatchImportService>(
-                            builder: (context, batch, _) {
-                              final count = batch.getPendingCount(
-                                widget.collectionId,
-                              );
-                              return Stack(
-                                clipBehavior: Clip.none,
-                                alignment: Alignment.topRight,
-                                children: [
-                                  _railButton(
-                                    size: buttonSize,
-                                    tooltip: _fabTooltip(
-                                      "批量导入媒体及对应字幕",
-                                      DesktopMediaManagementShortcutAction
-                                          .openBatchImport,
-                                    ),
-                                    icon: Icons.playlist_add,
-                                    color: AppTokens.brandBatch,
-                                    onPressed: () => Navigator.push(
-                                      context,
-                                      AppMaterialPageRoute(
-                                        builder: (_) => BatchImportScreen(
-                                          folderId: widget.collectionId,
-                                        ),
+                                  icon: Icons.playlist_add,
+                                  color: AppTokens.brandBatch,
+                                  onPressed: () => Navigator.push(
+                                    context,
+                                    AppMaterialPageRoute(
+                                      builder: (_) => BatchImportScreen(
+                                        folderId: widget.collectionId,
                                       ),
                                     ),
                                   ),
-                                  if (count > 0)
-                                    Positioned(
-                                      right: 2,
-                                      top: 2,
-                                      child: Container(
-                                        width: 8,
-                                        height: 8,
-                                        decoration: const BoxDecoration(
-                                          color: AppTokens.danger,
-                                          shape: BoxShape.circle,
-                                        ),
+                                ),
+                                if (count > 0)
+                                  Positioned(
+                                    right: 2,
+                                    top: 2,
+                                    child: Container(
+                                      width: 8,
+                                      height: 8,
+                                      decoration: const BoxDecoration(
+                                        color: AppTokens.danger,
+                                        shape: BoxShape.circle,
                                       ),
                                     ),
-                                ],
-                              );
-                            },
-                          ),
-                          const SizedBox(height: _buttonGap),
-                        ],
-                      ),
+                                  ),
+                              ],
+                            );
+                          },
+                        ),
+                        const SizedBox(height: _buttonGap),
+                      ],
+                    ),
             ),
             SizedBox(
               width: buttonSize,
@@ -1540,9 +1549,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
       waitDuration: const Duration(milliseconds: 400),
       child: Material(
         color: const Color(0xFF4A4A48),
-        shape: const CircleBorder(
-          side: BorderSide(color: Color(0x38FFFFFF)),
-        ),
+        shape: const CircleBorder(side: BorderSide(color: Color(0x38FFFFFF))),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: onPressed,
@@ -1564,7 +1571,9 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
     VideoActionButtons.openCreateCollectionDialog(context, parentId);
   }
 
-  static Future<bool> _requestStoragePermissionIfNeeded(BuildContext context) async {
+  static Future<bool> _requestStoragePermissionIfNeeded(
+    BuildContext context,
+  ) async {
     if (!Platform.isAndroid) {
       return true;
     }
@@ -1646,7 +1655,12 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
               return;
             case ImportSheetShortcutAction.fluentPack:
               Navigator.pop(sheetContext);
-              unawaited(PortableTransferNavigation.openImportTab(mainContext));
+              unawaited(
+                PortableTransferNavigation.openImportTab(
+                  mainContext,
+                  libraryFolderId: collectionId,
+                ),
+              );
               return;
           }
         }
@@ -1663,14 +1677,20 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                   ListTile(
                     leading: const Icon(Icons.photo_library),
                     title: Text(
-                      _VideoActionButtonsState.sheetTitle('从相册导入', ImportSheetShortcutAction.gallery),
+                      _VideoActionButtonsState.sheetTitle(
+                        '从相册导入',
+                        ImportSheetShortcutAction.gallery,
+                      ),
                     ),
                     onTap: () => run(ImportSheetShortcutAction.gallery),
                   ),
                 ListTile(
                   leading: const Icon(Icons.folder_open),
                   title: Text(
-                    _VideoActionButtonsState.sheetTitle('从文件管理导入', ImportSheetShortcutAction.files),
+                    _VideoActionButtonsState.sheetTitle(
+                      '从文件管理导入',
+                      ImportSheetShortcutAction.files,
+                    ),
                   ),
                   onTap: () => run(ImportSheetShortcutAction.files),
                 ),
@@ -1719,7 +1739,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                       ImportSheetShortcutAction.fluentPack,
                     ),
                   ),
-                  subtitle: const Text('打开导入页，选择 .fluentpack 便携包'),
+                  subtitle: const Text('打开导入页，选择 .fluentpack 或压缩包'),
                   onTap: () => run(ImportSheetShortcutAction.fluentPack),
                 ),
               ],
@@ -2232,10 +2252,7 @@ class _ArchiveSelection {
 /// Owns hardware-keyboard listeners for the import bottom sheet so keys still
 /// fire when Focus is lost or an attached phone keyboard bypasses Focus.
 class _ImportSheetShortcutHost extends StatefulWidget {
-  const _ImportSheetShortcutHost({
-    required this.onAction,
-    required this.child,
-  });
+  const _ImportSheetShortcutHost({required this.onAction, required this.child});
 
   final void Function(ImportSheetShortcutAction action) onAction;
   final Widget child;
@@ -2300,8 +2317,9 @@ class _ImportSheetShortcutHostState extends State<_ImportSheetShortcutHost> {
     final bool hasBlockingModifier =
         hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
     if (hasBlockingModifier) return KeyEventResult.ignored;
-    final ImportSheetShortcutAction? action =
-        ImportSheetShortcuts.matchAction(event.logicalKey);
+    final ImportSheetShortcutAction? action = ImportSheetShortcuts.matchAction(
+      event.logicalKey,
+    );
     if (action == null) return KeyEventResult.ignored;
     widget.onAction(action);
     return KeyEventResult.handled;

@@ -48,13 +48,15 @@ enum PortableIncomingFileKind { fluentpack, media, archive, folder, other }
 class PortableTransferNavigation {
   static const routeName = '/portable_transfer';
 
-  static final Map<String, DateTime> _recentLaunchSignatures = <String, DateTime>{};
+  static final Map<String, DateTime> _recentLaunchSignatures =
+      <String, DateTime>{};
 
   static Future<void> open(
     BuildContext context, {
     PortableTransferKind initialTab = PortableTransferKind.export,
     List<PortableImportSource>? pendingImportSources,
     List<String>? pendingExportRootIds,
+    String? libraryFolderId,
   }) async {
     final navigator = _navigator(context);
     if (navigator == null) return;
@@ -78,6 +80,7 @@ class PortableTransferNavigation {
           initialTab: initialTab,
           pendingImportSources: pendingImportSources,
           pendingExportRootIds: pendingExportRootIds,
+          libraryFolderId: libraryFolderId,
         ),
         settings: const RouteSettings(name: routeName),
       ),
@@ -85,14 +88,22 @@ class PortableTransferNavigation {
     );
   }
 
-  static Future<void> openImportTab(BuildContext context) {
-    return open(context, initialTab: PortableTransferKind.import);
+  static Future<void> openImportTab(
+    BuildContext context, {
+    String? libraryFolderId,
+  }) {
+    return open(
+      context,
+      initialTab: PortableTransferKind.import,
+      libraryFolderId: libraryFolderId,
+    );
   }
 
   static Future<void> openAndImportPackages(
     BuildContext context,
-    List<PortableImportSource> sources,
-  ) {
+    List<PortableImportSource> sources, {
+    String? libraryFolderId,
+  }) {
     final valid = sources
         .where((source) => source.path.trim().isNotEmpty)
         .toList(growable: false);
@@ -101,6 +112,7 @@ class PortableTransferNavigation {
       context,
       initialTab: PortableTransferKind.import,
       pendingImportSources: valid,
+      libraryFolderId: libraryFolderId,
     );
   }
 
@@ -125,8 +137,9 @@ class PortableTransferNavigation {
   /// both fire; [openAndImportPackages] dedupes the actual navigation.
   static Future<bool> handleDroppedPaths(
     BuildContext context,
-    List<String> paths,
-  ) async {
+    List<String> paths, {
+    String? libraryFolderId,
+  }) async {
     final fluentpackPaths = <String>[];
     var hasOtherSupported = false;
 
@@ -164,7 +177,10 @@ class PortableTransferNavigation {
 
     await openAndImportPackages(
       context,
-      fluentpackPaths.map(PortableImportSource.fromPath).toList(growable: false),
+      fluentpackPaths
+          .map(PortableImportSource.fromPath)
+          .toList(growable: false),
+      libraryFolderId: libraryFolderId,
     );
     return true;
   }

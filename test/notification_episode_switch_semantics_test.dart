@@ -241,21 +241,34 @@ void main() {
     },
   );
 
-  test('notification entry resets to library and forces portrait playback', () {
-    final source = read('lib/services/playback_navigation_service.dart');
-    final open = method(
-      source,
-      'Future<void> _openPlaybackInternal(',
-      'Future<NavigatorState?> _waitForNavigator()',
-    );
-    expect(open, contains('trackedRoutes.skip(1)'));
-    expect(open, contains('? buildPortraitRoute(item)'));
-    expect(open, contains(': buildPlaybackEntryRoute(item)'));
-    expect(
-      open.indexOf('trackedRoutes.skip(1)'),
-      lessThan(open.indexOf('navigator.push(route)')),
-    );
-  });
+  test(
+    'notification entry resets to library and honors skip-portrait',
+    () {
+      final source = read('lib/services/playback_navigation_service.dart');
+      final open = method(
+        source,
+        'Future<void> _openPlaybackInternal(',
+        'Future<NavigatorState?> _waitForNavigator()',
+      );
+      expect(open, contains('trackedRoutes.skip(1)'));
+      expect(open, contains('? buildNotificationPlaybackRoute(item)'));
+      expect(open, contains(': buildPlaybackEntryRoute(item)'));
+      expect(open, contains('entrySkipsPortraitPlayer'));
+      expect(
+        open.indexOf('trackedRoutes.skip(1)'),
+        lessThan(open.indexOf('navigator.push(route)')),
+      );
+
+      final notificationRoute = method(
+        source,
+        'Route<void> buildNotificationPlaybackRoute(',
+        '/// 桌面端以及开启"跳过竖屏播放页"的移动端',
+      );
+      expect(notificationRoute, contains('if (entrySkipsPortraitPlayer)'));
+      expect(notificationRoute, contains('VideoPlayerScreen(videoItem: item)'));
+      expect(notificationRoute, contains('return buildPortraitRoute(item);'));
+    },
+  );
 
   test('paused-notification priming starts the Android foreground service', () {
     final source = read('lib/services/system_media_session_service.dart');

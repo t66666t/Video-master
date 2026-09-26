@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.Locale
+import java.util.UUID
 import kotlin.concurrent.thread
 import org.json.JSONArray
 import org.json.JSONObject
@@ -41,6 +42,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         MEDIA,
         ARCHIVE,
         FLUENT_PACK,
+        IMPORT_FILE,
     }
 
     private val YTDLP_BEFORE_DL_MARKER = "__YTDLP_BEFORE_DL__:"
@@ -139,6 +141,15 @@ class MainActivity : AudioServiceFragmentActivity() {
                         ),
                         false,
                     )
+                }
+                "pickImportFile" -> {
+                    if (pendingResult != null) {
+                        result.error("PICKER_ACTIVE", "File picker is already active", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingResult = result
+                    pendingPickerMode = PickerMode.IMPORT_FILE
+                    openSystemFilePicker(listOf("*/*"), false)
                 }
                 "materializeArchiveForImport" -> {
                     val uriString = call.argument<String>("uri")
@@ -427,7 +438,7 @@ class MainActivity : AudioServiceFragmentActivity() {
         if (result == null) return
         if (resultCode != Activity.RESULT_OK || data == null) {
             when (pickerMode) {
-                PickerMode.ARCHIVE, PickerMode.FLUENT_PACK -> result.success(null)
+                PickerMode.ARCHIVE, PickerMode.FLUENT_PACK, PickerMode.IMPORT_FILE -> result.success(null)
                 else -> result.success(emptyList<String>())
             }
             return
@@ -475,6 +486,28 @@ class MainActivity : AudioServiceFragmentActivity() {
                     result.error(
                         "INVALID_FLUENTPACK_SELECTION",
                         e.message ?: "请选择 .fluentpack 文件",
+                        null,
+                    )
+                }
+            }
+            PickerMode.IMPORT_FILE -> {
+                val firstUri = uris.firstOrNull()
+                if (firstUri == null) {
+                    result.success(null)
+                    return
+                }
+                try {
+                    if (takeFlags != 0) {
+                        contentResolver.takePersistableUriPermission(firstUri, takeFlags)
+                    }
+                } catch (_: Exception) {
+                }
+                try {
+                    result.success(buildImportFileSelectionPayload(firstUri))
+                } catch (e: Exception) {
+                    result.error(
+                        "INVALID_IMPORT_SELECTION",
+                        e.message ?: "请选择 .fluentpack 或压缩包",
                         null,
                     )
                 }
@@ -943,6 +976,27 @@ class MainActivity : AudioServiceFragmentActivity() {
         )
     }
 
+    private fun buildImportFileSelectionPayload(uri: Uri): Map<String, Any?> {
+        val displayName = queryDisplayName(uri)
+            ?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment
+            ?: "import"
+        val fluentPack = isFluentPackPath(displayName)
+        val archive = isArchivePath(displayName)
+        if (!fluentPack && !archive) {
+            throw IllegalArgumentException("请选择 .fluentpack，或 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包")
+        }
+        val directPath = resolveToPath(uri)?.takeIf {
+            if (fluentPack) isFluentPackPath(it) else isArchivePath(it)
+        }
+        return mapOf(
+            "displayName" to displayName,
+            "sizeBytes" to queryFileSize(uri),
+            "path" to directPath,
+            "uri" to if (directPath == null) uri.toString() else null,
+        )
+    }
+
     private fun queryDisplayName(uri: Uri): String? {
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
             if (cursor.moveToFirst()) {
@@ -1283,15 +1337,11 @@ class MainActivity : AudioServiceFragmentActivity() {
         if (output.isBlank()) {
             throw IllegalStateException("yt-dlp resolve returned empty result")
         }
-        val decoded = decodeJsonObject(output)
-        return if (decoded != null) {
-            mapOf(
-                "rawInfo" to decoded,
-                "rawInfoJson" to output,
-            )
-        } else {
-            mapOf("rawInfoJson" to output)
-        }
+        // The info dict is often larger than Android's method-channel limit.
+        // Hand Dart a file path instead of the JSON itself.
+        val file = File(cacheDir, "yt_dlp_meta_${UUID.randomUUID()}.json")
+        file.writeText(output)
+        return mapOf("rawInfoPath" to file.absolutePath)
     }
 
     private fun resolveYtDlpBinary(): File {

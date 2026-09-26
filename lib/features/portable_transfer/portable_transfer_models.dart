@@ -15,9 +15,6 @@ enum PortableCompression { fast, balanced, smallest }
 
 enum PortableExportFormat { fluentPack, zip }
 
-/// How a Zip export carries the subtitles already attached to each card.
-enum ZipSubtitleMode { embed, external, none }
-
 class PortableExportOptions {
   final String packageName;
   final bool wrapInFolder;
@@ -25,7 +22,8 @@ class PortableExportOptions {
   final bool verifyChecksums;
   final PortableCompression compression;
   final PortableExportFormat format;
-  final ZipSubtitleMode zipSubtitleMode;
+  final bool zipEmbedSubtitles;
+  final bool zipExternalSubtitles;
   final bool includeDanmaku;
 
   const PortableExportOptions({
@@ -35,7 +33,8 @@ class PortableExportOptions {
     this.verifyChecksums = true,
     this.compression = PortableCompression.fast,
     this.format = PortableExportFormat.fluentPack,
-    this.zipSubtitleMode = ZipSubtitleMode.embed,
+    this.zipEmbedSubtitles = true,
+    this.zipExternalSubtitles = false,
     this.includeDanmaku = false,
   });
 
@@ -48,30 +47,37 @@ class PortableExportOptions {
     'verifyChecksums': verifyChecksums,
     'compression': compression.name,
     'format': format.name,
-    'zipSubtitleMode': zipSubtitleMode.name,
+    'zipEmbedSubtitles': zipEmbedSubtitles,
+    'zipExternalSubtitles': zipExternalSubtitles,
     'includeDanmaku': includeDanmaku,
   };
 
-  factory PortableExportOptions.fromJson(Map<String, dynamic> json) =>
-      PortableExportOptions(
-        packageName: json['packageName']?.toString() ?? '未命名导出包',
-        wrapInFolder: json['wrapInFolder'] != false,
-        includeSidecars: json['includeSidecars'] != false,
-        verifyChecksums: json['verifyChecksums'] != false,
-        compression: PortableCompression.values.firstWhere(
-          (value) => value.name == json['compression'],
-          orElse: () => PortableCompression.fast,
-        ),
-        format: PortableExportFormat.values.firstWhere(
-          (value) => value.name == json['format'],
-          orElse: () => PortableExportFormat.fluentPack,
-        ),
-        zipSubtitleMode: ZipSubtitleMode.values.firstWhere(
-          (value) => value.name == json['zipSubtitleMode'],
-          orElse: () => ZipSubtitleMode.embed,
-        ),
-        includeDanmaku: json['includeDanmaku'] == true,
-      );
+  factory PortableExportOptions.fromJson(Map<String, dynamic> json) {
+    final legacyMode = json['zipSubtitleMode']?.toString();
+    final hasEmbed = json.containsKey('zipEmbedSubtitles');
+    final hasExternal = json.containsKey('zipExternalSubtitles');
+    return PortableExportOptions(
+      packageName: json['packageName']?.toString() ?? '未命名导出包',
+      wrapInFolder: json['wrapInFolder'] != false,
+      includeSidecars: json['includeSidecars'] != false,
+      verifyChecksums: json['verifyChecksums'] != false,
+      compression: PortableCompression.values.firstWhere(
+        (value) => value.name == json['compression'],
+        orElse: () => PortableCompression.fast,
+      ),
+      format: PortableExportFormat.values.firstWhere(
+        (value) => value.name == json['format'],
+        orElse: () => PortableExportFormat.fluentPack,
+      ),
+      zipEmbedSubtitles: hasEmbed
+          ? json['zipEmbedSubtitles'] == true
+          : legacyMode != 'external' && legacyMode != 'none',
+      zipExternalSubtitles: hasExternal
+          ? json['zipExternalSubtitles'] == true
+          : legacyMode == 'external',
+      includeDanmaku: json['includeDanmaku'] == true,
+    );
+  }
 }
 
 /// Thrown when the user cancels a portable export before it finishes.

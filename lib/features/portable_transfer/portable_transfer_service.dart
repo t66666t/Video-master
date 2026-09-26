@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../models/import_card_placement.dart';
 import '../../models/library_activity.dart';
 import '../../models/media_source_ref.dart';
 import '../../models/video_collection.dart';
@@ -31,6 +32,18 @@ class PortableTransferService extends ChangeNotifier {
   static const int formatVersion = 2;
   static const String extension = 'fluentpack';
   static const String mimeType = 'application/x-fluent-player-package';
+  static const List<String> importPickerExtensions = <String>[
+    extension,
+    'zip',
+    'tar',
+    'tgz',
+    'gz',
+    'tbz',
+    'tbz2',
+    'bz2',
+    'txz',
+    'xz',
+  ];
 
   static bool hasPackageExtension(String pathOrName) =>
       p.extension(pathOrName).toLowerCase() == '.$extension';
@@ -335,9 +348,29 @@ class PortableTransferService extends ChangeNotifier {
       task
         ..status = PortableTransferStatus.failed
         ..subtitle = '无法重试'
-        ..error = '原始 FluentPack 文件已不存在';
+        ..error = spec.isArchive ? '原始压缩包已不存在' : '原始 FluentPack 文件已不存在';
       await _persistStateNow();
       notifyListeners();
+      return;
+    }
+    if (spec.isArchive) {
+      unawaited(
+        _runArchiveImport(
+          task,
+          library,
+          packagePath,
+          sortOptions: StructuredImportSortOptions(
+            field: spec.archiveSortField == 'modifiedTime'
+                ? StructuredImportSortField.modifiedTime
+                : StructuredImportSortField.fileName,
+            direction: spec.archiveSortDirection == 'descending'
+                ? StructuredImportSortDirection.descending
+                : StructuredImportSortDirection.ascending,
+          ),
+          deleteArchiveWhenDone: spec.deletePackageWhenDone,
+          libraryFolderId: spec.libraryFolderId,
+        ),
+      );
       return;
     }
     unawaited(
@@ -346,6 +379,7 @@ class PortableTransferService extends ChangeNotifier {
         library,
         packagePath,
         deletePackageWhenDone: spec.deletePackageWhenDone,
+        libraryFolderId: spec.libraryFolderId,
       ),
     );
   }
@@ -934,6 +968,7 @@ class PortableTransferService extends ChangeNotifier {
     required String packagePath,
     required PortablePackagePreview preview,
     bool deletePackageWhenDone = false,
+    String? libraryFolderId,
   }) async {
     await initialize(library: library);
     final task = _newTask(
@@ -948,6 +983,7 @@ class PortableTransferService extends ChangeNotifier {
       packagePath: packagePath,
       preview: preview,
       deletePackageWhenDone: deletePackageWhenDone,
+      libraryFolderId: libraryFolderId,
     );
     await _persistStateNow();
     unawaited(
@@ -956,9 +992,130 @@ class PortableTransferService extends ChangeNotifier {
         library,
         packagePath,
         deletePackageWhenDone: deletePackageWhenDone,
+        libraryFolderId: libraryFolderId,
       ),
     );
     return task;
+  }
+
+  Future<PortableTransferTask> importArchive({
+    required LibraryService library,
+    required String archivePath,
+    required String displayName,
+    bool deleteArchiveWhenDone = false,
+    String? libraryFolderId,
+  }) async {
+    if (!LibraryService.isSupportedArchivePath(displayName) &&
+        !LibraryService.isSupportedArchivePath(archivePath)) {
+      throw UnsupportedError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
+    }
+    await initialize(library: library);
+    final sortOptions = StructuredImportSortOptions.fromSettings(
+      SettingsService(),
+    );
+    final titleSource = displayName.trim().isNotEmpty
+        ? displayName
+        : archivePath;
+    final task = _newTask(
+      PortableTransferKind.import,
+      LibraryService.archiveRootCollectionName(titleSource),
+      '正在准备解压…',
+    );
+    task.filePath = archivePath;
+    final archiveFile = File(archivePath);
+    if (await archiveFile.exists()) {
+      task.totalBytes = await archiveFile.length();
+    }
+    _retrySpecs[task.id] = _PortableRetrySpec.archive(
+      archivePath: archivePath,
+      displayName: displayName,
+      sortOptions: sortOptions,
+      deleteArchiveWhenDone: deleteArchiveWhenDone,
+      libraryFolderId: libraryFolderId,
+    );
+    await _persistStateNow();
+    unawaited(
+      _runArchiveImport(
+        task,
+        library,
+        archivePath,
+        sortOptions: sortOptions,
+        deleteArchiveWhenDone: deleteArchiveWhenDone,
+        libraryFolderId: libraryFolderId,
+      ),
+    );
+    return task;
+  }
+
+  Future<void> _runArchiveImport(
+    PortableTransferTask task,
+    LibraryService library,
+    String archivePath, {
+    required StructuredImportSortOptions sortOptions,
+    bool deleteArchiveWhenDone = false,
+    String? libraryFolderId,
+  }) async {
+    VoidCallback? progressListener;
+    PortableTransferStatus? terminalStatus;
+    String? terminalSubtitle;
+    String? terminalError;
+    try {
+      if (task.cancelRequested) throw const _TransferCancelled();
+      task
+        ..status = PortableTransferStatus.preparing
+        ..progress = 0.4;
+      notifyListeners();
+      progressListener = () {
+        final status = library.importStatus.value.trim();
+        final extracting = status.contains('准备解压') || status.contains('后台解压');
+        task.status = extracting
+            ? PortableTransferStatus.preparing
+            : PortableTransferStatus.running;
+        task.progress = extracting
+            ? 0.4
+            : 0.4 + library.importProgress.value * 0.6;
+        task.subtitle = status.isEmpty ? '正在解压并导入…' : status;
+        notifyListeners();
+      };
+      library.importProgress.addListener(progressListener);
+      library.importStatus.addListener(progressListener);
+      final result = await library.importArchiveSelection(
+        archivePath,
+        libraryFolderId,
+        sortOptions: sortOptions,
+      );
+      task.progress = 1;
+      task.itemCount = result.affectedMediaCount;
+      terminalStatus = PortableTransferStatus.completed;
+      terminalSubtitle = '已导入 ${result.affectedMediaCount} 个媒体';
+      _retrySpecs.remove(task.id);
+    } on _TransferCancelled {
+      terminalStatus = PortableTransferStatus.cancelled;
+      terminalSubtitle = '已取消';
+    } catch (error) {
+      terminalStatus = PortableTransferStatus.failed;
+      terminalError = error.toString();
+      terminalSubtitle = '导入失败';
+    } finally {
+      if (progressListener != null) {
+        library.importProgress.removeListener(progressListener);
+        library.importStatus.removeListener(progressListener);
+      }
+      if (deleteArchiveWhenDone &&
+          terminalStatus == PortableTransferStatus.completed) {
+        final materializedArchive = File(archivePath);
+        if (await materializedArchive.exists()) {
+          try {
+            await materializedArchive.delete();
+          } catch (_) {}
+        }
+      }
+      task.status = terminalStatus ?? PortableTransferStatus.failed;
+      task.subtitle = terminalSubtitle ?? '导入失败';
+      task.error = terminalError;
+      await _persistStateNow();
+      notifyListeners();
+    }
   }
 
   Future<void> _runImport(
@@ -966,6 +1123,7 @@ class PortableTransferService extends ChangeNotifier {
     LibraryService library,
     String packagePath, {
     bool deletePackageWhenDone = false,
+    String? libraryFolderId,
   }) async {
     Directory? extractDir;
     VoidCallback? progressListener;
@@ -997,6 +1155,7 @@ class PortableTransferService extends ChangeNotifier {
           packageName: task.title,
           snapshot: Map<String, dynamic>.from(snapshot),
           task: task,
+          openedFromFolderId: libraryFolderId,
         );
         task.progress = 1;
         task.itemCount = imported;
@@ -1020,6 +1179,7 @@ class PortableTransferService extends ChangeNotifier {
         contentRoot.path,
         rootCollectionName: task.title,
         mediaEntriesHint: task.itemCount,
+        openedFromFolderId: libraryFolderId,
         sortOptions: const StructuredImportSortOptions(
           field: StructuredImportSortField.fileName,
           direction: StructuredImportSortDirection.ascending,
@@ -1079,6 +1239,7 @@ class PortableTransferService extends ChangeNotifier {
     required String packageName,
     required Map<String, dynamic> snapshot,
     required PortableTransferTask task,
+    String? openedFromFolderId,
   }) async {
     final rawCollections =
         (snapshot['collections'] as List? ?? const <dynamic>[])
@@ -1093,9 +1254,14 @@ class PortableTransferService extends ChangeNotifier {
       throw const FormatException('导出包快照为空');
     }
 
+    final destinationParentId = await library.resolveImportCardParentId(
+      feature: ImportCardFeature.fluentPack,
+      openedFromFolderId: openedFromFolderId,
+    );
     final snapshotBatchId = library.beginImportBatch(
       title: packageName,
       sourceKind: LibraryImportSourceKind.fluentPack,
+      targetCollectionId: destinationParentId,
     );
 
     final dataRoot = await SettingsService().resolveLargeDataRootDir();
@@ -1120,7 +1286,10 @@ class PortableTransferService extends ChangeNotifier {
       return copied;
     }
 
-    final packageRoot = await library.createCollection(packageName, null);
+    final packageRoot = await library.createCollection(
+      packageName,
+      destinationParentId,
+    );
     library.noteImportedCollection(packageRoot.id, batchId: snapshotBatchId);
     if (retrySpec != null) {
       retrySpec.transactionRootId = packageRoot.id;
@@ -1168,7 +1337,10 @@ class PortableTransferService extends ChangeNotifier {
             sourceRef: MediaSourceRef.fromJsonOrNull(record['sourceRef']),
           );
           idMap[exportId] = collection.id;
-          library.noteImportedCollection(collection.id, batchId: snapshotBatchId);
+          library.noteImportedCollection(
+            collection.id,
+            batchId: snapshotBatchId,
+          );
           pending.remove(record);
           progressed = true;
           importedCollectionCount++;
@@ -1589,6 +1761,11 @@ class _PortableRetrySpec {
   final String? packagePath;
   final PortablePackagePreview? preview;
   final bool deletePackageWhenDone;
+  final String? libraryFolderId;
+  final bool isArchive;
+  final String? importDisplayName;
+  final String? archiveSortField;
+  final String? archiveSortDirection;
   final Set<String> createdAssetPaths;
   String? transactionRootId;
 
@@ -1600,6 +1777,11 @@ class _PortableRetrySpec {
     this.packagePath,
     this.preview,
     this.deletePackageWhenDone = false,
+    this.libraryFolderId,
+    this.isArchive = false,
+    this.importDisplayName,
+    this.archiveSortField,
+    this.archiveSortDirection,
     Set<String>? createdAssetPaths,
     this.transactionRootId,
   }) : createdAssetPaths = createdAssetPaths ?? <String>{};
@@ -1619,11 +1801,30 @@ class _PortableRetrySpec {
     required String packagePath,
     required PortablePackagePreview preview,
     required bool deletePackageWhenDone,
+    String? libraryFolderId,
   }) => _PortableRetrySpec._(
     kind: PortableTransferKind.import,
     packagePath: packagePath,
     preview: preview,
     deletePackageWhenDone: deletePackageWhenDone,
+    libraryFolderId: libraryFolderId,
+  );
+
+  factory _PortableRetrySpec.archive({
+    required String archivePath,
+    required String displayName,
+    required StructuredImportSortOptions sortOptions,
+    required bool deleteArchiveWhenDone,
+    String? libraryFolderId,
+  }) => _PortableRetrySpec._(
+    kind: PortableTransferKind.import,
+    packagePath: archivePath,
+    importDisplayName: displayName,
+    isArchive: true,
+    archiveSortField: sortOptions.fieldStorageValue,
+    archiveSortDirection: sortOptions.directionStorageValue,
+    deletePackageWhenDone: deleteArchiveWhenDone,
+    libraryFolderId: libraryFolderId,
   );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -1634,6 +1835,11 @@ class _PortableRetrySpec {
     'packagePath': packagePath,
     'preview': preview?.toJson(),
     'deletePackageWhenDone': deletePackageWhenDone,
+    'libraryFolderId': libraryFolderId,
+    'isArchive': isArchive,
+    'importDisplayName': importDisplayName,
+    'archiveSortField': archiveSortField,
+    'archiveSortDirection': archiveSortDirection,
     'createdAssetPaths': createdAssetPaths.toList(growable: false),
     'transactionRootId': transactionRootId,
   };
@@ -1663,6 +1869,11 @@ class _PortableRetrySpec {
             )
           : null,
       deletePackageWhenDone: json['deletePackageWhenDone'] == true,
+      libraryFolderId: json['libraryFolderId']?.toString(),
+      isArchive: json['isArchive'] == true,
+      importDisplayName: json['importDisplayName']?.toString(),
+      archiveSortField: json['archiveSortField']?.toString(),
+      archiveSortDirection: json['archiveSortDirection']?.toString(),
       createdAssetPaths: (json['createdAssetPaths'] as List?)
           ?.map((value) => value.toString())
           .toSet(),

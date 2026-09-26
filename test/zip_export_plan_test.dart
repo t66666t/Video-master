@@ -50,19 +50,60 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: <String>[folder.id, 'c', 'online'],
-        packageName: '我的导出',
-        subtitleMode: ZipSubtitleMode.none,
+        embedSubtitles: false,
+        externalSubtitles: false,
         includeDanmaku: false,
         factsFor: (_) => const ZipSourceFacts(hasAttachedCover: true),
       );
 
       expect(layout.skippedOnline, 1);
       expect(layout.media.map((item) => item.archivePath), <String>[
-        '我的导出/旅行/京都夜景.mp4',
-        '我的导出/旅行/京都夜景 (2).mp4',
-        '我的导出/首页视频.mkv',
+        '旅行/京都夜景.mp4',
+        '旅行/京都夜景 (2).mp4',
+        '首页视频.mkv',
       ]);
       expect(layout.media.every((item) => item.remux), isFalse);
+    });
+
+    test('keeps folders only between items picked at different depths', () async {
+      final level2 = await library.createCollection('第二层', null);
+      final level3 = await library.createCollection('第三层', level2.id);
+      await _add(
+        library,
+        id: 'l1',
+        path: _file(tempDir, 'l1.mp4'),
+        title: '第一层视频',
+        parentId: null,
+      );
+      await _add(
+        library,
+        id: 'l2',
+        path: _file(tempDir, 'l2.mp4'),
+        title: '第二层视频',
+        parentId: level2.id,
+      );
+      await _add(
+        library,
+        id: 'l3',
+        path: _file(tempDir, 'l3.mp4'),
+        title: '第三层视频',
+        parentId: level3.id,
+      );
+
+      final layout = buildZipExportLayout(
+        library: library,
+        rootIds: const <String>['l1', 'l2', 'l3'],
+        embedSubtitles: false,
+        externalSubtitles: false,
+        includeDanmaku: false,
+        factsFor: (_) => const ZipSourceFacts(hasAttachedCover: true),
+      );
+
+      expect(layout.media.map((item) => item.archivePath).toSet(), <String>{
+        '第一层视频.mp4',
+        '第二层/第二层视频.mp4',
+        '第二层/第三层/第三层视频.mp4',
+      });
     });
 
     test('omits unused outer folders and skips a missing file', () async {
@@ -81,13 +122,13 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: const <String>['kept', 'missing'],
-        packageName: '包',
-        subtitleMode: ZipSubtitleMode.none,
+        embedSubtitles: false,
+        externalSubtitles: false,
         includeDanmaku: false,
       );
 
       expect(layout.skippedMissing, 1);
-      expect(layout.media.single.archivePath, '包/内层/保留.mp4');
+      expect(layout.media.single.archivePath, '内层/保留.mp4');
     });
 
     test('embeds associated subtitles and leaves styled tracks in mkv', () async {
@@ -126,8 +167,8 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: const <String>['clip'],
-        packageName: '包',
-        subtitleMode: ZipSubtitleMode.embed,
+        embedSubtitles: true,
+        externalSubtitles: false,
         includeDanmaku: true,
         factsFor: (_) => const ZipSourceFacts(
           hasAttachedCover: true,
@@ -136,7 +177,7 @@ void main() {
       );
       final media = layout.media.single;
       expect(media.remux, isTrue);
-      expect(media.archivePath, '包/讲座.mkv');
+      expect(media.archivePath, '讲座.mkv');
       expect(media.embedTracks.map((track) => track.title), <String>[
         '主字幕',
         '中文',
@@ -181,8 +222,8 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: const <String>['clip'],
-        packageName: '包',
-        subtitleMode: ZipSubtitleMode.embed,
+        embedSubtitles: true,
+        externalSubtitles: false,
         includeDanmaku: false,
         factsFor: (_) => const ZipSourceFacts(
           hasAttachedCover: true,
@@ -190,7 +231,7 @@ void main() {
         ),
       );
       final media = layout.media.single;
-      expect(media.archivePath, '包/课.mp4');
+      expect(media.archivePath, '课.mp4');
       expect(media.replacementChapters, isNull);
       expect(media.embedTracks.single.isDefault, isTrue);
     });
@@ -212,8 +253,8 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: const <String>['song'],
-        packageName: '包',
-        subtitleMode: ZipSubtitleMode.none,
+        embedSubtitles: false,
+        externalSubtitles: false,
         includeDanmaku: false,
         factsFor: (_) => const ZipSourceFacts(
           hasAttachedCover: false,
@@ -225,7 +266,7 @@ void main() {
       expect(media.remux, isTrue);
       expect(media.coverPath, cover);
       expect(media.replacementChapters, isNotNull);
-      expect(media.archivePath, '包/歌.m4a');
+      expect(media.archivePath, '歌.m4a');
     });
 
     test('external subtitles sit beside the video and danmaku stays named', () async {
@@ -246,8 +287,8 @@ void main() {
       final layout = buildZipExportLayout(
         library: library,
         rootIds: const <String>['clip'],
-        packageName: '包',
-        subtitleMode: ZipSubtitleMode.external,
+        embedSubtitles: false,
+        externalSubtitles: true,
         includeDanmaku: true,
         factsFor: (_) => const ZipSourceFacts(hasAttachedCover: true),
       );
@@ -255,10 +296,36 @@ void main() {
       expect(media.remux, isFalse);
       expect(media.embedTracks, isEmpty);
       expect(media.sidecars.map((item) => item.archivePath), <String>[
-        '包/对话.主字幕.srt',
-        '包/对话.副字幕.vtt',
-        '包/对话.弹幕.ass',
+        '对话.主字幕.srt',
+        '对话.副字幕.vtt',
+        '对话.弹幕.ass',
       ]);
+    });
+
+    test('embeds subtitles and also writes the same files beside the video', () async {
+      final video = _file(tempDir, 'both.mp4');
+      final primary = _file(tempDir, 'both.srt');
+      await _add(
+        library,
+        id: 'both',
+        path: video,
+        title: '双语',
+        parentId: null,
+        subtitlePath: primary,
+      );
+      final layout = buildZipExportLayout(
+        library: library,
+        rootIds: const <String>['both'],
+        embedSubtitles: true,
+        externalSubtitles: true,
+        includeDanmaku: false,
+        factsFor: (_) => const ZipSourceFacts(hasAttachedCover: true),
+      );
+      final media = layout.media.single;
+      expect(media.remux, isTrue);
+      expect(media.archivePath, '双语.mp4');
+      expect(media.embedTracks.single.path, primary);
+      expect(media.sidecars.single.archivePath, '双语.srt');
     });
 
     test('retries the full remux once, then subtitles only, then stops', () {

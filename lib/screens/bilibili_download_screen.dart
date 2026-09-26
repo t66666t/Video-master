@@ -286,6 +286,9 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     AndroidHardwareInputBridge.addKeyListener(_handleAndroidHardwareKeyEvent);
     HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
     _streamingMode = widget.initialStreamingMode;
+    context.read<BilibiliDownloadService>().rememberImportFolder(
+      widget.targetFolderId,
+    );
     _keepAwakeBannerController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 240),
@@ -407,9 +410,8 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     final bool hasBlockingModifier =
         hasBlockingModifierOverride ?? hasBlockingKeyboardModifier();
     if (hasBlockingModifier) return KeyEventResult.ignored;
-    final LinkDownloadShortcutAction? action = LinkDownloadShortcuts.matchAction(
-      event.logicalKey,
-    );
+    final LinkDownloadShortcutAction? action =
+        LinkDownloadShortcuts.matchAction(event.logicalKey);
     final platform = currentNativeTargetPlatform;
     if (action == null ||
         platform == null ||
@@ -1096,6 +1098,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
         library,
         episode: episode,
         targetFolderId: widget.targetFolderId,
+        folderExplicit: true,
       );
 
       if (!mounted) return;
@@ -1125,6 +1128,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
       library,
       episode: episode,
       targetFolderId: widget.targetFolderId,
+      folderExplicit: true,
     );
   }
 
@@ -4213,7 +4217,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
               ),
               _buildBottomAction(
                 Icons.file_upload,
-                _dlTooltip("导入到媒体库", LinkDownloadShortcutAction.importToLibrary),
+                _dlTooltip(
+                  "导入到媒体库",
+                  LinkDownloadShortcutAction.importToLibrary,
+                ),
                 () => _importToLibrary(service),
               ),
             ],

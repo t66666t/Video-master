@@ -30,17 +30,21 @@ class PortableTransferScreen extends StatefulWidget {
     this.initialTab = PortableTransferKind.export,
     this.pendingImportSources,
     this.pendingExportRootIds,
+    this.libraryFolderId,
   });
 
   final PortableTransferKind initialTab;
   final List<PortableImportSource>? pendingImportSources;
   final List<String>? pendingExportRootIds;
+  final String? libraryFolderId;
 
   @override
   State<PortableTransferScreen> createState() => _PortableTransferScreenState();
 }
 
 class _PortableTransferScreenState extends State<PortableTransferScreen> {
+  static const String _unsupportedImportMessage =
+      '只能选择 .fluentpack，或 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包';
   static const MethodChannel _androidFileManagerChannel = MethodChannel(
     'com.example.video_player_app/file_manager',
   );
@@ -589,7 +593,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
                 title: const Text('同时删除文件'),
                 subtitle: Text(
                   tasks.any((task) => task.kind == PortableTransferKind.import)
-                      ? '默认开启；导入任务可能指向你选择的原始 .fluentpack 文件。'
+                      ? '默认开启；导入任务可能指向你选择的原始文件。'
                       : '默认开启；关闭后只删除记录，导出包仍会保留。',
                 ),
               ),
@@ -728,7 +732,11 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
         await package.disposeIfOwned();
         return;
       }
-      await _importPickedPackage(package, showPreview: true);
+      if (package.archive) {
+        await _importPickedArchive(package, showPreview: true);
+      } else {
+        await _importPickedPackage(package, showPreview: true);
+      }
     } catch (error) {
       AppToast.show('无法导入：$error', type: AppToastType.error);
     } finally {
@@ -789,6 +797,57 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
         packagePath: package.path,
         preview: preview,
         deletePackageWhenDone: package.ownedTemporaryCopy,
+        libraryFolderId: widget.libraryFolderId,
+      );
+      handedToService = true;
+      if (mounted) setState(() => _tab = PortableTransferKind.import);
+    } finally {
+      if (!handedToService) await package.disposeIfOwned();
+    }
+  }
+
+  Future<void> _importPickedArchive(
+    _PickedPortablePackage package, {
+    required bool showPreview,
+  }) async {
+    var handedToService = false;
+    try {
+      if (!LibraryService.isSupportedArchivePath(package.displayName) &&
+          !LibraryService.isSupportedArchivePath(package.path)) {
+        throw UnsupportedError('当前仅支持 zip、tar、tar.gz、tar.bz2、tar.xz 压缩包');
+      }
+      final library = context.read<LibraryService>();
+      if (library.hasActiveImport) {
+        throw StateError('已有导入任务正在运行，请等待完成后再试');
+      }
+      var sizeBytes = 0;
+      final file = File(package.path);
+      if (await file.exists()) {
+        sizeBytes = await file.length();
+      }
+      if (!mounted) return;
+      final rootName = LibraryService.archiveRootCollectionName(
+        package.displayName.trim().isNotEmpty
+            ? package.displayName
+            : package.path,
+      );
+      if (showPreview) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (_) => _ArchiveImportPreviewDialog(
+            title: rootName,
+            fileName: package.displayName,
+            sizeBytes: sizeBytes,
+          ),
+        );
+        if (confirmed != true || !mounted) return;
+      }
+      await _service.importArchive(
+        library: context.read<LibraryService>(),
+        archivePath: package.path,
+        displayName: package.displayName,
+        deleteArchiveWhenDone: package.ownedTemporaryCopy,
+        libraryFolderId: widget.libraryFolderId,
       );
       handedToService = true;
       if (mounted) setState(() => _tab = PortableTransferKind.import);
@@ -844,11 +903,15 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
   Future<_PickedPortablePackage?> _pickPortablePackage() async {
     if (Platform.isAndroid) {
       final selection = await _androidFileManagerChannel
-          .invokeMapMethod<String, dynamic>('pickFluentPack');
+          .invokeMapMethod<String, dynamic>('pickImportFile');
       if (selection == null) return null;
       final displayName = selection['displayName']?.toString() ?? '';
-      if (!PortableTransferService.hasPackageExtension(displayName)) {
-        throw const FormatException('只能选择 .fluentpack 文件');
+      final archive = _isArchiveImportName(displayName);
+      final fluentPack = PortableTransferService.hasPackageExtension(
+        displayName,
+      );
+      if (!fluentPack && !archive) {
+        throw const FormatException(_unsupportedImportMessage);
       }
       final directPath = selection['path']?.toString();
       if (directPath != null &&
@@ -858,6 +921,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
           directPath,
           displayName: displayName,
           ownedTemporaryCopy: false,
+          archive: archive,
         );
       }
       final uri = selection['uri']?.toString();
@@ -865,44 +929,59 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
         throw const FileSystemException('系统文件选择器没有提供可读取的文件');
       }
       final materializedPath = await _androidFileManagerChannel
-          .invokeMethod<String>('materializeFluentPackForImport', {
-            'uri': uri,
-            'displayName': displayName,
-          });
+          .invokeMethod<String>(
+            archive
+                ? 'materializeArchiveForImport'
+                : 'materializeFluentPackForImport',
+            {'uri': uri, 'displayName': displayName},
+          );
       if (materializedPath == null || materializedPath.isEmpty) {
-        throw const FileSystemException('无法读取所选 FluentPack 文件');
+        throw FileSystemException(
+          archive ? '无法读取所选压缩包' : '无法读取所选 .fluentpack 文件',
+        );
       }
       return _PickedPortablePackage(
         materializedPath,
         displayName: displayName,
         ownedTemporaryCopy: true,
+        archive: archive,
       );
     }
 
     final picked = await FilePicker.platform.pickFiles(
-      dialogTitle: '选择 Fluent Player 导出包',
+      dialogTitle: '选择要导入的文件',
       type: FileType.custom,
-      allowedExtensions: const [PortableTransferService.extension],
+      allowedExtensions: PortableTransferService.importPickerExtensions,
       allowMultiple: false,
       withReadStream: true,
     );
     if (picked == null) return null;
     final pickedFile = picked.files.single;
-    final validName = PortableTransferService.hasPackageExtension(
-      pickedFile.name,
-    );
-    final validPath =
-        pickedFile.path != null &&
-        PortableTransferService.hasPackageExtension(pickedFile.path!);
-    if (!validName && !validPath) {
-      throw const FormatException('只能选择 .fluentpack 文件');
+    final archive =
+        _isArchiveImportName(pickedFile.name) ||
+        (pickedFile.path != null && _isArchiveImportName(pickedFile.path!));
+    final fluentPack =
+        PortableTransferService.hasPackageExtension(pickedFile.name) ||
+        (pickedFile.path != null &&
+            PortableTransferService.hasPackageExtension(pickedFile.path!));
+    if (!fluentPack && !archive) {
+      throw const FormatException(_unsupportedImportMessage);
     }
-    return _materializePickedPackage(pickedFile);
+    return _materializePickedPackage(
+      pickedFile,
+      archive: archive && !fluentPack,
+    );
+  }
+
+  static bool _isArchiveImportName(String pathOrName) {
+    if (PortableTransferService.hasPackageExtension(pathOrName)) return false;
+    return LibraryService.isSupportedArchivePath(pathOrName);
   }
 
   Future<_PickedPortablePackage> _materializePickedPackage(
-    PlatformFile picked,
-  ) async {
+    PlatformFile picked, {
+    required bool archive,
+  }) async {
     final pickedPath = picked.path;
     if (pickedPath != null && pickedPath.isNotEmpty) {
       final file = File(pickedPath);
@@ -911,6 +990,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
           file.path,
           displayName: picked.name,
           ownedTemporaryCopy: false,
+          archive: archive,
         );
       }
     }
@@ -922,7 +1002,9 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
     await importDirectory.create(recursive: true);
     var fileName = _safeFileName(picked.name);
     if (fileName.isEmpty) {
-      fileName = 'import.${PortableTransferService.extension}';
+      fileName = archive
+          ? 'import.zip'
+          : 'import.${PortableTransferService.extension}';
     }
     final target = File(_nextAvailablePath(importDirectory, fileName));
     final sink = target.openWrite();
@@ -946,6 +1028,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
       target.path,
       displayName: picked.name,
       ownedTemporaryCopy: true,
+      archive: archive,
     );
   }
 
@@ -970,11 +1053,13 @@ class _PickedPortablePackage {
   final String path;
   final String displayName;
   final bool ownedTemporaryCopy;
+  final bool archive;
 
   const _PickedPortablePackage(
     this.path, {
     required this.displayName,
     required this.ownedTemporaryCopy,
+    this.archive = false,
   });
 
   Future<void> disposeIfOwned() async {
@@ -1109,6 +1194,146 @@ class _ImportPreviewDialogState extends State<_ImportPreviewDialog> {
   }
 }
 
+class _ArchiveImportPreviewDialog extends StatefulWidget {
+  final String title;
+  final String fileName;
+  final int sizeBytes;
+
+  const _ArchiveImportPreviewDialog({
+    required this.title,
+    required this.fileName,
+    required this.sizeBytes,
+  });
+
+  @override
+  State<_ArchiveImportPreviewDialog> createState() =>
+      _ArchiveImportPreviewDialogState();
+}
+
+class _ArchiveImportPreviewDialogState
+    extends State<_ArchiveImportPreviewDialog> {
+  final FocusNode _focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    HardwareKeyboard.instance.addHandler(_handleGlobalHardwareKeyEvent);
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleGlobalHardwareKeyEvent);
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  bool _handleGlobalHardwareKeyEvent(KeyEvent event) {
+    if (_focusNode.hasFocus) return false;
+    return _handleKey(event) != KeyEventResult.ignored;
+  }
+
+  KeyEventResult _handleKey(KeyEvent event) {
+    if (event is KeyRepeatEvent) return KeyEventResult.handled;
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (hasBlockingKeyboardModifier()) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.escape) {
+      Navigator.pop(context, false);
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.numpadEnter) {
+      Navigator.pop(context, true);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  String _archiveSuffixLabel(String name) {
+    final lower = name.toLowerCase();
+    const suffixes = <String>[
+      '.tar.gz',
+      '.tar.bz2',
+      '.tar.xz',
+      '.tbz2',
+      '.tgz',
+      '.tbz',
+      '.txz',
+      '.zip',
+      '.tar',
+    ];
+    for (final suffix in suffixes) {
+      if (lower.endsWith(suffix)) return suffix;
+    }
+    final extension = p.extension(name);
+    return extension.isEmpty ? '压缩包' : extension;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final inheritedTheme = Theme.of(context);
+    return Theme(
+      data: inheritedTheme.copyWith(
+        textTheme: inheritedTheme.textTheme.apply(fontFamily: 'Noto Sans SC'),
+        primaryTextTheme: inheritedTheme.primaryTextTheme.apply(
+          fontFamily: 'Noto Sans SC',
+        ),
+      ),
+      child: Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        onKeyEvent: (node, event) => _handleKey(event),
+        child: AlertDialog(
+          icon: const Icon(Icons.folder_zip_outlined, size: 34),
+          title: Text(
+            widget.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.fileName,
+                style: const TextStyle(color: Colors.white54),
+              ),
+              const SizedBox(height: 18),
+              _PreviewRow(
+                icon: Icons.inventory_2_outlined,
+                label: '压缩包',
+                value: _archiveSuffixLabel(widget.fileName),
+              ),
+              _PreviewRow(
+                icon: Icons.data_usage_rounded,
+                label: '文件大小',
+                value: widget.sizeBytes > 0
+                    ? _prettyBytes(widget.sizeBytes)
+                    : '未知',
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                '确认后会解压压缩包，并把里面的媒体写入媒体库。原文件不会被修改。',
+                style: TextStyle(color: Colors.white60, height: 1.4),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消 (Esc)'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('开始导入 (Enter)'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _PreviewRow extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -1176,8 +1401,8 @@ class _EmptyTransferState extends StatelessWidget {
             const SizedBox(height: 8),
             Text(
               exporting
-                  ? '选择媒体和文件夹，再决定导出为 Fluent Pack 或 Zip。'
-                  : '只接受 .fluentpack 文件，选择后会先验证再导入。',
+                  ? '选择媒体和文件夹，再决定导出为 .fluentpack 或 .zip。'
+                  : '接受 .fluentpack，以及 .zip、.tar、.tar.gz、.tar.bz2、.tar.xz，选择后会先确认再导入。',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, height: 1.5),
             ),
@@ -1187,7 +1412,7 @@ class _EmptyTransferState extends StatelessWidget {
               icon: Icon(
                 exporting ? Icons.add_rounded : Icons.file_open_outlined,
               ),
-              label: Text(exporting ? '新建导出 (N)' : '选择导出包 (N)'),
+              label: Text(exporting ? '新建导出 (N)' : '选择文件 (N)'),
             ),
           ],
         ),
