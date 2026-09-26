@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
+import 'package:video_player_app/theme/app_page_transitions.dart';
 
 import '../../services/library_service.dart';
 import '../../utils/android_hardware_input_bridge.dart';
@@ -11,6 +13,7 @@ import '../../utils/hardware_keyboard_shortcuts.dart';
 import '../../utils/media_library_search_query.dart';
 import '../../utils/page_shortcut_keys.dart';
 import '../../widgets/cached_thumbnail_widget.dart';
+import 'portable_export_format_page.dart';
 import 'portable_media_selection.dart';
 
 /// Hierarchical media-card picker used by portable export.
@@ -34,6 +37,7 @@ class _PortableSelectionPageState extends State<PortableSelectionPage> {
   final FocusNode _shortcutFocusNode = FocusNode();
   final AndroidHardwareKeyDeduplicator _androidKeyDeduplicator =
       AndroidHardwareKeyDeduplicator();
+  var _continuing = false;
 
   @override
   void initState() {
@@ -131,12 +135,32 @@ class _PortableSelectionPageState extends State<PortableSelectionPage> {
         return KeyEventResult.handled;
       case PortableSelectionShortcutAction.confirm:
         if (_selection.isEmpty) return KeyEventResult.handled;
-        Navigator.pop(context, _selection.selectedRoots);
+        unawaited(_continue());
         return KeyEventResult.handled;
     }
   }
 
   PortableTreeIndex get _tree => PortableTreeIndex.fromLibrary(widget.library);
+
+  Future<void> _continue() async {
+    if (_continuing || _selection.isEmpty || !mounted) return;
+    _continuing = true;
+    try {
+      final started = await Navigator.of(context).push<bool>(
+        AppMaterialPageRoute<bool>(
+          builder: (_) => PortableExportFormatPage(
+            library: widget.library,
+            rootIds: _selection.selectedRoots.toList(),
+          ),
+        ),
+      );
+      if (started == true && mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } finally {
+      _continuing = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -265,9 +289,7 @@ class _PortableSelectionPageState extends State<PortableSelectionPage> {
         bottomNavigationBar: SafeArea(
           minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
           child: FilledButton.icon(
-            onPressed: _selection.isEmpty
-                ? null
-                : () => Navigator.pop(context, _selection.selectedRoots),
+            onPressed: _selection.isEmpty ? null : _continue,
             icon: const Icon(Icons.arrow_forward_rounded),
             label: Text(
               _selection.isEmpty

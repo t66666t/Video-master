@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
+import '../utils/android_hardware_input_bridge.dart';
 import '../utils/tooltip_hover_policy.dart';
 
 /// Listens to every pointer without participating in hit tests.
@@ -35,6 +38,11 @@ class _TooltipInteractionGuardState extends State<TooltipInteractionGuard> {
     TooltipHoverPolicy.observe(event);
     if (event is PointerDownEvent) {
       Tooltip.dismissAllToolTips();
+      if (TooltipHoverPolicy.isTouchLike(event.kind)) {
+        // After this down event, so a hover-exit cannot hide controls before
+        // the finger is recorded as the active pointer.
+        scheduleMicrotask(AndroidHardwareInputBridge.releaseParkedNativeMice);
+      }
     }
   }
 

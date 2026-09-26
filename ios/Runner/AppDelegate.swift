@@ -3,6 +3,7 @@ import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterStreamHandler {
+  private let imeChannelName = "com.example.video_player_app/ime_gate"
   private let shareChannelName = "com.example.video_player_app/share_intent"
   private let shareEventChannelName = "com.example.video_player_app/share_intent_events"
   private let ytDlpChannelName = "com.example.video_player_app/yt_dlp"
@@ -25,6 +26,7 @@ import UIKit
   ) -> Bool {
     GeneratedPluginRegistrant.register(with: self)
     if let controller = window?.rootViewController as? FlutterViewController {
+      registerImeGateChannel(controller: controller)
       registerShareChannels(controller: controller)
       registerYtDlpChannels(controller: controller)
     }
@@ -59,6 +61,24 @@ import UIKit
   func onCancel(withArguments arguments: Any?) -> FlutterError? {
     shareEventSink = nil
     return nil
+  }
+
+  private func registerImeGateChannel(controller: FlutterViewController) {
+    let methodChannel = FlutterMethodChannel(
+      name: imeChannelName,
+      binaryMessenger: controller.binaryMessenger
+    )
+    methodChannel.setMethodCallHandler { [weak controller] call, result in
+      if call.method == "setTextInputActive" {
+        let active = (call.arguments as? Bool) ?? false
+        if !active {
+          controller?.view.endEditing(true)
+        }
+        result(nil)
+      } else {
+        result(FlutterMethodNotImplemented)
+      }
+    }
   }
 
   private func registerShareChannels(controller: FlutterViewController) {

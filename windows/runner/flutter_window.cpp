@@ -1,5 +1,7 @@
 ﻿#include "flutter_window.h"
 
+#include "ime_shortcut_gate.h"
+
 #include <Windows.h>
 #include <algorithm>
 #include <chrono>
@@ -618,6 +620,11 @@ bool LooksLikeTemporaryArtifact(const std::filesystem::path& path) {
   return extension == L".part" || extension == L".ytdl" || extension == L".tmp";
 }
 
+bool DumpJsonHasThumbnailKey(const std::string& json) {
+  // Keep this marker aligned with dumpSingleJsonHasThumbnailKey in Dart.
+  return json.find("\"thumbnail\":") != std::string::npos;
+}
+
 bool LooksLikeSubtitleSidecar(const std::filesystem::path& path) {
   static const std::set<std::wstring> extensions = {
       L".srt", L".ass", L".ssa", L".vtt", L".lrc", L".json3", L".srv1",
@@ -669,6 +676,9 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   RegisterYtDlpChannel();
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  ImeShortcutGate::Install(GetHandle(),
+                           flutter_controller_->view()->GetNativeWindow(),
+                           flutter_controller_->engine()->messenger());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -895,16 +905,21 @@ void FlutterWindow::RegisterYtDlpChannel() {
             const auto process_result =
                 RunProcess(yt_dlp, command_args, kResolveTimeoutMs);
             std::string resolved_thumbnail_url;
-            const auto thumbnail_result =
-                RunProcess(yt_dlp, thumbnail_args, 15000);
-            if (thumbnail_result.success) {
-              std::istringstream thumbnail_stream(thumbnail_result.stdout_text);
-              std::string line;
-              while (std::getline(thumbnail_stream, line)) {
-                const auto trimmed_line = Trim(line);
-                if (!trimmed_line.empty()) {
-                  resolved_thumbnail_url = trimmed_line;
-                  break;
+            // dump-single-json already carries thumbnail URLs for YouTube.
+            // A second process repeats the watch-page and player requests.
+            if (process_result.success &&
+                !DumpJsonHasThumbnailKey(process_result.stdout_text)) {
+              const auto thumbnail_result =
+                  RunProcess(yt_dlp, thumbnail_args, 15000);
+              if (thumbnail_result.success) {
+                std::istringstream thumbnail_stream(thumbnail_result.stdout_text);
+                std::string line;
+                while (std::getline(thumbnail_stream, line)) {
+                  const auto trimmed_line = Trim(line);
+                  if (!trimmed_line.empty()) {
+                    resolved_thumbnail_url = trimmed_line;
+                    break;
+                  }
                 }
               }
             }
@@ -1069,6 +1084,7 @@ void FlutterWindow::RegisterYtDlpChannel() {
 }
 
 void FlutterWindow::OnDestroy() {
+  ImeShortcutGate::Uninstall();
   {
     std::lock_guard<std::mutex> lock(yt_dlp_mutex_);
     for (auto& entry : yt_dlp_tasks_) {
@@ -1094,6 +1110,12 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (const std::optional<LRESULT> ime_result =
+          ImeShortcutGate::HandleTopLevelMessage(hwnd, message, wparam,
+                                                 lparam)) {
+    return *ime_result;
+  }
+
   switch (message) {
     case kExecuteUiTasksMessage:
       DrainUiTasks();

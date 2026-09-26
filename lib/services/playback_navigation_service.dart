@@ -3,6 +3,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player/video_player.dart' show VideoPlayerController;
 
 import '../models/video_item.dart';
@@ -70,7 +71,7 @@ class PlaybackNavigationService {
   }
 
   Route<void> buildPortraitRoute(VideoItem item) {
-    return MaterialPageRoute<void>(
+    return buildPlaybackPageRoute<void>(
       builder: (context) => PortraitVideoScreen(videoItem: item),
       settings: portraitRouteSettings(item),
     );
@@ -87,15 +88,16 @@ class PlaybackNavigationService {
 
   /// 媒体卡片点击后的统一播放入口路由：
   /// 桌面端或开启"跳过竖屏播放页"时直入横屏播放页，否则进入竖屏播放页。
-  /// 两个分支都使用 `MaterialPageRoute`，共用平台默认页面转场，
-  /// 使直入横屏页的进入/返回与竖屏播放页的导航手感一致。
+  /// 播放页和其它整页路由都使用 [AppMaterialPageRoute]，进入和退出的缩放
+  /// 都会等下一帧再开始，避免重页面把动画吃成硬切。
+  /// 播放页本身不拍缩放快照，避免 Windows 上回读视频纹理时把缩放卡住。
   static Route<void> buildPlaybackEntryRoute(
     VideoItem item, {
     VideoPlayerController? existingController,
   }) {
     final autoPlayOnEntry = SettingsService().autoPlayOnPageEntry;
     if (entrySkipsPortraitPlayer) {
-      return MaterialPageRoute<void>(
+      return buildPlaybackPageRoute<void>(
         settings: landscapeRouteSettings(item),
         builder: (context) => VideoPlayerScreen(
           videoItem: item,
@@ -104,12 +106,27 @@ class PlaybackNavigationService {
         ),
       );
     }
-    return MaterialPageRoute<void>(
+    return buildPlaybackPageRoute<void>(
       settings: portraitRouteSettings(item),
       builder: (context) => PortraitVideoScreen(
         videoItem: item,
         autoPlayOnEntry: autoPlayOnEntry,
       ),
+    );
+  }
+
+  /// 视频播放页路由。缩放照常播放，但不把这一页拍成快照。
+  ///
+  /// 快照会把正在显示的视频纹理从 GPU 读回。Windows 上这次回读会堵住光栅线程，
+  /// 缩放要等回读结束才开始动。底下的文件夹路由仍使用自己的快照。
+  static AppMaterialPageRoute<T> buildPlaybackPageRoute<T>({
+    required WidgetBuilder builder,
+    RouteSettings? settings,
+  }) {
+    return AppMaterialPageRoute<T>(
+      builder: builder,
+      settings: settings,
+      allowSnapshotting: false,
     );
   }
 
@@ -142,10 +159,7 @@ class PlaybackNavigationService {
       // Keep the warmup owner until a real playback page registers. Dropping
       // it after one frame used to deselect Bilibili's video track while the
       // route was still mounting, painting a black texture over a ready stream.
-      _holdPlaybackPageVisibleUntilOwned(
-        playbackService,
-        maxAttempts: 1800,
-      );
+      _holdPlaybackPageVisibleUntilOwned(playbackService, maxAttempts: 1800);
       if (playbackService.controller == null) {
         // Restored Mini chrome has metadata only. Start prepare now so the
         // playback page does not wait 25s for a player that was never created.
@@ -258,10 +272,7 @@ class PlaybackNavigationService {
       if (item == null) return;
       final warmOnlineVideo = playbackService.isCurrentItemOnlineBilibiliStream;
       if (warmOnlineVideo) {
-        _holdPlaybackPageVisibleUntilOwned(
-          playbackService,
-          maxAttempts: 1800,
-        );
+        _holdPlaybackPageVisibleUntilOwned(playbackService, maxAttempts: 1800);
         if (playbackService.needsVisibleVideoOutputRecovery(item.id)) {
           unawaited(playbackService.ensureVisibleVideoOutput(item.id));
         }

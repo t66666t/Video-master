@@ -57,8 +57,11 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('media-library-activity-menu')));
     await tester.pumpAndSettle();
     expect(find.text('置顶到「继续学习」'), findsOneWidget);
-    expect(find.text('从本页移除'), findsOneWidget);
     expect(find.text('显示所在目录'), findsOneWidget);
+    expect(find.text('导出'), findsOneWidget);
+    expect(find.text('移入回收站'), findsOneWidget);
+    expect(find.text('从本页移除'), findsOneWidget);
+    expect(find.text('移动到上一级'), findsNothing);
 
     final menu = tester.getRect(find.text('置顶到「继续学习」'));
     final screen = tester.getRect(find.byType(MaterialApp));
@@ -70,6 +73,39 @@ void main() {
     await tester.tapAt(const Offset(12, 12));
     await tester.pumpAndSettle();
     expect(find.text('置顶到「继续学习」'), findsNothing);
+  });
+
+  testWidgets('move to parent appears only when the folder page provides it', (
+    tester,
+  ) async {
+    var moved = 0;
+    await tester.pumpWidget(
+      ChangeNotifierProvider<LibraryService>.value(
+        value: library,
+        child: MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topLeft,
+              child: MediaLibraryActivityMenuButton(
+                targetId: 'clip',
+                isCollection: false,
+                onMoveToParent: () => moved += 1,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('media-library-activity-menu')));
+    await tester.pumpAndSettle();
+    expect(find.text('移动到上一级'), findsOneWidget);
+    expect(find.text('从本页移除'), findsNothing);
+
+    await tester.tap(find.text('移动到上一级'));
+    await tester.pumpAndSettle();
+    expect(moved, 1);
+    expect(find.text('移动到上一级'), findsNothing);
   });
 
   test('menu glyph follows card width instead of a 24px floor', () {

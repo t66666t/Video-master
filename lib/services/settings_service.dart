@@ -1,6 +1,6 @@
 import 'subtitle_debug_session.dart';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart' show kIsWeb;
@@ -10,6 +10,7 @@ import 'package:window_manager/window_manager.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as p;
 import '../models/folder_placeholder_style.dart';
+import '../models/media_library_root_entry.dart';
 import '../models/media_library_continue_policy.dart';
 import '../models/subtitle_copy_format.dart';
 import '../models/subtitle_style.dart';
@@ -100,6 +101,7 @@ class SettingsService extends ChangeNotifier {
 
   // Settings Fields
   bool showSubtitles = true;
+  bool developerMode = false;
   bool showBilibiliDanmaku = true;
   bool bilibiliDanmakuOnlyInVideoArea = false;
   double bilibiliDanmakuDisplayArea = 0.5;
@@ -251,9 +253,16 @@ class SettingsService extends ChangeNotifier {
   String mediaLibraryRootEntry = '';
   bool mediaLibraryRootEntryUserChosen = false;
   String mediaLibraryRootEntryOrder = '';
+
+  /// When true, cold start reopens the last root page and nested folder.
+  bool mediaLibraryRestoreLastPage = true;
+
+  /// Used only when [mediaLibraryRestoreLastPage] is false.
+  String mediaLibraryStartupEntry = MediaLibraryRootEntry.folders.storageValue;
   String mediaLibraryLastFolderId = '';
   String mediaLibraryEntryAnchors = '';
   bool mediaLibraryLastFolderIncludeDescendants = false;
+
   /// Continue tab: false = all play history; true = unfinished + watch threshold.
   bool mediaLibraryContinueSeriousOnly = false;
   ContinueWatchPolicy continueWatchPolicy = ContinueWatchPolicy.defaults;
@@ -342,11 +351,13 @@ class SettingsService extends ChangeNotifier {
         slot: slot,
         portraitKey: 'mediaListCrossSpacingScalePortrait',
         landscapeKey: 'mediaListCrossSpacingScaleLandscape',
+        fallback: MediaLibraryLayoutDefaults.defaultListSpacingScale,
       ),
       mainSpacingScale: _resolveSpacing(
         slot: slot,
         portraitKey: 'mediaListMainSpacingScalePortrait',
         landscapeKey: 'mediaListMainSpacingScaleLandscape',
+        fallback: MediaLibraryLayoutDefaults.defaultListSpacingScale,
       ),
       showThumbnail: _resolveBool(
         slot: slot,
@@ -707,6 +718,7 @@ class SettingsService extends ChangeNotifier {
     required MediaLibraryOrientationSlot slot,
     required String portraitKey,
     required String landscapeKey,
+    double? fallback,
   }) {
     final stored = _slotDouble(
       slot == MediaLibraryOrientationSlot.landscape
@@ -714,7 +726,7 @@ class SettingsService extends ChangeNotifier {
           : portraitKey,
     );
     return MediaLibraryLayoutDefaults.clampSpacing(
-      stored ?? MediaLibraryLayoutDefaults.defaultSpacingScale,
+      stored ?? fallback ?? MediaLibraryLayoutDefaults.defaultSpacingScale,
     );
   }
 
@@ -779,6 +791,17 @@ class SettingsService extends ChangeNotifier {
   /// only fetch audio. Default is false so background playback keeps downloading
   /// video+audio and a later page entry can mount the live picture.
   bool bilibiliBackgroundAudioOnly = false;
+
+  /// When true, clipboard text that was already parsed is not parsed again
+  /// until the clipboard changes. Default is true so the same share text does
+  /// not prompt on every launch.
+  bool skipRepeatedClipboardText = true;
+
+  /// Latest clipboard text whose parse attempt finished. This is not a user
+  /// setting and is omitted from settings export so a backup does not carry
+  /// clipboard contents to another device.
+  String? clipboardLastHandledText;
+  static const String clipboardLastHandledTextKey = 'clipboardLastHandledText';
   String structuredImportSortField = 'fileName';
   String structuredImportSortDirection = 'ascending';
 
@@ -1461,6 +1484,19 @@ class SettingsService extends ChangeNotifier {
         defaultValue: '',
         apply: (service, value) => service.mediaLibraryRootEntryOrder = value,
       ),
+      _boolSetting(
+        key: 'mediaLibraryRestoreLastPage',
+        defaultValue: true,
+        apply: (service, value) => service.mediaLibraryRestoreLastPage = value,
+      ),
+      _stringSetting(
+        key: 'mediaLibraryStartupEntry',
+        defaultValue: MediaLibraryRootEntry.folders.storageValue,
+        normalize: (value) =>
+            MediaLibraryRootEntryX.tryParse(value)?.storageValue ??
+            MediaLibraryRootEntry.folders.storageValue,
+        apply: (service, value) => service.mediaLibraryStartupEntry = value,
+      ),
       _stringSetting(
         key: 'mediaLibraryLastFolderId',
         defaultValue: '',
@@ -1562,8 +1598,12 @@ class SettingsService extends ChangeNotifier {
       _boolSetting(
         key: 'bilibiliBackgroundAudioOnly',
         defaultValue: false,
-        apply: (service, value) =>
-            service.bilibiliBackgroundAudioOnly = value,
+        apply: (service, value) => service.bilibiliBackgroundAudioOnly = value,
+      ),
+      _boolSetting(
+        key: 'skipRepeatedClipboardText',
+        defaultValue: true,
+        apply: (service, value) => service.skipRepeatedClipboardText = value,
       ),
       _stringSetting(
         key: 'structuredImportSortField',
@@ -1755,6 +1795,11 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) =>
             service.batchSubtitleEmbedAutoDeleteSrt = value,
       ),
+      _boolSetting(
+        key: 'developerMode',
+        defaultValue: false,
+        apply: (service, value) => service.developerMode = value,
+      ),
     ];
   }
 
@@ -1805,10 +1850,7 @@ class SettingsService extends ChangeNotifier {
   /// rebuild twice (and decode two thumbnail grids) on a single chip tap.
   /// Chip taps pass [notify] false so HomeScreen is not rebuilt on the same
   /// frame as the destination grid.
-  Future<void> saveMediaLibraryRootChoice(
-    String entry, {
-    bool notify = true,
-  }) {
+  Future<void> saveMediaLibraryRootChoice(String entry, {bool notify = true}) {
     return _updateRegisteredSettingsAtomically({
       'mediaLibraryRootEntry': entry,
       'mediaLibraryRootEntryUserChosen': true,
@@ -1968,6 +2010,7 @@ class SettingsService extends ChangeNotifier {
     await SubtitleDebugSession.instance.initialize(_prefs);
     await _loadRegisteredSettings();
     await _loadPlaybackSpeedLockState();
+    _loadClipboardLastHandledText();
 
     largeDataRootPath = _prefs.getString('largeDataRootPath');
     final composePrimaryRaw = _prefs.getString(
@@ -2063,6 +2106,26 @@ class SettingsService extends ChangeNotifier {
     mediaLibraryLastFolderIncludeDescendants = false;
     mediaLibraryContinueSeriousOnly = false;
     continueWatchPolicy = ContinueWatchPolicy.defaults;
+    clipboardLastHandledText = null;
+  }
+
+  void _loadClipboardLastHandledText() {
+    final stored = _prefs.getString(clipboardLastHandledTextKey);
+    clipboardLastHandledText = (stored == null || stored.trim().isEmpty)
+        ? null
+        : stored.trim();
+  }
+
+  /// Records [content] as the latest clipboard text that finished parsing.
+  ///
+  /// The in-memory value updates before disk so a later check in this process
+  /// sees it even if persistence is still in flight. Empty text is ignored.
+  Future<void> rememberClipboardHandledText(String content) async {
+    final identity = content.trim();
+    if (identity.isEmpty || identity == clipboardLastHandledText) return;
+    clipboardLastHandledText = identity;
+    if (!_initialized) return;
+    await _prefs.setString(clipboardLastHandledTextKey, identity);
   }
 
   /// 加载字幕样式 - 支持新旧格式迁移
@@ -2649,6 +2712,10 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<bool>('showSubtitles', value);
   }
 
+  Future<void> toggleDeveloperMode() {
+    return updateSetting<bool>('developerMode', !developerMode);
+  }
+
   Future<void> saveShowBilibiliDanmaku(bool value) async {
     await _updateRegisteredSetting<bool>('showBilibiliDanmaku', value);
   }
@@ -2900,10 +2967,14 @@ class SettingsService extends ChangeNotifier {
     await _updateRegisteredSetting<bool>('isGhostModeEnabled', value);
   }
 
-  Future<void> saveLandscapeSubtitleSidebarVisible(bool value) async {
+  Future<void> saveLandscapeSubtitleSidebarVisible(
+    bool value, {
+    bool notify = true,
+  }) async {
     await _updateRegisteredSetting<bool>(
       'landscapeSubtitleSidebarVisible',
       value,
+      notify: notify,
     );
   }
 
@@ -3389,6 +3460,8 @@ class SettingsService extends ChangeNotifier {
         'mediaLibraryRootEntry': mediaLibraryRootEntry,
         'mediaLibraryRootEntryUserChosen': mediaLibraryRootEntryUserChosen,
         'mediaLibraryRootEntryOrder': mediaLibraryRootEntryOrder,
+        'mediaLibraryRestoreLastPage': mediaLibraryRestoreLastPage,
+        'mediaLibraryStartupEntry': mediaLibraryStartupEntry,
         'mediaLibraryLastFolderId': mediaLibraryLastFolderId,
         'mediaLibraryLastFolderIncludeDescendants':
             mediaLibraryLastFolderIncludeDescendants,
@@ -3407,6 +3480,7 @@ class SettingsService extends ChangeNotifier {
         'copyImportedMediaToPrivateStorage': copyImportedMediaToPrivateStorage,
         'useSearchResultsAsPlaybackQueue': useSearchResultsAsPlaybackQueue,
         'bilibiliBackgroundAudioOnly': bilibiliBackgroundAudioOnly,
+        'skipRepeatedClipboardText': skipRepeatedClipboardText,
         'structuredImportSortField': structuredImportSortField,
         'structuredImportSortDirection': structuredImportSortDirection,
       },

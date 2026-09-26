@@ -48,6 +48,13 @@ void main() {
         );
         expect(
           isSafeYtDlpTaskRemovalArtifact(
+            'D:/Downloads/video__$taskId.png',
+            taskId,
+          ),
+          isTrue,
+        );
+        expect(
+          isSafeYtDlpTaskRemovalArtifact(
             'D:/Downloads/video__another-task.mp4.part',
             taskId,
           ),

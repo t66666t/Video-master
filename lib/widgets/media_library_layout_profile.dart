@@ -89,6 +89,42 @@ class MediaLibraryCardGridMetrics {
   double get topPadding => mainSpacing;
 }
 
+/// Vertical rhythm for 最近添加 and 继续学习.
+///
+/// Every step is a multiple of the active style's 纵向间距 (`row`, the same
+/// pixel value as a card or list grid's `mainSpacing`). Horizontal insets use
+/// the grid's outer padding so titles line up with the cards.
+///
+/// * [leading] — under the app bar, same as the folder grid's first-row inset.
+/// * [attached] — a label to the content it introduces. The filter pill uses
+///   the same step before the first title under it.
+/// * [block] — peer groups inside one section.
+/// * [section] — later peer regions (置顶 / 最近在看 / 之前未看完, history days, import batches).
+class MediaLibraryFlowSpacing {
+  const MediaLibraryFlowSpacing({required this.row, required this.outer});
+
+  final double row;
+  final double outer;
+
+  double get leading => row;
+
+  double get attached => row * 0.5;
+
+  double get block => row * 1.5;
+
+  double get section => row * 2;
+
+  Widget? gap(double extent) {
+    if (extent <= 0) return null;
+    return SliverToBoxAdapter(child: SizedBox(height: extent));
+  }
+
+  void addGap(List<Widget> slivers, double extent) {
+    final gap = this.gap(extent);
+    if (gap != null) slivers.add(gap);
+  }
+}
+
 /// Two-sided log map: the slider's midpoint is [pivot], so the comfortable
 /// band can be tuned finely while min/max still remain reachable.
 class LogMappedRange {
@@ -154,11 +190,14 @@ class MediaLibraryLayoutDefaults {
 
   static const double minHeightScale = 0.70;
   static const double maxHeightScale = 2.40;
-  static const double defaultHeightScale = 1.39;
+  static const double defaultHeightScale = 1.08;
 
   static const double minSpacingScale = 0.0;
   static const double maxSpacingScale = 0.45;
-  static const double defaultSpacingScale = 0.12;
+  static const double defaultSpacingScale = 0.08;
+
+  /// List rows are short, so the unset spacing is tighter than the card grid.
+  static const double defaultListSpacingScale = 0.03;
 
   static const LogMappedRange columnRange = LogMappedRange(
     min: 1,
@@ -240,6 +279,11 @@ class MediaLibraryLayoutDefaults {
       case MediaLibrarySizeClass.desktop:
         return landscape ? 4 : 2;
     }
+  }
+
+  /// Outer corner of a grid card. Does not change the cover image itself.
+  static double cardCornerRadius(double cardWidth) {
+    return (cardWidth * 0.045).clamp(4.0, 8.0);
   }
 
   static int clampColumns(int value) {

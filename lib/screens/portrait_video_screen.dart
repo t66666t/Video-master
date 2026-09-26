@@ -2,7 +2,7 @@ import '../services/subtitle_debug_session.dart';
 import '../widgets/subtitle_debug_speed_gateway.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +14,7 @@ import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/ocr_subtitle_models.dart';
+import '../services/bilibili/bilibili_video_shot_backfill.dart';
 import '../services/library_service.dart';
 import '../services/task_subtitle_storage_service.dart';
 import '../services/settings_service.dart';
@@ -1190,6 +1191,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       debugPrint("Error refreshing item: $e");
     }
     _currentItem = currentItem;
+    if (mounted) {
+      scheduleBilibiliVideoShotBackfill(
+        context: context,
+        item: currentItem,
+        isStillCurrent: () => mounted && _currentItem.id == currentItem.id,
+        onUpdated: () {
+          if (mounted) setState(() {});
+        },
+      );
+    }
     _applyItemSubtitlePreference(currentItem, force: true);
     // Check if this is audio
     _isAudio = currentItem.type == MediaType.audio;
@@ -1579,21 +1590,20 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         context,
         listen: false,
       );
-      if (playbackService.controller == _controller) {
-        playbackService.updatePlaybackStateFromController();
-        if (_controller.value.isPlaying) {
-          playbackService.pause();
+      if (identical(playbackService.controller, _controller)) {
+        if (playbackService.desiredPlaying) {
+          unawaited(playbackService.pause());
         } else {
-          playbackService.resume();
+          unawaited(playbackService.resume());
         }
         return;
       }
     } catch (_) {}
 
     if (_controller.value.isPlaying) {
-      _controller.pause();
+      unawaited(_controller.pause());
     } else {
-      _controller.play();
+      unawaited(_controller.play());
     }
   }
 
@@ -1666,7 +1676,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   void _enterSubtitleDragMode() {
-    if (SubtitleDebugSession.instance.usesPresets) return;
+    if (SubtitleDebugSession.instance.usesPresets) {
+      AppToast.show('预设排版位置固定，可在横屏视频的幽灵模式中拖动', type: AppToastType.info);
+      return;
+    }
     setState(() {
       _isSubtitleDragMode = true;
       _isStylePanelDragMode = false;
@@ -1899,7 +1912,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       _subtitleStyleFromCompose = fromCompose;
       _activePanel = PortraitPanel.subtitleStyle;
     });
-    if (_initialized) {
+    if (_initialized && !SubtitleDebugSession.instance.usesPresets) {
       _enableStylePanelDragMode();
     }
   }
@@ -2458,7 +2471,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           );
       if (exitController == null) {
         if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
-          await playbackService.pause(expectedItemId: itemId);
+          await playbackService.pause(expectedItemId: itemId, notify: false);
         }
         await playbackService.persistCurrentProgress(expectedItemId: itemId);
         return;
@@ -2483,6 +2496,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         await playbackService.pause(
           expectedItemId: itemId,
           expectedController: exitController,
+          notify: false,
         );
       } else if (shouldAutoPauseSession) {
         await exitController.pause();
@@ -2492,6 +2506,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         playbackService.updatePlaybackStateFromController(
           expectedItemId: itemId,
           expectedController: exitController,
+          notify: false,
         );
       }
       await _saveProgressForSession(
@@ -2842,23 +2857,17 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
     try {
       final bool? landscapeChromeOnExit = await navigator.push<bool>(
-        PageRouteBuilder<bool>(
+        PlaybackNavigationService.buildPlaybackPageRoute<bool>(
           settings: PlaybackNavigationService.landscapeRouteSettings(
             _currentItem,
           ),
-          pageBuilder: (context, animation, secondaryAnimation) =>
-              VideoPlayerScreen(
-                videoFile: null, // Legacy param, ignored
-                existingController: controllerForHandoff,
-                videoItem: _currentItem, // Pass item for context
-                skipAutoPauseOnExit: true,
-                initialShowControls: landscapeChromeVisible,
-              ),
-          opaque: true,
-          transitionsBuilder: (context, animation, secondaryAnimation, child) {
-            return FadeTransition(opacity: animation, child: child);
-          },
-          transitionDuration: const Duration(milliseconds: 300),
+          builder: (context) => VideoPlayerScreen(
+            videoFile: null, // Legacy param, ignored
+            existingController: controllerForHandoff,
+            videoItem: _currentItem, // Pass item for context
+            skipAutoPauseOnExit: true,
+            initialShowControls: landscapeChromeVisible,
+          ),
         ),
       );
       if (mounted && landscapeChromeOnExit != null) {
@@ -3978,22 +3987,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               ),
               const SizedBox(width: 30),
 
-              // Play/Pause
-              IconButton(
+              // Play/Pause follows session intent, not the lagging controller flag.
+              _SessionPlayPauseButton(
+                controller: _controller,
+                service: playbackService,
                 iconSize: iconSize,
-                icon: Icon(
-                  value.isPlaying
-                      ? Icons.pause_circle_filled
-                      : Icons.play_circle_fill,
-                  color: value.isInitialized || _isSourceMissing
-                      ? Colors.white
-                      : Colors.white38,
-                ),
-                onPressed: value.isInitialized || _isSourceMissing
-                    ? _togglePlay
-                    : null,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
+                enabled: value.isInitialized || _isSourceMissing,
+                onPressed: _togglePlay,
               ),
 
               const SizedBox(width: 30),
@@ -5472,5 +5472,94 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       });
     }
     return map;
+  }
+}
+
+/// Play/pause icon for the portrait bar. Rebuilds only when the session
+/// intent changes, so a Windows libmpv acknowledgement cannot hold the icon.
+class _SessionPlayPauseButton extends StatefulWidget {
+  const _SessionPlayPauseButton({
+    required this.controller,
+    required this.service,
+    required this.iconSize,
+    required this.enabled,
+    required this.onPressed,
+  });
+
+  final VideoPlayerController controller;
+  final MediaPlaybackService service;
+  final double iconSize;
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  @override
+  State<_SessionPlayPauseButton> createState() =>
+      _SessionPlayPauseButtonState();
+}
+
+class _SessionPlayPauseButtonState extends State<_SessionPlayPauseButton> {
+  late bool _transportPlaying;
+
+  @override
+  void initState() {
+    super.initState();
+    _transportPlaying = _readPlaying();
+    widget.service.addListener(_handleService);
+    widget.controller.addListener(_handleController);
+  }
+
+  @override
+  void didUpdateWidget(_SessionPlayPauseButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.service, widget.service)) {
+      oldWidget.service.removeListener(_handleService);
+      widget.service.addListener(_handleService);
+    }
+    if (!identical(oldWidget.controller, widget.controller)) {
+      oldWidget.controller.removeListener(_handleController);
+      widget.controller.addListener(_handleController);
+    }
+    _publish();
+  }
+
+  @override
+  void dispose() {
+    widget.service.removeListener(_handleService);
+    widget.controller.removeListener(_handleController);
+    super.dispose();
+  }
+
+  bool _readPlaying() {
+    if (identical(widget.service.controller, widget.controller)) {
+      return widget.service.desiredPlaying;
+    }
+    return widget.controller.value.isPlaying;
+  }
+
+  void _handleService() => _publish();
+
+  void _handleController() {
+    if (identical(widget.service.controller, widget.controller)) return;
+    _publish();
+  }
+
+  void _publish() {
+    final bool next = _readPlaying();
+    if (!mounted || next == _transportPlaying) return;
+    setState(() => _transportPlaying = next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      iconSize: widget.iconSize,
+      icon: Icon(
+        _transportPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill,
+        color: widget.enabled ? Colors.white : Colors.white38,
+      ),
+      onPressed: widget.enabled ? widget.onPressed : null,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(),
+    );
   }
 }

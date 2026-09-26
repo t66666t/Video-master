@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../theme/app_tokens.dart';
+
 /// Shared chrome for media-library grid cards.
 ///
 /// Default [Card] + [InkWell] draws a translucent white rounded highlight.
@@ -25,7 +27,6 @@ class MediaLibraryGridCard extends StatelessWidget {
   final Widget child;
   final double? elevation;
 
-  static const Color _unselectedColor = Color(0xFF2C2C2C);
   static const WidgetStateProperty<Color?> _noOverlay =
       WidgetStatePropertyAll<Color?>(Colors.transparent);
 
@@ -33,18 +34,13 @@ class MediaLibraryGridCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       margin: EdgeInsets.zero,
-      elevation: elevation ?? (isSelected ? 3 : 0),
-      color: isSelected
-          ? Colors.blueAccent.withValues(alpha: 0.2)
-          : _unselectedColor,
+      elevation: elevation ?? 0,
+      color: isSelected ? AppTokens.accentSoft : AppTokens.bgCard,
       surfaceTintColor: Colors.transparent,
-      shadowColor: Colors.black54,
+      shadowColor: Colors.transparent,
       clipBehavior: Clip.antiAlias,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(radius),
-        side: isSelected
-            ? const BorderSide(color: Colors.blueAccent, width: 2)
-            : BorderSide.none,
       ),
       child: InkWell(
         onTap: onTap,

@@ -10,9 +10,77 @@
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  FlMethodChannel* ime_channel;
+  gchar* saved_im_module;
+  gboolean im_module_saved;
+  gboolean text_input_active;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
+
+static void apply_linux_ime(MyApplication* self, gboolean active) {
+  GtkSettings* settings = gtk_settings_get_default();
+  if (!self->im_module_saved) {
+    g_object_get(settings, "gtk-im-module", &self->saved_im_module, nullptr);
+    self->im_module_saved = TRUE;
+  }
+  self->text_input_active = active;
+  if (active) {
+    g_object_set(settings, "gtk-im-module",
+                 self->saved_im_module != nullptr ? self->saved_im_module : "",
+                 nullptr);
+  } else {
+    // gtk-im-context-simple does not compose CJK, so letter shortcuts stay
+    // raw while Chinese or English input is selected.
+    g_object_set(settings, "gtk-im-module", "gtk-im-context-simple", nullptr);
+  }
+}
+
+static void ime_method_call_cb(FlMethodChannel* channel,
+                               FlMethodCall* method_call,
+                               gpointer user_data) {
+  (void)channel;
+  MyApplication* self = MY_APPLICATION(user_data);
+  const gchar* method = fl_method_call_get_name(method_call);
+  g_autoptr(FlMethodResponse) response = nullptr;
+  if (g_strcmp0(method, "setTextInputActive") == 0) {
+    FlValue* args = fl_method_call_get_args(method_call);
+    gboolean active = FALSE;
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
+      active = fl_value_get_bool(args);
+    }
+    apply_linux_ime(self, active);
+    response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+  } else {
+    response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
+  }
+  fl_method_call_respond(method_call, response, nullptr);
+}
+
+static gboolean on_window_focus_in(GtkWidget* widget,
+                                   GdkEventFocus* event,
+                                   gpointer user_data) {
+  (void)widget;
+  (void)event;
+  MyApplication* self = MY_APPLICATION(user_data);
+  if (!self->text_input_active) {
+    apply_linux_ime(self, FALSE);
+  }
+  return FALSE;
+}
+
+static void register_ime_gate(MyApplication* self, FlView* view) {
+  g_autoptr(FlPluginRegistrar) registrar =
+      fl_plugin_registry_get_registrar_for_plugin(FL_PLUGIN_REGISTRY(view),
+                                                  "ImeShortcutGate");
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  self->ime_channel = fl_method_channel_new(
+      fl_plugin_registrar_get_messenger(registrar),
+      "com.example.video_player_app/ime_gate", FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(self->ime_channel, ime_method_call_cb,
+                                            self, nullptr);
+  apply_linux_ime(self, FALSE);
+}
 
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
@@ -58,6 +126,9 @@ static void my_application_activate(GApplication* application) {
   gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(view));
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
+  register_ime_gate(self, view);
+  g_signal_connect(window, "focus-in-event", G_CALLBACK(on_window_focus_in),
+                   self);
 
   gtk_widget_grab_focus(GTK_WIDGET(view));
 }
@@ -103,6 +174,8 @@ static void my_application_shutdown(GApplication* application) {
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
+  g_clear_pointer(&self->saved_im_module, g_free);
+  g_clear_object(&self->ime_channel);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }
 

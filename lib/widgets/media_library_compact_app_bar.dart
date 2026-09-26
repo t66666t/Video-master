@@ -98,27 +98,40 @@ PopupMenuItem<VoidCallback> mediaLibraryCompactMenuItem({
   required IconData icon,
   required String label,
   required VoidCallback onSelected,
+  VoidCallback? onLongPress,
   Color? color,
 }) {
   final itemColor = color ?? Colors.white;
+  final row = Row(
+    children: [
+      Icon(icon, size: 20, color: itemColor),
+      const SizedBox(width: 12),
+      Text(
+        label,
+        style: TextStyle(
+          fontFamily: 'Noto Sans SC',
+          fontSize: 14,
+          height: 1.0,
+          leadingDistribution: TextLeadingDistribution.even,
+          color: itemColor,
+        ),
+      ),
+    ],
+  );
   return PopupMenuItem<VoidCallback>(
     value: onSelected,
     height: 44,
-    child: Row(
-      children: [
-        Icon(icon, size: 20, color: itemColor),
-        const SizedBox(width: 12),
-        Text(
-          label,
-          style: TextStyle(
-            fontFamily: 'Noto Sans SC',
-            fontSize: 14,
-            height: 1.0,
-            leadingDistribution: TextLeadingDistribution.even,
-            color: itemColor,
+    child: onLongPress == null
+        ? row
+        : Builder(
+            builder: (itemContext) => GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onLongPress: () {
+                Navigator.of(itemContext).pop();
+                onLongPress();
+              },
+              child: SizedBox(width: double.infinity, child: row),
+            ),
           ),
-        ),
-      ],
-    ),
   );
 }

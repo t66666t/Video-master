@@ -8,6 +8,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
+import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
@@ -1326,8 +1327,12 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
       return;
     }
 
+    final previewBvid = ep.bvid.trim();
+    final previewCid = ep.page.cid;
     final videoItem = VideoItem(
-      id: "preview_${ep.bvid}_${ep.page.page}_${DateTime.now().millisecondsSinceEpoch}",
+      id: previewBvid.isNotEmpty && previewCid > 0
+          ? 'bilibili-preview-$previewBvid-$previewCid'
+          : "preview_${ep.bvid}_${ep.page.page}_${DateTime.now().millisecondsSinceEpoch}",
       path: ep.outputPath!,
       title: "预览: ${ep.page.part}",
       durationMs: 0,
@@ -1336,6 +1341,16 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
         RegExp(r'\.[a-zA-Z0-9]+$'),
         '.srt',
       ),
+      sourceRef: previewBvid.isNotEmpty && previewCid > 0
+          ? MediaSourceRef(
+              value: previewBvid,
+              kind: MediaSourceKind.bilibiliBv,
+              bvid: previewBvid,
+              aid: ep.page.aid,
+              cid: previewCid,
+              page: ep.page.page,
+            )
+          : null,
       chapters: ep.chapters,
       hasProbedChapters: true,
     );

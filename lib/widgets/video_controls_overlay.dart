@@ -21,12 +21,14 @@ import '../services/subtitle_hop_seek_policy.dart';
 import '../services/app_haptics.dart';
 import '../services/video_preview_service.dart';
 import '../utils/android_hardware_input_bridge.dart';
+import '../utils/tooltip_hover_policy.dart';
 import '../utils/desktop_player_shortcuts.dart';
 import '../utils/hardware_keyboard_shortcuts.dart';
 import '../utils/player_volume_keyboard.dart';
 import '../models/media_chapter.dart';
 import '../models/bilibili_video_shot.dart';
 import '../utils/app_toast.dart';
+import 'bilibili_sprite_preview.dart';
 import 'chapter_slider_track_shape.dart';
 import 'player_control_metrics.dart';
 import 'progress_interaction_geometry.dart';
@@ -195,6 +197,12 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     milliseconds: 150,
   );
 
+  /// Hold long enough to boost. A shorter physical press is always a tap, even
+  /// when a busy UI thread lets this timer run before the key-up is processed.
+  static const Duration _keyboardHoldToBoostThreshold = Duration(
+    milliseconds: 200,
+  );
+
   final ValueNotifier<VideoPlayerValue> _unavailableControllerValue =
       ValueNotifier<VideoPlayerValue>(VideoPlayerValue.uninitialized());
 
@@ -202,6 +210,46 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       widget.controller?.value ?? _unavailableControllerValue.value;
   Listenable get _controllerListenable =>
       widget.controller ?? _unavailableControllerValue;
+
+  MediaPlaybackService? _playbackServiceOrNull() {
+    try {
+      return Provider.of<MediaPlaybackService>(context, listen: false);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Non-null when this overlay's controller is the session player. The button
+  /// follows that intent instead of the lagging controller flag.
+  final ValueNotifier<bool?> _ownedTransportPlaying = ValueNotifier<bool?>(
+    null,
+  );
+  MediaPlaybackService? _transportService;
+
+  void _bindTransportService() {
+    final MediaPlaybackService? next = _playbackServiceOrNull();
+    if (!identical(next, _transportService)) {
+      _transportService?.removeListener(_syncOwnedTransportPlaying);
+      _transportService = next;
+      _transportService?.addListener(_syncOwnedTransportPlaying);
+    }
+    _syncOwnedTransportPlaying();
+  }
+
+  void _syncOwnedTransportPlaying() {
+    final MediaPlaybackService? service = _transportService;
+    final VideoPlayerController? controller = widget.controller;
+    final bool? next =
+        service != null &&
+            controller != null &&
+            identical(service.controller, controller)
+        ? service.desiredPlaying
+        : null;
+    if (_ownedTransportPlaying.value != next) {
+      _ownedTransportPlaying.value = next;
+    }
+  }
+
   String get _controllerDataSource => widget.controller?.dataSource ?? '';
 
   bool _isDraggingProgress = false;
@@ -782,6 +830,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _updateProgressHover({
     required double localDx,
+    required Offset globalPosition,
     required double width,
     required double sliderMax,
     required double trackInset,
@@ -790,7 +839,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     // A pressed mouse sends move events through the slider, not through the
     // hover-preview state. Keeping the two paths separate prevents a hover
     // rebuild from replacing the slider while it owns the drag gesture.
-    if (_isDraggingProgress || widget.isLocked || sliderMax <= 0) return;
+    // A finger also owns the preview: a parked cursor must not bring it back.
+    if (_shouldIgnoreMouseActivity() ||
+        !TooltipHoverPolicy.acceptHover(globalPosition) ||
+        _isDraggingProgress ||
+        widget.isLocked ||
+        sliderMax <= 0) {
+      return;
+    }
     final value = progressValueFromLocalDx(
       localDx: localDx,
       width: width,
@@ -834,8 +890,33 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     });
     if (!_isDraggingProgress) {
       VideoPreviewService().markInteractionEnded();
-      _startAutoHideTimer();
+      if (!_lastPointerInputWasTouch && !_shouldIgnoreMouseActivity()) {
+        _startAutoHideTimer();
+      }
     }
+  }
+
+  /// Finger contact ends a mouse hover preview. The drag that follows owns the
+  /// thumbnail itself, and releasing that drag must not restore the old hover.
+  void _dismissHoverPreviewForTouch() {
+    if (!_isProgressHovered && _hoverProgressValue == null) return;
+    if (_isDraggingProgress) {
+      setState(() {
+        _isProgressHovered = false;
+        _hoverProgressValue = null;
+      });
+      return;
+    }
+    _cancelSeekPreviewRefine();
+    _resetSeekPreviewRequestState();
+    setState(() {
+      _isProgressHovered = false;
+      _hoverProgressValue = null;
+      _previewRequestSerial++;
+      _previewImage = null;
+      _videoShotFrame = null;
+    });
+    VideoPreviewService().markInteractionEnded();
   }
 
   int _chapterIndexAt(double value) {
@@ -1080,35 +1161,19 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     double width,
     double height,
   ) {
-    final spriteWidth = width * videoShot.columns;
-    final spriteHeight = height * videoShot.rows;
     return SizedBox(
-      key: ValueKey<String>(
-        'bilibili-video-shot-${frame.spriteIndex}-${frame.row}-${frame.column}',
-      ),
       width: width,
       height: height,
-      child: ClipRect(
-        child: OverflowBox(
-          alignment: Alignment.topLeft,
-          minWidth: spriteWidth,
-          maxWidth: spriteWidth,
-          minHeight: spriteHeight,
-          maxHeight: spriteHeight,
-          child: Transform.translate(
-            offset: Offset(-frame.column * width, -frame.row * height),
-            child: Image.file(
-              File(frame.spritePath),
-              width: spriteWidth,
-              height: spriteHeight,
-              fit: BoxFit.fill,
-              gaplessPlayback: true,
-              filterQuality: FilterQuality.medium,
-              errorBuilder: (_, _, _) =>
-                  const ColoredBox(color: Color(0xFF202020)),
-            ),
-          ),
+      child: BilibiliSpritePreview(
+        key: ValueKey<String>('bilibili-sprite-page-${frame.spriteIndex}'),
+        cellKey: ValueKey<String>(
+          'bilibili-video-shot-${frame.spriteIndex}-${frame.row}-${frame.column}',
         ),
+        path: frame.spritePath,
+        column: frame.column,
+        row: frame.row,
+        columns: videoShot.columns,
+        rows: videoShot.rows,
       ),
     );
   }
@@ -1146,8 +1211,17 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _bindTransportService();
+  }
+
+  @override
   void didUpdateWidget(VideoControlsOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.controller, widget.controller)) {
+      _syncOwnedTransportPlaying();
+    }
     if (oldWidget.focusNode != widget.focusNode) {
       (oldWidget.focusNode ?? _focusNode).removeListener(
         _handleKeyboardFocusChange,
@@ -1195,8 +1269,10 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     if (oldWidget.subtitles != widget.subtitles) {
       _rebuildSubtitleIndex();
     }
-    if ((oldWidget.controller?.dataSource ?? '') != _controllerDataSource ||
-        oldWidget.bilibiliVideoShot != widget.bilibiliVideoShot) {
+    final sourceChanged =
+        (oldWidget.controller?.dataSource ?? '') != _controllerDataSource;
+    final shotChanged = oldWidget.bilibiliVideoShot != widget.bilibiliVideoShot;
+    if (sourceChanged) {
       VideoPreviewService().markInteractionEnded();
       _cancelSeekPreviewRefine();
       _resetSeekPreviewRequestState();
@@ -1211,6 +1287,15 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _isProgressDragCanceling = false;
       _progressDragWasCancelled = false;
       _warmSeekPreviewMetadata();
+    } else if (shotChanged) {
+      _previewImage = null;
+      _videoShotFrame = null;
+      if (_isSeekPreviewInteractionActive) {
+        final value = _isDraggingProgress
+            ? _dragProgressValue
+            : _hoverProgressValue;
+        if (value != null) _updateSeekPreview(value);
+      }
     }
   }
 
@@ -1237,7 +1322,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     _subtitleAvoidanceReleaseTimer?.cancel();
     _stopKeyboardVolumeHold();
     _volumeFeedbackHideTimer?.cancel();
+    _transportService?.removeListener(_syncOwnedTransportPlaying);
     _unavailableControllerValue.dispose();
+    _ownedTransportPlaying.dispose();
     super.dispose();
   }
 
@@ -1288,12 +1375,14 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
 
   void _onMouseEnter(PointerEnterEvent event) {
     if (_shouldIgnoreMouseActivity()) return;
+    if (!TooltipHoverPolicy.acceptHover(event.position)) return;
     _lastPointerInputWasTouch = false;
     _showControlsForMouseActivity();
   }
 
   void _onMouseHover(PointerHoverEvent event) {
     if (_shouldIgnoreMouseActivity()) return;
+    if (!TooltipHoverPolicy.acceptHover(event.position)) return;
     _lastPointerInputWasTouch = false;
     _showControlsForMouseActivity();
   }
@@ -1338,6 +1427,7 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       _suppressMouseActivityFor(const Duration(milliseconds: 180));
       _touchReleaseAutoHideTimer?.cancel();
       _cancelAutoHideTimer();
+      _dismissHoverPreviewForTouch();
     } else if (event.kind == PointerDeviceKind.mouse) {
       if (_shouldIgnoreMouseActivity()) return;
       _lastPointerInputWasTouch = false;
@@ -1376,8 +1466,32 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
   }
 
   void _handleKeyboardFocusChange() {
-    if (!_effectiveFocusNode.hasFocus) {
-      _resetKeyboardPressState();
+    if (_effectiveFocusNode.hasFocus) return;
+    // Windows can move focus before a character key's key-up arrives. Dropping
+    // that press swallows Space. Keep taps that have not become a hold; key-up
+    // still commits them. A hold that already started ends with focus.
+    _stopKeyboardVolumeHold();
+    final pendingTaps = <LogicalKeyboardKey, _KeyboardPressState>{};
+    for (final MapEntry<LogicalKeyboardKey, _KeyboardPressState> entry
+        in _keyboardPressStates.entries) {
+      entry.value.timer?.cancel();
+      if (!entry.value.longPressTriggered) {
+        pendingTaps[entry.key] = entry.value;
+      }
+    }
+    final bool endedBoost =
+        _activeSpeedBoostKey != null &&
+        !pendingTaps.containsKey(_activeSpeedBoostKey);
+    _keyboardPressStates
+      ..clear()
+      ..addAll(pendingTaps);
+    if (endedBoost) {
+      _activeSpeedBoostKey = null;
+      _endZoneLongPress();
+    }
+    if (_isKeyboardLongPressing) {
+      _isKeyboardLongPressing = false;
+      if (mounted) setState(() {});
     }
   }
 
@@ -1813,22 +1927,30 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
       if (!isLongPressKey && shortcutAction != null) {
         _dispatchDesktopShortcut(shortcutAction);
       } else if (isLongPressKey) {
-        _handleLongPressKeyDown(key);
+        _handleLongPressKeyDown(key, event.timeStamp);
       }
       return KeyEventResult.handled;
     } else if (event is KeyUpEvent) {
-      if (isLongPressKey) _handleLongPressKeyUp(key);
+      if (isLongPressKey) _handleLongPressKeyUp(key, event.timeStamp);
       return KeyEventResult.handled;
     }
 
     return KeyEventResult.handled;
   }
 
-  void _handleLongPressKeyDown(LogicalKeyboardKey key) {
-    if (_keyboardPressStates.containsKey(key)) return;
-    final _KeyboardPressState state = _KeyboardPressState();
+  void _handleLongPressKeyDown(LogicalKeyboardKey key, Duration timeStamp) {
+    final _KeyboardPressState? existing = _keyboardPressStates[key];
+    if (existing != null) {
+      // A second down means the previous up was lost. An in-progress hold
+      // keeps its timer; an uncommitted tap must not block the new press.
+      if (existing.longPressTriggered) return;
+      existing.timer?.cancel();
+      _keyboardPressStates.remove(key);
+    }
+    final _KeyboardPressState state = _KeyboardPressState()
+      ..downStamp = timeStamp;
     _keyboardPressStates[key] = state;
-    state.timer = Timer(const Duration(milliseconds: 200), () {
+    state.timer = Timer(_keyboardHoldToBoostThreshold, () {
       if (!mounted || _keyboardPressStates[key] != state) return;
       state.longPressTriggered = true;
       if (key == LogicalKeyboardKey.escape) {
@@ -1848,17 +1970,26 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
     });
   }
 
-  void _handleLongPressKeyUp(LogicalKeyboardKey key) {
+  void _handleLongPressKeyUp(LogicalKeyboardKey key, Duration timeStamp) {
     final _KeyboardPressState? state = _keyboardPressStates.remove(key);
     if (state == null) return;
     state.timer?.cancel();
-    if (state.longPressTriggered) {
+    final bool heldLongEnough =
+        timeStamp - state.downStamp >= _keyboardHoldToBoostThreshold;
+    if (state.longPressTriggered && heldLongEnough) {
       if (state.speedBoostStarted && _activeSpeedBoostKey == key) {
         _activeSpeedBoostKey = null;
         _endZoneLongPress();
         if (mounted) setState(() => _isKeyboardLongPressing = false);
       }
       return;
+    }
+    // The timer can run first when the UI thread was busy, even though the
+    // physical press was a tap. Undo that boost and still commit the tap.
+    if (state.speedBoostStarted && _activeSpeedBoostKey == key) {
+      _activeSpeedBoostKey = null;
+      _endZoneLongPress();
+      if (mounted) setState(() => _isKeyboardLongPressing = false);
     }
     if (key == LogicalKeyboardKey.space) {
       widget.onTogglePlay();
@@ -3951,33 +4082,6 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                 clipBehavior: Clip.none,
                                                 alignment: Alignment.bottomLeft,
                                                 children: [
-                                                  if (interactionPreviewValue !=
-                                                      null)
-                                                    _buildSeekPreviewOverlay(
-                                                      progressWidth:
-                                                          sliderConstraints
-                                                              .maxWidth,
-                                                      sliderMax: sliderMax,
-                                                      previewValue:
-                                                          interactionPreviewValue,
-                                                      trackInset: trackInset,
-                                                      textDirection:
-                                                          progressTextDirection,
-                                                      bottom:
-                                                          controlMetrics.progressAreaHeight(
-                                                            hasChapterButton:
-                                                                hasChapterButton,
-                                                            hasQualityButton:
-                                                                hasQualityButton,
-                                                          ) +
-                                                          6,
-                                                      showThumbnail:
-                                                          widget
-                                                              .enableSeekThumbnailPreview &&
-                                                          settings
-                                                              .enableSeekPreview,
-                                                    ),
-
                                                   if (hasChapterButton)
                                                     Positioned(
                                                       left: trackInset,
@@ -4202,6 +4306,34 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       ),
                                                     ),
 
+                                                  if (interactionPreviewValue !=
+                                                      null)
+                                                    _buildSeekPreviewOverlay(
+                                                      progressWidth:
+                                                          sliderConstraints
+                                                              .maxWidth,
+                                                      sliderMax: sliderMax,
+                                                      previewValue:
+                                                          interactionPreviewValue,
+                                                      trackInset: trackInset,
+                                                      textDirection:
+                                                          progressTextDirection,
+                                                      bottom:
+                                                          (hasQualityButton
+                                                              ? controlMetrics
+                                                                    .progressHitHeight
+                                                              : controlMetrics.progressAreaHeight(
+                                                                  hasChapterButton:
+                                                                      hasChapterButton,
+                                                                )) +
+                                                          6,
+                                                      showThumbnail:
+                                                          widget
+                                                              .enableSeekThumbnailPreview &&
+                                                          settings
+                                                              .enableSeekPreview,
+                                                    ),
+
                                                   Listener(
                                                     key: const ValueKey(
                                                       'video-controls-progress-interaction',
@@ -4381,6 +4513,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                     localDx: event
                                                                         .localPosition
                                                                         .dx,
+                                                                    globalPosition:
+                                                                        event
+                                                                            .position,
                                                                     width: sliderConstraints
                                                                         .maxWidth,
                                                                     sliderMax:
@@ -4400,6 +4535,9 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                     localDx: event
                                                                         .localPosition
                                                                         .dx,
+                                                                    globalPosition:
+                                                                        event
+                                                                            .position,
                                                                     width: sliderConstraints
                                                                         .maxWidth,
                                                                     sliderMax:
@@ -4895,14 +5033,20 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                       width: controlMetrics
                                                           .controlGap,
                                                     ),
-                                                    // 播放/暂停按钮 — 小范围 AnimatedBuilder，仅重建 IconButton
+                                                    // 播放/暂停按钮 — 跟播放意图走，不等原生 isPlaying 回执
                                                     AnimatedBuilder(
                                                       animation:
-                                                          _controllerListenable,
+                                                          _ownedTransportPlaying,
                                                       builder: (context, _) {
-                                                        final isPlaying =
-                                                            _controllerValue
-                                                                .isPlaying;
+                                                        return AnimatedBuilder(
+                                                          animation:
+                                                              _controllerListenable,
+                                                          builder: (context, _) {
+                                                            final isPlaying =
+                                                                _ownedTransportPlaying
+                                                                    .value ??
+                                                                _controllerValue
+                                                                    .isPlaying;
                                                         final isInitialized =
                                                             _controllerValue
                                                                 .isInitialized;
@@ -4944,6 +5088,8 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                 DesktopPlayerShortcutAction
                                                                     .playPause,
                                                               ),
+                                                        );
+                                                          },
                                                         );
                                                       },
                                                     ),
@@ -5461,6 +5607,7 @@ class _DanmakuToggleGlyph extends StatelessWidget {
 
 class _KeyboardPressState {
   Timer? timer;
+  Duration downStamp = Duration.zero;
   bool longPressTriggered = false;
   bool speedBoostStarted = false;
 }

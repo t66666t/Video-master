@@ -377,7 +377,11 @@ class YtDlpMetaParser {
       return false;
     }
     if (ext == 'mhtml') return false;
-    if (vcodec.isEmpty || vcodec == 'none') return false;
+    if (_looksLikeSeparatedAudio(format)) return false;
+    final hasPicture =
+        (_intValue(format['width']) ?? 0) > 0 ||
+        (_intValue(format['height']) ?? 0) > 0;
+    if ((vcodec.isEmpty || vcodec == 'none') && !hasPicture) return false;
     if (vcodec.contains('images')) return false;
     return true;
   }
@@ -392,9 +396,22 @@ class YtDlpMetaParser {
     if (formatId.isEmpty) return false;
     if (note.contains('storyboard')) return false;
     if (ext == 'mhtml') return false;
-    if (acodec.isEmpty || acodec == 'none') return false;
     if (vcodec.isNotEmpty && vcodec != 'none') return false;
-    return true;
+    if (acodec.isNotEmpty && acodec != 'none') return true;
+    return _looksLikeSeparatedAudio(format);
+  }
+
+  bool _looksLikeSeparatedAudio(Map<String, dynamic> format) {
+    final vcodec = (_stringValue(format['vcodec']) ?? '').toLowerCase();
+    if (vcodec.isNotEmpty && vcodec != 'none') {
+      return false;
+    }
+    final formatId = (_stringValue(format['format_id']) ?? '').toLowerCase();
+    final note = (_stringValue(format['format_note']) ?? '').toLowerCase();
+    final formatName = (_stringValue(format['format']) ?? '').toLowerCase();
+    return formatId.contains('audio') ||
+        note.contains('audio only') ||
+        formatName.contains('audio only');
   }
 
   bool _hasUsableAudio(Map<String, dynamic> format) {
@@ -440,6 +457,14 @@ class YtDlpMetaParser {
     if (formatText.contains('hev1') || formatText.contains('h265')) {
       return 'h265';
     }
+    final formatId = (_stringValue(format['format_id']) ?? '').toLowerCase();
+    final ext = (_stringValue(format['ext']) ?? '').toLowerCase();
+    final hasPicture =
+        (_intValue(format['width']) ?? 0) > 0 ||
+        (_intValue(format['height']) ?? 0) > 0;
+    if (hasPicture && (formatId.startsWith('http') || ext == 'mp4')) {
+      return 'h264';
+    }
     return null;
   }
 
@@ -455,6 +480,10 @@ class YtDlpMetaParser {
     }
     if (formatText.contains('mp3')) {
       return 'mp3';
+    }
+    final formatId = (_stringValue(format['format_id']) ?? '').toLowerCase();
+    if (formatId.contains('audio') || formatId.contains('mp4a')) {
+      return 'aac';
     }
     return null;
   }

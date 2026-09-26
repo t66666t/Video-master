@@ -246,7 +246,9 @@ class ImportBatchRecord {
     required this.sourceKind,
     this.targetCollectionId,
     List<String>? createdMediaIds,
-  }) : createdMediaIds = createdMediaIds ?? <String>[];
+    List<String>? createdCollectionIds,
+  }) : createdMediaIds = createdMediaIds ?? <String>[],
+       createdCollectionIds = createdCollectionIds ?? <String>[];
 
   final String id;
   final int startedAtMs;
@@ -254,6 +256,10 @@ class ImportBatchRecord {
   final LibraryImportSourceKind sourceKind;
   final String? targetCollectionId;
   final List<String> createdMediaIds;
+
+  /// Folders created for this import, root first. Recent view shows their
+  /// first layer instead of flattening every descendant file.
+  final List<String> createdCollectionIds;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -263,6 +269,7 @@ class ImportBatchRecord {
       'sourceKind': sourceKind.storageValue,
       'targetCollectionId': targetCollectionId,
       'createdMediaIds': List<String>.from(createdMediaIds),
+      'createdCollectionIds': List<String>.from(createdCollectionIds),
     };
   }
 
@@ -291,7 +298,21 @@ class ImportBatchRecord {
       sourceKind: LibraryImportSourceKindX.fromStorage(json['sourceKind']),
       targetCollectionId: _readNonEmptyString(json['targetCollectionId']),
       createdMediaIds: members,
+      createdCollectionIds: _readIdList(json['createdCollectionIds']),
     );
+  }
+
+  static List<String> _readIdList(Object? raw) {
+    final ids = <String>[];
+    final seen = <String>{};
+    if (raw is! List) return ids;
+    for (final entry in raw) {
+      if (entry is! String) continue;
+      final id = entry.trim();
+      if (id.isEmpty || !seen.add(id)) continue;
+      ids.add(id);
+    }
+    return ids;
   }
 }
 

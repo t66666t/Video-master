@@ -311,6 +311,100 @@ void main() {
     expect(find.text('only'), findsOneWidget);
   });
 
+  testWidgets('pinned folders keep a locate button at root and nested', (
+    tester,
+  ) async {
+    String? located;
+    String? openedFolder;
+    library.seedCollectionForTesting(
+      VideoCollection(id: 'root-folder', name: 'RootFolder', createTime: 1),
+    );
+    library.seedCollectionForTesting(
+      VideoCollection(
+        id: 'nested-folder',
+        name: 'NestedFolder',
+        createTime: 2,
+        parentId: 'root-folder',
+      ),
+    );
+    library.seedPinnedIdsForTesting(['root-folder', 'nested-folder']);
+    library.notifyListeners();
+
+    await tester.pumpWidget(
+      await _harness(
+        library,
+        scroll,
+        onOpenFolder: (id) => openedFolder = id,
+        onLocateFolder: (id) => located = id,
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('RootFolder'), findsOneWidget);
+    expect(find.text('NestedFolder'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('show-in-parent-folder-button')),
+      findsNWidgets(2),
+    );
+
+    final nestedCard = find.ancestor(
+      of: find.text('NestedFolder'),
+      matching: find.byKey(const ValueKey('media-list-card')),
+    );
+    await tester.tap(
+      find.descendant(
+        of: nestedCard,
+        matching: find.byKey(const ValueKey('show-in-parent-folder-button')),
+      ),
+    );
+    await tester.pump();
+    expect(located, 'nested-folder');
+    expect(openedFolder, isNull);
+
+    final rootCard = find.ancestor(
+      of: find.text('RootFolder'),
+      matching: find.byKey(const ValueKey('media-list-card')),
+    );
+    await tester.tap(
+      find.descendant(
+        of: rootCard,
+        matching: find.byKey(const ValueKey('show-in-parent-folder-button')),
+      ),
+    );
+    await tester.pump();
+    expect(located, 'root-folder');
+    expect(openedFolder, isNull);
+  });
+
+  testWidgets('pinned folder grid cards keep a locate button', (tester) async {
+    String? located;
+    library.seedCollectionForTesting(
+      VideoCollection(id: 'root-folder', name: 'RootFolder', createTime: 1),
+    );
+    library.seedPinnedIdsForTesting(['root-folder']);
+    library.notifyListeners();
+
+    await tester.pumpWidget(
+      await _harness(
+        library,
+        scroll,
+        viewMode: 0,
+        onLocateFolder: (id) => located = id,
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey('show-in-parent-folder-button')),
+      findsOneWidget,
+    );
+    await tester.tap(
+      find.byKey(const ValueKey('show-in-parent-folder-button')),
+    );
+    await tester.pump();
+    expect(located, 'root-folder');
+  });
+
   testWidgets('continue-learning rows are not pin-reorder targets', (
     tester,
   ) async {
@@ -353,11 +447,13 @@ Future<Widget> _harness(
   ScrollController scroll, {
   ValueChanged<String>? onOpen,
   ValueChanged<String>? onOpenFolder,
+  ValueChanged<String>? onLocateFolder,
   bool seriousOnly = false,
+  int viewMode = 1,
 }) async {
   final settings = SettingsService();
   await settings.init();
-  settings.mediaLibraryViewMode = 1;
+  settings.mediaLibraryViewMode = viewMode;
   settings.mediaLibraryContinueSeriousOnly = seriousOnly;
   return MultiProvider(
     providers: [
@@ -375,6 +471,7 @@ Future<Widget> _harness(
           onOpenMedia: (item) => onOpen?.call(item.id),
           onOpenFolder: (folder) => onOpenFolder?.call(folder.id),
           onLocateMedia: (_) {},
+          onLocateFolder: (folder) => onLocateFolder?.call(folder.id),
           onGoRecent: () {},
           onGoFolders: () {},
         ),

@@ -2,9 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../models/media_library_root_entry.dart';
 import '../models/video_item.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
+import '../theme/app_tokens.dart';
 import '../services/bilibili/bilibili_streaming_service.dart';
 import 'package:provider/provider.dart';
 
@@ -78,14 +80,19 @@ void showMediaLibrarySettingsBottomSheet(
   showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
-    backgroundColor: const Color(0xFF1E1E1E),
+    backgroundColor: AppTokens.bgRaised,
     shape: const RoundedRectangleBorder(
-      borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
     ),
     builder: (context) {
+      var restoreLastPage = settings.mediaLibraryRestoreLastPage;
+      var startupEntry =
+          MediaLibraryRootEntryX.tryParse(settings.mediaLibraryStartupEntry) ??
+          MediaLibraryRootEntry.folders;
       var copyImportedMedia = settings.copyImportedMediaToPrivateStorage;
       var useSearchResultsAsQueue = settings.useSearchResultsAsPlaybackQueue;
       var saveBilibiliBackgroundData = settings.bilibiliBackgroundAudioOnly;
+      var skipRepeatedClipboardText = settings.skipRepeatedClipboardText;
       return StatefulBuilder(
         builder: (context, setSheetState) {
           final maxHeight = MediaQuery.sizeOf(context).height * 0.65;
@@ -100,6 +107,85 @@ void showMediaLibrarySettingsBottomSheet(
                     fontSize: 17,
                     fontWeight: FontWeight.bold,
                     color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
+                  child: Column(
+                    children: [
+                      SwitchListTile.adaptive(
+                        key: const ValueKey('mediaLibraryRestoreLastPage'),
+                        value: restoreLastPage,
+                        activeThumbColor: Colors.blueAccent,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 4,
+                        ),
+                        title: const Text(
+                          '打开时回到上次离开的页面',
+                          style: TextStyle(color: Colors.white, fontSize: 15),
+                        ),
+                        subtitle: const Padding(
+                          padding: EdgeInsets.only(top: 6),
+                          child: Text(
+                            '包括上次打开的文件夹。关闭后，每次进入都打开下方选中的页面。',
+                            style: TextStyle(
+                              color: Colors.white60,
+                              fontSize: 12,
+                              height: 1.4,
+                            ),
+                          ),
+                        ),
+                        onChanged: (value) {
+                          setSheetState(() => restoreLastPage = value);
+                          unawaited(
+                            settings.updateSetting(
+                              'mediaLibraryRestoreLastPage',
+                              value,
+                            ),
+                          );
+                        },
+                      ),
+                      if (!restoreLastPage)
+                        for (final entry in const [
+                          MediaLibraryRootEntry.folders,
+                          MediaLibraryRootEntry.continueLearning,
+                          MediaLibraryRootEntry.recent,
+                        ])
+                          ListTile(
+                            key: ValueKey(
+                              'mediaLibraryStartupEntry-${entry.storageValue}',
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                            ),
+                            title: Text(
+                              entry.label,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 15,
+                              ),
+                            ),
+                            trailing: startupEntry == entry
+                                ? const Icon(
+                                    Icons.check_rounded,
+                                    color: Colors.blueAccent,
+                                  )
+                                : null,
+                            onTap: () {
+                              setSheetState(() => startupEntry = entry);
+                              unawaited(
+                                settings.updateSetting(
+                                  'mediaLibraryStartupEntry',
+                                  entry.storageValue,
+                                ),
+                              );
+                            },
+                          ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -226,6 +312,45 @@ void showMediaLibrarySettingsBottomSheet(
                   color: const Color(0xFF292929),
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
+                  child: SwitchListTile.adaptive(
+                    key: const ValueKey('skipRepeatedClipboardText'),
+                    value: skipRepeatedClipboardText,
+                    activeThumbColor: Colors.blueAccent,
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 4,
+                    ),
+                    title: const Text(
+                      '相同剪贴板内容只识别一次',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: const Padding(
+                      padding: EdgeInsets.only(top: 6),
+                      child: Text(
+                        '开启后，同一段文字不会反复解析，关掉软件再打开也一样。换成别的内容再复制回来，仍会识别。关闭后，下次回到软件会再识别一次。',
+                        style: TextStyle(
+                          color: Colors.white60,
+                          fontSize: 12,
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                    onChanged: (value) {
+                      setSheetState(() => skipRepeatedClipboardText = value);
+                      unawaited(
+                        settings.updateSetting(
+                          'skipRepeatedClipboardText',
+                          value,
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Material(
+                  color: const Color(0xFF292929),
+                  borderRadius: BorderRadius.circular(12),
+                  clipBehavior: Clip.antiAlias,
                   child: ListTile(
                     key: const ValueKey('clearPlaybackHistory'),
                     title: const Text(
@@ -256,17 +381,13 @@ void showMediaLibrarySettingsBottomSheet(
                                   ),
                                   actions: [
                                     TextButton(
-                                      onPressed: () => Navigator.pop(
-                                        dialogContext,
-                                        false,
-                                      ),
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, false),
                                       child: const Text('取消'),
                                     ),
                                     TextButton(
-                                      onPressed: () => Navigator.pop(
-                                        dialogContext,
-                                        true,
-                                      ),
+                                      onPressed: () =>
+                                          Navigator.pop(dialogContext, true),
                                       child: const Text('清除'),
                                     ),
                                   ],
@@ -312,8 +433,7 @@ class MediaLibraryBilibiliCacheSection extends StatefulWidget {
     this.inspectCache,
     this.clearCache,
   }) : assert(
-         streamService != null ||
-             (inspectCache != null && clearCache != null),
+         streamService != null || (inspectCache != null && clearCache != null),
        );
 
   @override
@@ -338,8 +458,7 @@ class _MediaLibraryBilibiliCacheSectionState
   }
 
   Future<BilibiliStreamCacheReport> _inspectCache() {
-    return widget.inspectCache?.call() ??
-        widget.streamService!.inspectCache();
+    return widget.inspectCache?.call() ?? widget.streamService!.inspectCache();
   }
 
   Future<void> _clearGatewayCache() {
@@ -393,9 +512,7 @@ class _MediaLibraryBilibiliCacheSectionState
 
   Future<void> _clearItemCache(String itemId) async {
     final library = widget.library;
-    if (library == null ||
-        _clearingAll ||
-        _clearingCardIds.contains(itemId)) {
+    if (library == null || _clearingAll || _clearingCardIds.contains(itemId)) {
       return;
     }
     setState(() {
@@ -459,10 +576,7 @@ class _MediaLibraryBilibiliCacheSectionState
     });
   }
 
-  Widget _buildActions({
-    required bool compact,
-    required bool waiting,
-  }) {
+  Widget _buildActions({required bool compact, required bool waiting}) {
     final style = mediaLibraryCacheActionStyle(compact: compact);
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -541,11 +655,7 @@ class _MediaLibraryBilibiliCacheSectionState
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      title,
-                      const SizedBox(height: 4),
-                      subtitle,
-                    ],
+                    children: [title, const SizedBox(height: 4), subtitle],
                   ),
                 ),
               ],
@@ -559,10 +669,7 @@ class _MediaLibraryBilibiliCacheSectionState
 
     return ListTile(
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-      leading: const Icon(
-        Icons.cloud_download_outlined,
-        color: Colors.white70,
-      ),
+      leading: const Icon(Icons.cloud_download_outlined, color: Colors.white70),
       title: title,
       subtitle: Padding(
         padding: const EdgeInsets.only(top: 6),
@@ -679,10 +786,7 @@ class _CollapsingCacheRow extends StatelessWidget {
   final bool collapsing;
   final Widget child;
 
-  const _CollapsingCacheRow({
-    required this.collapsing,
-    required this.child,
-  });
+  const _CollapsingCacheRow({required this.collapsing, required this.child});
 
   @override
   Widget build(BuildContext context) {
@@ -702,4 +806,3 @@ class _CollapsingCacheRow extends StatelessWidget {
     );
   }
 }
-

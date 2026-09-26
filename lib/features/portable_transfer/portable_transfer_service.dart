@@ -19,6 +19,7 @@ import '../../services/settings_service.dart';
 import '../../services/bilibili/bilibili_video_shot_service.dart';
 import 'portable_media_selection.dart';
 import 'portable_transfer_models.dart';
+import 'zip_media_exporter.dart';
 
 class PortableTransferService extends ChangeNotifier {
   PortableTransferService._();
@@ -122,6 +123,14 @@ class PortableTransferService extends ChangeNotifier {
     if (await extractionRoot.exists()) {
       try {
         await extractionRoot.delete(recursive: true);
+      } catch (_) {}
+    }
+    final zipScratch = Directory(
+      p.join(temp.path, zipExportScratchDirectoryName),
+    );
+    if (await zipScratch.exists()) {
+      try {
+        await zipScratch.delete(recursive: true);
       } catch (_) {}
     }
     for (final name in const <String>[
@@ -266,6 +275,7 @@ class PortableTransferService extends ChangeNotifier {
     if (task == null || !task.isActive) return;
     task.cancelRequested = true;
     task.subtitle = '正在安全停止…';
+    ZipExportRuntime.cancel(id);
     _workers[task.id]?.cancel();
     _schedulePersist();
     notifyListeners();
@@ -455,6 +465,10 @@ class PortableTransferService extends ChangeNotifier {
     String outputPath,
     PortableExportOptions options,
   ) async {
+    if (options.format == PortableExportFormat.zip) {
+      await _runZipExport(task, library, rootIds, outputPath, options);
+      return;
+    }
     final partial = File('$outputPath.part');
     PortableTransferStatus? terminalStatus;
     String? terminalSubtitle;
@@ -508,6 +522,78 @@ class PortableTransferService extends ChangeNotifier {
       terminalSubtitle =
           '${plan.mediaCount} 个媒体 · ${_formatBytes(await target.length())}';
       _retrySpecs.remove(task.id);
+    } on _TransferCancelled {
+      terminalStatus = PortableTransferStatus.cancelled;
+      terminalSubtitle = '已取消，没留下半成品';
+    } catch (error) {
+      terminalStatus = PortableTransferStatus.failed;
+      terminalError = error.toString();
+      terminalSubtitle = '导出失败';
+    } finally {
+      if (terminalStatus != PortableTransferStatus.completed &&
+          await partial.exists()) {
+        try {
+          await partial.delete();
+        } catch (_) {}
+      }
+      task.status = terminalStatus ?? PortableTransferStatus.failed;
+      task.subtitle = terminalSubtitle ?? '导出失败';
+      task.error = terminalError;
+      await _persistStateNow();
+      notifyListeners();
+    }
+  }
+
+  Future<void> _runZipExport(
+    PortableTransferTask task,
+    LibraryService library,
+    List<String> rootIds,
+    String outputPath,
+    PortableExportOptions options,
+  ) async {
+    final partial = File('$outputPath.part');
+    PortableTransferStatus? terminalStatus;
+    String? terminalSubtitle;
+    String? terminalError;
+    try {
+      task.status = PortableTransferStatus.preparing;
+      task.progress = 0;
+      task.subtitle = '正在整理 ${rootIds.length} 个项目…';
+      notifyListeners();
+      final result = await ZipMediaExporter().run(
+        library: library,
+        rootIds: rootIds,
+        partialPath: partial.path,
+        options: options,
+        taskId: task.id,
+        isCancelled: () => task.cancelRequested,
+        onProgress: (progress, subtitle, processedBytes, totalBytes) {
+          if (task.cancelRequested) return;
+          task.status = PortableTransferStatus.running;
+          task.progress = progress.clamp(0, 0.99);
+          task.subtitle = subtitle;
+          task.processedBytes = processedBytes;
+          task.totalBytes = totalBytes;
+          notifyListeners();
+        },
+      );
+      if (task.cancelRequested) throw const PortableExportCancelled();
+      if (!await partial.exists()) {
+        throw StateError('导出文件没有写完');
+      }
+      final target = File(outputPath);
+      if (await target.exists()) await target.delete();
+      await partial.rename(outputPath);
+      task
+        ..progress = 1
+        ..itemCount = result.mediaCount
+        ..totalBytes = await target.length();
+      terminalStatus = PortableTransferStatus.completed;
+      terminalSubtitle = result.summary(task.totalBytes);
+      _retrySpecs.remove(task.id);
+    } on PortableExportCancelled {
+      terminalStatus = PortableTransferStatus.cancelled;
+      terminalSubtitle = '已取消，没留下半成品';
     } on _TransferCancelled {
       terminalStatus = PortableTransferStatus.cancelled;
       terminalSubtitle = '已取消，没留下半成品';
@@ -1035,6 +1121,7 @@ class PortableTransferService extends ChangeNotifier {
     }
 
     final packageRoot = await library.createCollection(packageName, null);
+    library.noteImportedCollection(packageRoot.id, batchId: snapshotBatchId);
     if (retrySpec != null) {
       retrySpec.transactionRootId = packageRoot.id;
       await _persistStateNow();
@@ -1081,6 +1168,7 @@ class PortableTransferService extends ChangeNotifier {
             sourceRef: MediaSourceRef.fromJsonOrNull(record['sourceRef']),
           );
           idMap[exportId] = collection.id;
+          library.noteImportedCollection(collection.id, batchId: snapshotBatchId);
           pending.remove(record);
           progressed = true;
           importedCollectionCount++;

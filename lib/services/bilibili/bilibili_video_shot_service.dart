@@ -86,7 +86,7 @@ class BilibiliVideoShotService {
         );
         final temporary = File('${destination.path}.download');
         await temporary.writeAsBytes(bytes, flush: true);
-        await temporary.rename(destination.path);
+        await _commitSpriteFile(temporary, destination);
         savedPaths.add(destination.path);
       }
     } catch (_) {
@@ -162,13 +162,31 @@ class BilibiliVideoShotService {
     return directory;
   }
 
+  Future<void> _commitSpriteFile(File temporary, File destination) async {
+    try {
+      if (await destination.exists()) await destination.delete();
+      await temporary.rename(destination.path);
+    } catch (_) {
+      // Windows rename fails when the destination is locked or the move crosses
+      // a volume. Copy still publishes the sprite.
+      await temporary.copy(destination.path);
+      try {
+        await temporary.delete();
+      } catch (_) {}
+    }
+  }
+
   Uri? _normalizeSpriteUri(String value) {
     final trimmed = value.trim();
     if (trimmed.isEmpty) return null;
-    final uri = Uri.tryParse(
+    final parsed = Uri.tryParse(
       trimmed.startsWith('//') ? 'https:$trimmed' : trimmed,
     );
-    if (uri == null || !uri.isScheme('https') || uri.host.isEmpty) return null;
+    if (parsed == null || parsed.host.isEmpty) return null;
+    final uri = parsed.isScheme('http')
+        ? parsed.replace(scheme: 'https')
+        : parsed;
+    if (!uri.isScheme('https')) return null;
     final host = uri.host.toLowerCase();
     if (host != 'hdslb.com' &&
         !host.endsWith('.hdslb.com') &&

@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../../debug/developer_log.dart' as developer;
 import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -3644,6 +3644,10 @@ class BilibiliDownloadService extends ChangeNotifier {
                 task.collectionInfo!.cover,
               );
             }
+            library.noteImportedCollection(
+              rootCollectionId,
+              batchId: streamingBatchId,
+            );
           } else {
             rootCollectionId = targetFolderId;
           }
@@ -3667,6 +3671,10 @@ class BilibiliDownloadService extends ChangeNotifier {
                 video.videoInfo.pic,
               );
             }
+            library.noteImportedCollection(
+              folderId,
+              batchId: streamingBatchId,
+            );
           }
 
           final uuid = _uuid.v4();
@@ -3958,6 +3966,10 @@ class BilibiliDownloadService extends ChangeNotifier {
               task.collectionInfo!.cover,
             );
           }
+          library.noteImportedCollection(
+            rootCollectionId,
+            batchId: downloadBatchId,
+          );
         } else {
           rootCollectionId = targetFolderId;
         }
@@ -3981,6 +3993,7 @@ class BilibiliDownloadService extends ChangeNotifier {
               video.videoInfo.pic,
             );
           }
+          library.noteImportedCollection(folderId, batchId: downloadBatchId);
         }
 
         // --- End Hierarchy Logic ---

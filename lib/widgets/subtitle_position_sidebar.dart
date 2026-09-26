@@ -17,6 +17,7 @@ class SubtitlePositionSidebar extends StatefulWidget {
   final VoidCallback onEnterGhostMode;
   final bool isGhostModeActive;
   final bool hideGhostModeControls;
+  final bool lockPositionEditing;
 
   const SubtitlePositionSidebar({
     super.key,
@@ -31,6 +32,7 @@ class SubtitlePositionSidebar extends StatefulWidget {
     required this.onEnterGhostMode,
     required this.isGhostModeActive,
     this.hideGhostModeControls = false,
+    this.lockPositionEditing = false,
   });
 
   @override
@@ -176,368 +178,387 @@ class _SubtitlePositionSidebarState extends State<SubtitlePositionSidebar> {
                     color: Colors.white10,
                     height: isSmallScreen ? 2 : 24,
                   ),
-
-                // 1. Font Settings (Size & Spacing)
-                Text(
-                  "字体布局",
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: isSmallScreen ? 10 : 12,
+                if (widget.lockPositionEditing)
+                  Padding(
+                    padding: EdgeInsets.only(top: isSmallScreen ? 8 : 12),
+                    child: Text(
+                      '预设排版位置固定。打开幽灵模式后可以拖动。',
+                      style: TextStyle(
+                        color: Colors.white54,
+                        fontSize: isSmallScreen ? 10 : 12,
+                        height: 1.4,
+                      ),
+                    ),
                   ),
-                ),
-                SizedBox(height: isSmallScreen ? 4 : 8),
-                Consumer<SettingsService>(
-                  builder: (context, settings, child) {
-                    return Column(
-                      children: [
-                        // Main Font Size
-                        Row(
-                          children: [
-                            const SizedBox(
-                              width: 30,
-                              child: Text(
-                                "主",
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child: SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(
-                                    enabledThumbRadius: 6,
-                                  ),
-                                  overlayShape: const RoundSliderOverlayShape(
-                                    overlayRadius: 12,
+                if (!widget.lockPositionEditing) ...[
+                  // 1. Font Settings (Size & Spacing)
+                  Text(
+                    "字体布局",
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: isSmallScreen ? 10 : 12,
+                    ),
+                  ),
+                  SizedBox(height: isSmallScreen ? 4 : 8),
+                  Consumer<SettingsService>(
+                    builder: (context, settings, child) {
+                      return Column(
+                        children: [
+                          // Main Font Size
+                          Row(
+                            children: [
+                              const SizedBox(
+                                width: 30,
+                                child: Text(
+                                  "主",
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
                                   ),
                                 ),
-                                child: Slider(
-                                  value:
-                                      settings.subtitleStyleLandscape.fontSize,
-                                  min: 10,
-                                  max: 100,
-                                  divisions: 90,
-                                  activeColor: Colors.blueAccent,
-                                  inactiveColor: Colors.white24,
-                                  onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(
-                                      settings.subtitleStyleLandscape.copyWith(
-                                        fontSize: val,
-                                      ),
-                                    );
-                                  },
+                              ),
+                              Expanded(
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 2,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 6,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 12,
+                                    ),
+                                  ),
+                                  child: Slider(
+                                    value: settings
+                                        .subtitleStyleLandscape
+                                        .fontSize,
+                                    min: 10,
+                                    max: 100,
+                                    divisions: 90,
+                                    activeColor: Colors.blueAccent,
+                                    inactiveColor: Colors.white24,
+                                    onChanged: (val) {
+                                      settings.saveSubtitleStyleLandscape(
+                                        settings.subtitleStyleLandscape
+                                            .copyWith(fontSize: val),
+                                      );
+                                    },
+                                  ),
                                 ),
                               ),
-                            ),
-                            SizedBox(
-                              width: 30,
-                              child: Text(
-                                settings.subtitleStyleLandscape.fontSize
-                                    .toInt()
-                                    .toString(),
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
+                              SizedBox(
+                                width: 30,
+                                child: Text(
+                                  settings.subtitleStyleLandscape.fontSize
+                                      .toInt()
+                                      .toString(),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                  textAlign: TextAlign.right,
                                 ),
-                                textAlign: TextAlign.right,
                               ),
-                            ),
-                          ],
-                        ),
+                            ],
+                          ),
 
-                        // Secondary Font Size
-                        Row(
-                          children: [
-                            const SizedBox(
-                              width: 30,
-                              child: Text(
-                                "副",
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child: SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(
-                                    enabledThumbRadius: 6,
-                                  ),
-                                  overlayShape: const RoundSliderOverlayShape(
-                                    overlayRadius: 12,
+                          // Secondary Font Size
+                          Row(
+                            children: [
+                              const SizedBox(
+                                width: 30,
+                                child: Text(
+                                  "副",
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
                                   ),
                                 ),
-                                child: Slider(
-                                  value:
-                                      settings
-                                          .subtitleStyleLandscape
-                                          .secondaryFontSize ??
-                                      settings.subtitleStyleLandscape.fontSize,
-                                  min: 10,
-                                  max: 100,
-                                  divisions: 90,
-                                  activeColor: Colors.blueAccent,
-                                  inactiveColor: Colors.white24,
-                                  onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(
-                                      settings.subtitleStyleLandscape.copyWith(
-                                        secondaryFontSize: val,
-                                      ),
-                                    );
-                                  },
-                                ),
                               ),
-                            ),
-                            SizedBox(
-                              width: 30,
-                              child: Text(
-                                (settings
+                              Expanded(
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 2,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 6,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 12,
+                                    ),
+                                  ),
+                                  child: Slider(
+                                    value:
+                                        settings
                                             .subtitleStyleLandscape
                                             .secondaryFontSize ??
                                         settings
                                             .subtitleStyleLandscape
-                                            .fontSize)
-                                    .toInt()
-                                    .toString(),
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
-                                ),
-                                textAlign: TextAlign.right,
-                              ),
-                            ),
-                          ],
-                        ),
-
-                        // Line Spacing
-                        Row(
-                          children: [
-                            const SizedBox(
-                              width: 30,
-                              child: Text(
-                                "距",
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child: SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  trackHeight: 2,
-                                  thumbShape: const RoundSliderThumbShape(
-                                    enabledThumbRadius: 6,
-                                  ),
-                                  overlayShape: const RoundSliderOverlayShape(
-                                    overlayRadius: 12,
+                                            .fontSize,
+                                    min: 10,
+                                    max: 100,
+                                    divisions: 90,
+                                    activeColor: Colors.blueAccent,
+                                    inactiveColor: Colors.white24,
+                                    onChanged: (val) {
+                                      settings.saveSubtitleStyleLandscape(
+                                        settings.subtitleStyleLandscape
+                                            .copyWith(secondaryFontSize: val),
+                                      );
+                                    },
                                   ),
                                 ),
-                                child: Slider(
-                                  value: settings
-                                      .subtitleStyleLandscape
-                                      .lineSpacing,
-                                  min: -10,
-                                  max: 100,
-                                  divisions: 110,
-                                  activeColor: Colors.blueAccent,
-                                  inactiveColor: Colors.white24,
-                                  onChanged: (val) {
-                                    settings.saveSubtitleStyleLandscape(
-                                      settings.subtitleStyleLandscape.copyWith(
-                                        lineSpacing: val,
-                                      ),
-                                    );
-                                  },
+                              ),
+                              SizedBox(
+                                width: 30,
+                                child: Text(
+                                  (settings
+                                              .subtitleStyleLandscape
+                                              .secondaryFontSize ??
+                                          settings
+                                              .subtitleStyleLandscape
+                                              .fontSize)
+                                      .toInt()
+                                      .toString(),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                  textAlign: TextAlign.right,
                                 ),
                               ),
-                            ),
-                            SizedBox(
-                              width: 30,
-                              child: Text(
-                                settings.subtitleStyleLandscape.lineSpacing
-                                    .toInt()
-                                    .toString(),
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  color: Colors.white70,
+                            ],
+                          ),
+
+                          // Line Spacing
+                          Row(
+                            children: [
+                              const SizedBox(
+                                width: 30,
+                                child: Text(
+                                  "距",
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
                                 ),
-                                textAlign: TextAlign.right,
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    );
-                  },
-                ),
-
-                SizedBox(height: isSmallScreen ? 6 : 20),
-                Divider(color: Colors.white10, height: isSmallScreen ? 8 : 24),
-
-                // 2. D-Pad for Fine Tuning
-                Text(
-                  "微调",
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: isSmallScreen ? 10 : 12,
-                  ),
-                ),
-                SizedBox(height: isSmallScreen ? 4 : 12),
-                Center(
-                  child: SizedBox(
-                    width: dPadSize,
-                    height: dPadSize,
-                    child: Stack(
-                      children: [
-                        Align(
-                          alignment: Alignment.topCenter,
-                          child: _buildDirectionButton(
-                            Icons.arrow_upward,
-                            0.0,
-                            -0.05,
-                            buttonSize,
-                            iconSize,
+                              Expanded(
+                                child: SliderTheme(
+                                  data: SliderTheme.of(context).copyWith(
+                                    trackHeight: 2,
+                                    thumbShape: const RoundSliderThumbShape(
+                                      enabledThumbRadius: 6,
+                                    ),
+                                    overlayShape: const RoundSliderOverlayShape(
+                                      overlayRadius: 12,
+                                    ),
+                                  ),
+                                  child: Slider(
+                                    value: settings
+                                        .subtitleStyleLandscape
+                                        .lineSpacing,
+                                    min: -10,
+                                    max: 100,
+                                    divisions: 110,
+                                    activeColor: Colors.blueAccent,
+                                    inactiveColor: Colors.white24,
+                                    onChanged: (val) {
+                                      settings.saveSubtitleStyleLandscape(
+                                        settings.subtitleStyleLandscape
+                                            .copyWith(lineSpacing: val),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                width: 30,
+                                child: Text(
+                                  settings.subtitleStyleLandscape.lineSpacing
+                                      .toInt()
+                                      .toString(),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white70,
+                                  ),
+                                  textAlign: TextAlign.right,
+                                ),
+                              ),
+                            ],
                           ),
-                        ),
-                        Align(
-                          alignment: Alignment.bottomCenter,
-                          child: _buildDirectionButton(
-                            Icons.arrow_downward,
-                            0.0,
-                            0.05,
-                            buttonSize,
-                            iconSize,
-                          ),
-                        ),
-                        Align(
-                          alignment: Alignment.centerLeft,
-                          child: _buildDirectionButton(
-                            Icons.arrow_back,
-                            -0.05,
-                            0.0,
-                            buttonSize,
-                            iconSize,
-                          ),
-                        ),
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: _buildDirectionButton(
-                            Icons.arrow_forward,
-                            0.05,
-                            0.0,
-                            buttonSize,
-                            iconSize,
-                          ),
-                        ),
-                        Align(
-                          alignment: Alignment.center,
-                          child: Container(
-                            width: buttonSize * 0.8,
-                            height: buttonSize * 0.8,
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.05),
-                              shape: BoxShape.circle,
-                            ),
-                            child: Icon(
-                              Icons.open_with,
-                              color: Colors.white38,
-                              size: iconSize * 0.8,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-
-                SizedBox(height: isSmallScreen ? 8 : 24),
-                Divider(color: Colors.white10, height: isSmallScreen ? 8 : 24),
-
-                // 3. Actions
-                Row(
-                  children: [
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        onPressed: widget.onSavePreset,
-                        icon: Icon(
-                          Icons.save_as,
-                          size: isSmallScreen ? 14 : 16,
-                        ),
-                        label: Text(
-                          "保存",
-                          style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
-                        ),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blueAccent.withValues(
-                            alpha: 0.2,
-                          ),
-                          foregroundColor: Colors.blueAccent,
-                          padding: EdgeInsets.symmetric(
-                            horizontal: isSmallScreen ? 6 : 12,
-                            vertical: isSmallScreen ? 6 : 12,
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: widget.onReset,
-                        icon: Icon(
-                          Icons.restart_alt,
-                          size: isSmallScreen ? 14 : 16,
-                        ),
-                        label: Text(
-                          "重置",
-                          style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
-                        ),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white70,
-                          side: const BorderSide(color: Colors.white24),
-                          padding: EdgeInsets.symmetric(
-                            horizontal: isSmallScreen ? 6 : 12,
-                            vertical: isSmallScreen ? 6 : 12,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-
-                SizedBox(height: isSmallScreen ? 8 : 24),
-
-                // 4. Presets
-                Text(
-                  "预设位置",
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: isSmallScreen ? 10 : 12,
-                  ),
-                ),
-                SizedBox(height: isSmallScreen ? 4 : 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    _buildPresetChip("底部居中", 0.0, 0.9),
-                    _buildPresetChip("顶部居中", 0.0, -0.9),
-                    _buildPresetChip("正中央", 0.0, 0.0),
-                    ...widget.presets.map((p) {
-                      return _buildPresetChip(
-                        "自定义", // Could add naming later
-                        p['x'] ?? 0.0,
-                        p['y'] ?? 0.8,
-                        isCustom: true,
+                        ],
                       );
-                    }),
-                  ],
-                ),
+                    },
+                  ),
+
+                  SizedBox(height: isSmallScreen ? 6 : 20),
+                  Divider(
+                    color: Colors.white10,
+                    height: isSmallScreen ? 8 : 24,
+                  ),
+
+                  // 2. D-Pad for Fine Tuning
+                  Text(
+                    "微调",
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: isSmallScreen ? 10 : 12,
+                    ),
+                  ),
+                  SizedBox(height: isSmallScreen ? 4 : 12),
+                  Center(
+                    child: SizedBox(
+                      width: dPadSize,
+                      height: dPadSize,
+                      child: Stack(
+                        children: [
+                          Align(
+                            alignment: Alignment.topCenter,
+                            child: _buildDirectionButton(
+                              Icons.arrow_upward,
+                              0.0,
+                              -0.05,
+                              buttonSize,
+                              iconSize,
+                            ),
+                          ),
+                          Align(
+                            alignment: Alignment.bottomCenter,
+                            child: _buildDirectionButton(
+                              Icons.arrow_downward,
+                              0.0,
+                              0.05,
+                              buttonSize,
+                              iconSize,
+                            ),
+                          ),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: _buildDirectionButton(
+                              Icons.arrow_back,
+                              -0.05,
+                              0.0,
+                              buttonSize,
+                              iconSize,
+                            ),
+                          ),
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: _buildDirectionButton(
+                              Icons.arrow_forward,
+                              0.05,
+                              0.0,
+                              buttonSize,
+                              iconSize,
+                            ),
+                          ),
+                          Align(
+                            alignment: Alignment.center,
+                            child: Container(
+                              width: buttonSize * 0.8,
+                              height: buttonSize * 0.8,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.05),
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.open_with,
+                                color: Colors.white38,
+                                size: iconSize * 0.8,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  SizedBox(height: isSmallScreen ? 8 : 24),
+                  Divider(
+                    color: Colors.white10,
+                    height: isSmallScreen ? 8 : 24,
+                  ),
+
+                  // 3. Actions
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: widget.onSavePreset,
+                          icon: Icon(
+                            Icons.save_as,
+                            size: isSmallScreen ? 14 : 16,
+                          ),
+                          label: Text(
+                            "保存",
+                            style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blueAccent.withValues(
+                              alpha: 0.2,
+                            ),
+                            foregroundColor: Colors.blueAccent,
+                            padding: EdgeInsets.symmetric(
+                              horizontal: isSmallScreen ? 6 : 12,
+                              vertical: isSmallScreen ? 6 : 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: widget.onReset,
+                          icon: Icon(
+                            Icons.restart_alt,
+                            size: isSmallScreen ? 14 : 16,
+                          ),
+                          label: Text(
+                            "重置",
+                            style: TextStyle(fontSize: isSmallScreen ? 11 : 14),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            side: const BorderSide(color: Colors.white24),
+                            padding: EdgeInsets.symmetric(
+                              horizontal: isSmallScreen ? 6 : 12,
+                              vertical: isSmallScreen ? 6 : 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  SizedBox(height: isSmallScreen ? 8 : 24),
+
+                  // 4. Presets
+                  Text(
+                    "预设位置",
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: isSmallScreen ? 10 : 12,
+                    ),
+                  ),
+                  SizedBox(height: isSmallScreen ? 4 : 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _buildPresetChip("底部居中", 0.0, 0.9),
+                      _buildPresetChip("顶部居中", 0.0, -0.9),
+                      _buildPresetChip("正中央", 0.0, 0.0),
+                      ...widget.presets.map((p) {
+                        return _buildPresetChip(
+                          "自定义", // Could add naming later
+                          p['x'] ?? 0.0,
+                          p['y'] ?? 0.8,
+                          isCustom: true,
+                        );
+                      }),
+                    ],
+                  ),
+                ],
               ],
             ),
           ),

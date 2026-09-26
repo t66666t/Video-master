@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../theme/app_tokens.dart';
+
 import '../models/video_item.dart';
 import 'cached_thumbnail_widget.dart';
 import 'media_library_browse_grid_cards.dart';
@@ -18,6 +20,7 @@ class MediaLibraryGroupHeader extends StatelessWidget {
     this.onToggle,
     this.onOpenFolder,
     this.progress,
+    this.padding = const EdgeInsets.fromLTRB(12, 8, 8, 8),
   });
 
   final String title;
@@ -32,6 +35,10 @@ class MediaLibraryGroupHeader extends StatelessWidget {
   /// 0–1 watch progress of the featured item, if any.
   final double? progress;
 
+  /// Horizontal inset should match the grid's outer padding. Vertical inset
+  /// stays 0 when the parent inserts the flow-spacing gaps.
+  final EdgeInsets padding;
+
   @override
   Widget build(BuildContext context) {
     final canToggle = showChevron && onToggle != null;
@@ -40,7 +47,7 @@ class MediaLibraryGroupHeader extends StatelessWidget {
       child: InkWell(
         onTap: canToggle ? onToggle : null,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+          padding: padding,
           child: Row(
             children: [
               MediaLibraryStackedCovers(items: coverItems),
@@ -105,9 +112,14 @@ class MediaLibraryGroupHeader extends StatelessWidget {
                       ),
                     ),
                   ),
-                Icon(
-                  expanded ? Icons.expand_less : Icons.expand_more,
-                  color: Colors.white70,
+                AnimatedRotation(
+                  turns: expanded ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOutCubic,
+                  child: const Icon(
+                    Icons.expand_more,
+                    color: AppTokens.text3,
+                  ),
                 ),
               ],
             ],

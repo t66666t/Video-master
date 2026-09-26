@@ -425,9 +425,10 @@ void main() {
 
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(const ValueKey('slight-move-source'))),
+      kind: PointerDeviceKind.mouse,
     );
     await tester.pump(const Duration(milliseconds: 60));
-    // 位移 5px，未达到拖拽阈值（10px）。
+    // 鼠标位移 5px：已超过点击容差（1px），未达到拖拽阈值（10px）。
     await gesture.moveBy(const Offset(5, 0));
     await tester.pump();
     await gesture.up();
@@ -435,6 +436,134 @@ void main() {
 
     expect(taps, 1);
     expect(dragStarts, 0);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端鼠标微移仍只打开一次，不会和卡片点击叠成两次', (tester) async {
+    var taps = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('sub-slop-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () {},
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => taps++,
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('sub-slop-source'))),
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump(const Duration(milliseconds: 40));
+    // 0.5px 仍在鼠标点击容差内，只能由内层点击处理。
+    await gesture.moveBy(const Offset(0.5, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端鼠标超过点击容差但未达拖拽阈值时只补偿一次', (tester) async {
+    var taps = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('past-slop-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () {},
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => taps++,
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('past-slop-source'))),
+      kind: PointerDeviceKind.mouse,
+    );
+    await tester.pump(const Duration(milliseconds: 40));
+    await gesture.moveBy(const Offset(5, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 1);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('桌面端触控未达点击容差时不和卡片点击重复触发', (tester) async {
+    var taps = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Center(
+          child: SizedBox(
+            width: 180,
+            height: 48,
+            child: MediaLibraryItemInteractionWrapper(
+              key: const ValueKey('touch-slop-source'),
+              index: 0,
+              dragDelay: const Duration(milliseconds: 100),
+              isSelected: false,
+              selectedCount: 0,
+              onDragStarted: () {},
+              onReorder: (_, _) {},
+              onTap: () => taps++,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => taps++,
+                child: const ColoredBox(color: Colors.black),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const ValueKey('touch-slop-source'))),
+      kind: PointerDeviceKind.touch,
+    );
+    await tester.pump(const Duration(milliseconds: 40));
+    // 5px 小于触控点击容差，仍是一次内层点击。
+    await gesture.moveBy(const Offset(5, 0));
+    await tester.pump();
+    await gesture.up();
+    await tester.pump();
+
+    expect(taps, 1);
     expect(tester.takeException(), isNull);
   });
 

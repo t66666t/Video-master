@@ -627,6 +627,8 @@ class BilibiliStreamingService extends ChangeNotifier {
     }
   }
 
+  Future<void> ensureVideoShot(VideoItem item) => _ensureVideoShot(item);
+
   Future<void> _ensureVideoShot(VideoItem item) {
     if (item.bilibiliVideoShot?.hasLocalSprites == true ||
         _videoShotUnavailableByItem.contains(item.id)) {

@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/widgets/media_library_layout_profile.dart';
+import 'package:video_player_app/widgets/media_list_layout_metrics.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -44,7 +45,7 @@ void main() {
     expect(title.fromSlider(1), closeTo(0.22, 1e-6));
 
     const spacing = MediaLibraryLayoutDefaults.spacingRange;
-    expect(spacing.fromSlider(0.5), closeTo(0.12, 1e-4));
+    expect(spacing.fromSlider(0.5), closeTo(0.08, 1e-4));
     expect(spacing.fromSlider(0), closeTo(0, 1e-4));
     expect(spacing.fromSlider(1), closeTo(0.45, 1e-4));
   });
@@ -128,8 +129,8 @@ void main() {
     expect(portraitStyle.titleScale, closeTo(0.104, 1e-9));
     expect(landscapeStyle.heightScale, closeTo(1.39, 1e-6));
     expect(portraitStyle.heightScale, closeTo(1.39, 1e-6));
-    expect(landscapeStyle.crossSpacingScale, closeTo(0.12, 1e-9));
-    expect(portraitStyle.mainSpacingScale, closeTo(0.12, 1e-9));
+    expect(landscapeStyle.crossSpacingScale, closeTo(0.08, 1e-9));
+    expect(portraitStyle.mainSpacingScale, closeTo(0.08, 1e-9));
   });
 
   test('横屏和竖屏的卡片样式可以分别写入并持久化', () async {
@@ -235,6 +236,45 @@ void main() {
     expect(phonePortrait.crossAxisCount, 3);
     expect(tabletLandscape.crossAxisCount, 10);
     expect(phonePortrait.titleScale, closeTo(0.104, 1e-9));
-    expect(tabletLandscape.heightScale, closeTo(1.39, 1e-6));
+    expect(tabletLandscape.heightScale, closeTo(1.08, 1e-6));
+  });
+
+  test('最近添加和继续学习的区块间隙是纵向间距的固定倍数', () {
+    const flow = MediaLibraryFlowSpacing(row: 10, outer: 4);
+    expect(flow.leading, 10);
+    expect(flow.attached, 5);
+    expect(flow.block, 15);
+    expect(flow.section, 20);
+    expect(flow.gap(0), isNull);
+
+    const size = Size(390, 844);
+    const card = MediaCardStyleSettings(
+      crossAxisCount: 3,
+      titleScale: 0.104,
+      heightScale: 1.08,
+      crossSpacingScale: 0.08,
+      mainSpacingScale: 0.16,
+    );
+    final resolved = mediaLibraryFlowSpacingFor(
+      screenSize: size,
+      useList: false,
+      cardStyle: card,
+      listStyle: MediaListStyleSettings(
+        crossAxisCount: 1,
+        titleScale: 0.03,
+        heightScale: 0.1,
+        crossSpacingScale: 0.03,
+        mainSpacingScale: 0.03,
+        showThumbnail: true,
+        showIndex: false,
+      ),
+    );
+    final metrics = MediaLibraryLayoutDefaults.cardGrid(
+      screenSize: size,
+      style: card,
+    );
+    expect(resolved.row, metrics.mainSpacing);
+    expect(resolved.outer, metrics.outerPadding);
+    expect(resolved.section, metrics.mainSpacing * 2);
   });
 }

@@ -1,6 +1,7 @@
 import '../services/subtitle_debug_session.dart';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:path/path.dart' as p;
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
@@ -1569,7 +1570,7 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
                                               onPressed: () {
                                                 Navigator.push(
                                                   context,
-                                                  MaterialPageRoute(
+                                                  AppMaterialPageRoute(
                                                     builder: (context) =>
                                                         SimpleVideoPlayerScreen(
                                                           videoPath: task
@@ -2756,7 +2757,7 @@ class _VideoComposePanelState extends State<VideoComposePanel> {
                               onPressed: () {
                                 Navigator.push(
                                   context,
-                                  MaterialPageRoute(
+                                  AppMaterialPageRoute(
                                     builder: (context) =>
                                         SimpleVideoPlayerScreen(
                                           videoPath: latest.request.outputPath,

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:ui' show ImageFilter;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/subtitle_model.dart';
@@ -20,6 +21,7 @@ import '../widgets/music_lyric_view.dart';
 import '../widgets/music_playback_controls.dart';
 import '../widgets/music_text_optical_alignment.dart';
 import '../widgets/relocate_local_media_source.dart';
+import '../widgets/sleep_timer_dialog.dart';
 
 /// Prepares the already-blurred artwork while the source playback page is
 /// still visible. This moves image decoding and blur work out of the route's
@@ -34,30 +36,10 @@ Future<void> prepareMusicPlayerArtwork(
 }
 
 Route<T> buildMusicPlayerRoute<T>({required WidgetBuilder builder}) {
-  return PageRouteBuilder<T>(
+  return AppMaterialPageRoute<T>(
     settings: const RouteSettings(name: 'music-player'),
     fullscreenDialog: true,
-    opaque: true,
-    transitionDuration: const Duration(milliseconds: 280),
-    reverseTransitionDuration: const Duration(milliseconds: 220),
-    pageBuilder: (context, animation, secondaryAnimation) => builder(context),
-    transitionsBuilder: (context, animation, secondaryAnimation, child) {
-      final curved = CurvedAnimation(
-        parent: animation,
-        curve: Curves.easeOutCubic,
-        reverseCurve: Curves.easeInCubic,
-      );
-      return FadeTransition(
-        opacity: curved,
-        child: SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0, 0.018),
-            end: Offset.zero,
-          ).animate(curved),
-          child: child,
-        ),
-      );
-    },
+    builder: builder,
   );
 }
 
@@ -505,7 +487,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
       if (mediaService.isSourceMissing) return KeyEventResult.handled;
       if (widget.onPlayPause != null) {
         widget.onPlayPause!.call();
-      } else if (mediaService.isPlaying) {
+      } else if (mediaService.desiredPlaying) {
         unawaited(mediaService.pause());
       } else {
         unawaited(mediaService.resume());
@@ -569,6 +551,12 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
     // M键：静音/取消静音
     if (key == LogicalKeyboardKey.keyM) {
       unawaited(mediaService.toggleMute());
+      return KeyEventResult.handled;
+    }
+
+    if (DesktopPlayerShortcuts.matchAction(key) ==
+        DesktopPlayerShortcutAction.openSleepTimer) {
+      unawaited(showSleepTimerDialog(context));
       return KeyEventResult.handled;
     }
 
@@ -1040,6 +1028,7 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          _MusicSleepTimerButton(compact: true),
           // 全屏按钮（仅桌面端）
           if (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
             Consumer<SettingsService>(
@@ -1549,6 +1538,8 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
                   // 标题右端与关闭按钮之间的紧凑间距：让标题尽量延伸到叉叉按钮左侧
                   SizedBox(width: (screenWidth * 0.006).clamp(2.0, 5.0)),
 
+                  _MusicSleepTimerButton(compact: false),
+
                   // 可见圆形缩小，但 IconButton 仍保留系统的舒适触控热区。
                   IconButton(
                     icon: DecoratedBox(
@@ -1677,6 +1668,67 @@ class _MusicPlayerScreenState extends State<MusicPlayerScreen>
           ),
         ),
       ),
+    );
+  }
+}
+
+class _MusicSleepTimerButton extends StatelessWidget {
+  const _MusicSleepTimerButton({required this.compact});
+
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final playback = context.read<MediaPlaybackService>();
+    return AnimatedBuilder(
+      animation: playback.sleepTimer,
+      builder: (context, _) {
+        final timer = playback.sleepTimer;
+        final tooltip = DesktopPlayerShortcuts.buildTooltip(
+          timer.isActive ? timer.statusText : '定时关闭',
+          DesktopPlayerShortcutAction.openSleepTimer,
+        );
+        if (compact) {
+          return IconButton(
+            tooltip: tooltip,
+            onPressed: () => unawaited(showSleepTimerDialog(context)),
+            icon: Icon(
+              timer.isActive ? Icons.alarm_on_rounded : Icons.schedule_rounded,
+              size: 18,
+              color: timer.isActive
+                  ? Colors.blueAccent
+                  : Colors.white.withValues(alpha: 0.55),
+            ),
+            iconSize: 18,
+            padding: const EdgeInsets.all(6),
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          );
+        }
+        return IconButton(
+          tooltip: tooltip,
+          onPressed: () => unawaited(showSleepTimerDialog(context)),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+          icon: DecoratedBox(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.white.withValues(alpha: 0.16),
+            ),
+            child: SizedBox.square(
+              dimension: 36,
+              child: Icon(
+                timer.isActive
+                    ? Icons.alarm_on_rounded
+                    : Icons.schedule_rounded,
+                size: 18,
+                color: timer.isActive
+                    ? const Color(0xFF75A7FF)
+                    : Colors.white.withValues(alpha: 0.88),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }

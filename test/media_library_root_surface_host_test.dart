@@ -1,5 +1,6 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/media_library_root_entry.dart';
@@ -104,10 +105,7 @@ void main() {
     Widget tree() {
       return MediaLibraryFrozenWhenInactive(
         active: active,
-        child: _BuildProbe(
-          generation: generation,
-          onBuild: () => builds++,
-        ),
+        child: _BuildProbe(generation: generation, onBuild: () => builds++),
       );
     }
 
@@ -128,28 +126,31 @@ void main() {
     expect(builds, 2);
   });
 
-  test('saveMediaLibraryRootChoice notifies once and skips anchor notify', () async {
-    SharedPreferences.setMockInitialValues(<String, Object>{});
-    final settings = SettingsService();
-    settings.resetForTest();
-    await settings.init();
+  test(
+    'saveMediaLibraryRootChoice notifies once and skips anchor notify',
+    () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final settings = SettingsService();
+      settings.resetForTest();
+      await settings.init();
 
-    var notifications = 0;
-    settings.addListener(() => notifications++);
+      var notifications = 0;
+      settings.addListener(() => notifications++);
 
-    await settings.saveMediaLibraryRootChoice('recent');
-    expect(notifications, 1);
-    expect(settings.mediaLibraryRootEntry, 'recent');
-    expect(settings.mediaLibraryRootEntryUserChosen, isTrue);
+      await settings.saveMediaLibraryRootChoice('recent');
+      expect(notifications, 1);
+      expect(settings.mediaLibraryRootEntry, 'recent');
+      expect(settings.mediaLibraryRootEntryUserChosen, isTrue);
 
-    await settings.saveMediaLibraryEntryAnchors('{"recent":{"offset":12}}');
-    expect(notifications, 1);
-    expect(settings.mediaLibraryEntryAnchors, '{"recent":{"offset":12}}');
+      await settings.saveMediaLibraryEntryAnchors('{"recent":{"offset":12}}');
+      expect(notifications, 1);
+      expect(settings.mediaLibraryEntryAnchors, '{"recent":{"offset":12}}');
 
-    await settings.saveMediaLibraryRootChoice('folders', notify: false);
-    expect(notifications, 1);
-    expect(settings.mediaLibraryRootEntry, 'folders');
-  });
+      await settings.saveMediaLibraryRootChoice('folders', notify: false);
+      expect(notifications, 1);
+      expect(settings.mediaLibraryRootEntry, 'folders');
+    },
+  );
 
   testWidgets('touch fling opens the next tab, mouse drag does not', (
     tester,
@@ -172,9 +173,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(
-          body: SizedBox(width: 400, height: 640, child: host()),
-        ),
+        home: Scaffold(body: SizedBox(width: 400, height: 640, child: host())),
       ),
     );
     await tester.pump();
@@ -215,9 +214,7 @@ void main() {
 
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(
-          body: SizedBox(width: 400, height: 640, child: host()),
-        ),
+        home: Scaffold(body: SizedBox(width: 400, height: 640, child: host())),
       ),
     );
     await tester.pump();
@@ -234,7 +231,63 @@ void main() {
       1800,
     );
     await tester.pumpAndSettle();
-    expect(swiped, isNotEmpty);
+    expect(displayed, MediaLibraryRootEntry.continueLearning);
+    expect(swiped, isNot(contains(MediaLibraryRootEntry.folders)));
+  });
+
+  testWidgets('a halfway drag that flicks back opens the other tab', (
+    tester,
+  ) async {
+    var displayed = MediaLibraryRootEntry.folders;
+    MediaLibraryRootEntry? swiped;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 400,
+            height: 640,
+            child: MediaLibraryRootSurfaceHost(
+              displayedEntry: displayed,
+              onUserSwipe: (entry) {
+                swiped = entry;
+                displayed = entry;
+              },
+              continueBuilder: (_, _) => const Center(child: Text('continue')),
+              recentBuilder: (_, _) => const Center(child: Text('recent')),
+              foldersBuilder: (_, _) => const Center(child: Text('folders')),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final origin = tester.getCenter(find.text('folders'));
+    final gesture = await tester.startGesture(
+      origin,
+      kind: PointerDeviceKind.touch,
+    );
+    await gesture.moveBy(
+      const Offset(-240, 0),
+      timeStamp: const Duration(milliseconds: 280),
+    );
+    await gesture.moveBy(
+      const Offset(28, 0),
+      timeStamp: const Duration(milliseconds: 296),
+    );
+    await gesture.moveBy(
+      const Offset(28, 0),
+      timeStamp: const Duration(milliseconds: 312),
+    );
+    await gesture.moveBy(
+      const Offset(28, 0),
+      timeStamp: const Duration(milliseconds: 328),
+    );
+    await gesture.up(timeStamp: const Duration(milliseconds: 340));
+    await tester.pumpAndSettle();
+
+    expect(swiped, MediaLibraryRootEntry.continueLearning);
     expect(displayed, MediaLibraryRootEntry.continueLearning);
   });
 
@@ -274,6 +327,56 @@ void main() {
     await gesture.up();
     await tester.pumpAndSettle();
   });
+
+  testWidgets('a root switch fades the previous page fully out', (
+    tester,
+  ) async {
+    var displayed = MediaLibraryRootEntry.continueLearning;
+
+    Widget host() {
+      return MediaLibraryRootSurfaceHost(
+        displayedEntry: displayed,
+        continueBuilder: (_, _) =>
+            const ColoredBox(color: Color(0xFF111111), child: Text('continue')),
+        recentBuilder: (_, _) =>
+            const ColoredBox(color: Color(0xFF222222), child: Text('recent')),
+        foldersBuilder: (_, _) => const SizedBox.shrink(),
+      );
+    }
+
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: host())));
+    await tester.pump();
+    expect(find.text('continue'), findsOneWidget);
+
+    displayed = MediaLibraryRootEntry.recent;
+    await tester.pumpWidget(MaterialApp(home: Scaffold(body: host())));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+    await tester.pump(kMediaLibraryRootFadeDuration);
+    await tester.pump();
+
+    expect(find.text('recent'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    final alphas = _pageAlphas(tester);
+    expect(alphas.where((alpha) => alpha == 255), isNotEmpty);
+    expect(alphas.where((alpha) => alpha == 0), isNotEmpty);
+    expect(alphas.every((alpha) => alpha == 0 || alpha == 255), isTrue);
+  });
+}
+
+List<int> _pageAlphas(WidgetTester tester) {
+  final alphas = <int>[];
+  void visit(RenderObject object) {
+    final layer = object.layer;
+    if (layer is OpacityLayer && layer.alpha != null) {
+      alphas.add(layer.alpha!);
+    }
+    object.visitChildren(visit);
+  }
+
+  visit(tester.renderObject(find.byType(MediaLibraryRootSurfaceHost)));
+  return alphas;
 }
 
 class _InitProbe extends StatefulWidget {

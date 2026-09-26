@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:path/path.dart' as p;

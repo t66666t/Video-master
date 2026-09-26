@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="new">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>规范一览</title>
+  <link rel="stylesheet" href="tokens.css" />
+  <link rel="stylesheet" href="app.css" />
+  <style>
+    body { overflow: auto; height: auto; }
+    .page { max-width: 1080px; margin: 0 auto; padding: 32px 28px 64px; }
+    h1 { font-size: 20px; font-weight: 600; margin: 0 0 6px; }
+    .lead { color: var(--text-2); font-size: 13px; margin: 0 0 28px; }
+    section { margin-bottom: 36px; }
+    h2 { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+    .note { color: var(--text-3); font-size: 12px; margin: 0 0 14px; }
+    .row-flex { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .cols { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; align-items: start; }
+    .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .sw { border-radius: var(--r-lg); box-shadow: inset 0 0 0 1px var(--line); overflow: hidden; }
+    .sw i { display: block; height: 48px; }
+    .sw div { padding: 8px 10px; font-size: 12px; background: var(--bg-raised); }
+    .sw b { display: block; font-weight: 500; }
+    .sw span { color: var(--text-3); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+    .type-row { display: flex; align-items: baseline; gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--line-subtle); }
+    .type-row code { width: 110px; flex: 0 0 auto; color: var(--text-3); font-size: 11px; font-family: ui-monospace, Consolas, monospace; }
+    .radius-box { width: 64px; height: 44px; background: var(--bg-overlay); box-shadow: inset 0 0 0 1px var(--line); display: flex; align-items: flex-end; justify-content: center; padding-bottom: 4px; font-size: 11px; color: var(--text-3); }
+    .demo-panel { background: var(--bg-base); border-radius: var(--r-xl); box-shadow: inset 0 0 0 1px var(--line); padding: 16px; }
+    .label-sm { color: var(--text-3); font-size: 11px; margin-bottom: 8px; display: block; }
+    .popover.static { position: relative; animation: none; }
+    .toast.static { position: relative; left: auto; top: auto; transform: none; animation: none; display: inline-flex; }
+    .sheet.static { animation: none; border-radius: var(--r-xl); max-height: none; box-shadow: var(--shadow-popover); }
+    .bar-demo { border-radius: var(--r-lg); overflow: hidden; box-shadow: inset 0 0 0 1px var(--line); }
+    .bar-demo .appbar { height: 44px; }
+    #fabs.static { position: relative; right: auto; bottom: auto; display: inline-flex; }
+    .accent-pick { display: flex; gap: 6px; }
+
+    /* 悬浮工具条对比 */
+    .rail-lab { display: flex; flex-wrap: wrap; gap: 14px; }
+    .rail-case {
+      background: var(--bg-base);
+      border-radius: var(--r-xl);
+      box-shadow: inset 0 0 0 1px var(--line);
+      padding: 16px;
+      width: 200px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      text-align: center;
+    }
+    .rail-case b { font-size: 12px; font-weight: 600; }
+    .rail-case span { font-size: 11px; color: var(--text-3); line-height: 1.5; }
+    .r-rail {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 4px;
+      border-radius: var(--r-full);
+      background: var(--bg-overlay);
+      box-shadow: var(--shadow-float), inset 0 0 0 1px var(--line);
+    }
+    .r-btn {
+      width: 36px;
+      height: 36px;
+      border: 0;
+      background: transparent;
+      color: var(--text-1);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      position: relative;
+      transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+    }
+    .r-btn .ms { font-size: 20px; transition: transform var(--dur-fast) var(--ease); }
+    .r-btn.bili { color: var(--brand-bili); }
+    .r-btn.yt { color: var(--brand-yt); }
+    .r-btn.batch { color: var(--brand-batch); }
+    .r-btn.collapse { color: var(--text-3); }
+    .r-sep { width: 16px; height: 1px; background: var(--line); margin: 2px 0; }
+
+    /* A 圆形 */
+    [data-rail="a"] .r-btn { border-radius: 999px; }
+    [data-rail="a"] .r-btn:hover { background: rgba(255, 255, 255, 0.08); }
+    [data-rail="a"] .r-btn:active { background: rgba(255, 255, 255, 0.12); }
+
+    /* B 圆角方块贴内壁 */
+    [data-rail="b"] .r-btn { border-radius: var(--r-lg); }
+    [data-rail="b"] .r-btn:hover { background: rgba(255, 255, 255, 0.08); }
+    [data-rail="b"] .r-btn:active { background: rgba(255, 255, 255, 0.12); }
+
+    /* C 胶囊形高亮 */
+    [data-rail="c"] .r-rail { gap: 0; }
+    [data-rail="c"] .r-btn { border-radius: 999px; height: 34px; }
+    [data-rail="c"] .r-btn:hover { background: rgba(255, 255, 255, 0.08); }
+    [data-rail="c"] .r-btn:active { background: rgba(255, 255, 255, 0.12); }
+
+    /* D 只提亮图标 */
+    [data-rail="d"] .r-btn { color: var(--text-2); }
+    [data-rail="d"] .r-btn.bili { color: color-mix(in srgb, var(--brand-bili) 72%, #7a7a78); }
+    [data-rail="d"] .r-btn.yt { color: color-mix(in srgb, var(--brand-yt) 72%, #7a7a78); }
+    [data-rail="d"] .r-btn.batch { color: color-mix(in srgb, var(--brand-batch) 72%, #7a7a78); }
+    [data-rail="d"] .r-btn:hover { color: var(--text-1); }
+    [data-rail="d"] .r-btn.bili:hover { color: var(--brand-bili); }
+    [data-rail="d"] .r-btn.yt:hover { color: var(--brand-yt); }
+    [data-rail="d"] .r-btn.batch:hover { color: var(--brand-batch); }
+    [data-rail="d"] .r-btn:active .ms { transform: scale(0.86); }
+
+    /* E 无外壳 */
+    [data-rail="e"] .r-rail { background: transparent; box-shadow: none; gap: 4px; padding: 0; }
+    [data-rail="e"] .r-btn { border-radius: var(--r-lg); }
+    [data-rail="e"] .r-btn:hover { background: var(--bg-overlay); box-shadow: var(--shadow-float); }
+    [data-rail="e"] .r-btn:active { background: var(--bg-overlay); box-shadow: none; }
+    [data-rail="e"] .r-sep { background: transparent; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>规范一览</h1>
+    <p class="lead">按钮、控件、弹层的实际渲染。所有组件都直接读取 tokens.css，与首页预览完全一致。</p>
+
+    <section>
+      <h2>强调色</h2>
+      <p class="note">四个候选，默认蓝。切换后本页和设备预览都会跟着变。</p>
+      <div class="segmented accent-pick" id="accentPick" style="max-width:360px">
+        <button data-accent="blue">蓝</button><button data-accent="violet">紫</button><button data-accent="amber">琥珀</button><button data-accent="green">绿</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>颜色</h2>
+      <p class="note">三级底色，靠明度区分层级；白色透明度用于悬停、控件底和分隔线。</p>
+      <div class="swatches" id="swatches"></div>
+    </section>
+
+    <section>
+      <h2>字号</h2>
+      <p class="note">MiSans。正文 400，标题 500 / 600。</p>
+      <div class="type-row"><code>20 / 600</code><span style="font-size:20px;font-weight:600">页面标题</span></div>
+      <div class="type-row"><code>16 / 600</code><span style="font-size:16px;font-weight:600">弹层标题 卡片样式</span></div>
+      <div class="type-row"><code>15 / 500</code><span style="font-size:15px;font-weight:500">宽屏顶栏标签 继续学习</span></div>
+      <div class="type-row"><code>14 / 500</code><span style="font-size:14px;font-weight:500">紧凑顶栏标签、分组标题、设置行</span></div>
+      <div class="type-row"><code>13 / 400</code><span style="font-size:13px">菜单（指针）、按钮、胶囊</span></div>
+      <div class="type-row"><code>12 / 400</code><span style="font-size:12px;color:var(--text-3)">说明、分组标签、元数据</span></div>
+      <div class="type-row"><code>11 / 400</code><span style="font-size:11px;color:var(--text-3)">时间码、多选栏标签</span></div>
+    </section>
+
+    <section>
+      <h2>圆角</h2>
+      <div class="row-flex">
+        <div class="radius-box" style="border-radius:3px">xs 3</div>
+        <div class="radius-box" style="border-radius:4px">sm 4</div>
+        <div class="radius-box" style="border-radius:6px">md 6</div>
+        <div class="radius-box" style="border-radius:8px">lg 8</div>
+        <div class="radius-box" style="border-radius:12px">xl 12</div>
+        <div class="radius-box" style="border-radius:999px;width:88px">full</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>按钮</h2>
+      <p class="note">图标按钮 32×32 圆角 6，平时只有图标，悬停出现浅底。文字按钮只在弹层里出现。</p>
+      <div class="cols">
+        <div class="demo-panel">
+          <span class="label-sm">图标按钮（常态 / 悬停 / 选中）</span>
+          <div class="row-flex">
+            <button class="icon-btn"><span class="ms">search</span></button>
+            <button class="icon-btn" style="background:var(--fill-hover);color:var(--text-1)"><span class="ms">schedule</span></button>
+            <button class="icon-btn on"><span class="ms">grid_view</span></button>
+            <button class="icon-btn"><span class="ms">more_horiz</span></button>
+          </div>
+        </div>
+        <div class="demo-panel">
+          <span class="label-sm">对话框按钮</span>
+          <div class="row-flex">
+            <button class="btn ghost">取消</button>
+            <button class="btn secondary">恢复默认</button>
+            <button class="btn primary">创建</button>
+            <button class="btn danger">删除</button>
+          </div>
+        </div>
+        <div class="demo-panel">
+          <span class="label-sm">文字按钮 / 筛选胶囊</span>
+          <div class="row-flex">
+            <button class="text-btn">完成</button>
+            <button class="text-btn muted">恢复当前方向默认</button>
+            <button class="pill"><span class="ms">filter_list</span><span>全部记录</span><span class="ms caret">expand_more</span></button>
+            <button class="pill on"><span class="ms">filter_list</span><span>继续观看</span><span class="ms caret">expand_more</span></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>控件</h2>
+      <div class="cols">
+        <div class="demo-panel">
+          <span class="label-sm">开关</span>
+          <div class="row-flex"><span class="switch"><i></i></span><span class="switch on"><i></i></span></div>
+          <span class="label-sm" style="margin-top:16px">分段</span>
+          <div class="segmented"><button class="on">满足任一项</button><button>两项都满足</button></div>
+          <span class="label-sm" style="margin-top:16px">标签</span>
+          <div class="row-flex" style="gap:6px"><button class="chip on">不限</button><button class="chip">7 天</button><button class="chip">30 天</button></div>
+        </div>
+        <div class="demo-panel">
+          <span class="label-sm">滑块</span>
+          <div class="slider-row" style="padding:0 0 10px"><div class="slider-top"><span>卡片高度</span><span class="val">1.08 × 宽</span></div><input type="range" min="0" max="1000" value="500" style="--p:50%"></div>
+          <span class="label-sm" style="margin-top:8px">输入框</span>
+          <input class="field" placeholder="合集名称" />
+          <div style="height:8px"></div>
+          <input class="field" value="聚焦状态" style="box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3px var(--accent-soft)" />
+        </div>
+        <div class="demo-panel">
+          <span class="label-sm">提示</span>
+          <div class="toast static ok"><span class="ms">check_circle</span><span>已置顶到继续学习</span></div>
+          <div style="height:10px"></div>
+          <div class="toast static"><span class="ms">info</span><span>打开回收站</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>弹层</h2>
+      <p class="note">菜单、底部弹层、对话框共用同一套表头、分组列表和按钮。</p>
+      <div class="cols">
+        <div class="demo-panel" style="display:flex;justify-content:center">
+          <div class="popover static">
+            <button class="menu-item"><span class="ms">history</span><span>全部记录</span><span class="ms trail">check</span></button>
+            <button class="menu-item"><span class="ms">play_circle</span><span>继续观看</span></button>
+            <div class="menu-sep"></div>
+            <button class="menu-item"><span class="ms">tune</span><span>门槛设置…</span></button>
+            <button class="menu-item danger"><span class="ms">delete</span><span>移入回收站</span></button>
+          </div>
+        </div>
+        <div class="demo-panel" style="padding:0;background:transparent;box-shadow:none">
+          <div class="sheet static">
+            <div class="sheet-head"><h2>媒体库设置<span class="sub">分组列表示例</span></h2><button class="text-btn">完成</button></div>
+            <div class="sheet-body">
+              <div class="glabel">导入与播放</div>
+              <div class="gcard">
+                <button class="row"><span class="grow"><div class="t">导入时复制到应用私有目录</div><div class="d">关闭时直接引用原文件</div></span><span class="switch"><i></i></span></button>
+                <button class="row"><span class="grow"><div class="t">搜索结果作为播放队列</div></span><span class="switch on"><i></i></span></button>
+                <button class="row"><span class="grow"><div class="t">清除播放记录</div></span><span class="ms go">chevron_right</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="demo-panel" style="padding:0;background:transparent;box-shadow:none">
+          <div class="dialog" style="animation:none;max-width:none">
+            <div class="dialog-head"><h2>新建合集</h2></div>
+            <div class="dialog-body"><input class="field" placeholder="合集名称" /></div>
+            <div class="dialog-actions"><button class="btn ghost">取消</button><button class="btn primary">创建</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>顶栏与悬浮按钮</h2>
+      <div class="cols">
+        <div class="bar-demo">
+          <header class="appbar">
+            <button class="icon-btn"><span class="ms">view_list</span></button>
+            <div class="tabs"><button class="tab active">继续学习</button><button class="tab">文件夹</button><button class="tab">最近添加</button></div>
+            <div class="actions"><button class="icon-btn"><span class="ms">search</span></button><button class="icon-btn"><span class="ms">schedule</span></button><button class="icon-btn"><span class="ms">more_horiz</span></button></div>
+          </header>
+        </div>
+        <div class="demo-panel" style="display:flex;gap:24px;align-items:flex-end">
+          <div id="fabs" class="static">
+            <button class="fab" style="width:32px;height:32px"><span class="ms">create_new_folder</span></button>
+            <button class="fab" style="width:32px;height:32px"><span class="ms">video_call</span></button>
+            <button class="fab bili" style="width:32px;height:32px"><span class="ms">tv</span></button>
+            <button class="fab yt" style="width:32px;height:32px"><span class="ms">ondemand_video</span></button>
+            <span class="rail-sep"></span>
+            <button class="fab collapse" style="width:32px;height:32px"><span class="ms">keyboard_arrow_down</span></button>
+          </div>
+          <p class="note" style="margin:0;max-width:220px">悬浮按钮收成一条竖向工具条：同一底色、同一描边，品牌色只染图标。收起按钮用分隔线隔开。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rails">
+      <h2>悬浮工具条 · 悬停与按下</h2>
+      <p class="note">同一条工具条的五种做法，区别只在鼠标移上去和按下时那块高亮的形状。请把鼠标移上去、并按住不放来对比，选一个。</p>
+      <div class="rail-lab">
+        <div class="rail-case" data-rail="a">
+          <b>A 圆形高亮（当前软件里的样子）</b>
+          <span>高亮是正圆，比图标大一圈，和胶囊的直边不贴合。</span>
+        </div>
+        <div class="rail-case" data-rail="b">
+          <b>B 圆角方块，贴住胶囊内壁</b>
+          <span>高亮宽度等于胶囊内宽，圆角 8，左右与胶囊留同样的缝。</span>
+        </div>
+        <div class="rail-case" data-rail="c">
+          <b>C 整格胶囊形高亮</b>
+          <span>高亮本身也是胶囊形，和外壳同心，看上去像外壳里的一节。</span>
+        </div>
+        <div class="rail-case" data-rail="d">
+          <b>D 不变底，只让图标变亮</b>
+          <span>完全没有高亮块。悬停时图标提亮，按下时缩一点。</span>
+        </div>
+        <div class="rail-case" data-rail="e">
+          <b>E 去掉外壳</b>
+          <span>没有胶囊，图标直接浮在页面上，悬停时才出现圆角方块。</span>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+    const tokens = [
+      ["--bg-base", "页面 / 顶栏"], ["--bg-raised", "弹层 / 多选栏"], ["--bg-overlay", "菜单 / 迷你播放器"], ["--bg-inset", "输入框"],
+      ["--fill-hover", "悬停"], ["--fill-control", "控件底"], ["--line", "描边"],
+      ["--text-1", "主文字"], ["--text-2", "次文字"], ["--text-3", "辅助文字"], ["--text-4", "禁用"],
+      ["--accent", "强调"], ["--accent-soft", "强调浅底"], ["--danger", "危险"], ["--success", "成功"], ["--warning", "警告"],
+    ];
+    function paintSwatches() {
+      const cs = getComputedStyle(document.documentElement);
+      document.getElementById("swatches").innerHTML = tokens
+        .map(([v, label]) => `<div class="sw"><i style="background:var(${v})"></i><div><b>${label}</b><span>${v} ${cs.getPropertyValue(v).trim()}</span></div></div>`)
+        .join("");
+    }
+    function setAccent(a) {
+      document.documentElement.dataset.accent = a;
+      document.querySelectorAll("#accentPick button").forEach((b) => b.classList.toggle("on", b.dataset.accent === a));
+      paintSwatches();
+    }
+    document.getElementById("accentPick").addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      setAccent(b.dataset.accent);
+      if (window.parent !== window) window.parent.postMessage({ type: "pick-accent", accent: b.dataset.accent }, "*");
+    });
+    window.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "set-accent") setAccent(e.data.accent);
+    });
+    setAccent(new URLSearchParams(location.search).get("accent") || "blue");
+
+    const railIcons = [
+      ["closed_caption", ""],
+      ["create_new_folder", ""],
+      ["video_call", ""],
+      ["tv", "bili"],
+      ["ondemand_video", "yt"],
+      ["playlist_add", "batch"],
+    ];
+    document.querySelectorAll(".rail-case").forEach((box) => {
+      const rail = document.createElement("div");
+      rail.className = "r-rail";
+      rail.innerHTML =
+        railIcons.map(([n, c]) => `<button class="r-btn ${c}" type="button"><span class="ms">${n}</span></button>`).join("") +
+        `<span class="r-sep"></span><button class="r-btn collapse" type="button"><span class="ms">keyboard_arrow_down</span></button>`;
+      box.insertBefore(rail, box.firstChild);
+    });
+  </script>
+</body>
+</html>

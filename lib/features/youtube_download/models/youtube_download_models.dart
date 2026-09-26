@@ -979,7 +979,6 @@ class YtDlpTaskRecord {
       status == YtDlpTaskStatus.exported;
   bool get canPause =>
       status == YtDlpTaskStatus.queued ||
-      status == YtDlpTaskStatus.resolving ||
       status == YtDlpTaskStatus.downloading ||
       status == YtDlpTaskStatus.postProcessing;
   bool get canCancel =>
@@ -990,6 +989,7 @@ class YtDlpTaskRecord {
       status == YtDlpTaskStatus.failed || status == YtDlpTaskStatus.cancelled;
 
   YtDlpTaskRecord copyWith({
+    String? sourceUrl,
     VideoMeta? meta,
     Object? sourceRef = _unset,
     DownloadSelection? selection,
@@ -1019,7 +1019,7 @@ class YtDlpTaskRecord {
   }) {
     return YtDlpTaskRecord(
       taskId: taskId,
-      sourceUrl: sourceUrl,
+      sourceUrl: sourceUrl ?? this.sourceUrl,
       sourceRef: identical(sourceRef, _unset)
           ? this.sourceRef
           : sourceRef as MediaSourceRef?,

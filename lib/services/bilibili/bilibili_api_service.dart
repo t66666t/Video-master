@@ -3,7 +3,7 @@ import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../../debug/developer_log.dart' as developer;
 import 'dart:io' show ZLibDecoder, gzip;
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';

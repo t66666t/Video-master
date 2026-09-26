@@ -1,0 +1,65 @@
+/* 现状还原（lib/ 改动前的样子），便于和笔记风并排对比。 */
+:root[data-theme="legacy"] {
+  --bg-base: #121212;
+  --bg-raised: #1e1e1e;
+  --bg-overlay: #2c2c2e;
+  --bg-inset: #121212;
+  --fill-hover: rgba(255, 255, 255, 0.08);
+  --fill-pressed: rgba(255, 255, 255, 0.12);
+  --fill-control: #3a3a3c;
+  --fill-subtle: #292929;
+  --line-subtle: transparent;
+  --line: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --text-1: #ffffff;
+  --text-2: rgba(255, 255, 255, 0.7);
+  --text-3: rgba(255, 255, 255, 0.54);
+  --text-4: rgba(255, 255, 255, 0.38);
+  --text-on-accent: #ffffff;
+  --accent: #448aff;
+  --accent-text: #448aff;
+  --accent-soft: rgba(68, 138, 255, 0.2);
+  --accent-ring: #448aff;
+  --danger: #ff5252;
+  --r-lg: 12px;
+  --r-xl: 20px;
+  --shadow-popover: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --scrim: rgba(0, 0, 0, 0.5);
+
+  --bar-compact: 50px;
+  --bar-normal: 56px;
+  --group-pad-y: 10px;
+  --pill-h: 32px;
+  --card-radius-factor: 0.09;
+  --card-radius-min: 4;
+  --card-radius-max: 40;
+  --list-radius-max: 40;
+  --default-card-spacing: 0.12;
+  --default-card-height: 1.39;
+  --default-list-spacing: 0.12;
+  --default-mini-phone: 124;
+  --default-mini-tablet: 146;
+  --mini-inset: 0;
+  --default-fab-phone: 56;
+  --default-fab-desktop: 48;
+  --progress-h: 4px;
+
+  --appbar-bg: #1e1e1e;
+  --card-bg: #2c2c2c;
+  --card-bg-hover: #353535;
+  --card-cover-inset: 0;
+  --list-bg: #272a2f;
+  --list-bg-hover: #30343a;
+  --mini-bg: #2c2c2c;
+  --mini-radius: 16px;
+  --mini-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+  --rail-bg: transparent;
+  --rail-shadow: none;
+  --progress: #ff5252;
+  --popover-bg: rgba(44, 44, 46, 0.91);
+  --popover-radius: 12px;
+  --popover-blur: 22px;
+  --sheet-bg: #1e1e1e;
+  --cover-ph: #2a2a2a;
+  --cover-ph-icon: rgba(255, 255, 255, 0.24);
+}

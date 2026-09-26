@@ -2,13 +2,15 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../theme/app_tokens.dart';
+
 /// Bottom-right more / locate chrome shared by grid cards and list rows.
 ///
 /// Glyphs are laid out first (one centered icon, or two icons with equal
 /// leftover space on the left, middle and right). Hit targets are applied
 /// afterwards: a single square, or two equal halves of the bar.
 class MediaLibraryActionDockMetrics {
-  static const Color chipColor = Color(0xFF202328);
+  static const Color chipColor = Colors.transparent;
 
   /// Square chip as a fraction of grid card width (preview: 19%).
   static const double gridChipOfWidth = 0.19;
@@ -160,7 +162,7 @@ class _MoreDots extends StatelessWidget {
             width: diameter,
             height: diameter,
             decoration: const BoxDecoration(
-              color: Color(0xEBFFFFFF),
+              color: AppTokens.text3,
               shape: BoxShape.circle,
             ),
           ),
@@ -180,7 +182,7 @@ class _FolderGlyph extends StatelessWidget {
     return Icon(
       Icons.folder_open_outlined,
       size: chipSize * 0.56,
-      color: const Color(0xE0FFFFFF),
+      color: AppTokens.text3,
     );
   }
 }

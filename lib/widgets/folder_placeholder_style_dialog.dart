@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../models/folder_placeholder_style.dart';
 import '../models/video_collection.dart';
 import '../services/settings_service.dart';
+import '../theme/app_tokens.dart';
 import 'adaptive_settings_dialog.dart';
 import 'folder_placeholder_cover.dart';
 import 'media_library_grid_card.dart';
@@ -220,7 +221,7 @@ class FolderPlaceholderStyleDialogBody extends StatelessWidget {
       metrics: metrics,
       child: AlertDialog(
         key: FolderPlaceholderStyleDialog.dialogKey,
-        backgroundColor: const Color(0xFF1E1E1E),
+        backgroundColor: AppTokens.bgRaised,
         insetPadding: metrics.insetPadding,
         titlePadding: metrics.titlePadding,
         contentPadding: metrics.contentPadding,
@@ -1044,7 +1045,7 @@ class _CardPreviewGrid extends StatelessWidget {
             );
             final metaSize = MediaLibraryLayoutDefaults.metaFontSize(titleSize);
             return MediaLibraryGridCard(
-              radius: (cardWidth * 0.09).clamp(4.0, 40.0),
+              radius: MediaLibraryLayoutDefaults.cardCornerRadius(cardWidth),
               isSelected: false,
               onTap: () {},
               child: Column(

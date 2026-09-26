@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>媒体库首页 · 设计预览</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background: #111110;
+      color: #e3e2e0;
+      font-family: "MiSans", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 14px 24px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      flex-wrap: wrap;
+    }
+    .title { display: flex; flex-direction: column; gap: 2px; margin-right: auto; }
+    .title b { font-size: 15px; font-weight: 600; }
+    .title span { color: #7d7c78; font-size: 12px; }
+    .title a { color: #9b9a97; }
+    .group { display: flex; align-items: center; gap: 8px; }
+    .group > label { color: #7d7c78; font-size: 12px; }
+    .seg { display: flex; background: rgba(255, 255, 255, 0.07); border-radius: 8px; padding: 2px; gap: 2px; }
+    .seg button {
+      border: 0; background: transparent; color: #9b9a97; font: inherit;
+      height: 28px; padding: 0 12px; border-radius: 6px; cursor: pointer;
+    }
+    .seg button:hover { color: #e3e2e0; }
+    .seg button.on { background: #2a2a29; color: #e3e2e0; font-weight: 500; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+    .dot { width: 10px; height: 10px; border-radius: 99px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+    .stage { flex: 1; min-height: 0; display: flex; gap: 32px; align-items: flex-start; padding: 24px; overflow: auto; }
+    .slot { flex: 0 0 auto; }
+    .slot h2 { font-size: 12px; font-weight: 500; color: #bdbcb8; margin: 0 0 10px; }
+    .slot h2 span { color: #6f6e6b; font-weight: 400; margin-left: 6px; }
+    .device {
+      transform-origin: top left;
+      border-radius: 14px;
+      overflow: hidden;
+      background: #191919;
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 24px 60px rgba(0, 0, 0, 0.5);
+    }
+    iframe { width: 100%; height: 100%; border: 0; display: block; }
+    #spec { flex: 1; min-height: 0; border: 0; display: none; width: 100%; }
+    body.show-spec .stage { display: none; }
+    body.show-spec #spec { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <b>媒体库首页 · 笔记风 v2</b>
+      <span>只调整布局、按钮、弹层和控件，封面用中性占位。规范见 <a href="../../design/design-tokens.md">design-tokens.md</a> · 单页 <a href="app.html" target="_blank">app.html</a></span>
+    </div>
+    <div class="group">
+      <div class="seg" id="view">
+        <button data-view="devices" class="on">设备预览</button>
+        <button data-view="spec">规范一览</button>
+      </div>
+    </div>
+    <div class="group">
+      <label>强调色</label>
+      <div class="seg" id="accent">
+        <button data-accent="blue"><i class="dot" style="background:#4b8ef0"></i>蓝</button>
+        <button data-accent="violet"><i class="dot" style="background:#8b7cf6"></i>紫</button>
+        <button data-accent="amber"><i class="dot" style="background:#d9a24a"></i>琥珀</button>
+        <button data-accent="green"><i class="dot" style="background:#4fa872"></i>绿</button>
+      </div>
+    </div>
+    <div class="group">
+      <label>对比</label>
+      <div class="seg" id="theme">
+        <button data-theme="new">笔记风</button>
+        <button data-theme="legacy">现有样式</button>
+      </div>
+    </div>
+  </header>
+  <div class="stage" id="stage">
+    <div class="slot" data-w="390" data-h="844">
+      <h2>手机竖屏<span>390 × 844 · 紧凑顶栏 · 默认 3 列</span></h2>
+      <div class="scale-box"><div class="device"><iframe data-src="app.html?embed=1"></iframe></div></div>
+    </div>
+    <div class="slot" data-w="1440" data-h="900">
+      <h2>电脑横屏<span>1440 × 900 · 平板档 · 默认 10 列</span></h2>
+      <div class="scale-box"><div class="device"><iframe data-src="app.html?embed=1"></iframe></div></div>
+    </div>
+    <div class="slot" data-w="820" data-h="1180">
+      <h2>平板竖屏<span>820 × 1180 · 普通顶栏 · 默认 6 列</span></h2>
+      <div class="scale-box"><div class="device"><iframe data-src="app.html?embed=1"></iframe></div></div>
+    </div>
+  </div>
+  <iframe id="spec"></iframe>
+  <script>
+    const store = (k, d) => localStorage.getItem(k) || d;
+    let theme = store("fp-stage-theme", "new");
+    let accent = store("fp-stage-accent", "blue");
+    let view = store("fp-stage-view", "devices");
+    const frames = [...document.querySelectorAll(".stage iframe")];
+    const spec = document.getElementById("spec");
+
+    function fit() {
+      const avail = Math.max(420, document.getElementById("stage").clientHeight - 60);
+      document.querySelectorAll(".slot").forEach((slot) => {
+        const w = +slot.dataset.w, h = +slot.dataset.h;
+        const scale = Math.min(1, avail / h, 1100 / w);
+        const device = slot.querySelector(".device");
+        Object.assign(device.style, { width: w + "px", height: h + "px", transform: `scale(${scale})` });
+        Object.assign(slot.querySelector(".scale-box").style, { width: w * scale + "px", height: h * scale + "px" });
+      });
+    }
+    function paint() {
+      const mark = (id, key, val) => document.querySelectorAll(`#${id} button`).forEach((b) => b.classList.toggle("on", b.dataset[key] === val));
+      mark("theme", "theme", theme);
+      mark("accent", "accent", accent);
+      mark("view", "view", view);
+      document.body.classList.toggle("show-spec", view === "spec");
+    }
+    function send(win) {
+      if (!win) return;
+      win.postMessage({ type: "set-theme", theme }, "*");
+      win.postMessage({ type: "set-accent", accent }, "*");
+    }
+    function broadcast() {
+      frames.forEach((f) => send(f.contentWindow));
+      if (spec.contentWindow) spec.contentWindow.postMessage({ type: "set-accent", accent }, "*");
+    }
+    frames.forEach((f) => {
+      f.src = `${f.dataset.src}&theme=${theme}&accent=${accent}`;
+      f.addEventListener("load", () => send(f.contentWindow));
+    });
+    spec.src = `specimen.html?accent=${accent}`;
+
+    function bind(id, key, apply) {
+      document.getElementById(id).addEventListener("click", (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        apply(b.dataset[key]);
+        paint();
+        broadcast();
+        fit();
+      });
+    }
+    bind("theme", "theme", (v) => localStorage.setItem("fp-stage-theme", (theme = v)));
+    bind("accent", "accent", (v) => localStorage.setItem("fp-stage-accent", (accent = v)));
+    bind("view", "view", (v) => localStorage.setItem("fp-stage-view", (view = v)));
+    window.addEventListener("message", (e) => {
+      if (!e.data) return;
+      if (e.data.type === "preview-ready") broadcast();
+      if (e.data.type === "pick-accent") {
+        localStorage.setItem("fp-stage-accent", (accent = e.data.accent));
+        paint();
+        broadcast();
+      }
+    });
+    paint();
+    fit();
+    window.addEventListener("resize", fit);
+  </script>
+</body>
+</html>

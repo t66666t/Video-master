@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_video_shot.dart';
+import 'package:video_player_app/widgets/bilibili_sprite_preview.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_shot_service.dart';
@@ -13,6 +14,33 @@ import 'package:video_player_app/services/settings_service.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('sprite cell rect follows the image grid, not the preview box', () {
+    final first = bilibiliSpriteCellRect(
+      imageWidth: 1600,
+      imageHeight: 900,
+      columns: 10,
+      rows: 10,
+      column: 0,
+      row: 0,
+    );
+    final later = bilibiliSpriteCellRect(
+      imageWidth: 1600,
+      imageHeight: 900,
+      columns: 10,
+      rows: 10,
+      column: 3,
+      row: 2,
+    );
+
+    expect(first.left, 0.5);
+    expect(first.top, 0.5);
+    expect(first.width, 159);
+    expect(later.left, closeTo(480.5, 0.001));
+    expect(later.top, closeTo(180.5, 0.001));
+    expect(later.right, lessThan(640));
+    expect(later.bottom, lessThan(270));
+  });
 
   test('time index selects the correct sprite page, row and column', () {
     const shot = BilibiliVideoShot(

@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
@@ -5038,9 +5038,13 @@ class MediaPlaybackService extends ChangeNotifier {
   }
 
   /// 暂停播放
+  ///
+  /// [notify] is false only for a playback-page exit. The native pause still
+  /// happens immediately; listeners are told after the exit zoom has started.
   Future<void> pause({
     String? expectedItemId,
     VideoPlayerController? expectedController,
+    bool notify = true,
   }) async {
     if (expectedItemId != null && _currentItem?.id != expectedItemId) return;
     if (expectedController != null &&
@@ -5058,7 +5062,11 @@ class MediaPlaybackService extends ChangeNotifier {
         _syncWakelockWithState();
         _stopProgressTracking();
       }
-      notifyListeners();
+      if (notify) {
+        notifyListeners();
+      } else {
+        publishUiAfterExitTransition();
+      }
       final loadingController = _controller;
       if (_currentItem?.id == _session.itemId && loadingController != null) {
         try {
@@ -5098,7 +5106,11 @@ class MediaPlaybackService extends ChangeNotifier {
       _state = PlaybackState.paused;
       _setDesiredPlaying(false);
       _syncWakelockWithState();
-      notifyListeners();
+      if (notify) {
+        notifyListeners();
+      } else {
+        publishUiAfterExitTransition();
+      }
 
       // 停止进度追踪定时器
       _stopProgressTracking();
@@ -5133,10 +5145,26 @@ class MediaPlaybackService extends ChangeNotifier {
         return;
       }
 
-      notifyListeners();
+      if (notify) {
+        notifyListeners();
+      } else {
+        publishUiAfterExitTransition();
+      }
     } catch (e) {
       debugPrint('MediaPlaybackService: 暂停失败 $e');
+      if (!notify &&
+          _isCurrentPlayRequest(requestId, itemId, controller: controller)) {
+        publishUiAfterExitTransition();
+      }
     }
+  }
+
+  void publishUiAfterExitTransition() {
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        notifyListeners();
+      });
+    });
   }
 
   /// 继续播放
@@ -5285,6 +5313,7 @@ class MediaPlaybackService extends ChangeNotifier {
   bool updatePlaybackStateFromController({
     String? expectedItemId,
     VideoPlayerController? expectedController,
+    bool notify = true,
   }) {
     if (expectedItemId != null && _currentItem?.id != expectedItemId) {
       return false;
@@ -5391,7 +5420,11 @@ class MediaPlaybackService extends ChangeNotifier {
     });
 
     // 通知监听器，触发 UI 更新
-    notifyListeners();
+    if (notify) {
+      notifyListeners();
+    } else {
+      publishUiAfterExitTransition();
+    }
     return true;
   }
 

@@ -11,6 +11,21 @@ import '../utils/app_toast.dart';
 
 const String _sleepTimerFontFamily = 'Noto Sans SC';
 
+bool _countsPlaybackTime(SleepTimerController timer) {
+  switch (timer.mode) {
+    case SleepTimerMode.afterPlaybackDuration:
+      return true;
+    case SleepTimerMode.afterDuration:
+      return false;
+    case SleepTimerMode.off:
+    case SleepTimerMode.endOfCurrentItem:
+    case SleepTimerMode.endOfQueue:
+    case SleepTimerMode.afterItemCount:
+    case SleepTimerMode.atTime:
+      return timer.countOnlyWhilePlaying;
+  }
+}
+
 Future<void> showSleepTimerDialog(BuildContext context) {
   return showDialog<void>(
     context: context,
@@ -27,15 +42,22 @@ class _SleepTimerDialog extends StatefulWidget {
 }
 
 class _SleepTimerDialogState extends State<_SleepTimerDialog> {
-  final TextEditingController _minutesController = TextEditingController(
-    text: '30',
-  );
-  bool _countOnlyWhilePlaying = false;
+  final TextEditingController _minutesController = TextEditingController();
+  bool _minutesInitialized = false;
 
   bool get _isMobile =>
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.android ||
           defaultTargetPlatform == TargetPlatform.iOS);
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_minutesInitialized) return;
+    _minutesInitialized = true;
+    final timer = context.read<MediaPlaybackService>().sleepTimer;
+    _minutesController.text = '${timer.customMinutes}';
+  }
 
   @override
   void dispose() {
@@ -46,7 +68,7 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
   Future<void> _scheduleDuration(SleepTimerController timer, int minutes) {
     return timer.scheduleAfter(
       Duration(minutes: minutes),
-      countOnlyWhilePlaying: _countOnlyWhilePlaying,
+      countOnlyWhilePlaying: _countsPlaybackTime(timer),
     );
   }
 
@@ -56,6 +78,7 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
       AppToast.show('请输入 1 至 1440 分钟', type: AppToastType.info);
       return;
     }
+    await timer.setCustomMinutes(minutes);
     await _scheduleDuration(timer, minutes);
   }
 
@@ -83,7 +106,6 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
   Widget build(BuildContext context) {
     final playback = context.read<MediaPlaybackService>();
     final timer = playback.sleepTimer;
-    final settings = context.watch<SettingsService>();
     final metrics = _DialogMetrics.resolve(MediaQuery.sizeOf(context));
 
     return _NotoTheme(
@@ -95,18 +117,17 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
           borderRadius: BorderRadius.circular(metrics.cornerRadius),
           side: const BorderSide(color: Color(0x1FFFFFFF)),
         ),
-        clipBehavior: Clip.antiAlias,
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            minWidth: metrics.dialogWidth,
-            maxWidth: metrics.dialogWidth,
-            maxHeight: metrics.maxHeight,
-          ),
-          child: Padding(
-            padding: metrics.contentPadding,
-            child: AnimatedBuilder(
-              animation: timer,
-              builder: (context, _) => Column(
+        clipBehavior: Clip.hardEdge,
+        child: RepaintBoundary(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              minWidth: metrics.dialogWidth,
+              maxWidth: metrics.dialogWidth,
+              maxHeight: metrics.maxHeight,
+            ),
+            child: Padding(
+              padding: metrics.contentPadding,
+              child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -115,9 +136,9 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
                   _TimerStatusCard(timer: timer, dense: metrics.dense),
                   SizedBox(height: metrics.sectionGap),
                   if (metrics.twoColumns)
-                    _buildTwoColumnBody(timer, settings, metrics)
+                    _buildTwoColumnBody(timer, metrics)
                   else
-                    _buildSingleColumnBody(timer, settings, metrics),
+                    _buildSingleColumnBody(timer, metrics),
                 ],
               ),
             ),
@@ -140,10 +161,17 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
               borderRadius: BorderRadius.circular(10),
             ),
             alignment: Alignment.center,
-            child: Icon(
-              timer.isActive ? Icons.alarm_on_rounded : Icons.schedule_rounded,
-              size: metrics.dense ? 19 : 21,
-              color: timer.isActive ? const Color(0xFF75A7FF) : Colors.white70,
+            child: ListenableBuilder(
+              listenable: timer,
+              builder: (context, _) => Icon(
+                timer.isActive
+                    ? Icons.alarm_on_rounded
+                    : Icons.schedule_rounded,
+                size: metrics.dense ? 19 : 21,
+                color: timer.isActive
+                    ? const Color(0xFF75A7FF)
+                    : Colors.white70,
+              ),
             ),
           ),
           const SizedBox(width: 10),
@@ -194,7 +222,6 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
 
   Widget _buildTwoColumnBody(
     SleepTimerController timer,
-    SettingsService settings,
     _DialogMetrics metrics,
   ) {
     return Row(
@@ -204,10 +231,7 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
           child: _DurationCard(
             timer: timer,
             dense: metrics.dense,
-            countOnlyWhilePlaying: _countOnlyWhilePlaying,
             minutesController: _minutesController,
-            onCountingModeChanged: (value) =>
-                setState(() => _countOnlyWhilePlaying = value),
             onDurationSelected: (minutes) =>
                 unawaited(_scheduleDuration(timer, minutes)),
             onCustomSubmitted: () => unawaited(_scheduleCustom(timer)),
@@ -222,7 +246,6 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
               _CompletionCard(timer: timer, dense: metrics.dense),
               SizedBox(height: metrics.cardGap),
               _PlaybackSettingsCard(
-                settings: settings,
                 isMobile: _isMobile,
                 horizontal: metrics.shortLandscape,
                 dense: metrics.dense,
@@ -236,7 +259,6 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
 
   Widget _buildSingleColumnBody(
     SleepTimerController timer,
-    SettingsService settings,
     _DialogMetrics metrics,
   ) {
     return Column(
@@ -245,10 +267,7 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
         _DurationCard(
           timer: timer,
           dense: metrics.dense,
-          countOnlyWhilePlaying: _countOnlyWhilePlaying,
           minutesController: _minutesController,
-          onCountingModeChanged: (value) =>
-              setState(() => _countOnlyWhilePlaying = value),
           onDurationSelected: (minutes) =>
               unawaited(_scheduleDuration(timer, minutes)),
           onCustomSubmitted: () => unawaited(_scheduleCustom(timer)),
@@ -258,7 +277,6 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
         _CompletionCard(timer: timer, dense: metrics.dense),
         SizedBox(height: metrics.cardGap),
         _PlaybackSettingsCard(
-          settings: settings,
           isMobile: _isMobile,
           horizontal: false,
           dense: metrics.dense,
@@ -273,15 +291,19 @@ class _NotoTheme extends StatelessWidget {
 
   final Widget child;
 
+  static ThemeData? _cachedSource;
+  static ThemeData? _cachedThemed;
+
   @override
   Widget build(BuildContext context) {
     final base = Theme.of(context);
-    final textTheme = base.textTheme.apply(fontFamily: _sleepTimerFontFamily);
-    final primaryTextTheme = base.primaryTextTheme.apply(
-      fontFamily: _sleepTimerFontFamily,
-    );
-    return Theme(
-      data: base.copyWith(
+    var themed = _cachedThemed;
+    if (!identical(base, _cachedSource) || themed == null) {
+      final textTheme = base.textTheme.apply(fontFamily: _sleepTimerFontFamily);
+      final primaryTextTheme = base.primaryTextTheme.apply(
+        fontFamily: _sleepTimerFontFamily,
+      );
+      themed = base.copyWith(
         textTheme: textTheme,
         primaryTextTheme: primaryTextTheme,
         inputDecorationTheme: base.inputDecorationTheme.copyWith(
@@ -289,7 +311,12 @@ class _NotoTheme extends StatelessWidget {
           hintStyle: textTheme.bodyMedium,
           suffixStyle: textTheme.bodySmall,
         ),
-      ),
+      );
+      _cachedSource = base;
+      _cachedThemed = themed;
+    }
+    return Theme(
+      data: themed,
       child: DefaultTextStyle.merge(
         style: const TextStyle(fontFamily: _sleepTimerFontFamily),
         child: child,
@@ -306,62 +333,67 @@ class _TimerStatusCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final active = timer.isActive;
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      constraints: BoxConstraints(minHeight: dense ? 36 : 44),
-      padding: EdgeInsets.fromLTRB(dense ? 10 : 12, 3, 4, 3),
-      decoration: BoxDecoration(
-        color: active
-            ? const Color(0xFF3378F6).withValues(alpha: 0.13)
-            : Colors.white.withValues(alpha: 0.035),
-        borderRadius: BorderRadius.circular(11),
-        border: Border.all(
-          color: active
-              ? const Color(0xFF6B9FFF).withValues(alpha: 0.32)
-              : Colors.white.withValues(alpha: 0.07),
-        ),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 6,
-            height: 6,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: active ? const Color(0xFF75A7FF) : Colors.white30,
+    return ListenableBuilder(
+      listenable: timer,
+      builder: (context, _) {
+        final active = timer.isActive;
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          constraints: BoxConstraints(minHeight: dense ? 36 : 44),
+          padding: EdgeInsets.fromLTRB(dense ? 10 : 12, 3, 4, 3),
+          decoration: BoxDecoration(
+            color: active
+                ? const Color(0xFF3378F6).withValues(alpha: 0.13)
+                : Colors.white.withValues(alpha: 0.035),
+            borderRadius: BorderRadius.circular(11),
+            border: Border.all(
+              color: active
+                  ? const Color(0xFF6B9FFF).withValues(alpha: 0.32)
+                  : Colors.white.withValues(alpha: 0.07),
             ),
           ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              timer.statusText,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: active ? Colors.white : Colors.white54,
-                fontSize: dense ? 11.5 : 12.5,
-                height: 1.15,
-                fontWeight: active ? FontWeight.w500 : FontWeight.w400,
+          child: Row(
+            children: [
+              Container(
+                width: 6,
+                height: 6,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: active ? const Color(0xFF75A7FF) : Colors.white30,
+                ),
               ),
-            ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  timer.statusText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: active ? Colors.white : Colors.white54,
+                    fontSize: dense ? 11.5 : 12.5,
+                    height: 1.15,
+                    fontWeight: active ? FontWeight.w500 : FontWeight.w400,
+                  ),
+                ),
+              ),
+              if (timer.mode == SleepTimerMode.afterDuration ||
+                  timer.mode == SleepTimerMode.afterPlaybackDuration ||
+                  timer.mode == SleepTimerMode.atTime)
+                _StatusAction(
+                  label: '+10分',
+                  onPressed: () =>
+                      unawaited(timer.extend(const Duration(minutes: 10))),
+                ),
+              if (active)
+                _StatusAction(
+                  label: '取消',
+                  destructive: true,
+                  onPressed: () => unawaited(timer.cancel()),
+                ),
+            ],
           ),
-          if (timer.mode == SleepTimerMode.afterDuration ||
-              timer.mode == SleepTimerMode.afterPlaybackDuration ||
-              timer.mode == SleepTimerMode.atTime)
-            _StatusAction(
-              label: '+10分',
-              onPressed: () =>
-                  unawaited(timer.extend(const Duration(minutes: 10))),
-            ),
-          if (active)
-            _StatusAction(
-              label: '取消',
-              destructive: true,
-              onPressed: () => unawaited(timer.cancel()),
-            ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -404,9 +436,7 @@ class _DurationCard extends StatelessWidget {
   const _DurationCard({
     required this.timer,
     required this.dense,
-    required this.countOnlyWhilePlaying,
     required this.minutesController,
-    required this.onCountingModeChanged,
     required this.onDurationSelected,
     required this.onCustomSubmitted,
     required this.onPickClockTime,
@@ -414,9 +444,7 @@ class _DurationCard extends StatelessWidget {
 
   final SleepTimerController timer;
   final bool dense;
-  final bool countOnlyWhilePlaying;
   final TextEditingController minutesController;
-  final ValueChanged<bool> onCountingModeChanged;
   final ValueChanged<int> onDurationSelected;
   final VoidCallback onCustomSubmitted;
   final VoidCallback onPickClockTime;
@@ -455,11 +483,7 @@ class _DurationCard extends StatelessWidget {
             if (row.first == 15) SizedBox(height: dense ? 5 : 7),
           ],
           SizedBox(height: dense ? 5 : 8),
-          _CountingModeSwitch(
-            value: countOnlyWhilePlaying,
-            dense: dense,
-            onChanged: onCountingModeChanged,
-          ),
+          _CountingModeSwitch(timer: timer, dense: dense),
           SizedBox(height: dense ? 7 : 10),
           const Text(
             '自定义',
@@ -534,70 +558,73 @@ class _CompletionCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return _SettingCard(
-      dense: dense,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const _SectionHeader(
-            icon: Icons.playlist_play_rounded,
-            title: '播放完成后',
-          ),
-          SizedBox(height: dense ? 7 : 10),
-          Row(
-            children: [
-              Expanded(
-                child: _CompletionButton(
-                  label: '当前内容结束',
-                  icon: Icons.skip_next_rounded,
-                  dense: dense,
-                  selected: timer.mode == SleepTimerMode.endOfCurrentItem,
-                  onPressed: () =>
-                      unawaited(timer.scheduleAtEndOfCurrentItem()),
+    return ListenableBuilder(
+      listenable: timer,
+      builder: (context, _) => _SettingCard(
+        dense: dense,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const _SectionHeader(
+              icon: Icons.playlist_play_rounded,
+              title: '播放完成后',
+            ),
+            SizedBox(height: dense ? 7 : 10),
+            Row(
+              children: [
+                Expanded(
+                  child: _CompletionButton(
+                    label: '当前内容结束',
+                    icon: Icons.skip_next_rounded,
+                    dense: dense,
+                    selected: timer.mode == SleepTimerMode.endOfCurrentItem,
+                    onPressed: () =>
+                        unawaited(timer.scheduleAtEndOfCurrentItem()),
+                  ),
                 ),
-              ),
-              SizedBox(width: dense ? 5 : 7),
-              Expanded(
-                child: _CompletionButton(
-                  label: '队列结束',
-                  icon: Icons.queue_music_rounded,
-                  dense: dense,
-                  selected: timer.mode == SleepTimerMode.endOfQueue,
-                  onPressed: () => unawaited(timer.scheduleAtEndOfQueue()),
+                SizedBox(width: dense ? 5 : 7),
+                Expanded(
+                  child: _CompletionButton(
+                    label: '队列结束',
+                    icon: Icons.queue_music_rounded,
+                    dense: dense,
+                    selected: timer.mode == SleepTimerMode.endOfQueue,
+                    onPressed: () => unawaited(timer.scheduleAtEndOfQueue()),
+                  ),
                 ),
-              ),
-            ],
-          ),
-          SizedBox(height: dense ? 5 : 7),
-          Row(
-            children: [
-              Expanded(
-                child: _CompletionButton(
-                  label: '再播 1 个',
-                  icon: Icons.looks_one_outlined,
-                  dense: dense,
-                  selected:
-                      timer.mode == SleepTimerMode.afterItemCount &&
-                      timer.remainingItemCount == 1,
-                  onPressed: () => unawaited(timer.scheduleAfterItems(1)),
+              ],
+            ),
+            SizedBox(height: dense ? 5 : 7),
+            Row(
+              children: [
+                Expanded(
+                  child: _CompletionButton(
+                    label: '再播 1 个',
+                    icon: Icons.looks_one_outlined,
+                    dense: dense,
+                    selected:
+                        timer.mode == SleepTimerMode.afterItemCount &&
+                        timer.scheduledItemCount == 1,
+                    onPressed: () => unawaited(timer.scheduleAfterItems(1)),
+                  ),
                 ),
-              ),
-              SizedBox(width: dense ? 5 : 7),
-              Expanded(
-                child: _CompletionButton(
-                  label: '再播 3 个',
-                  icon: Icons.filter_3_outlined,
-                  dense: dense,
-                  selected:
-                      timer.mode == SleepTimerMode.afterItemCount &&
-                      timer.remainingItemCount == 3,
-                  onPressed: () => unawaited(timer.scheduleAfterItems(3)),
+                SizedBox(width: dense ? 5 : 7),
+                Expanded(
+                  child: _CompletionButton(
+                    label: '再播 3 个',
+                    icon: Icons.filter_3_outlined,
+                    dense: dense,
+                    selected:
+                        timer.mode == SleepTimerMode.afterItemCount &&
+                        timer.scheduledItemCount == 3,
+                    onPressed: () => unawaited(timer.scheduleAfterItems(3)),
+                  ),
                 ),
-              ),
-            ],
-          ),
-        ],
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -605,19 +632,18 @@ class _CompletionCard extends StatelessWidget {
 
 class _PlaybackSettingsCard extends StatelessWidget {
   const _PlaybackSettingsCard({
-    required this.settings,
     required this.isMobile,
     required this.horizontal,
     required this.dense,
   });
 
-  final SettingsService settings;
   final bool isMobile;
   final bool horizontal;
   final bool dense;
 
   @override
   Widget build(BuildContext context) {
+    final settings = context.watch<SettingsService>();
     final exitPage = _PlaybackSettingTile(
       title: '退出页面后自动暂停',
       subtitle: '主动退出播放页时暂停媒体',
@@ -747,54 +773,58 @@ class _QuickDurationButton extends StatelessWidget {
 }
 
 class _CountingModeSwitch extends StatelessWidget {
-  const _CountingModeSwitch({
-    required this.value,
-    required this.dense,
-    required this.onChanged,
-  });
+  const _CountingModeSwitch({required this.timer, required this.dense});
 
-  final bool value;
+  final SleepTimerController timer;
   final bool dense;
-  final ValueChanged<bool> onChanged;
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: () => onChanged(!value),
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        height: dense ? 32 : 38,
-        padding: const EdgeInsets.only(left: 8, right: 2),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.13),
+    return ListenableBuilder(
+      listenable: timer,
+      builder: (context, _) {
+        final value = _countsPlaybackTime(timer);
+        return InkWell(
+          onTap: () => unawaited(timer.setCountOnlyWhilePlaying(!value)),
           borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                value ? '仅计算实际播放时间' : '按现实时间计时',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: Colors.white60,
-                  fontSize: dense ? 10 : 11,
-                  fontWeight: FontWeight.w400,
+          child: Container(
+            height: dense ? 32 : 38,
+            padding: const EdgeInsets.only(left: 8, right: 2),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.13),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    value ? '仅计算实际播放时间' : '按现实时间计时',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: Colors.white60,
+                      fontSize: dense ? 10 : 11,
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
                 ),
-              ),
+                IgnorePointer(
+                  child: Transform.scale(
+                    scale: dense ? 0.72 : 0.82,
+                    child: Switch(
+                      value: value,
+                      onChanged: (next) =>
+                          unawaited(timer.setCountOnlyWhilePlaying(next)),
+                      activeThumbColor: const Color(0xFF6B9FFF),
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ),
+                ),
+              ],
             ),
-            Transform.scale(
-              scale: dense ? 0.72 : 0.82,
-              child: Switch(
-                value: value,
-                onChanged: onChanged,
-                activeThumbColor: const Color(0xFF6B9FFF),
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -912,13 +942,15 @@ class _PlaybackSettingTile extends StatelessWidget {
                   ],
                 ),
               ),
-              Transform.scale(
-                scale: dense ? 0.72 : 0.8,
-                child: Switch(
-                  value: value,
-                  onChanged: (next) => unawaited(onChanged(next)),
-                  activeThumbColor: const Color(0xFF6B9FFF),
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              IgnorePointer(
+                child: Transform.scale(
+                  scale: dense ? 0.72 : 0.8,
+                  child: Switch(
+                    value: value,
+                    onChanged: (next) => unawaited(onChanged(next)),
+                    activeThumbColor: const Color(0xFF6B9FFF),
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
                 ),
               ),
             ],

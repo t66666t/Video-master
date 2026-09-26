@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../theme/app_tokens.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
 import 'media_library_compact_app_bar.dart';
 
@@ -24,7 +25,7 @@ class MediaLibrarySelectionBottomBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final compact = useCompactMediaLibraryTopBar(context);
     return BottomAppBar(
-      color: const Color(0xFF1E1E1E),
+      color: AppTokens.bgRaised,
       padding: EdgeInsets.symmetric(
         horizontal: compact ? 4 : 8,
         vertical: compact ? 2 : 4,
@@ -37,7 +38,7 @@ class MediaLibrarySelectionBottomBar extends StatelessWidget {
           _action(
             compact: compact,
             icon: Icons.delete,
-            color: Colors.redAccent,
+            color: AppTokens.danger,
             label: DesktopMediaManagementShortcuts.buildTooltip(
               '移入回收站',
               DesktopMediaManagementShortcutAction.openRecycleBin,
@@ -47,18 +48,18 @@ class MediaLibrarySelectionBottomBar extends StatelessWidget {
           _action(
             compact: compact,
             icon: Icons.unarchive_outlined,
-            color: const Color(0xFFAEB8FF),
+            color: AppTokens.text1,
             label: compact
                 ? DesktopMediaManagementShortcuts.buildTooltip(
                     '导出',
                     DesktopMediaManagementShortcutAction.exportFluentPack,
                   )
                 : DesktopMediaManagementShortcuts.buildTooltip(
-                    '以 FluentPack 文件导出',
+                    '导出',
                     DesktopMediaManagementShortcutAction.exportFluentPack,
                   ),
             tooltip: DesktopMediaManagementShortcuts.buildTooltip(
-              '以 FluentPack 文件导出',
+              '导出为 Fluent Pack 或 Zip',
               DesktopMediaManagementShortcutAction.exportFluentPack,
             ),
             onPressed: onExportFluentPack,
@@ -67,7 +68,7 @@ class MediaLibrarySelectionBottomBar extends StatelessWidget {
             _action(
               compact: compact,
               icon: Icons.edit,
-              color: Colors.blueAccent,
+              color: AppTokens.text1,
               label: DesktopMediaManagementShortcuts.buildTooltip(
                 '重命名',
                 DesktopMediaManagementShortcutAction.createCollection,

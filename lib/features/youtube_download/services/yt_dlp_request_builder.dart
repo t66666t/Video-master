@@ -1,5 +1,6 @@
 import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
+import 'package:video_player_app/features/youtube_download/services/x_post_media_fallback.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
 
 class YtDlpRequestBuilder {
@@ -26,9 +27,6 @@ class YtDlpRequestBuilder {
       '--no-force-overwrites',
       '--restrict-filenames',
       '--no-mtime',
-      '--write-thumbnail',
-      '--convert-thumbnails',
-      'png',
       '--embed-metadata',
       '--embed-chapters',
       '--print',
@@ -61,15 +59,21 @@ class YtDlpRequestBuilder {
       args.addAll(['--extractor-args', extractorArgs]);
     }
 
-    args.addAll(['--paths', outputDir]);
-    args.addAll(
-      _buildFormatArgs(
-        meta: meta,
-        selection: selection,
-        resolvedVideoId: resolvedVideoId,
-        resolvedAudioIds: resolvedAudioIds,
-      ),
+    final directUrl = XPostMediaFallback.downloadUrlForFormat(
+      meta,
+      resolvedVideoId,
     );
+    args.addAll(['--paths', outputDir]);
+    if (directUrl == null) {
+      args.addAll(
+        _buildFormatArgs(
+          meta: meta,
+          selection: selection,
+          resolvedVideoId: resolvedVideoId,
+          resolvedAudioIds: resolvedAudioIds,
+        ),
+      );
+    }
     args.addAll(
       _buildSubtitleArgs(
         meta: meta,
@@ -80,11 +84,25 @@ class YtDlpRequestBuilder {
     );
     args.addAll(_buildPostProcessArgs(selection));
     args.addAll(['-o', outputTemplate]);
-    args.add(url);
+    if (directUrl != null) {
+      final headers = meta.rawInfo['http_headers'];
+      if (headers is Map) {
+        for (final entry in headers.entries) {
+          final name = entry.key.toString().trim();
+          final value = entry.value?.toString().trim() ?? '';
+          if (name.isEmpty || value.isEmpty) {
+            continue;
+          }
+          args.addAll(['--add-header', '$name:$value']);
+        }
+      }
+    }
+    final downloadUrl = directUrl ?? url;
+    args.add(downloadUrl);
 
     return NativeDownloadRequest(
       taskId: taskId,
-      url: url,
+      url: downloadUrl,
       outputDir: outputDir,
       outputTemplate: outputTemplate,
       args: args,
@@ -212,18 +230,22 @@ class YtDlpRequestBuilder {
     final audioId = resolvedAudioIds.isNotEmpty ? resolvedAudioIds.first : null;
     final selectedVideo = meta.videoFormats
         .where((item) => item.formatId == videoId)
-        .toList();
-    final selectedVideoHasAudio =
-        selectedVideo.isNotEmpty && selectedVideo.first.hasAudio;
+        .firstOrNull;
+    final needsSeparateAudio = YtDlpVideoFormatSelector.needsSeparateAudioTrack(
+      selectedVideo,
+    );
     final shouldMergeAudio =
-        audioId != null &&
-        (!selectedVideoHasAudio || selection.selectedAudioFormatIds.isNotEmpty);
+        audioId != null && needsSeparateAudio && !selection.removeAudio;
 
-    if (videoId != null && shouldMergeAudio) {
-      return ['-f', '$videoId+$audioId'];
-    }
     if (videoId != null) {
-      return ['-f', videoId];
+      return [
+        '-f',
+        YtDlpVideoFormatSelector.downloadFormatSelector(
+          videoId: videoId,
+          audioId: audioId,
+          mergeAudio: shouldMergeAudio,
+        ),
+      ];
     }
     return ['-f', 'bestvideo+bestaudio/best'];
   }
@@ -261,7 +283,7 @@ class YtDlpRequestBuilder {
     } else {
       final shouldMergeAudio =
           resolvedAudioId != null &&
-          (!(selectedVideo?.hasAudio ?? false) ||
+          (YtDlpVideoFormatSelector.needsSeparateAudioTrack(selectedVideo) ||
               selection.selectedAudioFormatIds.isNotEmpty);
       _appendExpectedTrack(
         tracks,

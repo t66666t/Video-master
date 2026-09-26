@@ -6,11 +6,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../features/portable_transfer/portable_transfer_navigation.dart';
 import '../services/library_service.dart';
 import '../services/media_playback_service.dart';
+import '../utils/app_toast.dart';
 import 'media_library_anchor_menu.dart';
 
-/// Pin / hide / locate overflow for library cards. Hide never stops playback.
+/// Pin / hide / locate / recycle / export overflow for library cards.
+///
+/// Hide never stops playback. Recycle and export act on this card
+/// only. Move-to-parent is shown only when [onMoveToParent] is set, which is
+/// the opened-folder page and not continue, recent, search, or the library root.
 ///
 /// The visible ⋯ lives on the bottom-right action dock, not on the cover.
 class MediaLibraryActivityMenuMetrics {
@@ -38,6 +44,7 @@ class MediaLibraryActivityMenuButton extends StatefulWidget {
     this.allowHide = false,
     this.onLocate,
     this.onHidden,
+    this.onMoveToParent,
     this.cardWidth,
     this.fillSlot = false,
   });
@@ -47,6 +54,10 @@ class MediaLibraryActivityMenuButton extends StatefulWidget {
   final bool allowHide;
   final VoidCallback? onLocate;
   final VoidCallback? onHidden;
+
+  /// Moves this card to the folder that contains the folder currently open.
+  /// Null on continue, recent, search, and the library root.
+  final VoidCallback? onMoveToParent;
 
   /// Grid cell / list cell width used to scale glyph and hit target.
   final double? cardWidth;
@@ -148,17 +159,33 @@ class _MediaLibraryActivityMenuButtonState
         label: pinned ? '取消「继续学习」置顶' : '置顶到「继续学习」',
         icon: pinned ? CupertinoIcons.pin_slash : CupertinoIcons.pin,
       ),
-      if (!widget.isCollection && widget.allowHide)
-        const MediaLibraryAnchorMenuEntry(
-          value: 'hide',
-          label: '从本页移除',
-          icon: CupertinoIcons.eye_slash,
-        ),
       if (widget.onLocate != null)
         const MediaLibraryAnchorMenuEntry(
           value: 'locate',
           label: '显示所在目录',
           icon: CupertinoIcons.folder,
+        ),
+      if (widget.onMoveToParent != null)
+        const MediaLibraryAnchorMenuEntry(
+          value: 'parent',
+          label: '移动到上一级',
+          icon: CupertinoIcons.arrow_turn_up_left,
+        ),
+      const MediaLibraryAnchorMenuEntry(
+        value: 'export',
+        label: '导出',
+        icon: CupertinoIcons.square_arrow_up,
+      ),
+      const MediaLibraryAnchorMenuEntry(
+        value: 'recycle',
+        label: '移入回收站',
+        icon: CupertinoIcons.trash,
+      ),
+      if (!widget.isCollection && widget.allowHide)
+        const MediaLibraryAnchorMenuEntry(
+          value: 'hide',
+          label: '从本页移除',
+          icon: CupertinoIcons.eye_slash,
         ),
     ];
     try {
@@ -185,6 +212,19 @@ class _MediaLibraryActivityMenuButtonState
         return;
       case 'locate':
         widget.onLocate?.call();
+        return;
+      case 'parent':
+        widget.onMoveToParent?.call();
+        return;
+      case 'export':
+        await PortableTransferNavigation.openExportSettings(context, [
+          widget.targetId,
+        ]);
+        return;
+      case 'recycle':
+        await library.moveToRecycleBin([widget.targetId]);
+        if (!mounted) return;
+        AppToast.show('已移入回收站', type: AppToastType.success);
         return;
       case 'hide':
         // Block the current watch cycle from immediately undoing hide.

@@ -82,6 +82,11 @@ class LibraryActivityProjection {
   }
 
   /// Import batches plus orphan singles, never sorted by lastUpdated.
+  ///
+  /// A batch that created folders shows each top folder's first layer:
+  /// direct new files as cards, direct child folders as folder cards.
+  /// Bilibili and YT-DLP loose files stay individual cards so a source
+  /// name is not used as a collection title.
   List<RecentAddedEntry> recentAddedEntries() {
     final partition = recentAddedMediaIds();
     final mediaInBatch = <String>{};
@@ -95,26 +100,7 @@ class LibraryActivityProjection {
         mediaInBatch.add(mediaId);
       }
       if (visible.isEmpty) continue;
-      if (visible.length == 1) {
-        dated.add(
-          RecentAddedEntry.single(
-            mediaId: visible.first,
-            sortKeyMs: batch.startedAtMs,
-            sortId: batch.id,
-            sourceBatchId: batch.id,
-          ),
-        );
-        continue;
-      }
-      dated.add(
-        RecentAddedEntry.batch(
-          batchId: batch.id,
-          title: batch.title,
-          sortKeyMs: batch.startedAtMs,
-          sortId: batch.id,
-          visibleMediaIds: List<String>.unmodifiable(visible),
-        ),
-      );
+      dated.addAll(_entriesForBatch(batch, visible));
     }
 
     for (final mediaId in partition.datedIds) {
@@ -133,7 +119,9 @@ class LibraryActivityProjection {
     dated.sort((a, b) {
       final byTime = b.sortKeyMs.compareTo(a.sortKeyMs);
       if (byTime != 0) return byTime;
-      return b.sortId.compareTo(a.sortId);
+      final byId = b.sortId.compareTo(a.sortId);
+      if (byId != 0) return byId;
+      return a.innerIndex.compareTo(b.innerIndex);
     });
 
     final unknownIds = partition.unknownAddedIds
@@ -148,6 +136,155 @@ class LibraryActivityProjection {
         visibleMediaIds: List<String>.unmodifiable(unknownIds),
       ),
     ]);
+  }
+
+  List<RecentAddedEntry> _entriesForBatch(
+    ImportBatchRecord batch,
+    List<String> visibleMedia,
+  ) {
+    final created = <String>{
+      for (final id in batch.createdCollectionIds)
+        if (isVisibleCollection(id)) id,
+    };
+    final batchMedia = visibleMedia.toSet();
+    final roots = <String>[];
+    for (final id in batch.createdCollectionIds) {
+      if (!created.contains(id)) continue;
+      final parentId = collectionOf(id)?.parentId;
+      if (parentId != null && created.contains(parentId)) continue;
+      roots.add(id);
+    }
+
+    final covered = <String>{};
+    final entries = <RecentAddedEntry>[];
+    var inner = 0;
+    for (final rootId in roots) {
+      final children = _firstLayerChildren(rootId, created, batchMedia);
+      if (children.isEmpty) continue;
+      for (final child in children) {
+        if (child.kind == RecentAddedChildKind.media) {
+          covered.add(child.id);
+        }
+      }
+      covered.addAll(
+        _descendantBatchMedia(rootId, created, batchMedia),
+      );
+      final onlyOneFile =
+          children.length == 1 &&
+          children.single.kind == RecentAddedChildKind.media;
+      if (onlyOneFile) {
+        entries.add(
+          RecentAddedEntry.single(
+            mediaId: children.single.id,
+            sortKeyMs: batch.startedAtMs,
+            sortId: batch.id,
+            innerIndex: inner,
+            sourceBatchId: batch.id,
+          ),
+        );
+      } else {
+        final name = collectionOf(rootId)?.name.trim();
+        entries.add(
+          RecentAddedEntry.batch(
+            batchId: '${batch.id}:$rootId',
+            title: (name == null || name.isEmpty) ? batch.title : name,
+            sortKeyMs: batch.startedAtMs,
+            sortId: batch.id,
+            innerIndex: inner,
+            sourceBatchId: batch.id,
+            children: children,
+          ),
+        );
+      }
+      inner++;
+    }
+
+    final loose = <String>[
+      for (final id in visibleMedia)
+        if (!covered.contains(id)) id,
+    ];
+    if (loose.isEmpty) return entries;
+
+    final keepLooseFlat =
+        loose.length > 1 &&
+        roots.isEmpty &&
+        batch.sourceKind != LibraryImportSourceKind.bilibili &&
+        batch.sourceKind != LibraryImportSourceKind.ytDlp;
+    if (keepLooseFlat) {
+      entries.add(
+        RecentAddedEntry.batch(
+          batchId: batch.id,
+          title: batch.title,
+          sortKeyMs: batch.startedAtMs,
+          sortId: batch.id,
+          innerIndex: inner,
+          sourceBatchId: batch.id,
+          children: [
+            for (final id in loose) RecentAddedChild.media(id),
+          ],
+        ),
+      );
+      return entries;
+    }
+    for (final id in loose) {
+      entries.add(
+        RecentAddedEntry.single(
+          mediaId: id,
+          sortKeyMs: batch.startedAtMs,
+          sortId: batch.id,
+          innerIndex: inner,
+          sourceBatchId: batch.id,
+        ),
+      );
+      inner++;
+    }
+    return entries;
+  }
+
+  List<RecentAddedChild> _firstLayerChildren(
+    String rootId,
+    Set<String> created,
+    Set<String> batchMedia,
+  ) {
+    final collection = collectionOf(rootId);
+    if (collection == null) return const <RecentAddedChild>[];
+    final children = <RecentAddedChild>[];
+    for (final childId in collection.childrenIds) {
+      if (created.contains(childId)) {
+        if (_descendantBatchMedia(childId, created, batchMedia).isNotEmpty) {
+          children.add(RecentAddedChild.folder(childId));
+        }
+        continue;
+      }
+      if (batchMedia.contains(childId)) {
+        children.add(RecentAddedChild.media(childId));
+      }
+    }
+    return children;
+  }
+
+  Set<String> _descendantBatchMedia(
+    String collectionId,
+    Set<String> created,
+    Set<String> batchMedia,
+  ) {
+    final found = <String>{};
+    final pending = <String>[collectionId];
+    final seen = <String>{};
+    while (pending.isNotEmpty) {
+      final current = pending.removeLast();
+      if (!seen.add(current)) continue;
+      final collection = collectionOf(current);
+      if (collection == null) continue;
+      for (final childId in collection.childrenIds) {
+        if (batchMedia.contains(childId)) {
+          found.add(childId);
+          continue;
+        }
+        if (created.contains(childId)) pending.add(childId);
+      }
+    }
+    return found;
   }
 
   /// Live against [policy]; changing sliders refilters without rewatching.
@@ -430,15 +567,28 @@ class ContinueLearningSections {
 enum RecentAddedKind { batch, single, unknown }
 
 /// One root-level row in 最近添加. Batch rows are not [VideoCollection]s.
+enum RecentAddedChildKind { media, folder }
+
+class RecentAddedChild {
+  const RecentAddedChild.media(this.id) : kind = RecentAddedChildKind.media;
+
+  const RecentAddedChild.folder(this.id) : kind = RecentAddedChildKind.folder;
+
+  final RecentAddedChildKind kind;
+  final String id;
+}
+
 class RecentAddedEntry {
   const RecentAddedEntry._({
     required this.kind,
     required this.sortKeyMs,
     required this.sortId,
+    this.innerIndex = 0,
     this.batchId,
     this.mediaId,
     this.title = '',
     this.visibleMediaIds = const <String>[],
+    this.children = const <RecentAddedChild>[],
     this.sourceBatchId,
   });
 
@@ -447,16 +597,29 @@ class RecentAddedEntry {
     required String title,
     required int sortKeyMs,
     required String sortId,
-    required List<String> visibleMediaIds,
+    int innerIndex = 0,
+    String? sourceBatchId,
+    List<String> visibleMediaIds = const <String>[],
+    List<RecentAddedChild>? children,
   }) {
+    final rows =
+        children ??
+        <RecentAddedChild>[
+          for (final id in visibleMediaIds) RecentAddedChild.media(id),
+        ];
     return RecentAddedEntry._(
       kind: RecentAddedKind.batch,
       batchId: batchId,
       title: title,
       sortKeyMs: sortKeyMs,
       sortId: sortId,
-      visibleMediaIds: visibleMediaIds,
-      sourceBatchId: batchId,
+      innerIndex: innerIndex,
+      visibleMediaIds: List<String>.unmodifiable([
+        for (final child in rows)
+          if (child.kind == RecentAddedChildKind.media) child.id,
+      ]),
+      children: List<RecentAddedChild>.unmodifiable(rows),
+      sourceBatchId: sourceBatchId ?? batchId,
     );
   }
 
@@ -464,6 +627,7 @@ class RecentAddedEntry {
     required String mediaId,
     required int sortKeyMs,
     required String sortId,
+    int innerIndex = 0,
     String? sourceBatchId,
   }) {
     return RecentAddedEntry._(
@@ -471,7 +635,9 @@ class RecentAddedEntry {
       mediaId: mediaId,
       sortKeyMs: sortKeyMs,
       sortId: sortId,
+      innerIndex: innerIndex,
       visibleMediaIds: <String>[mediaId],
+      children: <RecentAddedChild>[RecentAddedChild.media(mediaId)],
       sourceBatchId: sourceBatchId,
     );
   }
@@ -483,16 +649,21 @@ class RecentAddedEntry {
       sortId: 'unknown',
       title: '更早添加',
       visibleMediaIds: visibleMediaIds,
+      children: <RecentAddedChild>[
+        for (final id in visibleMediaIds) RecentAddedChild.media(id),
+      ],
     );
   }
 
   final RecentAddedKind kind;
   final int sortKeyMs;
   final String sortId;
+  final int innerIndex;
   final String? batchId;
   final String? mediaId;
   final String title;
   final List<String> visibleMediaIds;
+  final List<RecentAddedChild> children;
   final String? sourceBatchId;
 
   String get rowId {
@@ -506,7 +677,8 @@ class RecentAddedEntry {
     }
   }
 
-  int get visibleCount => visibleMediaIds.length;
+  int get visibleCount =>
+      children.isEmpty ? visibleMediaIds.length : children.length;
 
   String groupHeaderLabel() => '$title·当前$visibleCount项';
 }

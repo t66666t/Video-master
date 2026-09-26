@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../../debug/developer_log.dart' as developer;
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:dio/dio.dart';

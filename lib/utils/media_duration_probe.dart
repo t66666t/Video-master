@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'dart:io';
 
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';

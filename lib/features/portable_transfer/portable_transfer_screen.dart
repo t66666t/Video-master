@@ -4,8 +4,8 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
-import 'package:intl/intl.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -19,7 +19,7 @@ import '../../utils/android_hardware_input_bridge.dart';
 import '../../utils/batch_tool_shortcuts.dart';
 import '../../utils/hardware_keyboard_shortcuts.dart';
 import '../../utils/page_shortcut_keys.dart';
-import 'portable_media_selection.dart';
+import 'portable_export_format_page.dart';
 import 'portable_selection_page.dart';
 import 'portable_transfer_models.dart';
 import 'portable_transfer_service.dart';
@@ -78,7 +78,7 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
   }
 
   /// Consume one-shot launch args after the first frame so the import tab or
-  /// export-settings sheet appears on top of a fully built page.
+  /// export format choice appears on top of a fully built page.
   Future<void> _consumePendingLaunch() async {
     if (_consumedPendingLaunch || !mounted) return;
     _consumedPendingLaunch = true;
@@ -91,7 +91,14 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
     if (exportIds != null && exportIds.isNotEmpty) {
       await Future<void>.delayed(const Duration(milliseconds: 50));
       if (!mounted) return;
-      await _prepareExport(exportIds.toSet());
+      await Navigator.of(context).push<bool>(
+        AppMaterialPageRoute<bool>(
+          builder: (_) => PortableExportFormatPage(
+            library: context.read<LibraryService>(),
+            rootIds: exportIds,
+          ),
+        ),
+      );
     }
   }
 
@@ -704,61 +711,11 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
   Future<void> _startExport() async {
     if (_picking) return;
     final library = context.read<LibraryService>();
-    final selected = await Navigator.of(context).push<Set<String>>(
-      MaterialPageRoute(
+    await Navigator.of(context).push<void>(
+      AppMaterialPageRoute<void>(
         builder: (_) => PortableSelectionPage(library: library),
       ),
     );
-    if (selected == null || selected.isEmpty || !mounted) return;
-    await _prepareExport(selected);
-  }
-
-  /// Same as tapping "新建导出" after the media tree selection is already known.
-  Future<void> _prepareExport(Set<String> selected) async {
-    if (_picking || selected.isEmpty) return;
-    final library = context.read<LibraryService>();
-    final inclusion = PortableMediaSelection(
-      selected,
-    ).resolveAgainstLibrary(library);
-    if (inclusion.isEmpty) {
-      AppToast.show('没有可导出的媒体', type: AppToastType.error);
-      return;
-    }
-    final options = await showModalBottomSheet<PortableExportOptions>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => _ExportOptionsSheet(
-        selectedCount: inclusion.mediaCount,
-        folderCount: inclusion.folderCount,
-      ),
-    );
-    if (options == null || !mounted) return;
-
-    setState(() => _picking = true);
-    try {
-      var fileName =
-          '${_safeFileName(options.packageName)}.${PortableTransferService.extension}';
-      final outputPath = await _chooseExportPath(fileName);
-      if (outputPath == null || !mounted) return;
-      final normalized =
-          outputPath.toLowerCase().endsWith(
-            '.${PortableTransferService.extension}',
-          )
-          ? outputPath
-          : '$outputPath.${PortableTransferService.extension}';
-      await _service.exportSelection(
-        library: library,
-        rootIds: selected.toList(),
-        outputPath: normalized,
-        options: options,
-      );
-      if (mounted) setState(() => _tab = PortableTransferKind.export);
-    } catch (error) {
-      AppToast.show('无法开始导出：$error', type: AppToastType.error);
-    } finally {
-      if (mounted) setState(() => _picking = false);
-    }
   }
 
   Future<void> _startImport() async {
@@ -882,28 +839,6 @@ class _PortableTransferScreenState extends State<PortableTransferScreen> {
     final path = task.filePath;
     if (path == null) return;
     await revealInFileManager(path);
-  }
-
-  Future<String?> _chooseExportPath(String fileName) async {
-    if (_isDesktop) {
-      return FilePicker.platform.saveFile(
-        dialogTitle: '保存 Fluent Player 导出包',
-        fileName: fileName,
-        type: FileType.custom,
-        allowedExtensions: const [PortableTransferService.extension],
-      );
-    }
-
-    // file_picker's Android/iOS save API accepts only complete byte buffers.
-    // Portable packages may be many gigabytes, so buffering one in RAM is not
-    // viable. Generate it as a stream in app storage, then let the task card
-    // hand the finished file to the platform share / Files UI.
-    final documents = await getApplicationDocumentsDirectory();
-    final exportDirectory = Directory(
-      p.join(documents.path, 'Fluent Player', 'Exports'),
-    );
-    await exportDirectory.create(recursive: true);
-    return _nextAvailablePath(exportDirectory, fileName);
   }
 
   Future<_PickedPortablePackage?> _pickPortablePackage() async {
@@ -1050,238 +985,6 @@ class _PickedPortablePackage {
         await file.delete();
       } catch (_) {}
     }
-  }
-}
-
-class _ExportOptionsSheet extends StatefulWidget {
-  final int selectedCount;
-  final int folderCount;
-  const _ExportOptionsSheet({
-    required this.selectedCount,
-    this.folderCount = 0,
-  });
-
-  @override
-  State<_ExportOptionsSheet> createState() => _ExportOptionsSheetState();
-}
-
-class _ExportOptionsSheetState extends State<_ExportOptionsSheet> {
-  late final TextEditingController _nameController;
-  bool _wrap = true;
-  bool _sidecars = true;
-  bool _checksums = true;
-  PortableCompression _compression = PortableCompression.fast;
-
-  @override
-  void initState() {
-    super.initState();
-    _nameController = TextEditingController(
-      text:
-          'Fluent Player ${DateFormat('yyyy-MM-dd HH-mm').format(DateTime.now())}',
-    );
-  }
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final inheritedTheme = Theme.of(context);
-    return Theme(
-      data: inheritedTheme.copyWith(
-        textTheme: inheritedTheme.textTheme.apply(fontFamily: 'Noto Sans SC'),
-        primaryTextTheme: inheritedTheme.primaryTextTheme.apply(
-          fontFamily: 'Noto Sans SC',
-        ),
-      ),
-      child: Material(
-        color: const Color(0xFF181A21),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        child: SafeArea(
-          top: false,
-          child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(
-              20,
-              12,
-              20,
-              20 + MediaQuery.viewInsetsOf(context).bottom,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.white24,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 18),
-                Text(
-                  '导出设置',
-                  style: Theme.of(
-                    context,
-                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  widget.selectedCount == 0
-                      ? '${widget.folderCount} 个文件夹将合并为一个跨平台文件'
-                      : widget.folderCount == 0
-                      ? '${widget.selectedCount} 个媒体将合并为一个跨平台文件'
-                      : '${widget.selectedCount} 个媒体、${widget.folderCount} 个文件夹将合并为一个跨平台文件',
-                  style: const TextStyle(color: Colors.white54),
-                ),
-                const SizedBox(height: 10),
-                Container(
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF222532),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(
-                        Icons.cloud_done_outlined,
-                        size: 19,
-                        color: Color(0xFFAEB8FF),
-                      ),
-                      SizedBox(width: 9),
-                      Expanded(
-                        child: Text(
-                          'Bilibili 在线卡片会保留来源、封面、字幕、弹幕和预览图，不携带视频分片、转录音频或物化媒体缓存。',
-                          style: TextStyle(
-                            color: Colors.white60,
-                            fontSize: 12,
-                            height: 1.45,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (Platform.isAndroid || Platform.isIOS) ...[
-                  const SizedBox(height: 10),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF222532),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(
-                          Icons.mobile_friendly_rounded,
-                          size: 19,
-                          color: Color(0xFF70D8A4),
-                        ),
-                        SizedBox(width: 9),
-                        Expanded(
-                          child: Text(
-                            '移动端会流式生成文件，避免大文件撑爆内存。完成后可在任务卡片中分享、存储到“文件”或用其他应用打开。',
-                            style: TextStyle(
-                              color: Colors.white60,
-                              fontSize: 12,
-                              height: 1.45,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-                const SizedBox(height: 20),
-                TextField(
-                  controller: _nameController,
-                  onChanged: (_) => setState(() {}),
-                  autofocus: false,
-                  decoration: const InputDecoration(
-                    labelText: '导出包名称',
-                    prefixIcon: Icon(Icons.drive_file_rename_outline),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                DropdownButtonFormField<PortableCompression>(
-                  initialValue: _compression,
-                  decoration: const InputDecoration(
-                    labelText: '压缩策略',
-                    prefixIcon: Icon(Icons.compress_rounded),
-                  ),
-                  items: const [
-                    DropdownMenuItem(
-                      value: PortableCompression.fast,
-                      child: Text('极速 · 推荐给视频'),
-                    ),
-                    DropdownMenuItem(
-                      value: PortableCompression.balanced,
-                      child: Text('均衡 · 稍省空间'),
-                    ),
-                    DropdownMenuItem(
-                      value: PortableCompression.smallest,
-                      child: Text('最小体积 · 耐心模式'),
-                    ),
-                  ],
-                  onChanged: (value) => setState(() => _compression = value!),
-                ),
-                const SizedBox(height: 10),
-                SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
-                  value: _wrap,
-                  onChanged: (value) => setState(() => _wrap = value),
-                  title: const Text('最外层包一层文件夹'),
-                  subtitle: const Text('解压后桌面不会突然“下文件雨”'),
-                ),
-                SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
-                  value: _sidecars,
-                  onChanged: (value) => setState(() => _sidecars = value),
-                  title: const Text('包含字幕与附属文件'),
-                  subtitle: const Text('保留外挂字幕、弹幕和已管理字幕'),
-                ),
-                SwitchListTile.adaptive(
-                  contentPadding: EdgeInsets.zero,
-                  value: _checksums,
-                  onChanged: (value) => setState(() => _checksums = value),
-                  title: const Text('生成完整性校验'),
-                  subtitle: const Text('导出前多看一眼，跨设备更安心'),
-                ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _nameController.text.trim().isEmpty
-                      ? null
-                      : () => Navigator.pop(
-                          context,
-                          PortableExportOptions(
-                            packageName: _nameController.text.trim(),
-                            wrapInFolder: _wrap,
-                            includeSidecars: _sidecars,
-                            verifyChecksums: _checksums,
-                            compression: _compression,
-                          ),
-                        ),
-                  icon: const Icon(Icons.save_alt_rounded),
-                  label: Text(
-                    Platform.isAndroid || Platform.isIOS ? '开始导出' : '选择保存位置',
-                  ),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(52),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 }
 
@@ -1473,7 +1176,7 @@ class _EmptyTransferState extends StatelessWidget {
             const SizedBox(height: 8),
             Text(
               exporting
-                  ? '选择媒体和文件夹，导出为一个跨平台文件。'
+                  ? '选择媒体和文件夹，再决定导出为 Fluent Pack 或 Zip。'
                   : '只接受 .fluentpack 文件，选择后会先验证再导入。',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, height: 1.5),

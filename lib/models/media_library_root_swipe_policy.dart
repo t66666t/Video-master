@@ -56,9 +56,48 @@ class MediaLibraryRootSwipePolicy {
     if (width <= 0) return false;
     final towardNext = dragDx < 0;
     final distance = dragDx.abs();
-    final flick = towardNext ? velocityDx < -commitVelocity : velocityDx > commitVelocity;
+    final flick = towardNext
+        ? velocityDx < -commitVelocity
+        : velocityDx > commitVelocity;
     if (flick && distance > 24) return true;
     return distance >= width * commitFraction;
+  }
+
+  /// Page to show after the finger lifts. Null stays on [current].
+  ///
+  /// [shouldCommit] only accepts a flick that points the same way as
+  /// [dragDx]. Past [commitFraction] that locks the first direction, so a
+  /// halfway drag that reverses still lands on the page being left. A flick
+  /// against the current offset picks the other neighbor instead.
+  static MediaLibraryRootEntry? settleTarget({
+    required MediaLibraryRootEntry current,
+    required double dragDx,
+    required double width,
+    required double velocityDx,
+    List<MediaLibraryRootEntry> order = MediaLibraryRootEntryOrder.defaults,
+  }) {
+    if (width <= 0) return null;
+    if (_isOpposingFlick(dragDx: dragDx, velocityDx: velocityDx)) {
+      final direction = velocityDx > 0 ? 1.0 : -1.0;
+      return neighbor(current: current, dx: direction, order: order);
+    }
+    if (!shouldCommit(
+      dragDx: dragDx,
+      width: width,
+      velocityDx: velocityDx,
+    )) {
+      return null;
+    }
+    return neighbor(current: current, dx: dragDx, order: order);
+  }
+
+  static bool _isOpposingFlick({
+    required double dragDx,
+    required double velocityDx,
+  }) {
+    if (velocityDx > commitVelocity) return dragDx < 0;
+    if (velocityDx < -commitVelocity) return dragDx > 0;
+    return false;
   }
 
   /// Resist sliding off the first/last tab.

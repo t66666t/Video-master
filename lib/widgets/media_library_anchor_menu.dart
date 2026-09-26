@@ -1,7 +1,8 @@
 import 'dart:math' as math;
-import 'dart:ui';
 
 import 'package:flutter/material.dart';
+
+import '../theme/app_tokens.dart';
 
 import 'media_library_layout_profile.dart';
 
@@ -324,14 +325,12 @@ class _AnchorMenuPanel extends StatelessWidget {
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(radius),
-            child: BackdropFilter(
-              filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
-              child: DecoratedBox(
+            child: DecoratedBox(
                 decoration: BoxDecoration(
-                  color: const Color(0xE82C2C2E),
+                  color: AppTokens.bgOverlay,
                   borderRadius: BorderRadius.circular(radius),
                   border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.12),
+                    color: Colors.white.withValues(alpha: 0.09),
                   ),
                 ),
                 child: Padding(
@@ -362,7 +361,6 @@ class _AnchorMenuPanel extends StatelessWidget {
             ),
           ),
         ),
-      ),
     );
   }
 }
@@ -414,7 +412,7 @@ class _AnchorMenuRow extends StatelessWidget {
                 Icon(
                   Icons.check,
                   size: metrics.iconSize,
-                  color: const Color(0xFF0A84FF),
+                  color: AppTokens.accent,
                 ),
             ],
           ),

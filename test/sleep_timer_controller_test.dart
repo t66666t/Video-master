@@ -91,10 +91,21 @@ void main() {
     expect(timer.consumeItemCompletion(hasNextItem: true), isFalse);
     expect(timer.consumeItemCompletion(hasNextItem: false), isTrue);
 
+    await timer.scheduleAfterItems(1);
+    expect(timer.consumeItemCompletion(hasNextItem: true), isFalse);
+    expect(timer.remainingItemCount, 1);
+    expect(timer.awaitingCurrentItemEnd, isFalse);
+    expect(timer.consumeItemCompletion(hasNextItem: true), isTrue);
+
     await timer.scheduleAfterItems(3);
+    expect(timer.scheduledItemCount, 3);
+    expect(timer.consumeItemCompletion(hasNextItem: true), isFalse);
+    expect(timer.remainingItemCount, 3);
     expect(timer.consumeItemCompletion(hasNextItem: true), isFalse);
     expect(timer.remainingItemCount, 2);
     expect(timer.consumeItemCompletion(hasNextItem: true), isFalse);
+    expect(timer.remainingItemCount, 1);
+    expect(timer.scheduledItemCount, 3);
     expect(timer.consumeItemCompletion(hasNextItem: true), isTrue);
     timer.dispose();
   });
@@ -141,4 +152,148 @@ void main() {
     expect(preferences.containsKey('sleepTimer.deadlineMs'), isFalse);
     timer.dispose();
   });
+
+  test('counting preference and custom minutes survive a restart', () async {
+    final playback = _FakePlayback();
+    final first = SleepTimerController(now: () => DateTime(2026, 9, 7, 22));
+    await first.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => playback.playing,
+      onExpired: () async {},
+    );
+    await first.setCountOnlyWhilePlaying(true);
+    await first.setCustomMinutes(75);
+    await first.cancel();
+    first.dispose();
+
+    final restored = SleepTimerController(now: () => DateTime(2026, 9, 7, 22));
+    await restored.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => playback.playing,
+      onExpired: () async {},
+    );
+    expect(restored.countOnlyWhilePlaying, isTrue);
+    expect(restored.customMinutes, 75);
+    expect(restored.isActive, isFalse);
+    restored.dispose();
+  });
+
+  test('running duration timer converts without changing time left', () async {
+    var now = DateTime(2026, 9, 7, 22);
+    final playback = _FakePlayback()..playing = true;
+    final timer = SleepTimerController(now: () => now);
+    await timer.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => playback.playing,
+      onExpired: () async {},
+    );
+    await timer.scheduleAfter(const Duration(minutes: 30));
+    now = now.add(const Duration(minutes: 5));
+    await timer.setCountOnlyWhilePlaying(true);
+    expect(timer.mode, SleepTimerMode.afterPlaybackDuration);
+    expect(timer.remaining, const Duration(minutes: 25));
+
+    playback.setPlaying(false);
+    now = now.add(const Duration(hours: 1));
+    timer.checkNow();
+    expect(timer.remaining, const Duration(minutes: 25));
+
+    await timer.setCountOnlyWhilePlaying(false);
+    expect(timer.mode, SleepTimerMode.afterDuration);
+    expect(timer.remaining, const Duration(minutes: 25));
+    timer.dispose();
+  });
+
+  test('playback, completion, and item-count timers survive restart', () async {
+    var now = DateTime(2026, 9, 7, 22);
+    final playback = _FakePlayback()..playing = true;
+    final first = SleepTimerController(now: () => now);
+    await first.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => playback.playing,
+      onExpired: () async {},
+    );
+
+    await first.scheduleAfter(
+      const Duration(minutes: 40),
+      countOnlyWhilePlaying: true,
+    );
+    now = now.add(const Duration(minutes: 10));
+    first.checkNow();
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    first.dispose();
+
+    final playbackRestored = SleepTimerController(now: () => now);
+    await playbackRestored.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+    expect(playbackRestored.mode, SleepTimerMode.afterPlaybackDuration);
+    expect(playbackRestored.remaining, const Duration(minutes: 30));
+    playbackRestored.dispose();
+
+    final completion = SleepTimerController(now: () => now);
+    await completion.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+    await completion.scheduleAtEndOfCurrentItem();
+    completion.dispose();
+    final completionRestored = SleepTimerController(now: () => now);
+    await completionRestored.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+    expect(completionRestored.mode, SleepTimerMode.endOfCurrentItem);
+    completionRestored.dispose();
+
+    final items = SleepTimerController(now: () => now);
+    await items.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+    await items.scheduleAfterItems(3);
+    expect(items.consumeItemCompletion(hasNextItem: true), isFalse);
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    items.dispose();
+    final itemsRestored = SleepTimerController(now: () => now);
+    await itemsRestored.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+    expect(itemsRestored.mode, SleepTimerMode.afterItemCount);
+    expect(itemsRestored.remainingItemCount, 3);
+    expect(itemsRestored.scheduledItemCount, 3);
+    expect(itemsRestored.awaitingCurrentItemEnd, isFalse);
+    itemsRestored.dispose();
+  });
+
+  test(
+    'paused or stalled playback does not reduce playback countdown',
+    () async {
+      var now = DateTime(2026, 9, 7, 22);
+      final playback = _FakePlayback()..playing = true;
+      final timer = SleepTimerController(now: () => now);
+      await timer.initialize(
+        playbackListenable: playback,
+        isPlaybackRunning: () => playback.playing,
+        onExpired: () async {},
+      );
+      await timer.scheduleAfter(
+        const Duration(minutes: 20),
+        countOnlyWhilePlaying: true,
+      );
+      now = now.add(const Duration(minutes: 4));
+      playback.setPlaying(false);
+      now = now.add(const Duration(minutes: 9));
+      timer.checkNow();
+      expect(timer.remaining, const Duration(minutes: 16));
+      timer.dispose();
+    },
+  );
 }

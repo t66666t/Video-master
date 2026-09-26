@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/media_library_group_expand_policy.dart';
+import '../models/video_collection.dart';
 import '../models/video_item.dart';
 import '../services/library_activity_projection.dart';
 import '../services/library_service.dart';
@@ -21,6 +22,8 @@ class MediaLibraryRecentView extends StatefulWidget {
     required this.cardBottomPadding,
     required this.onOpenMedia,
     required this.onLocateMedia,
+    this.onOpenFolder,
+    this.onLocateFolder,
     this.expandBatchId,
     this.isActive = true,
   });
@@ -29,6 +32,8 @@ class MediaLibraryRecentView extends StatefulWidget {
   final double cardBottomPadding;
   final ValueChanged<VideoItem> onOpenMedia;
   final ValueChanged<VideoItem> onLocateMedia;
+  final ValueChanged<VideoCollection>? onOpenFolder;
+  final ValueChanged<VideoCollection>? onLocateFolder;
   final String? expandBatchId;
 
   /// Hidden keep-alive copies skip Provider watches and reuse the last tree.
@@ -41,6 +46,7 @@ class MediaLibraryRecentView extends StatefulWidget {
 class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   final MediaLibraryGroupExpandMemory _expand = MediaLibraryGroupExpandMemory();
   final Map<String, GlobalKey> _headerKeys = <String, GlobalKey>{};
+  String? _appliedExpandBatchId;
   String? _topRowId;
   bool _userScrolled = false;
   bool _showNewContentHint = false;
@@ -55,7 +61,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   void initState() {
     super.initState();
     widget.scrollController.addListener(_onScroll);
-    _expandRequestedBatch();
   }
 
   @override
@@ -77,7 +82,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
       widget.scrollController.addListener(_onScroll);
     }
     if (oldWidget.expandBatchId != widget.expandBatchId) {
-      _expandRequestedBatch();
+      _appliedExpandBatchId = null;
       _tryReuseFrozen = false;
     }
     if (widget.isActive && !oldWidget.isActive) {
@@ -104,10 +109,16 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     }
   }
 
-  void _expandRequestedBatch() {
+  void _expandRequestedBatch(List<RecentAddedEntry> entries) {
     final batchId = widget.expandBatchId;
     if (batchId == null || batchId.isEmpty) return;
-    _expand.forceOpen('batch:$batchId');
+    if (_appliedExpandBatchId == batchId) return;
+    _appliedExpandBatchId = batchId;
+    for (final entry in entries) {
+      if (entry.sourceBatchId == batchId || entry.rowId == 'batch:$batchId') {
+        _expand.forceOpen(entry.rowId);
+      }
+    }
   }
 
   void _syncNewContentHint(List<RecentAddedEntry> entries) {
@@ -175,6 +186,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     _tryReuseFrozen = false;
     _libraryChangedWhileAway = false;
     final entries = library.activityProjection.recentAddedEntries();
+    _expandRequestedBatch(entries);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !widget.isActive) return;
       _syncNewContentHint(entries);
@@ -192,24 +204,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     final useList = settings.mediaLibraryViewMode == 1;
     final screenSize = MediaQuery.sizeOf(context);
     // Match 文件夹: first-row inset equals mainSpacing so cards sit off the app bar.
-    final double topGap;
-    if (useList) {
-      final listStyle = settings.listStyleFor(screenSize);
-      topGap = MediaListLayoutMetrics.forGrid(
-        screenShortestSide: screenSize.shortestSide,
-        availableWidth: screenSize.width,
-        crossAxisCount: listStyle.crossAxisCount,
-        heightSetting: listStyle.heightScale,
-        titleSetting: listStyle.titleScale,
-        mainSpacingSetting: listStyle.mainSpacingScale,
-        crossSpacingSetting: listStyle.crossSpacingScale,
-      ).topPadding;
-    } else {
-      topGap = MediaLibraryLayoutDefaults.cardGrid(
-        screenSize: screenSize,
-        style: settings.collectionCardStyleFor(screenSize),
-      ).topPadding;
-    }
+    final flow = _flowSpacing(settings, screenSize, useList);
     _frozenViewMode = settings.mediaLibraryViewMode;
     _frozenBottomPadding = widget.cardBottomPadding;
     _frozenSubtree = Stack(
@@ -217,13 +212,14 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
         CustomScrollView(
           controller: widget.scrollController,
           slivers: [
-            SliverToBoxAdapter(child: SizedBox(height: topGap)),
+            if (flow.gap(flow.leading) case final leading?) leading,
             ..._sliversForEntries(
               context: context,
               library: library,
               settings: settings,
               entries: entries,
               useList: useList,
+              flow: flow,
             ),
             SliverToBoxAdapter(
               child: SizedBox(height: 24 + widget.cardBottomPadding),
@@ -269,32 +265,39 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required SettingsService settings,
     required List<RecentAddedEntry> entries,
     required bool useList,
+    required MediaLibraryFlowSpacing flow,
   }) {
     final slivers = <Widget>[];
-    var singles = <String>[];
+    var singles = <RecentAddedChild>[];
+    void startRegion() {
+      if (slivers.isNotEmpty) flow.addGap(slivers, flow.section);
+    }
+
     void flushSingles() {
       if (singles.isEmpty) return;
+      startRegion();
       slivers.add(
         _memberGridOrListSliver(
           context: context,
           library: library,
           settings: settings,
-          ids: List<String>.from(singles),
+          children: List<RecentAddedChild>.from(singles),
           useList: useList,
         ),
       );
-      singles = <String>[];
+      singles = <RecentAddedChild>[];
     }
 
     for (final entry in entries) {
       if (entry.kind == RecentAddedKind.single) {
         final id = entry.mediaId;
         if (id != null && library.getVideo(id) != null) {
-          singles.add(id);
+          singles.add(RecentAddedChild.media(id));
         }
         continue;
       }
       flushSingles();
+      startRegion();
       slivers.addAll(
         _sliversForGroup(
           context: context,
@@ -303,6 +306,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
           entry: entry,
           entries: entries,
           useList: useList,
+          flow: flow,
         ),
       );
     }
@@ -317,6 +321,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required RecentAddedEntry entry,
     required List<RecentAddedEntry> entries,
     required bool useList,
+    required MediaLibraryFlowSpacing flow,
   }) {
 
     final newestBatch = _newestMultiItemBatch(entries);
@@ -331,7 +336,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     final expanded =
         flat ||
         _expand.isExpanded(entry.rowId, defaultExpanded: defaultExpanded);
-    final covers = _coverItems(library, entry.visibleMediaIds);
+    final covers = _coverItems(library, entry);
     final header = SliverToBoxAdapter(
       key: ValueKey(entry.rowId),
       child: KeyedSubtree(
@@ -340,6 +345,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
           title: entry.groupHeaderLabel(),
           coverItems: covers,
           expanded: expanded,
+          padding: EdgeInsets.symmetric(horizontal: flow.outer),
           showChevron: !flat,
           remainderCount: expanded ? 0 : count,
           onToggle: flat
@@ -360,11 +366,12 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     if (!expanded) return [header];
     return [
       header,
+      if (flow.gap(flow.attached) case final attached?) attached,
       _memberGridOrListSliver(
         context: context,
         library: library,
         settings: settings,
-        ids: entry.visibleMediaIds,
+        children: entry.children,
         useList: useList,
       ),
     ];
@@ -379,12 +386,35 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     return null;
   }
 
-  List<VideoItem> _coverItems(LibraryService library, List<String> ids) {
+  List<VideoItem> _coverItems(LibraryService library, RecentAddedEntry entry) {
     final out = <VideoItem>[];
-    for (final id in ids) {
-      if (out.length >= MediaLibraryGroupExpandPolicy.coverPreviewMax) break;
+    void takeMedia(String id) {
+      if (out.length >= MediaLibraryGroupExpandPolicy.coverPreviewMax) return;
       final item = library.getVideo(id);
       if (item != null) out.add(item);
+    }
+
+    void takeFolder(String id) {
+      final collection = library.getCollection(id);
+      if (collection == null) return;
+      for (final childId in collection.childrenIds) {
+        if (out.length >= MediaLibraryGroupExpandPolicy.coverPreviewMax) return;
+        final item = library.getVideo(childId);
+        if (item != null) {
+          out.add(item);
+          continue;
+        }
+        if (library.getCollection(childId) != null) takeFolder(childId);
+      }
+    }
+
+    for (final child in entry.children) {
+      if (out.length >= MediaLibraryGroupExpandPolicy.coverPreviewMax) break;
+      if (child.kind == RecentAddedChildKind.media) {
+        takeMedia(child.id);
+      } else {
+        takeFolder(child.id);
+      }
     }
     return out;
   }
@@ -431,23 +461,36 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     }
   }
 
+  MediaLibraryFlowSpacing _flowSpacing(
+    SettingsService settings,
+    Size screenSize,
+    bool useList,
+  ) {
+    return mediaLibraryFlowSpacingFor(
+      screenSize: screenSize,
+      useList: useList,
+      cardStyle: settings.collectionCardStyleFor(screenSize),
+      listStyle: settings.listStyleFor(screenSize),
+    );
+  }
+
   Widget _memberGridOrListSliver({
     required BuildContext context,
     required LibraryService library,
     required SettingsService settings,
-    required List<String> ids,
+    required List<RecentAddedChild> children,
     required bool useList,
   }) {
     if (useList) {
-      return _memberListSliver(library, settings, ids);
+      return _memberListSliver(library, settings, children);
     }
-    return _memberGridSliver(context, library, settings, ids);
+    return _memberGridSliver(context, library, settings, children);
   }
 
   Widget _memberListSliver(
     LibraryService library,
     SettingsService settings,
-    List<String> ids,
+    List<RecentAddedChild> children,
   ) {
     final listStyle = settings.listStyleFor(MediaQuery.sizeOf(context));
     final metrics = MediaListLayoutMetrics.forGrid(
@@ -469,18 +512,16 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
           mainAxisSpacing: metrics.mainSpacing,
         ),
         delegate: SliverChildBuilderDelegate((context, index) {
-          final item = library.getVideo(ids[index]);
-          if (item == null) return const SizedBox.shrink();
-          return _mediaTile(
+          return _childTile(
             context: context,
             library: library,
             settings: settings,
-            item: item,
+            child: children[index],
             index: index,
             useList: true,
             listStyle: listStyle,
           );
-        }, childCount: ids.length),
+        }, childCount: children.length),
       ),
     );
   }
@@ -489,7 +530,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     BuildContext context,
     LibraryService library,
     SettingsService settings,
-    List<String> ids,
+    List<RecentAddedChild> children,
   ) {
     final metrics = MediaLibraryLayoutDefaults.cardGrid(
       screenSize: MediaQuery.sizeOf(context),
@@ -505,18 +546,87 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
           mainAxisSpacing: metrics.mainSpacing,
         ),
         delegate: SliverChildBuilderDelegate((context, index) {
-          final item = library.getVideo(ids[index]);
-          if (item == null) return const SizedBox.shrink();
-          return _mediaTile(
+          return _childTile(
             context: context,
             library: library,
             settings: settings,
-            item: item,
+            child: children[index],
             index: index,
             useList: false,
           );
-        }, childCount: ids.length),
+        }, childCount: children.length),
       ),
+    );
+  }
+
+  Widget _childTile({
+    required BuildContext context,
+    required LibraryService library,
+    required SettingsService settings,
+    required RecentAddedChild child,
+    required int index,
+    required bool useList,
+    MediaListStyleSettings? listStyle,
+  }) {
+    if (child.kind == RecentAddedChildKind.folder) {
+      final collection = library.getCollection(child.id);
+      if (collection == null) return const SizedBox.shrink();
+      return _folderTile(
+        context: context,
+        settings: settings,
+        collection: collection,
+        useList: useList,
+        listStyle: listStyle,
+      );
+    }
+    final item = library.getVideo(child.id);
+    if (item == null) return const SizedBox.shrink();
+    return _mediaTile(
+      context: context,
+      library: library,
+      settings: settings,
+      item: item,
+      index: index,
+      useList: useList,
+      listStyle: listStyle,
+    );
+  }
+
+  Widget _folderTile({
+    required BuildContext context,
+    required SettingsService settings,
+    required VideoCollection collection,
+    required bool useList,
+    MediaListStyleSettings? listStyle,
+  }) {
+    final open = widget.onOpenFolder;
+    final locate = widget.onLocateFolder;
+    if (useList) {
+      final style =
+          listStyle ?? settings.listStyleFor(MediaQuery.sizeOf(context));
+      return MediaLibraryListTile.collection(
+        collection: collection,
+        index: 0,
+        showIndex: false,
+        showThumbnail: style.showThumbnail,
+        isSelected: false,
+        isSelectionMode: false,
+        titleScale: style.titleScale,
+        onTap: () => open?.call(collection),
+        onShowInParentFolder: locate == null
+            ? null
+            : () => locate(collection),
+        showActivityMenu: true,
+        allowHide: false,
+      );
+    }
+    return MediaLibraryFolderGridCard(
+      collection: collection,
+      titleScale: settings
+          .collectionCardStyleFor(MediaQuery.sizeOf(context))
+          .titleScale,
+      onTap: () => open?.call(collection),
+      onLocate: locate == null ? null : () => locate(collection),
     );
   }
 

@@ -1,7 +1,7 @@
 ﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:archive/archive_io.dart';
@@ -565,6 +565,16 @@ class LibraryService extends ChangeNotifier {
     if (batch == null) return;
     if (!batch.createdMediaIds.contains(mediaId)) {
       batch.createdMediaIds.add(mediaId);
+    }
+  }
+
+  void noteImportedCollection(String collectionId, {required String? batchId}) {
+    if (batchId == null || !_canMutateActivity) return;
+    if (!_collections.containsKey(collectionId)) return;
+    final batch = _openImportBatches[batchId];
+    if (batch == null) return;
+    if (!batch.createdCollectionIds.contains(collectionId)) {
+      batch.createdCollectionIds.add(collectionId);
     }
   }
 
@@ -2834,6 +2844,10 @@ class LibraryService extends ChangeNotifier {
     );
     _collections[collection.id] = collection;
     accumulator.newCollectionIds.add(collection.id);
+    noteImportedCollection(
+      collection.id,
+      batchId: accumulator.activityBatchId,
+    );
     if (parentId != null && _collections.containsKey(parentId)) {
       _collections[parentId]!.childrenIds.add(collection.id);
     } else {

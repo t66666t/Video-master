@@ -112,11 +112,16 @@ class MediaLibraryNavigation {
     required bool returnToSearchResults,
     required bool Function(String id) isActiveFolder,
     required String? Function(String id) parentIdOf,
+    bool restoreLastPage = true,
+    String startupEntry = '',
   }) {
     final locateHome = revealItemId != null || returnToSearchResults;
     final parsedStored = MediaLibraryRootEntryX.tryParse(storedEntry);
     final MediaLibraryRootEntry preferred;
-    if (userChosen && parsedStored != null) {
+    if (!restoreLastPage) {
+      preferred =
+          MediaLibraryRootEntryX.tryParse(startupEntry) ?? foldersFallback;
+    } else if (userChosen && parsedStored != null) {
       preferred = parsedStored;
     } else if (parsedStored != null && libraryInitialized) {
       preferred = parsedStored;
@@ -129,7 +134,10 @@ class MediaLibraryNavigation {
       );
     }
 
+    // Keep the last real visit on disk while restore is off, so turning the
+    // setting back on still returns to that page.
     final persistPreferred =
+        restoreLastPage &&
         libraryInitialized &&
         !userChosen &&
         (storedEntry.isEmpty || parsedStored != preferred);
@@ -144,7 +152,9 @@ class MediaLibraryNavigation {
         preferred: MediaLibraryRootEntry.folders,
         availableEntries: availableEntries,
       );
-    } else if (libraryInitialized && displayed == MediaLibraryRootEntry.folders) {
+    } else if (restoreLastPage &&
+        libraryInitialized &&
+        displayed == MediaLibraryRootEntry.folders) {
       folderToOpen = resolveLivingFolderId(
         requestedId: lastFolderId,
         isActiveFolder: isActiveFolder,

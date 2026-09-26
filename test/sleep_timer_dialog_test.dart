@@ -84,4 +84,64 @@ void main() {
       await tester.pumpAndSettle();
     }
   });
+
+  testWidgets(
+      'counting switch stays on after the dialog closes',
+    (tester) async {
+      tester.view.devicePixelRatio = 1;
+      tester.view.physicalSize = const Size(800, 600);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final settings = SettingsService();
+      await settings.init();
+      final playback = MediaPlaybackService();
+      await playback.sleepTimer.initialize(
+        playbackListenable: playback,
+        isPlaybackRunning: () => false,
+        onExpired: () async {},
+      );
+
+      await tester.pumpWidget(
+        MultiProvider(
+          providers: [
+            ChangeNotifierProvider<SettingsService>.value(value: settings),
+            ChangeNotifierProvider<MediaPlaybackService>.value(value: playback),
+          ],
+          child: MaterialApp(
+            theme: ThemeData.dark(),
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: FilledButton(
+                    onPressed: () => showSleepTimerDialog(context),
+                    child: const Text('open'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      Future<void> openDialog() async {
+        await tester.tap(find.text('open'));
+        await tester.pumpAndSettle();
+      }
+
+      await openDialog();
+      expect(find.text('按现实时间计时'), findsOneWidget);
+      await tester.tap(find.text('按现实时间计时'));
+      await tester.pumpAndSettle();
+      expect(playback.sleepTimer.countOnlyWhilePlaying, isTrue);
+      expect(find.text('仅计算实际播放时间'), findsOneWidget);
+      await tester.tap(find.byTooltip('关闭'));
+      await tester.pumpAndSettle();
+
+      await openDialog();
+      expect(find.text('仅计算实际播放时间'), findsOneWidget);
+      await tester.tap(find.byTooltip('关闭'));
+      await tester.pumpAndSettle();
+    },
+  );
 }

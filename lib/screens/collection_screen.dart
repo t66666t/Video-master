@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/gestures.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
@@ -11,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
+import '../theme/app_tokens.dart';
 import '../services/library_service.dart';
 import '../services/settings_service.dart';
 import '../services/app_haptics.dart';
@@ -29,6 +31,7 @@ import '../widgets/media_library_action_dock.dart';
 import '../widgets/media_library_layout_profile.dart';
 import '../widgets/media_library_style_sheet.dart';
 import '../widgets/media_list_layout_metrics.dart';
+import '../debug/debug_log_overlay.dart';
 import '../widgets/media_library_settings_sheet.dart';
 import '../widgets/media_library_search_prompt.dart';
 import '../widgets/media_library_compact_app_bar.dart';
@@ -37,6 +40,7 @@ import '../widgets/media_library_selection_drop_targets.dart';
 import '../widgets/media_library_top_bar_import_progress.dart';
 import '../widgets/media_library_locate_button.dart';
 import '../widgets/media_library_folder_breadcrumb.dart';
+import '../widgets/media_library_folder_route.dart';
 import '../services/media_library_folder_walk.dart';
 import '../services/bilibili/bilibili_download_service.dart';
 import '../services/thumbnail_preload_manager.dart';
@@ -137,11 +141,9 @@ class _CollectionScreenState extends State<CollectionScreen>
     );
   }
 
-  bool _allowsFolderReorder() =>
-      !_isSearchResults && !_includeDescendantsNow();
+  bool _allowsFolderReorder() => !_isSearchResults && !_includeDescendantsNow();
 
-  bool _showParentLocate() =>
-      _isSearchResults || _includeDescendantsNow();
+  bool _showParentLocate() => _isSearchResults || _includeDescendantsNow();
 
   List<dynamic> _visibleContents(LibraryService library) {
     if (_isSearchResults) {
@@ -177,6 +179,7 @@ class _CollectionScreenState extends State<CollectionScreen>
   void _openBreadcrumbTarget(String? folderId) {
     if (folderId == widget.collectionId) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
+    final navigator = Navigator.of(context);
     if (folderId == null) {
       unawaited(
         settings.updateSetting(
@@ -187,22 +190,23 @@ class _CollectionScreenState extends State<CollectionScreen>
       unawaited(
         settings.updateSetting('mediaLibraryRootEntryUserChosen', true),
       );
-      Navigator.of(context).popUntil((route) => route.isFirst);
+      popMediaLibraryToFolder(navigator);
       return;
     }
-    final current = Provider.of<LibraryService>(
-      context,
-      listen: false,
-    ).getCollection(widget.collectionId);
-    Navigator.of(context).pushReplacement(
-      _buildDirectoryLocationRoute(
-        CollectionScreen(
-          collectionId: folderId,
-          revealItemId: current?.id,
-          returnToSearchResults: widget.returnToSearchResults,
+    final found = popMediaLibraryToFolder(navigator, folderId: folderId);
+    if (!found) {
+      navigator.push(
+        buildMediaLibraryFolderRoute<void>(
+          folderId: folderId,
+          restored: true,
+          builder: (_) => CollectionScreen(
+            collectionId: folderId,
+            returnToSearchResults: widget.returnToSearchResults,
+          ),
         ),
-      ),
-    );
+      );
+    }
+    unawaited(settings.updateSetting('mediaLibraryLastFolderId', folderId));
   }
 
   List<MediaLibraryBreadcrumbCrumb> _folderCrumbs(LibraryService library) {
@@ -241,28 +245,7 @@ class _CollectionScreenState extends State<CollectionScreen>
   }
 
   Route<void> _buildDirectoryLocationRoute(Widget page) {
-    return PageRouteBuilder<void>(
-      pageBuilder: (context, animation, secondaryAnimation) => page,
-      transitionDuration: const Duration(milliseconds: 280),
-      reverseTransitionDuration: const Duration(milliseconds: 240),
-      transitionsBuilder: (context, animation, secondaryAnimation, child) {
-        final eased = CurvedAnimation(
-          parent: animation,
-          curve: Curves.easeOutCubic,
-          reverseCurve: Curves.easeInCubic,
-        );
-        return FadeTransition(
-          opacity: eased,
-          child: SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0.018, 0),
-              end: Offset.zero,
-            ).animate(eased),
-            child: child,
-          ),
-        );
-      },
-    );
+    return AppMaterialPageRoute<void>(builder: (_) => page);
   }
 
   void _showInParentDirectory(dynamic item) {
@@ -415,9 +398,9 @@ class _CollectionScreenState extends State<CollectionScreen>
         ),
         onLongPress: _toggleExportButtonVisibility,
         onPressed: () {
-          Navigator.of(
-            context,
-          ).push(MaterialPageRoute(builder: (_) => const RecycleBinScreen()));
+          Navigator.of(context).push(
+            AppMaterialPageRoute(builder: (_) => const RecycleBinScreen()),
+          );
         },
       ),
       SizedBox(
@@ -430,9 +413,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                 icon: _includeDescendantsNow()
                     ? Icons.account_tree
                     : Icons.account_tree_outlined,
-                label: _includeDescendantsNow()
-                    ? '仅显示当前目录'
-                    : '包含子文件夹内容',
+                label: _includeDescendantsNow() ? '仅显示当前目录' : '包含子文件夹内容',
                 onSelected: () {
                   unawaited(_toggleIncludeDescendants());
                 },
@@ -480,6 +461,7 @@ class _CollectionScreenState extends State<CollectionScreen>
               ),
               onSelected: () =>
                   showMediaLibrarySettingsBottomSheet(context, settings),
+              onLongPress: () => unawaited(toggleDebugDeveloperMode(context)),
             ),
             mediaLibraryCompactMenuItem(
               icon: Icons.checklist,
@@ -602,6 +584,24 @@ class _CollectionScreenState extends State<CollectionScreen>
       attemptedItemIds: itemsToMove,
     );
     AppToast.show("已移出 ${itemsToMove.length} 个项目", type: AppToastType.success);
+  }
+
+  /// Card overflow action: move this one item, not the current selection.
+  Future<void> _moveSingleItemToParent(String itemId) async {
+    if (_isSearchResults) return;
+    final library = Provider.of<LibraryService>(context, listen: false);
+    final collection = library.getCollection(widget.collectionId);
+    if (collection == null) return;
+    await library.moveItemsToCollection([itemId], collection.parentId);
+    if (!mounted) return;
+    AppToast.show('已移出 1 个项目', type: AppToastType.success);
+  }
+
+  VoidCallback? _moveToParentMenuAction(String itemId) {
+    if (_isSearchResults) return null;
+    return () {
+      unawaited(_moveSingleItemToParent(itemId));
+    };
   }
 
   Future<void> _moveItemsToRecycleBin({int? draggedIndex}) async {
@@ -1006,10 +1006,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       if (!mounted || widget.searchQuery != null) return;
       final settings = Provider.of<SettingsService>(context, listen: false);
       unawaited(
-        settings.updateSetting(
-          'mediaLibraryLastFolderId',
-          widget.collectionId,
-        ),
+        settings.updateSetting('mediaLibraryLastFolderId', widget.collectionId),
       );
     });
 
@@ -1138,7 +1135,7 @@ class _CollectionScreenState extends State<CollectionScreen>
         }
         Navigator.of(
           context,
-        ).push(MaterialPageRoute(builder: (_) => const RecycleBinScreen()));
+        ).push(AppMaterialPageRoute(builder: (_) => const RecycleBinScreen()));
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.openCardStyle:
         if (_isSelectionMode) return KeyEventResult.handled;
@@ -1223,7 +1220,7 @@ class _CollectionScreenState extends State<CollectionScreen>
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.exportFluentPack:
         // Same letter as the toolbar button: browse mode opens the page,
-        // selection mode exports the current pick as FluentPack.
+        // selection mode opens the Fluent Pack / Zip choice.
         if (!_isSelectionMode) {
           _openPortableTransfer();
           return KeyEventResult.handled;
@@ -1236,9 +1233,7 @@ class _CollectionScreenState extends State<CollectionScreen>
           _selectedIds.clear();
           _isSelectionMode = false;
         });
-        unawaited(
-          PortableTransferNavigation.openExportSettings(context, ids),
-        );
+        unawaited(PortableTransferNavigation.openExportSettings(context, ids));
         return KeyEventResult.handled;
     }
   }
@@ -1328,7 +1323,7 @@ class _CollectionScreenState extends State<CollectionScreen>
     if (!canControl) return KeyEventResult.handled;
 
     if (key == LogicalKeyboardKey.space) {
-      if (playbackService.isPlaying) {
+      if (playbackService.desiredPlaying) {
         playbackService.pause();
       } else {
         playbackService.resume();
@@ -1525,7 +1520,7 @@ class _CollectionScreenState extends State<CollectionScreen>
               _exitSelectionMode();
             },
             child: Scaffold(
-              backgroundColor: const Color(0xFF121212),
+              backgroundColor: AppTokens.bgBase,
               extendBody: true,
               // Only the search prompt follows the Android keyboard. The
               // folder/search-result grid stays at its original dimensions
@@ -1533,7 +1528,16 @@ class _CollectionScreenState extends State<CollectionScreen>
               resizeToAvoidBottomInset: false,
               appBar: AppBar(
                 clipBehavior: Clip.hardEdge,
-                toolbarHeight: useCompactTopBar ? 50 : kToolbarHeight,
+                backgroundColor: AppTokens.bgBase,
+                surfaceTintColor: Colors.transparent,
+                elevation: 0,
+                scrolledUnderElevation: 0,
+                iconTheme: const IconThemeData(color: AppTokens.text2),
+                actionsIconTheme: const IconThemeData(color: AppTokens.text2),
+                shape: const Border(
+                  bottom: BorderSide(color: AppTokens.lineSubtle),
+                ),
+                toolbarHeight: useCompactTopBar ? 44 : 48,
                 leadingWidth: useCompactTopBar ? 40 : 44,
                 titleSpacing: useCompactTopBar ? 3 : 8,
                 title: _isSelectionMode
@@ -1578,9 +1582,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                               settings.mediaLibraryViewMode == 0
                                   ? Icons.view_list_rounded
                                   : Icons.grid_view_rounded,
-                              color: settings.mediaLibraryViewMode == 0
-                                  ? Colors.white70
-                                  : Colors.blueAccent,
+                              color: AppTokens.text2,
                             ),
                             tooltip: settings.mediaLibraryViewMode == 0
                                 ? _managementTooltip(
@@ -1644,7 +1646,8 @@ class _CollectionScreenState extends State<CollectionScreen>
                                                 color: Colors.white70,
                                                 height: 1.0,
                                                 leadingDistribution:
-                                                    TextLeadingDistribution.even,
+                                                    TextLeadingDistribution
+                                                        .even,
                                               ),
                                               overflow: TextOverflow.ellipsis,
                                             ),
@@ -1782,7 +1785,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                                 onLongPress: _toggleExportButtonVisibility,
                                 onPressed: () {
                                   Navigator.of(context).push(
-                                    MaterialPageRoute(
+                                    AppMaterialPageRoute(
                                       builder: (_) => const RecycleBinScreen(),
                                     ),
                                   );
@@ -1803,6 +1806,9 @@ class _CollectionScreenState extends State<CollectionScreen>
                                   "媒体库设置",
                                   DesktopMediaManagementShortcutAction
                                       .openLibrarySettings,
+                                ),
+                                onLongPress: () => unawaited(
+                                  toggleDebugDeveloperMode(context),
                                 ),
                                 onPressed: () =>
                                     showMediaLibrarySettingsBottomSheet(
@@ -1910,81 +1916,81 @@ class _CollectionScreenState extends State<CollectionScreen>
                                   _activePointerKind = event.kind;
                                 },
                                 child: GestureDetector(
-                                onScaleStart: (details) {
-                                  if (_tryStartMouseBoxSelection(
-                                    pointerCount: details.pointerCount,
-                                    globalPos: details.focalPoint,
-                                  )) {
-                                    return;
-                                  }
-                                  _baseCrossAxisCount =
-                                      settings.mediaLibraryViewMode == 1
-                                      ? _listStyle().crossAxisCount
-                                      : _collectionCardStyle().crossAxisCount;
-                                },
-                                onScaleUpdate: (details) {
-                                  if (_isBoxSelecting) {
-                                    _applyMouseBoxSelectionAt(details.focalPoint);
-                                    _syncSelectionAutoScroll(details.focalPoint);
-                                    return;
-                                  }
-
-                                  double newScale = details.scale;
-                                  int newCount = _baseCrossAxisCount;
-
-                                  if (newScale > 1.3) {
-                                    newCount = (_baseCrossAxisCount - 1).clamp(
-                                      1,
-                                      20,
-                                    );
-                                  } else if (newScale < 0.7) {
-                                    newCount = (_baseCrossAxisCount + 1).clamp(
-                                      1,
-                                      20,
-                                    );
-                                  }
-
-                                  final currentCount =
-                                      settings.mediaLibraryViewMode == 1
-                                      ? _listStyle().crossAxisCount
-                                      : _collectionCardStyle().crossAxisCount;
-                                  if (newCount != currentCount) {
-                                    final size = MediaQuery.sizeOf(context);
-                                    if (settings.mediaLibraryViewMode == 1) {
-                                      unawaited(
-                                        settings.updateListStyleFor(
-                                          size,
-                                          crossAxisCount: newCount,
-                                        ),
-                                      );
-                                    } else {
-                                      unawaited(
-                                        settings.updateCollectionCardStyleFor(
-                                          size,
-                                          crossAxisCount: newCount,
-                                        ),
-                                      );
+                                  onScaleStart: (details) {
+                                    if (_tryStartMouseBoxSelection(
+                                      pointerCount: details.pointerCount,
+                                      globalPos: details.focalPoint,
+                                    )) {
+                                      return;
                                     }
-                                  }
-                                },
-                                onScaleEnd: (details) {
-                                  if (_isBoxSelecting) {
-                                    _finishMouseBoxSelection();
-                                    return;
-                                  }
-                                },
-                                child: Container(
-                                  height: MediaQuery.of(context).size.height,
-                                  color: Colors.transparent,
-                                  child: _buildMediaGridOrList(
-                                    context: context,
-                                    library: library,
-                                    settings: settings,
-                                    contents: contents,
+                                    _baseCrossAxisCount =
+                                        settings.mediaLibraryViewMode == 1
+                                        ? _listStyle().crossAxisCount
+                                        : _collectionCardStyle().crossAxisCount;
+                                  },
+                                  onScaleUpdate: (details) {
+                                    if (_isBoxSelecting) {
+                                      _applyMouseBoxSelectionAt(
+                                        details.focalPoint,
+                                      );
+                                      _syncSelectionAutoScroll(
+                                        details.focalPoint,
+                                      );
+                                      return;
+                                    }
+
+                                    double newScale = details.scale;
+                                    int newCount = _baseCrossAxisCount;
+
+                                    if (newScale > 1.3) {
+                                      newCount = (_baseCrossAxisCount - 1)
+                                          .clamp(1, 20);
+                                    } else if (newScale < 0.7) {
+                                      newCount = (_baseCrossAxisCount + 1)
+                                          .clamp(1, 20);
+                                    }
+
+                                    final currentCount =
+                                        settings.mediaLibraryViewMode == 1
+                                        ? _listStyle().crossAxisCount
+                                        : _collectionCardStyle().crossAxisCount;
+                                    if (newCount != currentCount) {
+                                      final size = MediaQuery.sizeOf(context);
+                                      if (settings.mediaLibraryViewMode == 1) {
+                                        unawaited(
+                                          settings.updateListStyleFor(
+                                            size,
+                                            crossAxisCount: newCount,
+                                          ),
+                                        );
+                                      } else {
+                                        unawaited(
+                                          settings.updateCollectionCardStyleFor(
+                                            size,
+                                            crossAxisCount: newCount,
+                                          ),
+                                        );
+                                      }
+                                    }
+                                  },
+                                  onScaleEnd: (details) {
+                                    if (_isBoxSelecting) {
+                                      _finishMouseBoxSelection();
+                                      return;
+                                    }
+                                  },
+                                  child: Container(
+                                    height: MediaQuery.of(context).size.height,
+                                    color: Colors.transparent,
+                                    child: _buildMediaGridOrList(
+                                      context: context,
+                                      library: library,
+                                      settings: settings,
+                                      contents: contents,
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
                         // Fill the rest of the screen with a transparent hit target to ensure GestureDetector catches taps in empty space
                         if (contents.length <
                             20) // Only if potentially empty space at bottom
@@ -2047,7 +2053,6 @@ class _CollectionScreenState extends State<CollectionScreen>
                             builder: (context, playbackService, child) {
                               final isVisible =
                                   playbackService.shouldShowMiniPlaybackCard;
-
                               return MiniPlaybackCard(
                                 isVisible: isVisible,
                                 onTap: () async {
@@ -2062,19 +2067,12 @@ class _CollectionScreenState extends State<CollectionScreen>
                                     );
                                     return;
                                   }
-
-                                  // 1. 立即触发一次 UI 刷新
                                   setState(() {});
-
-                                  // 2. 短暂延迟
                                   await Future.delayed(
                                     const Duration(milliseconds: 150),
                                   );
                                   if (!context.mounted) return;
-
-                                  // 3. 再次强制刷新
                                   setState(() {});
-
                                   Navigator.of(
                                     context,
                                     rootNavigator: true,
@@ -2326,7 +2324,8 @@ class _CollectionScreenState extends State<CollectionScreen>
         _toggleListSelection(collection.id);
       } else {
         Navigator.of(context).push(
-          MaterialPageRoute(
+          buildMediaLibraryFolderRoute<void>(
+            folderId: collection.id,
             builder: (context) => CollectionScreen(collectionId: collection.id),
           ),
         );
@@ -2367,6 +2366,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(collection.id),
       showActivityMenu: !_isSelectionMode,
+      onMoveToParent: _moveToParentMenuAction(collection.id),
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2454,6 +2454,7 @@ class _CollectionScreenState extends State<CollectionScreen>
       onTap: handleTap,
       onSecondaryTap: () => _handleCardSecondaryTap(item.id),
       showActivityMenu: !_isSelectionMode,
+      onMoveToParent: _moveToParentMenuAction(item.id),
     );
     return MediaLibraryItemInteractionWrapper(
       index: index,
@@ -2604,13 +2605,18 @@ class _CollectionScreenState extends State<CollectionScreen>
           chipSize: chipSize,
           showMore: showMenu,
           showLocate: showLocate,
-          existingPadding:
-              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+          existingPadding: MediaListLayoutMetrics.cardGridContentPadding(
+            cardWidth,
+          ).right,
         );
-        final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
+        final double radius = MediaLibraryLayoutDefaults.cardCornerRadius(
+          cardWidth,
+        );
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
-          settings.collectionCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
+          settings
+              .collectionCardStyleFor(MediaQuery.sizeOf(context))
+              .titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
 
@@ -2728,7 +2734,8 @@ class _CollectionScreenState extends State<CollectionScreen>
             _toggleListSelection(collection.id);
           } else {
             Navigator.of(context).push(
-              MaterialPageRoute(
+              buildMediaLibraryFolderRoute<void>(
+                folderId: collection.id,
                 builder: (context) =>
                     CollectionScreen(collectionId: collection.id),
               ),
@@ -2753,6 +2760,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                         targetId: collection.id,
                         isCollection: true,
                         allowHide: false,
+                        onMoveToParent: _moveToParentMenuAction(collection.id),
                         fillSlot: true,
                       )
                     : null,
@@ -2964,13 +2972,18 @@ class _CollectionScreenState extends State<CollectionScreen>
           chipSize: chipSize,
           showMore: showMenu,
           showLocate: showLocate,
-          existingPadding:
-              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+          existingPadding: MediaListLayoutMetrics.cardGridContentPadding(
+            cardWidth,
+          ).right,
         );
-        final double radius = (cardWidth * 0.09).clamp(4.0, 40.0);
+        final double radius = MediaLibraryLayoutDefaults.cardCornerRadius(
+          cardWidth,
+        );
         final double titleFontSize = _resolveCardTitleFontSize(
           cardWidth,
-          settings.collectionCardStyleFor(MediaQuery.sizeOf(context)).titleScale,
+          settings
+              .collectionCardStyleFor(MediaQuery.sizeOf(context))
+              .titleScale,
         );
         final double metaFontSize = _resolveCardMetaFontSize(titleFontSize);
         final library = Provider.of<LibraryService>(context, listen: false);
@@ -3186,6 +3199,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                     ? MediaLibraryActivityMenuButton(
                         targetId: item.id,
                         isCollection: false,
+                        onMoveToParent: _moveToParentMenuAction(item.id),
                         fillSlot: true,
                       )
                     : null,

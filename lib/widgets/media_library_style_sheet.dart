@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/settings_service.dart';
+import '../theme/app_tokens.dart';
 import 'folder_placeholder_style_dialog.dart';
 import 'media_library_layout_profile.dart';
 import 'media_list_layout_metrics.dart';
@@ -19,9 +20,9 @@ class MediaLibraryStyleSheet {
     return showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF1E1E1E),
+      backgroundColor: AppTokens.bgRaised,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
       ),
       builder: (context) => _MediaLibraryStyleSheetBody(scope: scope),
     );
@@ -141,7 +142,8 @@ class _MediaLibraryStyleSheetBody extends StatelessWidget {
         range: MediaLibraryLayoutDefaults.columnRange,
         value: style.crossAxisCount.toDouble(),
         divisions: 240,
-        onChanged: (value) => update(crossAxisCount: value.round().clamp(1, 20)),
+        onChanged: (value) =>
+            update(crossAxisCount: value.round().clamp(1, 20)),
       ),
       _logSlider(
         title: '标题字号',

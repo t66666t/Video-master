@@ -6,6 +6,7 @@ import '../models/video_item.dart';
 import '../services/media_library_folder_walk.dart';
 import '../services/media_playback_service.dart';
 import '../services/library_service.dart';
+import '../theme/app_tokens.dart';
 import 'cached_thumbnail_widget.dart';
 import 'folder_placeholder_cover.dart';
 import 'media_library_activity_menu.dart';
@@ -88,7 +89,7 @@ class MediaLibraryMediaGridCard extends StatelessWidget {
           existingPadding:
               MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
         );
-        final radius = (cardWidth * 0.09).clamp(4.0, 40.0);
+        final radius = MediaLibraryLayoutDefaults.cardCornerRadius(cardWidth);
         final titleFontSize = MediaLibraryLayoutDefaults.titleFontSize(
           cardWidth,
           titleScale,
@@ -256,12 +257,14 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
     required this.collection,
     required this.titleScale,
     required this.onTap,
+    this.onLocate,
     this.showActivityMenu = true,
   });
 
   final VideoCollection collection;
   final double titleScale;
   final VoidCallback onTap;
+  final VoidCallback? onLocate;
   final bool showActivityMenu;
 
   @override
@@ -271,14 +274,15 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
         final cardWidth = constraints.maxWidth;
         final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
         final showMenu = showActivityMenu;
+        final showLocate = onLocate != null;
         final textInset = MediaLibraryActionDockMetrics.textInset(
           chipSize: chipSize,
           showMore: showMenu,
-          showLocate: false,
+          showLocate: showLocate,
           existingPadding:
               MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
         );
-        final radius = (cardWidth * 0.09).clamp(4.0, 40.0);
+        final radius = MediaLibraryLayoutDefaults.cardCornerRadius(cardWidth);
         final titleFontSize = MediaLibraryLayoutDefaults.titleFontSize(
           cardWidth,
           titleScale,
@@ -404,8 +408,12 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
                         targetId: collection.id,
                         isCollection: true,
                         allowHide: false,
+                        onLocate: onLocate,
                         fillSlot: true,
                       )
+                    : null,
+                locate: showLocate
+                    ? MediaLibraryLocateButton(onPressed: onLocate!)
                     : null,
               ),
             ],
@@ -441,11 +449,11 @@ class _WatchProgressBar extends StatelessWidget {
           final shouldShow = durationMs > 0 && (isCurrent || positionMs > 0);
           if (!shouldShow) return const SizedBox.shrink();
           return SizedBox(
-            height: 4,
+            height: 3,
             child: LinearProgressIndicator(
               value: (positionMs / durationMs).clamp(0.0, 1.0),
-              backgroundColor: Colors.white24,
-              color: Colors.redAccent,
+              backgroundColor: const Color(0x73000000),
+              color: AppTokens.accent,
             ),
           );
         }

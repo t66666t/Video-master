@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
 
 const _searchFontFamily = 'Noto Sans SC';
@@ -25,13 +26,10 @@ Future<String?> showMediaLibrarySearchPrompt(BuildContext context) {
         opacity: eased,
         child: SlideTransition(
           position: Tween<Offset>(
-            begin: const Offset(0, -0.025),
+            begin: const Offset(0, -0.04),
             end: Offset.zero,
           ).animate(eased),
-          child: ScaleTransition(
-            scale: Tween<double>(begin: 0.985, end: 1).animate(eased),
-            child: child,
-          ),
+          child: child,
         ),
       );
     },
@@ -39,28 +37,7 @@ Future<String?> showMediaLibrarySearchPrompt(BuildContext context) {
 }
 
 Route<void> buildMediaLibrarySearchResultsRoute(Widget page) {
-  return PageRouteBuilder<void>(
-    pageBuilder: (context, animation, secondaryAnimation) => page,
-    transitionDuration: const Duration(milliseconds: 340),
-    reverseTransitionDuration: const Duration(milliseconds: 280),
-    transitionsBuilder: (context, animation, secondaryAnimation, child) {
-      final entrance = CurvedAnimation(
-        parent: animation,
-        curve: Curves.easeOutCubic,
-        reverseCurve: Curves.easeInCubic,
-      );
-      return FadeTransition(
-        opacity: entrance,
-        child: SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0.018, 0),
-            end: Offset.zero,
-          ).animate(entrance),
-          child: child,
-        ),
-      );
-    },
-  );
+  return AppMaterialPageRoute<void>(builder: (_) => page);
 }
 
 class _MediaLibrarySearchPrompt extends StatefulWidget {

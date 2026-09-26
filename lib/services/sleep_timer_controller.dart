@@ -19,7 +19,14 @@ class SleepTimerController extends ChangeNotifier {
 
   static const String _modeKey = 'sleepTimer.mode';
   static const String _deadlineKey = 'sleepTimer.deadlineMs';
+  static const String _playbackRemainingKey = 'sleepTimer.playbackRemainingMs';
+  static const String _remainingItemsKey = 'sleepTimer.remainingItemCount';
+  static const String _scheduledItemsKey = 'sleepTimer.scheduledItemCount';
+  static const String _awaitingCurrentKey = 'sleepTimer.awaitingCurrentItemEnd';
+  static const String _countOnlyKey = 'sleepTimer.countOnlyWhilePlaying';
+  static const String _customMinutesKey = 'sleepTimer.customMinutes';
   static const Duration _heartbeatInterval = Duration(milliseconds: 500);
+  static const Duration _playbackPersistInterval = Duration(seconds: 5);
 
   final DateTime Function() _now;
   Timer? _heartbeat;
@@ -27,6 +34,7 @@ class SleepTimerController extends ChangeNotifier {
   bool Function()? _isPlaybackRunning;
   Future<void> Function()? _onExpired;
   DateTime _lastSettledAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastPlaybackPersistAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _wasPlaybackRunning = false;
   bool _expirationInFlight = false;
   int _lastNotifiedSecond = -1;
@@ -36,11 +44,24 @@ class SleepTimerController extends ChangeNotifier {
   DateTime? _deadline;
   Duration _playbackRemaining = Duration.zero;
   int _remainingItemCount = 0;
+  int _scheduledItemCount = 0;
+  bool _awaitingCurrentItemEnd = false;
+  bool _countOnlyWhilePlaying = false;
+  int _customMinutes = 30;
 
   SleepTimerMode get mode => _mode;
   bool get isActive => _mode != SleepTimerMode.off;
   DateTime? get deadline => _deadline;
   int get remainingItemCount => _remainingItemCount;
+  int get scheduledItemCount => _scheduledItemCount;
+  bool get awaitingCurrentItemEnd => _awaitingCurrentItemEnd;
+  bool get countOnlyWhilePlaying => _countOnlyWhilePlaying;
+  int get customMinutes => _customMinutes;
+
+  bool get tracksItemCompletion =>
+      _mode == SleepTimerMode.endOfCurrentItem ||
+      _mode == SleepTimerMode.endOfQueue ||
+      _mode == SleepTimerMode.afterItemCount;
 
   Duration get remaining {
     if (!isActive) return Duration.zero;
@@ -70,6 +91,9 @@ class SleepTimerController extends ChangeNotifier {
       case SleepTimerMode.endOfQueue:
         return '当前队列结束后暂停';
       case SleepTimerMode.afterItemCount:
+        if (_awaitingCurrentItemEnd) {
+          return '当前结束后再播放 $_remainingItemCount 个';
+        }
         return '再播放 $_remainingItemCount 个内容后暂停';
       case SleepTimerMode.atTime:
         final target = _deadline;
@@ -92,27 +116,66 @@ class SleepTimerController extends ChangeNotifier {
     playbackListenable.addListener(_handlePlaybackStateChanged);
 
     final preferences = await SharedPreferences.getInstance();
+    _countOnlyWhilePlaying = preferences.getBool(_countOnlyKey) ?? false;
+    final storedMinutes = preferences.getInt(_customMinutesKey);
+    if (storedMinutes != null && storedMinutes >= 1 && storedMinutes <= 1440) {
+      _customMinutes = storedMinutes;
+    }
+
     final storedMode = preferences.getInt(_modeKey);
-    final storedDeadlineMs = preferences.getInt(_deadlineKey);
     if (storedMode != null &&
         storedMode >= 0 &&
-        storedMode < SleepTimerMode.values.length &&
-        storedDeadlineMs != null) {
+        storedMode < SleepTimerMode.values.length) {
       final restoredMode = SleepTimerMode.values[storedMode];
-      final restoredDeadline = DateTime.fromMillisecondsSinceEpoch(
-        storedDeadlineMs,
-      );
-      if ((restoredMode == SleepTimerMode.afterDuration ||
-              restoredMode == SleepTimerMode.atTime) &&
-          restoredDeadline.isAfter(_now())) {
+      final restored = _restoreActiveTimer(preferences, restoredMode);
+      if (!restored) await _clearActivePersistence(preferences);
+    }
+    notifyListeners();
+  }
+
+  bool _restoreActiveTimer(
+    SharedPreferences preferences,
+    SleepTimerMode restoredMode,
+  ) {
+    switch (restoredMode) {
+      case SleepTimerMode.off:
+        return false;
+      case SleepTimerMode.afterDuration:
+      case SleepTimerMode.atTime:
+        final storedDeadlineMs = preferences.getInt(_deadlineKey);
+        if (storedDeadlineMs == null) return false;
+        final restoredDeadline = DateTime.fromMillisecondsSinceEpoch(
+          storedDeadlineMs,
+        );
+        if (!restoredDeadline.isAfter(_now())) return false;
         _mode = restoredMode;
         _deadline = restoredDeadline;
         _ensureHeartbeat();
-      } else {
-        await _clearPersistence(preferences);
-      }
+        return true;
+      case SleepTimerMode.afterPlaybackDuration:
+        final remainingMs = preferences.getInt(_playbackRemainingKey) ?? 0;
+        if (remainingMs <= 0) return false;
+        _mode = restoredMode;
+        _playbackRemaining = Duration(milliseconds: remainingMs);
+        _lastSettledAt = _now();
+        _wasPlaybackRunning = _isPlaybackRunning?.call() ?? false;
+        _ensureHeartbeat();
+        return true;
+      case SleepTimerMode.endOfCurrentItem:
+      case SleepTimerMode.endOfQueue:
+        _mode = restoredMode;
+        return true;
+      case SleepTimerMode.afterItemCount:
+        final remaining = preferences.getInt(_remainingItemsKey) ?? 0;
+        if (remaining <= 0) return false;
+        _mode = restoredMode;
+        _remainingItemCount = remaining;
+        _scheduledItemCount =
+            preferences.getInt(_scheduledItemsKey) ?? remaining;
+        _awaitingCurrentItemEnd =
+            preferences.getBool(_awaitingCurrentKey) ?? false;
+        return true;
     }
-    notifyListeners();
   }
 
   Future<void> scheduleAfter(
@@ -127,6 +190,8 @@ class SleepTimerController extends ChangeNotifier {
     _deadline = countOnlyWhilePlaying ? null : _now().add(duration);
     _playbackRemaining = countOnlyWhilePlaying ? duration : Duration.zero;
     _remainingItemCount = 0;
+    _scheduledItemCount = 0;
+    _awaitingCurrentItemEnd = false;
     _lastSettledAt = _now();
     _wasPlaybackRunning = _isPlaybackRunning?.call() ?? false;
     _lastNotifiedSecond = -1;
@@ -135,12 +200,47 @@ class SleepTimerController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Saves the countdown switch and, when a duration timer is running,
+  /// converts that timer in place without changing the time left.
+  Future<void> setCountOnlyWhilePlaying(bool value) async {
+    _countOnlyWhilePlaying = value;
+    _settlePlaybackTime();
+    if (_mode == SleepTimerMode.afterDuration && value) {
+      final left = remaining;
+      _mode = SleepTimerMode.afterPlaybackDuration;
+      _deadline = null;
+      _playbackRemaining = left;
+      _lastSettledAt = _now();
+      _wasPlaybackRunning = _isPlaybackRunning?.call() ?? false;
+      _ensureHeartbeat();
+    } else if (_mode == SleepTimerMode.afterPlaybackDuration && !value) {
+      final left = remaining;
+      _mode = SleepTimerMode.afterDuration;
+      _playbackRemaining = Duration.zero;
+      _deadline = _now().add(left);
+      _ensureHeartbeat();
+    }
+    _lastNotifiedSecond = -1;
+    notifyListeners();
+    await Future<void>.delayed(Duration.zero);
+    await _persist();
+  }
+
+  Future<void> setCustomMinutes(int minutes) async {
+    final next = minutes.clamp(1, 1440);
+    if (_customMinutes == next) return;
+    _customMinutes = next;
+    await _persistPreferences();
+  }
+
   Future<void> scheduleAt(DateTime time) async {
     if (!time.isAfter(_now())) return;
     _mode = SleepTimerMode.atTime;
     _deadline = time;
     _playbackRemaining = Duration.zero;
     _remainingItemCount = 0;
+    _scheduledItemCount = 0;
+    _awaitingCurrentItemEnd = false;
     _lastNotifiedSecond = -1;
     _ensureHeartbeat();
     await _persist();
@@ -166,6 +266,8 @@ class SleepTimerController extends ChangeNotifier {
     _deadline = null;
     _playbackRemaining = Duration.zero;
     _remainingItemCount = count;
+    _scheduledItemCount = count;
+    _awaitingCurrentItemEnd = mode == SleepTimerMode.afterItemCount;
     _lastNotifiedSecond = -1;
     _heartbeat?.cancel();
     _heartbeat = null;
@@ -196,8 +298,10 @@ class SleepTimerController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Called before the normal auto-play-on-completion decision.
+  /// Called before the normal auto-play-on-completion decision, and before a
+  /// manual skip actually opens another item.
   bool consumeItemCompletion({required bool hasNextItem}) {
+    if (!tracksItemCompletion) return false;
     var shouldStop = false;
     switch (_mode) {
       case SleepTimerMode.endOfCurrentItem:
@@ -205,8 +309,12 @@ class SleepTimerController extends ChangeNotifier {
       case SleepTimerMode.endOfQueue:
         shouldStop = !hasNextItem;
       case SleepTimerMode.afterItemCount:
-        if (_remainingItemCount > 0) _remainingItemCount--;
-        shouldStop = _remainingItemCount <= 0;
+        if (_awaitingCurrentItemEnd) {
+          _awaitingCurrentItemEnd = false;
+        } else {
+          if (_remainingItemCount > 0) _remainingItemCount--;
+          shouldStop = _remainingItemCount <= 0;
+        }
       case SleepTimerMode.off:
       case SleepTimerMode.afterDuration:
       case SleepTimerMode.afterPlaybackDuration:
@@ -220,12 +328,19 @@ class SleepTimerController extends ChangeNotifier {
   }
 
   /// Reconciles an overdue wall-clock timer immediately after foregrounding.
-  void checkNow() => _heartbeatTick();
+  void checkNow() => _heartbeatTick(forcePersist: true);
 
   void _handlePlaybackStateChanged() {
+    final wasRunning = _wasPlaybackRunning;
     _settlePlaybackTime();
     _wasPlaybackRunning = _isPlaybackRunning?.call() ?? false;
     _lastSettledAt = _now();
+    if (_mode == SleepTimerMode.afterPlaybackDuration &&
+        wasRunning &&
+        !_wasPlaybackRunning) {
+      _rememberPlaybackPersistTime();
+      unawaited(_persist(settle: false));
+    }
   }
 
   void _settlePlaybackTime() {
@@ -241,15 +356,20 @@ class SleepTimerController extends ChangeNotifier {
     _heartbeat ??= Timer.periodic(_heartbeatInterval, (_) => _heartbeatTick());
   }
 
-  void _heartbeatTick() {
+  void _heartbeatTick({bool forcePersist = false}) {
     if (!isActive) {
       _heartbeat?.cancel();
       _heartbeat = null;
       return;
     }
+    final wasRunning = _wasPlaybackRunning;
     _settlePlaybackTime();
     _wasPlaybackRunning = _isPlaybackRunning?.call() ?? false;
     _lastSettledAt = _now();
+    if (_mode == SleepTimerMode.afterPlaybackDuration) {
+      final stopped = wasRunning && !_wasPlaybackRunning;
+      _maybePersistPlaybackRemaining(force: forcePersist || stopped);
+    }
     final value = remaining;
     if ((_mode == SleepTimerMode.afterDuration ||
             _mode == SleepTimerMode.afterPlaybackDuration ||
@@ -265,12 +385,26 @@ class SleepTimerController extends ChangeNotifier {
     }
   }
 
+  void _maybePersistPlaybackRemaining({required bool force}) {
+    final now = _now();
+    if (!force &&
+        now.difference(_lastPlaybackPersistAt) < _playbackPersistInterval) {
+      return;
+    }
+    _rememberPlaybackPersistTime();
+    unawaited(_persist(settle: false));
+  }
+
+  void _rememberPlaybackPersistTime() {
+    _lastPlaybackPersistAt = _now();
+  }
+
   Future<void> _expire() async {
     if (_expirationInFlight || !isActive) return;
     _expirationInFlight = true;
     try {
       _clearInMemory();
-      await _persist();
+      await _persist(settle: false);
       notifyListeners();
       await _onExpired?.call();
     } finally {
@@ -283,32 +417,115 @@ class SleepTimerController extends ChangeNotifier {
     _deadline = null;
     _playbackRemaining = Duration.zero;
     _remainingItemCount = 0;
+    _scheduledItemCount = 0;
+    _awaitingCurrentItemEnd = false;
     _lastNotifiedSecond = -1;
     _heartbeat?.cancel();
     _heartbeat = null;
   }
 
-  Future<void> _persist() async {
-    final mode = _mode;
-    final deadline = _deadline;
+  Future<void> _persist({bool settle = true}) async {
+    if (settle) _settlePlaybackTime();
+    final snapshot = _TimerSnapshot.capture(this);
     final operation = _persistenceTail.then((_) async {
       final preferences = await SharedPreferences.getInstance();
-      if ((mode == SleepTimerMode.afterDuration ||
-              mode == SleepTimerMode.atTime) &&
-          deadline != null) {
-        await preferences.setInt(_modeKey, mode.index);
-        await preferences.setInt(_deadlineKey, deadline.millisecondsSinceEpoch);
-        return;
-      }
-      await _clearPersistence(preferences);
+      await _writePreferences(preferences, snapshot);
+      await _writeActiveTimer(preferences, snapshot);
     });
     _persistenceTail = operation.catchError((Object _) {});
     await operation;
   }
 
-  Future<void> _clearPersistence(SharedPreferences preferences) async {
+  Future<void> _persistPreferences() async {
+    final snapshot = _TimerSnapshot.capture(this);
+    final operation = _persistenceTail.then((_) async {
+      final preferences = await SharedPreferences.getInstance();
+      await _writePreferences(preferences, snapshot);
+    });
+    _persistenceTail = operation.catchError((Object _) {});
+    await operation;
+  }
+
+  Future<void> _writePreferences(
+    SharedPreferences preferences,
+    _TimerSnapshot snapshot,
+  ) async {
+    await preferences.setBool(_countOnlyKey, snapshot.countOnlyWhilePlaying);
+    await preferences.setInt(_customMinutesKey, snapshot.customMinutes);
+  }
+
+  Future<void> _writeActiveTimer(
+    SharedPreferences preferences,
+    _TimerSnapshot snapshot,
+  ) async {
+    switch (snapshot.mode) {
+      case SleepTimerMode.afterDuration:
+      case SleepTimerMode.atTime:
+        final deadline = snapshot.deadline;
+        if (deadline == null) {
+          await _clearActivePersistence(preferences);
+          return;
+        }
+        await preferences.setInt(_modeKey, snapshot.mode.index);
+        await preferences.setInt(_deadlineKey, deadline.millisecondsSinceEpoch);
+        await _removePlaybackAndItemKeys(preferences);
+      case SleepTimerMode.afterPlaybackDuration:
+        if (snapshot.playbackRemainingMs <= 0) {
+          await _clearActivePersistence(preferences);
+          return;
+        }
+        await preferences.setInt(_modeKey, snapshot.mode.index);
+        await preferences.setInt(
+          _playbackRemainingKey,
+          snapshot.playbackRemainingMs,
+        );
+        await preferences.remove(_deadlineKey);
+        await _removeItemKeys(preferences);
+      case SleepTimerMode.endOfCurrentItem:
+      case SleepTimerMode.endOfQueue:
+        await preferences.setInt(_modeKey, snapshot.mode.index);
+        await preferences.remove(_deadlineKey);
+        await _removePlaybackAndItemKeys(preferences);
+      case SleepTimerMode.afterItemCount:
+        if (snapshot.remainingItemCount <= 0) {
+          await _clearActivePersistence(preferences);
+          return;
+        }
+        await preferences.setInt(_modeKey, snapshot.mode.index);
+        await preferences.setInt(
+          _remainingItemsKey,
+          snapshot.remainingItemCount,
+        );
+        await preferences.setInt(
+          _scheduledItemsKey,
+          snapshot.scheduledItemCount,
+        );
+        await preferences.setBool(
+          _awaitingCurrentKey,
+          snapshot.awaitingCurrentItemEnd,
+        );
+        await preferences.remove(_deadlineKey);
+        await preferences.remove(_playbackRemainingKey);
+      case SleepTimerMode.off:
+        await _clearActivePersistence(preferences);
+    }
+  }
+
+  Future<void> _removePlaybackAndItemKeys(SharedPreferences preferences) async {
+    await preferences.remove(_playbackRemainingKey);
+    await _removeItemKeys(preferences);
+  }
+
+  Future<void> _removeItemKeys(SharedPreferences preferences) async {
+    await preferences.remove(_remainingItemsKey);
+    await preferences.remove(_scheduledItemsKey);
+    await preferences.remove(_awaitingCurrentKey);
+  }
+
+  Future<void> _clearActivePersistence(SharedPreferences preferences) async {
     await preferences.remove(_modeKey);
     await preferences.remove(_deadlineKey);
+    await _removePlaybackAndItemKeys(preferences);
   }
 
   static String _formatDuration(Duration duration) {
@@ -329,5 +546,40 @@ class SleepTimerController extends ChangeNotifier {
     _heartbeat?.cancel();
     _playbackListenable?.removeListener(_handlePlaybackStateChanged);
     super.dispose();
+  }
+}
+
+class _TimerSnapshot {
+  const _TimerSnapshot({
+    required this.mode,
+    required this.deadline,
+    required this.playbackRemainingMs,
+    required this.remainingItemCount,
+    required this.scheduledItemCount,
+    required this.awaitingCurrentItemEnd,
+    required this.countOnlyWhilePlaying,
+    required this.customMinutes,
+  });
+
+  final SleepTimerMode mode;
+  final DateTime? deadline;
+  final int playbackRemainingMs;
+  final int remainingItemCount;
+  final int scheduledItemCount;
+  final bool awaitingCurrentItemEnd;
+  final bool countOnlyWhilePlaying;
+  final int customMinutes;
+
+  factory _TimerSnapshot.capture(SleepTimerController timer) {
+    return _TimerSnapshot(
+      mode: timer._mode,
+      deadline: timer._deadline,
+      playbackRemainingMs: timer._playbackRemaining.inMilliseconds,
+      remainingItemCount: timer._remainingItemCount,
+      scheduledItemCount: timer._scheduledItemCount,
+      awaitingCurrentItemEnd: timer._awaitingCurrentItemEnd,
+      countOnlyWhilePlaying: timer._countOnlyWhilePlaying,
+      customMinutes: timer._customMinutes,
+    );
   }
 }

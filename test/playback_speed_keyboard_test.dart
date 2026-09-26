@@ -119,6 +119,74 @@ void main() {
       await _settleOverlay(tester);
     });
 
+    testWidgets('a short space still toggles when the hold timer runs first', (
+      tester,
+    ) async {
+      var toggles = 0;
+      final state = await _pumpOverlay(
+        tester,
+        onSpeedUpdate: (_) async {},
+        onTogglePlay: () => toggles++,
+        onLongPressStart: () => true,
+      );
+      final focusNode = FocusNode();
+      addTearDown(focusNode.dispose);
+
+      state.handleKeyEvent(
+        focusNode,
+        const KeyDownEvent(
+          physicalKey: PhysicalKeyboardKey.space,
+          logicalKey: LogicalKeyboardKey.space,
+          timeStamp: Duration.zero,
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 250));
+      state.handleKeyEvent(
+        focusNode,
+        const KeyUpEvent(
+          physicalKey: PhysicalKeyboardKey.space,
+          logicalKey: LogicalKeyboardKey.space,
+          timeStamp: Duration(milliseconds: 40),
+        ),
+      );
+
+      expect(toggles, 1);
+      await _settleOverlay(tester);
+    });
+
+    testWidgets('a real space hold boosts and does not toggle', (tester) async {
+      var toggles = 0;
+      final state = await _pumpOverlay(
+        tester,
+        onSpeedUpdate: (_) async {},
+        onTogglePlay: () => toggles++,
+        onLongPressStart: () => true,
+      );
+      final focusNode = FocusNode();
+      addTearDown(focusNode.dispose);
+
+      state.handleKeyEvent(
+        focusNode,
+        const KeyDownEvent(
+          physicalKey: PhysicalKeyboardKey.space,
+          logicalKey: LogicalKeyboardKey.space,
+          timeStamp: Duration.zero,
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 250));
+      state.handleKeyEvent(
+        focusNode,
+        const KeyUpEvent(
+          physicalKey: PhysicalKeyboardKey.space,
+          logicalKey: LogicalKeyboardKey.space,
+          timeStamp: Duration(milliseconds: 400),
+        ),
+      );
+
+      expect(toggles, 0);
+      await _settleOverlay(tester);
+    });
+
     testWidgets('ignores Shift+arrows during hold-to-boost', (tester) async {
       final speeds = <double>[];
       final state = await _pumpOverlay(
@@ -174,6 +242,8 @@ Future<VideoControlsOverlayState> _pumpOverlay(
   SettingsService? settings,
   required Future<void> Function(double speed) onSpeedUpdate,
   bool isLongPressing = false,
+  VoidCallback? onTogglePlay,
+  bool Function()? onLongPressStart,
 }) async {
   await tester.pumpWidget(
     MultiProvider(
@@ -191,7 +261,7 @@ Future<VideoControlsOverlayState> _pumpOverlay(
             controller: null,
             isLocked: false,
             allowPlayWhenUninitialized: true,
-            onTogglePlay: () {},
+            onTogglePlay: onTogglePlay ?? () {},
             onBackPressed: () {},
             onToggleLock: () {},
             onSpeedUpdate: onSpeedUpdate,
@@ -200,7 +270,7 @@ Future<VideoControlsOverlayState> _pumpOverlay(
             onMoveSubtitles: () {},
             isLongPressing: isLongPressing,
             longPressFeedbackText: '',
-            onLongPressStart: () => false,
+            onLongPressStart: onLongPressStart ?? () => false,
             onLongPressEnd: () {},
             subtitleEntries: const [],
             subtitleStyle: const SubtitleStyle(),

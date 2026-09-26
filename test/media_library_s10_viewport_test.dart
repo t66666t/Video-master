@@ -195,6 +195,7 @@ void main() {
             onOpenMedia: (_) {},
             onOpenFolder: (_) {},
             onLocateMedia: (_) {},
+            onLocateFolder: (_) {},
             onGoRecent: () {},
             onGoFolders: () {},
           ),

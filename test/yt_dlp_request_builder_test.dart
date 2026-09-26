@@ -217,7 +217,7 @@ void main() {
         expect(request.args, contains('--paths'));
         expect(request.args, contains('C:/downloads'));
         expect(request.args, contains('-f'));
-        expect(request.args, contains('137+140'));
+        expect(request.args, contains('137+140/137'));
         expect(request.debugContext['resolvedVideoFormatId'], '137');
         expect(request.debugContext['resolvedAudioFormatIds'], ['140']);
         expect(request.debugContext['resolvedSubtitleTrackKeys'], [
@@ -302,7 +302,7 @@ void main() {
         outputDir: 'C:/downloads',
       );
 
-      expect(request.args, contains('137+140'));
+      expect(request.args, contains('137+140/137'));
       expect(request.args, contains('--sub-langs'));
       expect(request.args, contains('zh-CN'));
       expect(request.debugContext['resolvedSubtitleLanguages'], ['zh-CN']);
@@ -547,6 +547,51 @@ void main() {
 
       expect(request.args, isNot(contains('--extractor-args')));
       expect(request.debugContext['extractorArgs'], isNull);
+    });
+
+    test('adaptive video formats are merged with a separate audio track', () {
+      const splitMeta = VideoMeta(
+        id: 'split-1',
+        source: 'twitter',
+        webpageUrl: 'https://x.com/example/status/1001',
+        title: 'Split streams',
+        uploader: 'Uploader',
+        videoFormats: [
+          VideoFormat(
+            formatId: 'hls-1920',
+            ext: 'mp4',
+            videoCodec: 'avc1.64001F',
+            audioCodec: 'mp4a.40.2',
+            height: 1080,
+            hasAudio: true,
+          ),
+        ],
+        audioFormats: [
+          AudioFormat(
+            formatId: 'hls-audio-64000',
+            ext: 'm4a',
+            audioCodec: 'mp4a.40.2',
+            bitrate: 64,
+          ),
+        ],
+        recommendedVideoFormatId: 'hls-1920',
+        recommendedAudioFormatId: 'hls-audio-64000',
+      );
+
+      final request = builder.build(
+        taskId: 'task-split',
+        url: splitMeta.webpageUrl,
+        meta: splitMeta,
+        selection: const DownloadSelection(outputContainer: 'mkv'),
+        sessionConfig: DownloadSessionConfig.defaults(),
+        outputDir: 'C:/downloads',
+      );
+
+      final formatIndex = request.args.indexOf('-f');
+      expect(
+        request.args[formatIndex + 1],
+        'hls-1920+hls-audio-64000/hls-1920',
+      );
     });
   });
 }

@@ -22,7 +22,9 @@ void main() {
   group('MediaLibraryNavigation', () {
     test('新装默认最近添加，旧库首次升级默认文件夹', () {
       expect(
-        MediaLibraryNavigation.firstRunDefault(hasExistingLibraryContent: false),
+        MediaLibraryNavigation.firstRunDefault(
+          hasExistingLibraryContent: false,
+        ),
         MediaLibraryRootEntry.recent,
       );
       expect(
@@ -89,7 +91,10 @@ void main() {
     test('缺失或回收目录回退到最近有效祖先', () {
       final folders = <String, _FakeFolder>{
         'root-child': const _FakeFolder(parentId: null),
-        'gone-parent': const _FakeFolder(parentId: 'root-child', recycled: true),
+        'gone-parent': const _FakeFolder(
+          parentId: 'root-child',
+          recycled: true,
+        ),
         'leaf': const _FakeFolder(parentId: 'gone-parent'),
       };
       expect(
@@ -100,7 +105,10 @@ void main() {
         ),
         'leaf',
       );
-      folders['leaf'] = const _FakeFolder(parentId: 'gone-parent', recycled: true);
+      folders['leaf'] = const _FakeFolder(
+        parentId: 'gone-parent',
+        recycled: true,
+      );
       expect(
         MediaLibraryNavigation.resolveLivingFolderId(
           requestedId: 'leaf',
@@ -117,6 +125,46 @@ void main() {
         ),
         isNull,
       );
+    });
+
+    test('关闭恢复上次页面后使用指定入口且不打开文件夹', () {
+      final plan = MediaLibraryNavigation.plan(
+        libraryInitialized: true,
+        hasExistingLibraryContent: true,
+        storedEntry: 'recent',
+        userChosen: true,
+        lastFolderId: 'nested',
+        availableEntries: allEntries,
+        revealItemId: null,
+        returnToSearchResults: false,
+        isActiveFolder: (id) => id == 'nested',
+        parentIdOf: (_) => null,
+        restoreLastPage: false,
+        startupEntry: 'continueLearning',
+      );
+      expect(plan.preferredEntry, MediaLibraryRootEntry.continueLearning);
+      expect(plan.displayedEntry, MediaLibraryRootEntry.continueLearning);
+      expect(plan.persistPreferred, isFalse);
+      expect(plan.folderToOpen, isNull);
+    });
+
+    test('关闭恢复时非法默认入口回退到文件夹', () {
+      final plan = MediaLibraryNavigation.plan(
+        libraryInitialized: true,
+        hasExistingLibraryContent: true,
+        storedEntry: 'recent',
+        userChosen: true,
+        lastFolderId: 'nested',
+        availableEntries: allEntries,
+        revealItemId: null,
+        returnToSearchResults: false,
+        isActiveFolder: (id) => id == 'nested',
+        parentIdOf: (_) => null,
+        restoreLastPage: false,
+        startupEntry: 'missing',
+      );
+      expect(plan.displayedEntry, MediaLibraryRootEntry.folders);
+      expect(plan.folderToOpen, isNull);
     });
 
     test('定位真实目录忽略上次全局入口且不恢复嵌套文件夹', () {
@@ -244,15 +292,15 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
 
-    await tester.pumpWidget(
-      const MaterialApp(
-        home: _ChromeProbe(),
-      ),
-    );
+    await tester.pumpWidget(const MaterialApp(home: _ChromeProbe()));
 
     final switcherRect = tester.getRect(find.byType(MediaLibraryEntrySwitcher));
-    final importRect = tester.getRect(find.byKey(const ValueKey('import-progress')));
-    final cardRect = tester.getRect(find.byKey(MediaLibraryOverlayKeys.miniPlaybackCard));
+    final importRect = tester.getRect(
+      find.byKey(const ValueKey('import-progress')),
+    );
+    final cardRect = tester.getRect(
+      find.byKey(MediaLibraryOverlayKeys.miniPlaybackCard),
+    );
     expect(switcherRect.bottom, lessThanOrEqualTo(importRect.top + 0.01));
     expect(importRect.bottom, lessThan(cardRect.top));
     expect(find.byType(MediaLibraryCompactTitle), findsNothing);
@@ -309,7 +357,8 @@ class _NavHostState extends State<_NavHost> {
       availableEntries: widget.availableEntries,
       revealItemId: widget.revealItemId,
       returnToSearchResults: widget.returnToSearchResults,
-      isActiveFolder: (id) => widget.folders[id] != null && !widget.folders[id]!.recycled,
+      isActiveFolder: (id) =>
+          widget.folders[id] != null && !widget.folders[id]!.recycled,
       parentIdOf: (id) => widget.folders[id]?.parentId,
     );
   }

@@ -203,88 +203,88 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                     top: Radius.circular(16.0),
                   ),
                   child: Stack(
-                      children: [
-                        Container(
-                          height: dimensions.height.clamp(80.0, 200.0),
-                          padding: EdgeInsets.all(
-                            dimensions.padding.clamp(6.0, 20.0),
-                          ),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.end,
-                            children: [
-                              // 第一行：缩略图、标题、列表展开按钮
-                              SizedBox(
-                                height: dimensions.thumbnailSize,
-                                child: _buildFirstRow(
-                                  context,
-                                  currentItem,
-                                  dimensions,
-                                  playbackService,
-                                ),
+                    children: [
+                      Container(
+                        height: dimensions.height.clamp(80.0, 200.0),
+                        padding: EdgeInsets.all(
+                          dimensions.padding.clamp(6.0, 20.0),
+                        ),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            // 第一行：缩略图、标题、列表展开按钮
+                            SizedBox(
+                              height: dimensions.thumbnailSize,
+                              child: _buildFirstRow(
+                                context,
+                                currentItem,
+                                dimensions,
+                                playbackService,
                               ),
+                            ),
 
-                              SizedBox(height: dimensions.padding / 3),
+                            SizedBox(height: dimensions.padding / 3),
 
-                              // 新增：字幕显示行
-                              _buildSubtitleRow(
+                            // 新增：字幕显示行
+                            _buildSubtitleRow(
+                              context,
+                              dimensions,
+                              playbackService,
+                            ),
+
+                            SizedBox(height: dimensions.padding / 3),
+
+                            // 第二行：进度条、控制按钮
+                            SizedBox(
+                              height: _resolvePrimaryControlButtonSize(
+                                dimensions,
+                              ),
+                              child: _buildSecondRow(
                                 context,
                                 dimensions,
                                 playbackService,
                               ),
-
-                              SizedBox(height: dimensions.padding / 3),
-
-                              // 第二行：进度条、控制按钮
-                              SizedBox(
-                                height: _resolvePrimaryControlButtonSize(
-                                  dimensions,
-                                ),
-                                child: _buildSecondRow(
-                                  context,
-                                  dimensions,
-                                  playbackService,
-                                ),
-                              ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
+                      ),
 
-                        // 取消拖动提示遮罩层
-                        if (_isDraggingProgress && _isProgressDragCanceling)
-                          Positioned.fill(
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.75),
-                                borderRadius: const BorderRadius.vertical(
-                                  top: Radius.circular(16.0),
-                                ),
+                      // 取消拖动提示遮罩层
+                      if (_isDraggingProgress && _isProgressDragCanceling)
+                        Positioned.fill(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.75),
+                              borderRadius: const BorderRadius.vertical(
+                                top: Radius.circular(16.0),
                               ),
-                              child: const Center(
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.undo,
+                            ),
+                            child: const Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.undo,
+                                    color: Colors.white,
+                                    size: 36,
+                                  ),
+                                  SizedBox(height: 8),
+                                  Text(
+                                    "松手取消跳转",
+                                    style: TextStyle(
                                       color: Colors.white,
-                                      size: 36,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
                                     ),
-                                    SizedBox(height: 8),
-                                    Text(
-                                      "松手取消跳转",
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 16,
-                                      ),
-                                    ),
-                                  ],
-                                ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
-                      ],
-                    ),
+                        ),
+                    ],
                   ),
+                ),
               ),
             );
           },
@@ -319,10 +319,7 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
   }
 
   /// 构建缩略图
-  Widget _buildThumbnail(
-    VideoItem item,
-    PlaybackCardDimensions dimensions,
-  ) {
+  Widget _buildThumbnail(VideoItem item, PlaybackCardDimensions dimensions) {
     final thumbnail = Container(
       width: dimensions.thumbnailSize,
       height: dimensions.thumbnailSize,
@@ -643,13 +640,14 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
               },
               child: SliderTheme(
                 data: SliderThemeData(
-                  trackHeight: 2.0, // 减小轨道高度
+                  trackHeight: 2.0,
+                  trackShape: const RoundedRectSliderTrackShape(),
                   thumbShape: const RoundSliderThumbShape(
                     enabledThumbRadius: 4.0,
-                  ), // 减小滑块半径
+                  ),
                   overlayShape: const RoundSliderOverlayShape(
                     overlayRadius: 10.0,
-                  ), // 减小覆盖层半径
+                  ),
                   activeTrackColor: _isProgressDragCanceling
                       ? Colors.grey
                       : Colors.blue,
@@ -662,6 +660,8 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
                       : Colors.blue.withValues(alpha: 0.2),
                 ),
                 child: Slider(
+                  year2023: true,
+                  padding: EdgeInsets.zero,
                   value: currentProgress.clamp(0.0, 1.0),
                   onChanged: (value) {
                     setState(() {

@@ -60,7 +60,7 @@ class DesktopMediaManagementShortcuts {
     DesktopMediaManagementShortcutAction.openBatchImport:
         LogicalKeyboardKey.keyM,
     DesktopMediaManagementShortcutAction.moveToParent: LogicalKeyboardKey.keyU,
-    // Browse: open 导入与导出. Selection: export the current pick.
+    // Browse: open 导入与导出. Selection: choose Fluent Pack or Zip.
     DesktopMediaManagementShortcutAction.exportFluentPack:
         LogicalKeyboardKey.keyX,
   };

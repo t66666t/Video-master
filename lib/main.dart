@@ -30,14 +30,22 @@ import 'services/ocr_subtitle_manager.dart';
 import 'services/system_media_session_service.dart';
 import 'utils/app_toast.dart';
 import 'utils/app_localizations.dart';
+import 'utils/ime_shortcut_gate.dart';
 import 'utils/first_open_ui_warmup.dart';
 import 'utils/tooltip_hover_policy.dart';
 import 'widgets/incoming_share_listener.dart';
 import 'widgets/library_persistence_notification_bridge.dart';
+import 'theme/app_page_transitions.dart';
 import 'widgets/tooltip_interaction_guard.dart';
+import 'debug/debug_log_buffer.dart';
+import 'debug/debug_log_navigator.dart';
+import 'debug/debug_log_overlay.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  DebugLogBuffer.instance.install();
+  installDebugLogBackHandler();
+  ImeShortcutGate.install();
   _configureImageCaches();
 
   // Create a stable provider graph synchronously. Disk-backed and plugin
@@ -93,7 +101,19 @@ void main() async {
   // 捕获框架级异常（渲染/布局/Widget 错误）。
   // runZonedGuarded 无法捕获此类异常，需单独处理，否则直接导致崩溃无日志。
   FlutterError.onError = (FlutterErrorDetails details) {
-    FlutterError.presentError(details);
+    final own = DebugLogBuffer.instance.stackOriginatesInOverlay(details.stack);
+    if (own) DebugLogBuffer.instance.beginSuppressingOwnOutput();
+    try {
+      FlutterError.presentError(details);
+    } finally {
+      if (own) DebugLogBuffer.instance.endSuppressingOwnOutput();
+    }
+    if (!own) {
+      DebugLogBuffer.instance.recordReleaseFrameworkError(
+        details.exception,
+        details.stack,
+      );
+    }
     _writeCrashLog(
       '[FlutterError] ${details.exception}\n${details.stack ?? ''}',
     );
@@ -170,11 +190,28 @@ void main() async {
       );
     },
     (error, stack) {
-      debugPrint('Uncaught error: $error');
-      debugPrint(stack.toString());
+      final own = DebugLogBuffer.instance.stackOriginatesInOverlay(stack);
+      if (own) DebugLogBuffer.instance.beginSuppressingOwnOutput();
+      try {
+        debugPrint('Uncaught error: $error');
+        debugPrint(stack.toString());
+      } finally {
+        if (own) DebugLogBuffer.instance.endSuppressingOwnOutput();
+      }
+      if (!own) {
+        DebugLogBuffer.instance.recordReleaseFrameworkError(error, stack);
+      }
       _writeCrashLog('[ZoneError] $error\n$stack');
       unawaited(transcriptionManager.shutdown());
     },
+    zoneSpecification: ZoneSpecification(
+      print: (self, parent, zone, line) {
+        if (!DebugLogBuffer.instance.isForwardingDebugPrint) {
+          DebugLogBuffer.instance.add(line);
+        }
+        parent.print(zone, line);
+      },
+    ),
   );
 }
 
@@ -688,13 +725,16 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               AppToast.observer,
               AppToast.routeObserver,
               PlaybackNavigationService.instance.observer,
+              DebugLogNavigatorObserver(),
             ],
             builder: (context, child) {
-              return TooltipInteractionGuard(
-                child: IncomingShareListener(
-                  child: LibraryPersistenceNotificationBridge(
-                    child: FirstOpenUiWarmupHost(
-                      child: child ?? const SizedBox.shrink(),
+              return DebugLogOverlay(
+                child: TooltipInteractionGuard(
+                  child: IncomingShareListener(
+                    child: LibraryPersistenceNotificationBridge(
+                      child: FirstOpenUiWarmupHost(
+                        child: child ?? const SizedBox.shrink(),
+                      ),
                     ),
                   ),
                 ),
@@ -760,6 +800,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
                 surface: Color(0xFF121212),
               ),
               useMaterial3: true,
+              pageTransitionsTheme: appPageTransitionsTheme,
               tooltipTheme: const TooltipThemeData(
                 waitDuration: kAppTooltipWaitDuration,
               ),

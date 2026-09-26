@@ -121,6 +121,65 @@ void main() {
       expect(meta.recommendedAudioFormatId, '251');
     });
 
+    test('keeps split audio tracks when the codec field is missing', () {
+      final meta = parser.parse({
+        'id': 'split-audio',
+        'extractor_key': 'twitter',
+        'webpage_url': 'https://x.com/example/status/1001',
+        'title': 'Split',
+        'uploader': 'Example',
+        'formats': [
+          {
+            'format_id': 'hls-audio-32000-Audio',
+            'ext': 'mp4',
+            'protocol': 'm3u8_native',
+            'vcodec': 'none',
+            'acodec': null,
+            'tbr': 32,
+          },
+          {
+            'format_id': 'hls-1122',
+            'ext': 'mp4',
+            'protocol': 'm3u8_native',
+            'vcodec': 'avc1.64001F',
+            'acodec': 'none',
+            'width': 720,
+            'height': 1280,
+            'tbr': 1122,
+          },
+          {
+            'format_id': 'hls-audio-128000-Audio',
+            'ext': 'mp4',
+            'protocol': 'm3u8_native',
+            'vcodec': 'none',
+            'acodec': null,
+            'tbr': 128,
+          },
+          {
+            'format_id': 'http-2176',
+            'ext': 'mp4',
+            'protocol': 'https',
+            'vcodec': null,
+            'acodec': null,
+            'width': 720,
+            'height': 1280,
+            'tbr': 2176,
+          },
+        ],
+      });
+
+      expect(meta.videoFormats.map((format) => format.formatId), [
+        'http-2176',
+        'hls-1122',
+      ]);
+      expect(meta.videoFormats.every((format) => format.hasAudio), isFalse);
+      expect(meta.audioFormats.map((format) => format.formatId), [
+        'hls-audio-128000-Audio',
+        'hls-audio-32000-Audio',
+      ]);
+      expect(meta.recommendedAudioFormatId, 'hls-audio-128000-Audio');
+    });
+
     test('sorts shorts by quality but recommends compatible h264', () {
       final meta = parser.parse({
         'id': 'shorts-demo',

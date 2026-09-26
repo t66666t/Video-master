@@ -417,6 +417,35 @@ void main() {
       await touchDrag.cancel();
       await tester.pump(const Duration(milliseconds: 180));
       expect(chapterTitle('章节'), findsOneWidget);
+      await drag.removePointer();
+
+      final parkedMouse = await tester.createGesture(
+        kind: PointerDeviceKind.mouse,
+      );
+      await parkedMouse.addPointer(location: progressRect.center);
+      await tester.pump(const Duration(milliseconds: 180));
+      expect(
+        find.byKey(const ValueKey('video-controls-seek-preview')),
+        findsOneWidget,
+      );
+      final finger = await tester.startGesture(
+        progressRect.center,
+        kind: PointerDeviceKind.touch,
+      );
+      await finger.moveTo(
+        Offset(
+          progressRect.left + (progressRect.width * 0.6),
+          progressRect.center.dy,
+        ),
+      );
+      await finger.moveTo(const Offset(500, 40));
+      await finger.up();
+      await tester.pump(const Duration(milliseconds: 180));
+      expect(
+        find.byKey(const ValueKey('video-controls-seek-preview')),
+        findsNothing,
+      );
+      await parkedMouse.removePointer();
 
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pump(const Duration(seconds: 20));

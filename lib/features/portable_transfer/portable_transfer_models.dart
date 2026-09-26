@@ -13,12 +13,20 @@ enum PortableTransferStatus {
 
 enum PortableCompression { fast, balanced, smallest }
 
+enum PortableExportFormat { fluentPack, zip }
+
+/// How a Zip export carries the subtitles already attached to each card.
+enum ZipSubtitleMode { embed, external, none }
+
 class PortableExportOptions {
   final String packageName;
   final bool wrapInFolder;
   final bool includeSidecars;
   final bool verifyChecksums;
   final PortableCompression compression;
+  final PortableExportFormat format;
+  final ZipSubtitleMode zipSubtitleMode;
+  final bool includeDanmaku;
 
   const PortableExportOptions({
     required this.packageName,
@@ -26,7 +34,12 @@ class PortableExportOptions {
     this.includeSidecars = true,
     this.verifyChecksums = true,
     this.compression = PortableCompression.fast,
+    this.format = PortableExportFormat.fluentPack,
+    this.zipSubtitleMode = ZipSubtitleMode.embed,
+    this.includeDanmaku = false,
   });
+
+  bool get isZip => format == PortableExportFormat.zip;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     'packageName': packageName,
@@ -34,6 +47,9 @@ class PortableExportOptions {
     'includeSidecars': includeSidecars,
     'verifyChecksums': verifyChecksums,
     'compression': compression.name,
+    'format': format.name,
+    'zipSubtitleMode': zipSubtitleMode.name,
+    'includeDanmaku': includeDanmaku,
   };
 
   factory PortableExportOptions.fromJson(Map<String, dynamic> json) =>
@@ -46,7 +62,21 @@ class PortableExportOptions {
           (value) => value.name == json['compression'],
           orElse: () => PortableCompression.fast,
         ),
+        format: PortableExportFormat.values.firstWhere(
+          (value) => value.name == json['format'],
+          orElse: () => PortableExportFormat.fluentPack,
+        ),
+        zipSubtitleMode: ZipSubtitleMode.values.firstWhere(
+          (value) => value.name == json['zipSubtitleMode'],
+          orElse: () => ZipSubtitleMode.embed,
+        ),
+        includeDanmaku: json['includeDanmaku'] == true,
       );
+}
+
+/// Thrown when the user cancels a portable export before it finishes.
+class PortableExportCancelled implements Exception {
+  const PortableExportCancelled();
 }
 
 class PortableTransferTask {

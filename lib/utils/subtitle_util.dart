@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 
 class SubtitleUtil {
   static const Map<String, String> _lanMap = {

@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../services/media_playback_service.dart';
@@ -143,7 +144,7 @@ class _RecycleBinScreenState extends State<RecycleBinScreen> {
     VideoCollection collection,
   ) {
     Navigator.of(context).push(
-      MaterialPageRoute(
+      AppMaterialPageRoute(
         builder: (context) =>
             RecycledFolderDetailScreen(collection: collection),
       ),
@@ -758,7 +759,7 @@ class _RecycledFolderDetailScreenState
                                   onTap: () {
                                     if (isFolder) {
                                       Navigator.of(context).push(
-                                        MaterialPageRoute(
+                                        AppMaterialPageRoute(
                                           builder: (context) =>
                                               RecycledFolderDetailScreen(
                                                 collection: item,

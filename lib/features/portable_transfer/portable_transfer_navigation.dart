@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:path/path.dart' as p;
 
 import '../../services/library_service.dart';
@@ -72,7 +73,7 @@ class PortableTransferNavigation {
     }
 
     await navigator.pushAndRemoveUntil<void>(
-      MaterialPageRoute<void>(
+      AppMaterialPageRoute<void>(
         builder: (_) => PortableTransferScreen(
           initialTab: initialTab,
           pendingImportSources: pendingImportSources,

@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+
+import '../theme/app_tokens.dart';
 import 'package:provider/provider.dart';
 
 import '../models/video_collection.dart';
@@ -32,6 +34,7 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onSelectionLongPressMoveUpdate,
     this.onSelectionLongPressEnd,
     this.onShowInParentFolder,
+    this.onMoveToParent,
     this.showActivityMenu = false,
     this.allowHide = false,
     this.relativePath,
@@ -57,6 +60,7 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onSelectionLongPressMoveUpdate,
     this.onSelectionLongPressEnd,
     this.onShowInParentFolder,
+    this.onMoveToParent,
     this.showActivityMenu = false,
     this.allowHide = false,
     this.relativePath,
@@ -83,6 +87,7 @@ class MediaLibraryListTile extends StatelessWidget {
   final GestureLongPressMoveUpdateCallback? onSelectionLongPressMoveUpdate;
   final GestureLongPressEndCallback? onSelectionLongPressEnd;
   final VoidCallback? onShowInParentFolder;
+  final VoidCallback? onMoveToParent;
   final bool showActivityMenu;
   final bool allowHide;
   final String? relativePath;
@@ -91,7 +96,7 @@ class MediaLibraryListTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final accent = Colors.blueAccent;
+        final accent = AppTokens.accent;
     return LayoutBuilder(
       builder: (context, constraints) {
         final metrics = MediaListLayoutMetrics.forTile(
@@ -116,9 +121,7 @@ class MediaLibraryListTile extends StatelessWidget {
 
         return Material(
           key: const ValueKey('media-list-card'),
-          color: isSelected
-              ? accent.withValues(alpha: 0.14)
-              : const Color(0xFF272A2F),
+          color: isSelected ? AppTokens.accentSoft : Colors.transparent,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(metrics.radius),
             side: BorderSide(
@@ -247,6 +250,7 @@ class MediaLibraryListTile extends StatelessWidget {
                             isCollection: _isCollection,
                             allowHide: allowHide && !_isCollection,
                             onLocate: onShowInParentFolder,
+                            onMoveToParent: onMoveToParent,
                             fillSlot: true,
                           )
                         : null,
@@ -371,7 +375,7 @@ class MediaLibraryListTile extends StatelessWidget {
               minHeight: progressThickness,
               value: (position / data.duration).clamp(0.0, 1.0),
               backgroundColor: Colors.black45,
-              color: Colors.redAccent,
+              color: AppTokens.accent,
             ),
           );
         }

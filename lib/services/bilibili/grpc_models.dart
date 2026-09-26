@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 import 'dart:convert';
-import 'dart:developer' as developer;
+import '../../debug/developer_log.dart' as developer;
 
 /// Simple manual Protobuf writer/reader for specific Bilibili messages.
 /// Avoids heavy dependencies.

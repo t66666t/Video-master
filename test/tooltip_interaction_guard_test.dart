@@ -116,6 +116,16 @@ void main() {
       'deviceId': 77,
     });
     await tester.pump(kAppTooltipWaitDuration);
+    expect(find.text('字幕开关'), findsNothing);
+
+    AndroidHardwareInputBridge.dispatchNativeHoverForTesting(<Object?, Object?>{
+      'action': 7,
+      'x': target.dx + 12,
+      'y': target.dy,
+      'eventTime': 35,
+      'deviceId': 77,
+    });
+    await tester.pump(kAppTooltipWaitDuration);
     expect(find.text('字幕开关'), findsOneWidget);
 
     AndroidHardwareInputBridge.dispatchNativeHoverForTesting(<Object?, Object?>{

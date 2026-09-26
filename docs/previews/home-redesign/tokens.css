@@ -1,0 +1,116 @@
+/* 笔记风 v2。数值与 docs/design/design-tokens.md 一致。 */
+:root {
+  /* 中性色：略偏暖的灰，参照 Notion 深色 */
+  --bg-base: #191919;
+  --bg-raised: #202020;
+  --bg-overlay: #252525;
+  --bg-inset: #141414;
+
+  --fill-hover: rgba(255, 255, 255, 0.055);
+  --fill-pressed: rgba(255, 255, 255, 0.09);
+  --fill-control: rgba(255, 255, 255, 0.1);
+  --fill-subtle: rgba(255, 255, 255, 0.03);
+
+  --line-subtle: rgba(255, 255, 255, 0.055);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.14);
+
+  --text-1: #e3e2e0;
+  --text-2: #9b9a97;
+  --text-3: #6f6e6b;
+  --text-4: #4a4a48;
+  --text-on-accent: #ffffff;
+
+  --accent: #4b8ef0;
+  --accent-text: #7eb1ff;
+  --accent-soft: rgba(75, 142, 240, 0.16);
+  --accent-ring: rgba(75, 142, 240, 0.55);
+
+  --danger: #e5625c;
+  --danger-soft: rgba(229, 98, 92, 0.14);
+  --success: #4fa872;
+  --warning: #d19b3f;
+
+  --brand-bili: #fb7299;
+  --brand-yt: #ff5a52;
+  --brand-batch: #a98bf2;
+
+  /* 形状 */
+  --r-xs: 3px;
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 8px;
+  --r-xl: 12px;
+  --r-full: 999px;
+
+  --shadow-float: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 24px rgba(0, 0, 0, 0.32);
+  --shadow-popover: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 4px 10px rgba(0, 0, 0, 0.28), 0 14px 36px rgba(0, 0, 0, 0.4);
+  --shadow-sheet: 0 -1px 0 rgba(255, 255, 255, 0.06), 0 -16px 48px rgba(0, 0, 0, 0.4);
+  --scrim: rgba(0, 0, 0, 0.5);
+
+  --font: "MiSans", "PingFang SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-sheet: 240ms;
+
+  /* 首页尺寸 */
+  --bar-compact: 44px;
+  --bar-normal: 48px;
+  --group-pad-y: 8px;
+  --pill-h: 28px;
+  --card-radius-factor: 0.045;
+  --card-radius-min: 4;
+  --card-radius-max: 8;
+  --list-radius-max: 6;
+  --default-card-spacing: 0.08;
+  --default-card-height: 1.08;
+  --default-list-spacing: 0.03;
+  --default-mini-phone: 96;
+  --default-mini-tablet: 112;
+  --mini-inset: 8;
+  --default-fab-phone: 44;
+  --default-fab-desktop: 40;
+  --progress-h: 3px;
+
+  /* 组件别名：现有样式在 tokens-legacy.css 里覆盖这些 */
+  --appbar-bg: var(--bg-base);
+  --card-bg: #2c2c2c;
+  --card-bg-hover: #2c2c2c;
+  --card-cover-inset: 1;
+  --list-bg: transparent;
+  --list-bg-hover: var(--fill-hover);
+  --mini-bg: var(--bg-overlay);
+  --mini-radius: var(--r-xl);
+  --mini-shadow: var(--shadow-float);
+  --rail-bg: var(--bg-overlay);
+  --rail-shadow: var(--shadow-float);
+  --progress: var(--accent);
+  --popover-bg: var(--bg-overlay);
+  --popover-radius: var(--r-lg);
+  --popover-blur: 0px;
+  --sheet-bg: var(--bg-raised);
+  /* 预览用封面占位，不属于设计范围 */
+  --cover-ph: #2a2a29;
+  --cover-ph-icon: #4a4a48;
+}
+
+:root[data-accent="violet"] {
+  --accent: #8b7cf6;
+  --accent-text: #ab9ffa;
+  --accent-soft: rgba(139, 124, 246, 0.16);
+  --accent-ring: rgba(139, 124, 246, 0.55);
+}
+:root[data-accent="amber"] {
+  --accent: #d9a24a;
+  --accent-text: #e8bb6f;
+  --accent-soft: rgba(217, 162, 74, 0.16);
+  --accent-ring: rgba(217, 162, 74, 0.55);
+  --text-on-accent: #1a1406;
+}
+:root[data-accent="green"] {
+  --accent: #4fa872;
+  --accent-text: #74c293;
+  --accent-soft: rgba(79, 168, 114, 0.16);
+  --accent-ring: rgba(79, 168, 114, 0.55);
+}

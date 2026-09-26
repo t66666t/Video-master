@@ -100,6 +100,17 @@ void main() {
       await controller.dispose();
     });
 
+    testWidgets('打开设置后面板悬浮，文稿视口高度不变', (tester) async {
+      await _pumpSidebar(tester, controller: controller);
+      final before = _tallestScrollableHeight(tester);
+
+      await tester.tap(find.byIcon(Icons.format_size));
+      await tester.pump();
+
+      expect(find.text('字体'), findsOneWidget);
+      expect(_tallestScrollableHeight(tester), before);
+    });
+
     testWidgets('设置项有名称，隐藏时间后不保留时间列', (tester) async {
       await _pumpSidebar(tester, controller: controller);
 
@@ -382,6 +393,19 @@ void main() {
       expect(tester.takeException(), isNull);
     });
   });
+}
+
+double _tallestScrollableHeight(WidgetTester tester) {
+  final scrollables = find.descendant(
+    of: find.byType(SubtitleSidebar),
+    matching: find.byType(Scrollable),
+  );
+  var maxHeight = 0.0;
+  for (var index = 0; index < scrollables.evaluate().length; index++) {
+    final height = tester.getSize(scrollables.at(index)).height;
+    if (height > maxHeight) maxHeight = height;
+  }
+  return maxHeight;
 }
 
 TextSpan? _findTextSpan(TextSpan span, String text) {

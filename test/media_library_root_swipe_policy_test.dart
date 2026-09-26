@@ -76,6 +76,63 @@ void main() {
     );
   });
 
+  test('a reverse flick settles on the other page, not the one already approached', () {
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: -200,
+        width: 400,
+        velocityDx: 1400,
+      ),
+      MediaLibraryRootEntry.continueLearning,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: 200,
+        width: 400,
+        velocityDx: -1400,
+      ),
+      MediaLibraryRootEntry.recent,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.continueLearning,
+        dragDx: -200,
+        width: 400,
+        velocityDx: 1400,
+      ),
+      isNull,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: -200,
+        width: 400,
+        velocityDx: -1400,
+      ),
+      MediaLibraryRootEntry.recent,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: -160,
+        width: 400,
+        velocityDx: 0,
+      ),
+      MediaLibraryRootEntry.recent,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: -40,
+        width: 400,
+        velocityDx: 200,
+      ),
+      isNull,
+    );
+  });
+
   test('commit needs a real fraction or a flick, not a twitch', () {
     expect(
       MediaLibraryRootSwipePolicy.shouldCommit(

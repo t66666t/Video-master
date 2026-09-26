@@ -120,6 +120,44 @@ class YtDlpVideoFormatSelector {
     return known.where((format) => format.height == closestAbove).toList();
   }
 
+  /// Adaptive streams such as HLS often advertise an audio codec while the
+  /// selected rendition itself is video-only. Those need a separate audio merge.
+  /// A progressive file that already contains audio does not.
+  static bool needsSeparateAudioTrack(VideoFormat? video) {
+    if (video == null || !video.hasAudio) {
+      return true;
+    }
+    final codec = (video.audioCodec ?? '').trim().toLowerCase();
+    if (codec.isEmpty || codec == 'none') {
+      return true;
+    }
+    final ext = video.ext.trim().toLowerCase();
+    final formatId = video.formatId.trim().toLowerCase();
+    return ext == 'm3u8' ||
+        formatId.startsWith('hls') ||
+        formatId.contains('dash');
+  }
+
+  /// Prefer a merged video+audio download, but keep the selected video alone
+  /// when that pair is not offered by the site.
+  static String downloadFormatSelector({
+    required String videoId,
+    required String? audioId,
+    required bool mergeAudio,
+  }) {
+    if (!mergeAudio || audioId == null || audioId.isEmpty) {
+      return videoId;
+    }
+    final merged = '$videoId+$audioId';
+    if (videoId.contains('/') ||
+        audioId.contains('/') ||
+        videoId.contains('+') ||
+        audioId.contains('+')) {
+      return merged;
+    }
+    return '$merged/$videoId';
+  }
+
   static int _compareWithinQuality(VideoFormat a, VideoFormat b) {
     final compatibility = _broadCompatibilityRank(
       b,

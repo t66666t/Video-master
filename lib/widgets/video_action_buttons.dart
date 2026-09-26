@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
+
+import '../theme/app_tokens.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
@@ -105,7 +108,7 @@ class VideoActionButtons extends StatefulWidget {
   }) {
     Navigator.push(
       context,
-      MaterialPageRoute(
+      AppMaterialPageRoute(
         builder: (_) => BilibiliDownloadScreen(
           targetFolderId: collectionId,
           initialStreamingMode: streamingMode,
@@ -120,7 +123,7 @@ class VideoActionButtons extends StatefulWidget {
   static void openYtDlpDownloadPage(BuildContext context) {
     Navigator.push(
       context,
-      MaterialPageRoute(
+      AppMaterialPageRoute(
         builder: (_) => const YtDlpDownloadScreen(),
         settings: const RouteSettings(name: '/yt_dlp_download'),
       ),
@@ -133,7 +136,7 @@ class VideoActionButtons extends StatefulWidget {
   }) {
     Navigator.push(
       context,
-      MaterialPageRoute(
+      AppMaterialPageRoute(
         builder: (_) => BatchSubtitleScreen(collectionId: collectionId),
         settings: const RouteSettings(name: '/batch_subtitle'),
       ),
@@ -146,7 +149,7 @@ class VideoActionButtons extends StatefulWidget {
   }) {
     Navigator.push(
       context,
-      MaterialPageRoute(
+      AppMaterialPageRoute(
         builder: (_) => BatchImportScreen(folderId: collectionId),
       ),
     );
@@ -994,6 +997,9 @@ class VideoActionButtons extends StatefulWidget {
 }
 
 class _VideoActionButtonsState extends State<VideoActionButtons> {
+  static const double _phoneButtonSize = 44;
+  static const double _wideButtonSize = 40;
+  static const double _buttonGap = 8;
   Timer? _hiddenCleanupTapResetTimer;
   int _hiddenCleanupTapCount = 0;
   bool _isHiddenCleanupDialogOpen = false;
@@ -1238,7 +1244,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(
+                AppMaterialPageRoute(
                   builder: (_) =>
                       BatchSubtitleScreen(collectionId: widget.collectionId),
                   settings: const RouteSettings(name: '/batch_subtitle'),
@@ -1266,7 +1272,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           ElevatedButton(
             onPressed: () => Navigator.push(
               context,
-              MaterialPageRoute(
+              AppMaterialPageRoute(
                 builder: (_) =>
                     BatchImportScreen(folderId: widget.collectionId),
               ),
@@ -1278,7 +1284,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
             onPressed: () {
               Navigator.push(
                 context,
-                MaterialPageRoute(
+                AppMaterialPageRoute(
                   builder: (_) => BilibiliDownloadScreen(
                     targetFolderId: widget.collectionId,
                   ),
@@ -1296,7 +1302,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           ElevatedButton(
             onPressed: () => Navigator.push(
               context,
-              MaterialPageRoute(
+              AppMaterialPageRoute(
                 builder: (_) => const YtDlpDownloadScreen(),
                 settings: const RouteSettings(name: '/yt_dlp_download'),
               ),
@@ -1316,6 +1322,7 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
         final isCollapsed = settings.isActionButtonsCollapsed;
         final mediaQuery = MediaQuery.of(context);
         final isTablet = mediaQuery.size.shortestSide >= 600.0;
+        final buttonSize = isTablet ? _wideButtonSize : _phoneButtonSize;
         final maxExpandedHeight = (widget.maxExpandedHeight ?? double.infinity)
             .clamp(96.0, double.infinity);
 
@@ -1324,34 +1331,27 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
-            SizedBox(
-              width: 56, // Enforce width to align with standard FAB
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 300),
-                reverseDuration: const Duration(milliseconds: 300),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (Widget child, Animation<double> animation) {
-                  return SizeTransition(
-                    sizeFactor: animation,
-                    alignment: AlignmentDirectional.bottomStart,
-                    child: FadeTransition(opacity: animation, child: child),
-                  );
-                },
-                // Use default layoutBuilder (Stack with Alignment.center)
-                // Since we constrained width to 56, center alignment is effectively same as left/right
-                child: isCollapsed
-                    ? const SizedBox.shrink(key: ValueKey('collapsed'))
-                    : Column(
-                        key: const ValueKey('expanded'),
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          FloatingActionButton(
-                            heroTag: "batch_subtitle_${widget.collectionId}",
+            AnimatedSize(
+              duration: const Duration(milliseconds: 240),
+              curve: Curves.easeOutCubic,
+              alignment: Alignment.bottomCenter,
+              child: isCollapsed
+                  ? SizedBox(width: buttonSize, height: 0)
+                  : Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                          _railButton(
+                            size: buttonSize,
+                            tooltip: _fabTooltip(
+                              "批量字幕生成",
+                              DesktopMediaManagementShortcutAction
+                                  .openBatchSubtitle,
+                            ),
+                            icon: Icons.closed_caption,
                             onPressed: () {
                               Navigator.push(
                                 context,
-                                MaterialPageRoute(
+                                AppMaterialPageRoute(
                                   builder: (_) => BatchSubtitleScreen(
                                     collectionId: widget.collectionId,
                                   ),
@@ -1361,49 +1361,46 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: _fabTooltip(
-                              "批量字幕生成",
-                              DesktopMediaManagementShortcutAction
-                                  .openBatchSubtitle,
-                            ),
-                            backgroundColor: Colors.teal,
-                            child: const Icon(
-                              Icons.closed_caption,
-                              color: Colors.white,
-                            ),
                           ),
-                          const SizedBox(height: 16),
-                          FloatingActionButton(
-                            heroTag: "add_folder_${widget.collectionId}",
-                            onPressed: () => showCreateCollectionDialog(
-                              context,
-                              widget.collectionId,
-                            ),
+                          const SizedBox(height: _buttonGap),
+                          _railButton(
+                            size: buttonSize,
                             tooltip: _fabTooltip(
                               "新建合集",
                               DesktopMediaManagementShortcutAction
                                   .createCollection,
                             ),
-                            child: const Icon(Icons.create_new_folder),
+                            icon: Icons.create_new_folder,
+                            onPressed: () => showCreateCollectionDialog(
+                              context,
+                              widget.collectionId,
+                            ),
                           ),
-                          const SizedBox(height: 16),
-                          FloatingActionButton(
-                            heroTag: "add_video_${widget.collectionId}",
-                            onPressed: () =>
-                                importVideos(context, widget.collectionId),
+                          const SizedBox(height: _buttonGap),
+                          _railButton(
+                            size: buttonSize,
                             tooltip: _fabTooltip(
                               "导入视频或音频",
                               DesktopMediaManagementShortcutAction.importMedia,
                             ),
-                            child: const Icon(Icons.video_call),
+                            icon: Icons.video_call,
+                            onPressed: () =>
+                                importVideos(context, widget.collectionId),
                           ),
-                          const SizedBox(height: 16),
-                          FloatingActionButton(
-                            heroTag: "bbdown_download_${widget.collectionId}",
+                          const SizedBox(height: _buttonGap),
+                          _railButton(
+                            size: buttonSize,
+                            tooltip: _fabTooltip(
+                              "B站视频下载",
+                              DesktopMediaManagementShortcutAction
+                                  .openBilibiliDownload,
+                            ),
+                            icon: Icons.tv,
+                            color: AppTokens.brandBilibili,
                             onPressed: () {
                               Navigator.push(
                                 context,
-                                MaterialPageRoute(
+                                AppMaterialPageRoute(
                                   builder: (_) => BilibiliDownloadScreen(
                                     targetFolderId: widget.collectionId,
                                   ),
@@ -1413,21 +1410,21 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: _fabTooltip(
-                              "B站视频下载",
-                              DesktopMediaManagementShortcutAction
-                                  .openBilibiliDownload,
-                            ),
-                            backgroundColor: const Color(0xFFFB7299),
-                            child: const Icon(Icons.tv, color: Colors.white),
                           ),
-                          const SizedBox(height: 16),
-                          FloatingActionButton(
-                            heroTag: "yt_dlp_download_${widget.collectionId}",
+                          const SizedBox(height: _buttonGap),
+                          _railButton(
+                            size: buttonSize,
+                            tooltip: _fabTooltip(
+                              "YT-DLP 视频下载",
+                              DesktopMediaManagementShortcutAction
+                                  .openYtDlpDownload,
+                            ),
+                            icon: Icons.ondemand_video,
+                            color: AppTokens.brandYtDlp,
                             onPressed: () {
                               Navigator.push(
                                 context,
-                                MaterialPageRoute(
+                                AppMaterialPageRoute(
                                   builder: (_) => const YtDlpDownloadScreen(),
                                   settings: const RouteSettings(
                                     name: '/yt_dlp_download',
@@ -1435,18 +1432,8 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 ),
                               );
                             },
-                            tooltip: _fabTooltip(
-                              "YT-DLP 视频下载",
-                              DesktopMediaManagementShortcutAction
-                                  .openYtDlpDownload,
-                            ),
-                            backgroundColor: const Color(0xFFFF4040),
-                            child: const Icon(
-                              Icons.ondemand_video,
-                              color: Colors.white,
-                            ),
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: _buttonGap),
                           Consumer<BatchImportService>(
                             builder: (context, batch, _) {
                               final count = batch.getPendingCount(
@@ -1456,45 +1443,34 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                                 clipBehavior: Clip.none,
                                 alignment: Alignment.topRight,
                                 children: [
-                                  FloatingActionButton(
-                                    heroTag:
-                                        "batch_import_${widget.collectionId}",
-                                    onPressed: () => Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (_) => BatchImportScreen(
-                                          folderId: widget.collectionId,
-                                        ),
-                                      ),
-                                    ),
+                                  _railButton(
+                                    size: buttonSize,
                                     tooltip: _fabTooltip(
                                       "批量导入媒体及对应字幕",
                                       DesktopMediaManagementShortcutAction
                                           .openBatchImport,
                                     ),
-                                    backgroundColor: Colors.deepPurpleAccent,
-                                    child: const Icon(
-                                      Icons.playlist_add,
-                                      color: Colors.white,
+                                    icon: Icons.playlist_add,
+                                    color: AppTokens.brandBatch,
+                                    onPressed: () => Navigator.push(
+                                      context,
+                                      AppMaterialPageRoute(
+                                        builder: (_) => BatchImportScreen(
+                                          folderId: widget.collectionId,
+                                        ),
+                                      ),
                                     ),
                                   ),
                                   if (count > 0)
                                     Positioned(
-                                      right: -4,
-                                      top: -4,
+                                      right: 2,
+                                      top: 2,
                                       child: Container(
-                                        padding: const EdgeInsets.all(6),
+                                        width: 8,
+                                        height: 8,
                                         decoration: const BoxDecoration(
-                                          color: Colors.redAccent,
+                                          color: AppTokens.danger,
                                           shape: BoxShape.circle,
-                                        ),
-                                        child: Text(
-                                          "$count",
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.bold,
-                                          ),
                                         ),
                                       ),
                                     ),
@@ -1502,33 +1478,31 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
                               );
                             },
                           ),
-                          const SizedBox(height: 16),
+                          const SizedBox(height: _buttonGap),
                         ],
                       ),
-              ),
             ),
             SizedBox(
-              width: 56,
-              child: Align(
-                alignment: Alignment.center,
-                child: FloatingActionButton.small(
-                  heroTag: "collapse_toggle_${widget.collectionId ?? 'root'}",
-                  onPressed: () {
-                    _registerHiddenCleanupTap(context);
-                    settings.updateSetting(
-                      'isActionButtonsCollapsed',
-                      !isCollapsed,
-                    );
-                  },
-                  tooltip: isCollapsed ? "展开" : "收起",
-                  backgroundColor: const Color(0xFF333333),
-                  foregroundColor: Colors.white,
-                  child: Icon(
-                    isCollapsed
+              width: buttonSize,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _railButton(
+                    size: buttonSize,
+                    tooltip: isCollapsed ? "展开" : "收起",
+                    icon: isCollapsed
                         ? Icons.keyboard_arrow_up
                         : Icons.keyboard_arrow_down,
+                    color: AppTokens.text1,
+                    onPressed: () {
+                      _registerHiddenCleanupTap(context);
+                      settings.updateSetting(
+                        'isActionButtonsCollapsed',
+                        !isCollapsed,
+                      );
+                    },
                   ),
-                ),
+                ],
               ),
             ),
           ],
@@ -1549,6 +1523,40 @@ class _VideoActionButtonsState extends State<VideoActionButtons> {
           ),
         );
       },
+    );
+  }
+
+  /// Quiet circle. Hover and press only tint this disc; they do not
+  /// paint a second, larger splash behind it.
+  Widget _railButton({
+    required double size,
+    required String tooltip,
+    required IconData icon,
+    required VoidCallback onPressed,
+    Color color = AppTokens.text1,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 400),
+      child: Material(
+        color: const Color(0xFF4A4A48),
+        shape: const CircleBorder(
+          side: BorderSide(color: Color(0x38FFFFFF)),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onPressed,
+          customBorder: const CircleBorder(),
+          splashFactory: NoSplash.splashFactory,
+          hoverColor: const Color(0x1AFFFFFF),
+          highlightColor: const Color(0x24FFFFFF),
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Icon(icon, size: 20, color: color),
+          ),
+        ),
+      ),
     );
   }
 

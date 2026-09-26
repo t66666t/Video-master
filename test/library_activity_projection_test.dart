@@ -391,6 +391,127 @@ void main() {
       isFalse,
     );
   });
+
+  test('folder import shows the root first layer, not nested files', () {
+    final videos = <String, VideoItem>{
+      'loose': _item('loose', parentId: 'root'),
+      'deep': _item('deep', parentId: 'chapter'),
+      'deeper': _item('deeper', parentId: 'section'),
+    };
+    final collections = <String, VideoCollection>{
+      'root': _folder(
+        'root',
+        name: '课程',
+        childrenIds: ['loose', 'chapter', 'other'],
+      ),
+      'chapter': _folder(
+        'chapter',
+        name: '第一章',
+        parentId: 'root',
+        childrenIds: ['deep', 'section'],
+      ),
+      'section': _folder(
+        'section',
+        name: '小节',
+        parentId: 'chapter',
+        childrenIds: ['deeper'],
+      ),
+      'other': _folder(
+        'other',
+        name: '第二章',
+        parentId: 'root',
+        childrenIds: <String>[],
+      ),
+    };
+    final projection = _projection(
+      videos: videos,
+      collections: collections,
+      store: LibraryActivityStore(
+        media: <String, MediaActivityRecord>{
+          for (final id in videos.keys)
+            id: MediaActivityRecord(mediaId: id, addedAtMs: 5),
+        },
+        batches: [
+          ImportBatchRecord(
+            id: 'folder-batch',
+            startedAtMs: 5,
+            title: '课程',
+            sourceKind: LibraryImportSourceKind.folder,
+            createdMediaIds: videos.keys.toList(),
+            createdCollectionIds: ['root', 'chapter', 'section', 'other'],
+          ),
+        ],
+      ),
+    );
+
+    final rows = projection.recentAddedEntries();
+    expect(rows, hasLength(1));
+    expect(rows.single.groupHeaderLabel(), '课程·当前2项');
+    expect(
+      rows.single.children.map((child) => child.id).toList(),
+      ['loose', 'chapter'],
+    );
+    expect(rows.single.children[1].kind, RecentAddedChildKind.folder);
+  });
+
+  test('bilibili import splits a collection and a lone video', () {
+    final videos = <String, VideoItem>{
+      'p1': _item('p1', parentId: 'parts'),
+      'p2': _item('p2', parentId: 'parts'),
+      'single': _item('single'),
+    };
+    final collections = <String, VideoCollection>{
+      'season': _folder(
+        'season',
+        name: '合集',
+        childrenIds: ['parts', 'episode-file'],
+      ),
+      'parts': _folder(
+        'parts',
+        name: '分P视频',
+        parentId: 'season',
+        childrenIds: ['p1', 'p2'],
+      ),
+      'episode': _folder(
+        'episode',
+        name: '单集成片',
+        parentId: 'season',
+        childrenIds: <String>[],
+      ),
+    };
+    videos['episode-file'] = _item('episode-file', parentId: 'season');
+    final projection = _projection(
+      videos: videos,
+      collections: collections,
+      store: LibraryActivityStore(
+        media: <String, MediaActivityRecord>{
+          for (final id in ['p1', 'p2', 'single', 'episode-file'])
+            id: MediaActivityRecord(mediaId: id, addedAtMs: 8),
+        },
+        batches: [
+          ImportBatchRecord(
+            id: 'bili',
+            startedAtMs: 8,
+            title: 'B站下载 4 项',
+            sourceKind: LibraryImportSourceKind.bilibili,
+            createdMediaIds: ['p1', 'p2', 'episode-file', 'single'],
+            createdCollectionIds: ['season', 'parts'],
+          ),
+        ],
+      ),
+    );
+
+    final rows = projection.recentAddedEntries();
+    expect(rows.map((row) => row.rowId).toList(), [
+      'batch:bili:season',
+      'media:single',
+    ]);
+    expect(rows.first.groupHeaderLabel(), '合集·当前2项');
+    expect(rows.first.children.map((child) => child.id).toList(), [
+      'parts',
+      'episode-file',
+    ]);
+  });
 }
 
 LibraryActivityProjection _projection({
@@ -430,6 +551,7 @@ VideoCollection _folder(
   String? parentId,
   bool recycled = false,
   String? name,
+  List<String>? childrenIds,
 }) {
   return VideoCollection(
     id: id,
@@ -437,5 +559,6 @@ VideoCollection _folder(
     createTime: 1,
     parentId: parentId,
     isRecycled: recycled,
+    childrenIds: childrenIds,
   );
 }

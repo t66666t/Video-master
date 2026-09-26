@@ -30,6 +30,7 @@ class MediaLibraryContinueView extends StatefulWidget {
     required this.onOpenMedia,
     required this.onOpenFolder,
     required this.onLocateMedia,
+    required this.onLocateFolder,
     required this.onGoRecent,
     required this.onGoFolders,
     this.isActive = true,
@@ -40,6 +41,7 @@ class MediaLibraryContinueView extends StatefulWidget {
   final ValueChanged<VideoItem> onOpenMedia;
   final ValueChanged<VideoCollection> onOpenFolder;
   final ValueChanged<VideoItem> onLocateMedia;
+  final ValueChanged<VideoCollection> onLocateFolder;
   final VoidCallback onGoRecent;
   final VoidCallback onGoFolders;
 
@@ -188,6 +190,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
         : historyDays.isEmpty;
 
     final useList = settings.mediaLibraryViewMode == 1;
+    final flow = _flowSpacing(settings, useList);
     _frozenViewMode = settings.mediaLibraryViewMode;
     _frozenBottomPadding = widget.cardBottomPadding;
     _frozenSeriousOnly = seriousOnly;
@@ -196,7 +199,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       child: CustomScrollView(
         controller: widget.scrollController,
         slivers: [
-          SliverToBoxAdapter(child: _filterTile(settings)),
+          SliverToBoxAdapter(child: _filterTile(settings, flow)),
           if (pins.isEmpty && recordsEmpty)
             SliverFillRemaining(
               hasScrollBody: false,
@@ -204,27 +207,63 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
             )
           else ...[
             if (pins.isNotEmpty) ...[
-              const SliverToBoxAdapter(child: _SectionHeader(title: '置顶')),
-              _idGridOrListSliver(
-                library: library,
-                settings: settings,
-                ids: pins,
-                useList: useList,
-                pinMode: true,
+              ..._sectionSlivers(
+                flow,
+                title: '置顶',
+                beforeTitle: flow.attached,
+                body: [
+                  _idGridOrListSliver(
+                    library: library,
+                    settings: settings,
+                    ids: pins,
+                    useList: useList,
+                    pinMode: true,
+                  ),
+                ],
               ),
             ],
             if (seriousOnly) ...[
-              if (recent.isNotEmpty) ...[
-                const SliverToBoxAdapter(child: _SectionHeader(title: '最近在看')),
-                ..._seriousGroupSlivers(library, settings, recent, useList),
-              ],
-              if (unknown.isNotEmpty) ...[
-                const SliverToBoxAdapter(child: _SectionHeader(title: '之前未看完')),
-                ..._seriousGroupSlivers(library, settings, unknown, useList),
-              ],
+              if (recent.isNotEmpty)
+                ..._sectionSlivers(
+                  flow,
+                  title: '最近在看',
+                  beforeTitle: pins.isEmpty ? flow.attached : flow.section,
+                  body: _seriousGroupSlivers(
+                    library,
+                    settings,
+                    recent,
+                    useList,
+                    flow,
+                  ),
+                ),
+              if (unknown.isNotEmpty)
+                ..._sectionSlivers(
+                  flow,
+                  title: '之前未看完',
+                  beforeTitle: pins.isEmpty && recent.isEmpty
+                      ? flow.attached
+                      : flow.section,
+                  body: _seriousGroupSlivers(
+                    library,
+                    settings,
+                    unknown,
+                    useList,
+                    flow,
+                  ),
+                ),
             ] else ...[
-              for (final day in historyDays)
-                ..._daySlivers(library, settings, day, historyDays, useList),
+              for (var i = 0; i < historyDays.length; i++)
+                ..._daySlivers(
+                  library,
+                  settings,
+                  historyDays[i],
+                  historyDays,
+                  useList,
+                  flow,
+                  beforeHeader: i == 0 && pins.isEmpty
+                      ? flow.attached
+                      : flow.section,
+                ),
             ],
             SliverToBoxAdapter(
               child: SizedBox(height: 24 + widget.cardBottomPadding),
@@ -236,12 +275,38 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     return _frozenSubtree!;
   }
 
-  Widget _filterTile(SettingsService settings) {
+  MediaLibraryFlowSpacing _flowSpacing(SettingsService settings, bool useList) {
+    final screenSize = MediaQuery.sizeOf(context);
+    return mediaLibraryFlowSpacingFor(
+      screenSize: screenSize,
+      useList: useList,
+      cardStyle: settings.collectionCardStyleFor(screenSize),
+      listStyle: settings.listStyleFor(screenSize),
+    );
+  }
+
+  List<Widget> _sectionSlivers(
+    MediaLibraryFlowSpacing flow, {
+    required String title,
+    required double beforeTitle,
+    required List<Widget> body,
+  }) {
+    return [
+      if (flow.gap(beforeTitle) case final gap?) gap,
+      SliverToBoxAdapter(
+        child: _SectionHeader(title: title, horizontalPadding: flow.outer),
+      ),
+      if (flow.gap(flow.attached) case final gap?) gap,
+      ...body,
+    ];
+  }
+
+  Widget _filterTile(SettingsService settings, MediaLibraryFlowSpacing flow) {
     final on = settings.mediaLibraryContinueSeriousOnly;
     return Align(
       alignment: Alignment.centerLeft,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 4, 12, 2),
+        padding: EdgeInsets.fromLTRB(flow.outer, flow.leading, flow.outer, 0),
         child: _ContinueFilterPill(
           active: on,
           onToggleSeriousOnly: () {
@@ -290,11 +355,13 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     SettingsService settings,
     List<ContinueLearningGroup> groups,
     bool useList,
+    MediaLibraryFlowSpacing flow,
   ) {
     final slivers = <Widget>[];
     final rootIds = <String>[];
     void flushRoot() {
       if (rootIds.isEmpty) return;
+      if (slivers.isNotEmpty) flow.addGap(slivers, flow.block);
       slivers.add(
         _idGridOrListSliver(
           library: library,
@@ -312,7 +379,10 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
         continue;
       }
       flushRoot();
-      slivers.addAll(_groupSlivers(library, settings, group, groups, useList));
+      if (slivers.isNotEmpty) flow.addGap(slivers, flow.block);
+      slivers.addAll(
+        _groupSlivers(library, settings, group, groups, useList, flow),
+      );
     }
     flushRoot();
     return slivers;
@@ -324,7 +394,9 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     PlaybackHistoryDayGroup day,
     List<PlaybackHistoryDayGroup> siblings,
     bool useList,
-  ) {
+    MediaLibraryFlowSpacing flow, {
+    required double beforeHeader,
+  }) {
     final count = day.mediaIds.length;
     final flat = MediaLibraryGroupExpandPolicy.alwaysExpanded(count);
     final expanded =
@@ -345,6 +417,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
           title: '${day.label}·$count项',
           coverItems: covers,
           expanded: expanded,
+          padding: EdgeInsets.symmetric(horizontal: flow.outer),
           showChevron: !flat,
           remainderCount: expanded ? 0 : count,
           onToggle: flat
@@ -361,9 +434,13 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
         ),
       ),
     );
-    if (!expanded) return [header];
+    if (!expanded) {
+      return [if (flow.gap(beforeHeader) case final gap?) gap, header];
+    }
     return [
+      if (flow.gap(beforeHeader) case final gap?) gap,
       header,
+      if (flow.gap(flow.attached) case final attached?) attached,
       _idGridOrListSliver(
         library: library,
         settings: settings,
@@ -507,6 +584,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
               .listStyleFor(MediaQuery.sizeOf(context))
               .titleScale,
           onTap: () => widget.onOpenFolder(collection),
+          onShowInParentFolder: () => widget.onLocateFolder(collection),
           showActivityMenu: true,
           allowHide: false,
         ),
@@ -518,6 +596,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
           .collectionCardStyleFor(MediaQuery.sizeOf(context))
           .titleScale,
       onTap: () => widget.onOpenFolder(collection),
+      onLocate: () => widget.onLocateFolder(collection),
     );
   }
 
@@ -527,6 +606,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     ContinueLearningGroup group,
     List<ContinueLearningGroup> siblings,
     bool useList,
+    MediaLibraryFlowSpacing flow,
   ) {
     final ids = group.mediaIds;
     final count = ids.length;
@@ -547,6 +627,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
           subtitle: _resumeSubtitle(featured),
           coverItems: _coverItems(library, ids),
           expanded: expanded,
+          padding: EdgeInsets.symmetric(horizontal: flow.outer),
           showChevron: !flat && rest.isNotEmpty,
           remainderCount: rest.length,
           progress: _progressOf(featured),
@@ -570,6 +651,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     if (flat) {
       return [
         header,
+        if (flow.gap(flow.attached) case final attached?) attached,
         _idGridOrListSliver(
           library: library,
           settings: settings,
@@ -580,19 +662,22 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     }
     return [
       header,
+      if (flow.gap(flow.attached) case final attached?) attached,
       _idGridOrListSliver(
         library: library,
         settings: settings,
         ids: <String>[group.featuredMediaId],
         useList: useList,
       ),
-      if (expanded)
+      if (expanded && rest.isNotEmpty) ...[
+        if (flow.gap(flow.row) case final rowGap?) rowGap,
         _idGridOrListSliver(
           library: library,
           settings: settings,
           ids: rest,
           useList: useList,
         ),
+      ],
     ];
   }
 
@@ -705,14 +790,15 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
 }
 
 class _SectionHeader extends StatelessWidget {
-  const _SectionHeader({required this.title});
+  const _SectionHeader({required this.title, required this.horizontalPadding});
 
   final String title;
+  final double horizontalPadding;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+      padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
       child: Text(
         title,
         style: const TextStyle(

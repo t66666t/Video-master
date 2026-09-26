@@ -90,6 +90,7 @@ class MainActivity : AudioServiceFragmentActivity() {
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        ImeShortcutGate.install(this, flutterEngine)
         hardwareInputChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             HARDWARE_INPUT_CHANNEL,
@@ -349,7 +350,19 @@ class MainActivity : AudioServiceFragmentActivity() {
         enqueueSharedItemsFromIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        ImeShortcutGate.onHostResume()
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (!ImeShortcutGate.isTextInputActive &&
+            event.action == KeyEvent.ACTION_DOWN &&
+            event.keyCode != KeyEvent.KEYCODE_BACK &&
+            event.keyCode != KeyEvent.KEYCODE_ESCAPE
+        ) {
+            ImeShortcutGate.hideIme(this)
+        }
         // The Xiaomi keyboard and some Android desktop modes can deliver keys
         // to the Activity without Flutter's current FocusNode seeing them.
         // Forward all ordinary down/up events as a fallback while leaving

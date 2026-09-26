@@ -3526,395 +3526,377 @@ class SubtitleSidebarState extends State<SubtitleSidebar> {
                           ),
                         ),
                       ),
+                    ],
+                  ),
 
-                      // 字幕显示设置面板
-                      if (_showFontSettings)
-                        Container(
-                          color: Colors.white.withValues(alpha: 0.05),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 8,
-                            vertical: 2,
-                          ),
-                          child: LayoutBuilder(
-                            builder: (context, constraints) {
-                              final isVeryNarrow = constraints.maxWidth < 180;
-                              final labelWidth = isVeryNarrow ? 24.0 : 52.0;
-                              return Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  SizedBox(
-                                    height: 28,
-                                    child: Row(
-                                      children: [
-                                        SizedBox(
-                                          width: labelWidth,
-                                          child: Text(
-                                            isVeryNarrow ? "字" : "字体",
-                                            style: const TextStyle(
-                                              fontSize: 11,
-                                              color: Colors.white70,
-                                            ),
-                                          ),
-                                        ),
-                                        Expanded(
-                                          child: _FontSizeSliderWidget(
-                                            fontSizeScale: _fontSizeScale,
-                                            showValue: !isVeryNarrow,
-                                            onChanged: (nextScale) {
-                                              setState(
-                                                () =>
-                                                    _fontSizeScale = nextScale,
-                                              );
-                                            },
-                                            onCommit: (nextScale) {
-                                              final key = widget.isPortrait
-                                                  ? 'portraitSidebarFontSizeScale'
-                                                  : 'landscapeSidebarFontSizeScale';
-                                              SettingsService().updateSetting(
-                                                key,
-                                                nextScale,
-                                              );
-                                            },
-                                          ),
-                                        ),
-                                      ],
+                  // 2. 内容区。设置面板悬浮在文稿之上，不参与高度分配。
+                  Expanded(
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        _displaySubtitles.isEmpty
+                            ? Center(
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      widget.showEmbeddedLoadingMessage
+                                          ? "已识别到内嵌字幕，\n正在提取中..."
+                                          : "暂无字幕",
+                                      style: const TextStyle(
+                                        color: Colors.white54,
+                                      ),
+                                      textAlign: TextAlign.center,
                                     ),
-                                  ),
-                                  SizedBox(
-                                    height: 28,
-                                    child: Row(
-                                      children: [
-                                        SizedBox(
-                                          width: labelWidth,
-                                          child: Text(
-                                            isVeryNarrow ? "定位" : "定位位置",
-                                            style: const TextStyle(
-                                              fontSize: 11,
-                                              color: Colors.white70,
-                                            ),
+                                    if (widget.onOpenSubtitleManager !=
+                                        null) ...[
+                                      const SizedBox(height: 16),
+                                      InkWell(
+                                        canRequestFocus: false,
+                                        onTap: widget.onOpenSubtitleManager,
+                                        borderRadius: BorderRadius.circular(4),
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 16,
+                                            vertical: 8,
                                           ),
-                                        ),
-                                        Expanded(
-                                          child: _LocatePositionInputWidget(
-                                            key: ValueKey(
-                                              'subtitle-locate-position-editor-${widget.isPortrait ? 'portrait' : 'landscape'}',
+                                          decoration: BoxDecoration(
+                                            border: Border.all(
+                                              color: Colors.purpleAccent
+                                                  .withValues(alpha: 0.5),
                                             ),
-                                            value: _locatePositionPercent,
-                                            onChanged:
-                                                _updateLocatePositionPercent,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  if (_isArticleMode)
-                                    SizedBox(
-                                      height: 32,
-                                      child: Semantics(
-                                        toggled: _articleParagraphModeEnabled,
-                                        button: true,
-                                        label: '段落模式',
-                                        hint: '关闭后连续显示全部字幕',
-                                        onTap: () =>
-                                            _updateArticleParagraphMode(
-                                              !_articleParagraphModeEnabled,
+                                            borderRadius: BorderRadius.circular(
+                                              4,
                                             ),
-                                        child: GestureDetector(
-                                          key: const ValueKey(
-                                            'subtitle-paragraph-mode-control',
+                                            color: Colors.purpleAccent
+                                                .withValues(alpha: 0.1),
                                           ),
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () =>
-                                              _updateArticleParagraphMode(
-                                                !_articleParagraphModeEnabled,
-                                              ),
                                           child: Row(
-                                            children: [
-                                              SizedBox(
-                                                width: labelWidth,
-                                                child: Text(
-                                                  isVeryNarrow ? "段" : "段落模式",
-                                                  style: const TextStyle(
-                                                    fontSize: 11,
-                                                    color: Colors.white70,
-                                                  ),
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: const [
+                                              Icon(
+                                                Icons.subtitles,
+                                                size: 18,
+                                                color: Colors.purpleAccent,
+                                              ),
+                                              SizedBox(width: 8),
+                                              Text(
+                                                "查看字幕管理",
+                                                style: TextStyle(
+                                                  color: Colors.purpleAccent,
+                                                  fontSize: 14,
+                                                  fontWeight: FontWeight.bold,
                                                 ),
                                               ),
-                                              Tooltip(
-                                                message: "关闭后连续显示全部字幕",
-                                                child: SizedBox(
-                                                  width: 44,
-                                                  height: 30,
-                                                  child: FittedBox(
-                                                    fit: BoxFit.contain,
-                                                    child: Switch(
-                                                      key: const ValueKey(
-                                                        'subtitle-paragraph-mode-switch',
-                                                      ),
-                                                      value:
-                                                          _articleParagraphModeEnabled,
-                                                      onChanged:
-                                                          _updateArticleParagraphMode,
-                                                      materialTapTargetSize:
-                                                          MaterialTapTargetSize
-                                                              .shrinkWrap,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                              if (!isVeryNarrow)
-                                                const Expanded(
-                                                  child: Text(
-                                                    "关闭后连续显示全部字幕",
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                    style: TextStyle(
-                                                      fontSize: 10,
-                                                      color: Colors.white54,
-                                                    ),
-                                                  ),
-                                                ),
                                             ],
                                           ),
                                         ),
                                       ),
-                                    ),
-                                  if (_isArticleMode)
-                                    SizedBox(
-                                      height: 28,
-                                      child: Row(
-                                        children: [
-                                          SizedBox(
-                                            width: labelWidth,
-                                            child: Text(
-                                              isVeryNarrow ? "句" : "每段",
-                                              style: const TextStyle(
-                                                fontSize: 11,
-                                                color: Colors.white70,
-                                              ),
-                                            ),
-                                          ),
-                                          Expanded(
-                                            child: IgnorePointer(
-                                              ignoring:
-                                                  !_articleParagraphModeEnabled,
-                                              child: Opacity(
-                                                opacity:
-                                                    _articleParagraphModeEnabled
-                                                    ? 1
-                                                    : 0.45,
-                                                child: _SentenceCountInputWidget(
-                                                  value: _articleChunkSize,
-                                                  min: _minArticleChunkSize,
-                                                  max: _maxArticleChunkSize,
-                                                  onChanged:
-                                                      _updateArticleChunkSize,
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  if (!_isArticleMode)
-                                    SizedBox(
-                                      height: 28,
-                                      child: Row(
-                                        children: [
-                                          SizedBox(
-                                            width: labelWidth,
-                                            child: Text(
-                                              isVeryNarrow ? "时" : "时间",
-                                              style: const TextStyle(
-                                                fontSize: 11,
-                                                color: Colors.white70,
-                                              ),
-                                            ),
-                                          ),
-                                          Tooltip(
-                                            message: _showTimestamps
-                                                ? "隐藏时间"
-                                                : "显示时间",
-                                            child: InkWell(
-                                              key: const ValueKey(
-                                                'subtitle-show-time-switch',
-                                              ),
-                                              borderRadius:
-                                                  BorderRadius.circular(10),
-                                              onTap: () {
-                                                final value = !_showTimestamps;
-                                                setState(
-                                                  () => _showTimestamps = value,
-                                                );
-                                                final key = widget.isPortrait
-                                                    ? 'portraitSidebarShowTimestamps'
-                                                    : 'landscapeSidebarShowTimestamps';
-                                                SettingsService().updateSetting(
-                                                  key,
-                                                  value,
-                                                );
-                                              },
-                                              child: SizedBox(
-                                                width: 20,
-                                                height: 20,
-                                                child: Icon(
-                                                  _showTimestamps
-                                                      ? Icons.circle
-                                                      : Icons.circle_outlined,
-                                                  size: 12,
-                                                  color: _showTimestamps
-                                                      ? Colors.blueAccent
-                                                      : Colors.white38,
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                          if (_showTimestamps) ...[
-                                            const SizedBox(width: 4),
-                                            if (!isVeryNarrow)
-                                              const SizedBox(
-                                                width: 36,
-                                                child: Text(
-                                                  "宽度",
-                                                  style: TextStyle(
-                                                    fontSize: 11,
-                                                    color: Colors.white70,
-                                                  ),
-                                                ),
-                                              ),
-                                            Expanded(
-                                              child: _TimeColumnRatioSliderWidget(
-                                                ratio: _timeColumnRatio,
-                                                showValue: !isVeryNarrow,
-                                                onChanged: (nextRatio) {
-                                                  setState(
-                                                    () => _timeColumnRatio =
-                                                        nextRatio,
-                                                  );
-                                                },
-                                                onCommit: (nextRatio) {
-                                                  final key = widget.isPortrait
-                                                      ? 'portraitSidebarTimeColumnRatio'
-                                                      : 'landscapeSidebarTimeColumnRatio';
-                                                  SettingsService()
-                                                      .updateSetting(
-                                                        key,
-                                                        nextRatio,
-                                                      );
-                                                },
-                                              ),
-                                            ),
-                                          ],
-                                        ],
-                                      ),
-                                    ),
-                                ],
-                              );
-                            },
-                          ),
-                        ),
-                    ],
-                  ),
-
-                  // 2. 内容区
-                  Expanded(
-                    child: _displaySubtitles.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Text(
-                                  widget.showEmbeddedLoadingMessage
-                                      ? "已识别到内嵌字幕，\n正在提取中..."
-                                      : "暂无字幕",
-                                  style: const TextStyle(color: Colors.white54),
-                                  textAlign: TextAlign.center,
+                                    ],
+                                  ],
                                 ),
-                                if (widget.onOpenSubtitleManager != null) ...[
-                                  const SizedBox(height: 16),
-                                  InkWell(
-                                    canRequestFocus: false,
-                                    onTap: widget.onOpenSubtitleManager,
-                                    borderRadius: BorderRadius.circular(4),
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 16,
-                                        vertical: 8,
-                                      ),
-                                      decoration: BoxDecoration(
-                                        border: Border.all(
-                                          color: Colors.purpleAccent.withValues(
-                                            alpha: 0.5,
-                                          ),
+                              )
+                            // 只给字幕列表区再套一层指针登记：顶部工具栏按钮上的
+                            // 手指既不能充当双击的锚点，也不会被当成候选轻点。
+                            : Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  Listener(
+                                    behavior: HitTestBehavior.translucent,
+                                    onPointerDown:
+                                        _onTranscriptContextMenuPointer,
+                                    child: SelectionArea(
+                                      key: _textSelectionKey,
+                                      focusNode: _textSelectionFocusNode,
+                                      contextMenuBuilder:
+                                          _buildTextSelectionContextMenu,
+                                      onSelectionChanged:
+                                          _handleTextSelectionChanged,
+                                      child: _SelectionStatusObserver(
+                                        onStatusChanged:
+                                            _handleSelectionRegionStatusChanged,
+                                        child: Listener(
+                                          behavior: HitTestBehavior.translucent,
+                                          onPointerDown: _onListAreaPointerDown,
+                                          child: _isArticleMode
+                                              ? _buildArticleView(isSmallScreen)
+                                              : _buildListView(isSmallScreen),
                                         ),
-                                        borderRadius: BorderRadius.circular(4),
-                                        color: Colors.purpleAccent.withValues(
-                                          alpha: 0.1,
-                                        ),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: const [
-                                          Icon(
-                                            Icons.subtitles,
-                                            size: 18,
-                                            color: Colors.purpleAccent,
-                                          ),
-                                          SizedBox(width: 8),
-                                          Text(
-                                            "查看字幕管理",
-                                            style: TextStyle(
-                                              color: Colors.purpleAccent,
-                                              fontSize: 14,
-                                              fontWeight: FontWeight.bold,
-                                            ),
-                                          ),
-                                        ],
                                       ),
                                     ),
                                   ),
+                                  if (_hasTextSelection)
+                                    _buildSelectionPreservingScrollShield(),
                                 ],
-                              ],
-                            ),
-                          )
-                        // 只给字幕列表区再套一层指针登记：顶部工具栏按钮上的
-                        // 手指既不能充当双击的锚点，也不会被当成候选轻点。
-                        : Stack(
-                            fit: StackFit.expand,
-                            children: [
-                              Listener(
-                                behavior: HitTestBehavior.translucent,
-                                onPointerDown: _onTranscriptContextMenuPointer,
-                                child: SelectionArea(
-                                  key: _textSelectionKey,
-                                  focusNode: _textSelectionFocusNode,
-                                  contextMenuBuilder:
-                                      _buildTextSelectionContextMenu,
-                                  onSelectionChanged:
-                                      _handleTextSelectionChanged,
-                                  child: _SelectionStatusObserver(
-                                    onStatusChanged:
-                                        _handleSelectionRegionStatusChanged,
-                                    child: Listener(
-                                      behavior: HitTestBehavior.translucent,
-                                      onPointerDown: _onListAreaPointerDown,
-                                      child: _isArticleMode
-                                          ? _buildArticleView(isSmallScreen)
-                                          : _buildListView(isSmallScreen),
-                                    ),
-                                  ),
-                                ),
                               ),
-                              if (_hasTextSelection)
-                                _buildSelectionPreservingScrollShield(),
-                            ],
+                        if (_showFontSettings)
+                          Positioned(
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            child: _buildFloatingDisplaySettings(),
                           ),
+                      ],
+                    ),
                   ),
                 ],
               ),
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildFloatingDisplaySettings() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Color.alphaBlend(
+          Colors.white.withValues(alpha: 0.05),
+          const Color(0xFF1E1E1E),
+        ),
+        border: const Border(bottom: BorderSide(color: Colors.white10)),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final isVeryNarrow = constraints.maxWidth < 180;
+          final labelWidth = isVeryNarrow ? 24.0 : 52.0;
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                height: 28,
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: labelWidth,
+                      child: Text(
+                        isVeryNarrow ? "字" : "字体",
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: _FontSizeSliderWidget(
+                        fontSizeScale: _fontSizeScale,
+                        showValue: !isVeryNarrow,
+                        onChanged: (nextScale) {
+                          setState(() => _fontSizeScale = nextScale);
+                        },
+                        onCommit: (nextScale) {
+                          final key = widget.isPortrait
+                              ? 'portraitSidebarFontSizeScale'
+                              : 'landscapeSidebarFontSizeScale';
+                          SettingsService().updateSetting(key, nextScale);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(
+                height: 28,
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: labelWidth,
+                      child: Text(
+                        isVeryNarrow ? "定位" : "定位位置",
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: _LocatePositionInputWidget(
+                        key: ValueKey(
+                          'subtitle-locate-position-editor-${widget.isPortrait ? 'portrait' : 'landscape'}',
+                        ),
+                        value: _locatePositionPercent,
+                        onChanged: _updateLocatePositionPercent,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (_isArticleMode)
+                SizedBox(
+                  height: 32,
+                  child: Semantics(
+                    toggled: _articleParagraphModeEnabled,
+                    button: true,
+                    label: '段落模式',
+                    hint: '关闭后连续显示全部字幕',
+                    onTap: () => _updateArticleParagraphMode(
+                      !_articleParagraphModeEnabled,
+                    ),
+                    child: GestureDetector(
+                      key: const ValueKey('subtitle-paragraph-mode-control'),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _updateArticleParagraphMode(
+                        !_articleParagraphModeEnabled,
+                      ),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: labelWidth,
+                            child: Text(
+                              isVeryNarrow ? "段" : "段落模式",
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                          Tooltip(
+                            message: "关闭后连续显示全部字幕",
+                            child: SizedBox(
+                              width: 44,
+                              height: 30,
+                              child: FittedBox(
+                                fit: BoxFit.contain,
+                                child: Switch(
+                                  key: const ValueKey(
+                                    'subtitle-paragraph-mode-switch',
+                                  ),
+                                  value: _articleParagraphModeEnabled,
+                                  onChanged: _updateArticleParagraphMode,
+                                  materialTapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                ),
+                              ),
+                            ),
+                          ),
+                          if (!isVeryNarrow)
+                            const Expanded(
+                              child: Text(
+                                "关闭后连续显示全部字幕",
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.white54,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              if (_isArticleMode)
+                SizedBox(
+                  height: 28,
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: labelWidth,
+                        child: Text(
+                          isVeryNarrow ? "句" : "每段",
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: IgnorePointer(
+                          ignoring: !_articleParagraphModeEnabled,
+                          child: Opacity(
+                            opacity: _articleParagraphModeEnabled ? 1 : 0.45,
+                            child: _SentenceCountInputWidget(
+                              value: _articleChunkSize,
+                              min: _minArticleChunkSize,
+                              max: _maxArticleChunkSize,
+                              onChanged: _updateArticleChunkSize,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (!_isArticleMode)
+                SizedBox(
+                  height: 28,
+                  child: Row(
+                    children: [
+                      SizedBox(
+                        width: labelWidth,
+                        child: Text(
+                          isVeryNarrow ? "时" : "时间",
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                      Tooltip(
+                        message: _showTimestamps ? "隐藏时间" : "显示时间",
+                        child: InkWell(
+                          key: const ValueKey('subtitle-show-time-switch'),
+                          borderRadius: BorderRadius.circular(10),
+                          onTap: () {
+                            final value = !_showTimestamps;
+                            setState(() => _showTimestamps = value);
+                            final key = widget.isPortrait
+                                ? 'portraitSidebarShowTimestamps'
+                                : 'landscapeSidebarShowTimestamps';
+                            SettingsService().updateSetting(key, value);
+                          },
+                          child: SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: Icon(
+                              _showTimestamps
+                                  ? Icons.circle
+                                  : Icons.circle_outlined,
+                              size: 12,
+                              color: _showTimestamps
+                                  ? Colors.blueAccent
+                                  : Colors.white38,
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (_showTimestamps) ...[
+                        const SizedBox(width: 4),
+                        if (!isVeryNarrow)
+                          const SizedBox(
+                            width: 36,
+                            child: Text(
+                              "宽度",
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                        Expanded(
+                          child: _TimeColumnRatioSliderWidget(
+                            ratio: _timeColumnRatio,
+                            showValue: !isVeryNarrow,
+                            onChanged: (nextRatio) {
+                              setState(() => _timeColumnRatio = nextRatio);
+                            },
+                            onCommit: (nextRatio) {
+                              final key = widget.isPortrait
+                                  ? 'portraitSidebarTimeColumnRatio'
+                                  : 'landscapeSidebarTimeColumnRatio';
+                              SettingsService().updateSetting(key, nextRatio);
+                            },
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+            ],
+          );
+        },
       ),
     );
   }

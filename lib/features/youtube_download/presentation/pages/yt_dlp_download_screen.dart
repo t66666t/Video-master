@@ -201,10 +201,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
       AppToast.show('已创建 $successCount 个任务', type: AppToastType.success);
       _inputController.clear();
     } else {
-      AppToast.show(
-        service.resolvingStatus ?? '解析失败',
-        type: AppToastType.error,
-      );
+      final status = service.resolvingStatus;
+      if (status != null && status.isNotEmpty) {
+        AppToast.show(status, type: AppToastType.error);
+      }
     }
   }
 
@@ -2097,15 +2097,18 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
                                   iconSize: actionIconSize,
                                   onPressed: () => service.pauseTask(task),
                                 )
-                              else if (isPausing)
+                              else if (isPausing ||
+                                  task.status == YtDlpTaskStatus.resolving)
                                 SizedBox(
                                   width: actionButtonSize,
                                   height: actionButtonSize,
-                                  child: const Padding(
-                                    padding: EdgeInsets.all(6),
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(6),
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      color: Colors.amber,
+                                      color: isPausing
+                                          ? Colors.amber
+                                          : Colors.lightBlueAccent,
                                     ),
                                   ),
                                 )
@@ -2399,8 +2402,10 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
 
   Widget _buildTaskProgressSection(YtDlpTaskRecord task) {
     final progress = _normalizedTaskProgress(task);
+    final isResolvingTask = task.status == YtDlpTaskStatus.resolving;
     final showIndeterminate =
-        task.status == YtDlpTaskStatus.pausing && task.progress <= 0;
+        isResolvingTask ||
+        (task.status == YtDlpTaskStatus.pausing && task.progress <= 0);
     final effectiveProgress =
         task.status == YtDlpTaskStatus.queued && progress <= 0 ? 0.0 : progress;
     final stageText = task.statusMessage?.trim();
@@ -2431,7 +2436,7 @@ class _YtDlpDownloadScreenState extends State<YtDlpDownloadScreen> {
         Row(
           children: [
             Text(
-              '${(progress * 100).toStringAsFixed(2)}%',
+              isResolvingTask ? '' : '${(progress * 100).toStringAsFixed(2)}%',
               style: const TextStyle(color: Colors.white38, fontSize: 10),
             ),
             const Spacer(),

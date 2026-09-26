@@ -75,8 +75,11 @@ class DropZone<T extends Object> extends StatelessWidget {
 ///  - 平台拖拽的反馈置为透明、拖拽中保持原样，避免点击时出现拖拽残影；
 ///  - 拖拽视觉反馈由本组件用 [feedback] 自行绘制，且仅在真正开始移动后出现，
 ///    避免「长按选中」时闪出拖拽残影；
-///  - 位移未达阈值但发生过轻微移动（0 < 位移 < [threshold]）时，平台手势
-///    已把本次操作判定为非点击，通过 [onTap] 把「点击」语义补回来；
+///  - 位移已经超过内层点击容差、但还没到 [threshold] 时，原生 [Draggable]
+///    已把这次操作判成非点击，通过 [onTap] 把点击语义补回来；
+///  - 位移仍在点击容差内时不补偿。鼠标容差只有 1 逻辑像素，点击时的轻微
+///    抖动经常落在这个区间；若这里也补一次，会和卡片内部 [InkWell] 各
+///    触发一次，把同一播放页压进导航栈两次；
 ///  - 本次按住已经 armed 后，抬起时会在手势竞技场里抢占胜利，避免卡片内部
 ///    [InkWell] 把同一次松手再当成点击（否则会把刚选中的卡片立刻取消）。
 class GatedDraggable<T extends Object> extends StatefulWidget {
@@ -188,8 +191,12 @@ class _GatedDraggableState<T extends Object> extends State<GatedDraggable<T>> {
     }
     if (down != null && !armed) {
       final distance = (event.position - down).distance;
-      if (distance > 0 && distance < widget.threshold) {
-        // 轻微移动但未达拖拽阈值：平台已取消 InkWell 点击，这里补一次点击。
+      // 只在内层点击确定已被取消时补偿。鼠标的 Draggable 命中容差是 1
+      // 逻辑像素，0 < 位移 <= 容差时 InkWell 仍会自己触发；再补一次就会
+      // 把播放页 push 两层。触控容差大于拖拽阈值时，未达阈值的移动也仍由
+      // InkWell 处理，这里同样不能补。
+      if (distance > _innerTapCancelSlop(event.kind) &&
+          distance < widget.threshold) {
         widget.onTap?.call();
       }
     }
@@ -213,6 +220,17 @@ class _GatedDraggableState<T extends Object> extends State<GatedDraggable<T>> {
   void _disposeTapSuppressor() {
     _tapSuppressor?.dispose();
     _tapSuppressor = null;
+  }
+
+  /// 内层 [InkWell] / [GestureDetector] 不再把这次按下当成点击的最小位移。
+  ///
+  /// 取点击手势自身容差和竞争中的 [Draggable] 命中容差里更小的那个：谁先
+  /// 越界，谁就会把另一次点击从竞技场里淘汰掉。
+  double _innerTapCancelSlop(PointerDeviceKind kind) {
+    final settings = MediaQuery.maybeGestureSettingsOf(context);
+    final tapSlop = settings?.touchSlop ?? kTouchSlop;
+    final dragSlop = computeHitSlop(kind, settings);
+    return tapSlop < dragSlop ? tapSlop : dragSlop;
   }
 
   void _showFeedback(Offset position) {

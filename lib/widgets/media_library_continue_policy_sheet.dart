@@ -6,14 +6,15 @@ import 'package:provider/provider.dart';
 
 import '../models/media_library_continue_policy.dart';
 import '../services/settings_service.dart';
+import '../theme/app_tokens.dart';
 
 /// Bottom sheet for tuning continue-watching gates. Changes apply live.
 class MediaLibraryContinuePolicySheet {
   const MediaLibraryContinuePolicySheet._();
 
-  static const Color groupedBackground = Color(0xFF1C1C1E);
-  static const Color groupedCard = Color(0xFF2C2C2E);
-  static const Color iosBlue = Color(0xFF0A84FF);
+  static const Color groupedBackground = AppTokens.bgRaised;
+  static const Color groupedCard = AppTokens.bgOverlay;
+  static const Color iosBlue = AppTokens.accent;
   static const Color secondaryLabel = Color(0x99EBEBF5);
   static const Color tertiaryLabel = Color(0x4DEBEBF5);
 

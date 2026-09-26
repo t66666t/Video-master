@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
 
 import '../models/ocr_subtitle_models.dart';
@@ -22,7 +23,7 @@ Future<List<NormalizedOcrRegion>?> showOcrRegionEditor(
   OcrRegionFrameLoader? loadFastFrameAt,
   required OcrRegionFrameReleaser releaseFrame,
 }) => Navigator.of(context).push<List<NormalizedOcrRegion>>(
-  MaterialPageRoute(
+  AppMaterialPageRoute(
     fullscreenDialog: true,
     builder: (_) => OcrRegionEditor(
       framePath: framePath,

@@ -179,6 +179,38 @@ class MediaListGridMetrics {
   double get topPadding => mainSpacing;
 }
 
+/// Resolves [MediaLibraryFlowSpacing] from whichever style is on screen.
+MediaLibraryFlowSpacing mediaLibraryFlowSpacingFor({
+  required Size screenSize,
+  required bool useList,
+  required MediaCardStyleSettings cardStyle,
+  required MediaListStyleSettings listStyle,
+}) {
+  if (useList) {
+    final metrics = MediaListLayoutMetrics.forGrid(
+      screenShortestSide: screenSize.shortestSide,
+      availableWidth: screenSize.width,
+      crossAxisCount: listStyle.crossAxisCount,
+      heightSetting: listStyle.heightScale,
+      titleSetting: listStyle.titleScale,
+      mainSpacingSetting: listStyle.mainSpacingScale,
+      crossSpacingSetting: listStyle.crossSpacingScale,
+    );
+    return MediaLibraryFlowSpacing(
+      row: metrics.mainSpacing,
+      outer: metrics.outerPadding,
+    );
+  }
+  final metrics = MediaLibraryLayoutDefaults.cardGrid(
+    screenSize: screenSize,
+    style: cardStyle,
+  );
+  return MediaLibraryFlowSpacing(
+    row: metrics.mainSpacing,
+    outer: metrics.outerPadding,
+  );
+}
+
 /// Geometry shared by hit testing, box selection and drag selection.
 class MediaLibraryGridGeometry {
   const MediaLibraryGridGeometry({

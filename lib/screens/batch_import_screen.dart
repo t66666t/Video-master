@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
@@ -752,7 +753,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                                         onTap: () {
                                           Navigator.push(
                                             context,
-                                            MaterialPageRoute(
+                                            AppMaterialPageRoute(
                                               builder: (_) =>
                                                   SimpleVideoPreviewScreen(
                                                     videoPath: item.path!,
@@ -877,7 +878,7 @@ class _BatchImportScreenState extends State<BatchImportScreen> {
                                         onTap: () {
                                           Navigator.push(
                                             context,
-                                            MaterialPageRoute(
+                                            AppMaterialPageRoute(
                                               builder: (_) =>
                                                   SubtitlePreviewScreen(
                                                     subtitlePath: item.path!,

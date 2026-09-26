@@ -66,6 +66,7 @@ class AndroidHardwareInputBridge {
   static final Set<AndroidHardwareKeyListener> _keyListeners =
       <AndroidHardwareKeyListener>{};
   static final Set<int> _nativeMouseDevices = <int>{};
+  static final Map<int, Offset> _nativeMousePositions = <int, Offset>{};
   static bool _initialized = false;
 
   static void addKeyListener(AndroidHardwareKeyListener listener) {
@@ -132,10 +133,13 @@ class AndroidHardwareInputBridge {
     switch (action) {
       case 9: // MotionEvent.ACTION_HOVER_ENTER
       case 7: // MotionEvent.ACTION_HOVER_MOVE
-        // A parked cursor still emits hover while the user is touching.
-        // Drop those events so Tooltips/InkWell do not treat the leftover
-        // position as new mouse activity.
-        if (TooltipHoverPolicy.suppressSyntheticHover) return;
+        // A parked cursor still emits hover while, and just after, a touch.
+        // Drop it until the cursor actually moves.
+        if (!TooltipHoverPolicy.acceptHover(position)) {
+          _removeNativeMouse(device, timestamp, position);
+          return;
+        }
+        _nativeMousePositions[device] = position;
         ensureAdded();
         GestureBinding.instance.handlePointerEvent(
           PointerHoverEvent(
@@ -148,18 +152,39 @@ class AndroidHardwareInputBridge {
         );
         return;
       case 10: // MotionEvent.ACTION_HOVER_EXIT
-        if (!_nativeMouseDevices.remove(device)) return;
-        GestureBinding.instance.handlePointerEvent(
-          PointerRemovedEvent(
-            timeStamp: timestamp,
-            pointer: device,
-            device: device,
-            position: position,
-            kind: PointerDeviceKind.mouse,
-          ),
-        );
+        _removeNativeMouse(device, timestamp, position);
         return;
     }
+  }
+
+  /// Drops every re-injected mouse so MouseRegions exit when a finger goes down.
+  static void releaseParkedNativeMice() {
+    final devices = List<int>.of(_nativeMouseDevices);
+    for (final device in devices) {
+      _removeNativeMouse(
+        device,
+        Duration.zero,
+        _nativeMousePositions[device] ?? Offset.zero,
+      );
+    }
+  }
+
+  static void _removeNativeMouse(
+    int device,
+    Duration timestamp,
+    Offset position,
+  ) {
+    _nativeMousePositions.remove(device);
+    if (!_nativeMouseDevices.remove(device)) return;
+    GestureBinding.instance.handlePointerEvent(
+      PointerRemovedEvent(
+        timeStamp: timestamp,
+        pointer: device,
+        device: device,
+        position: position,
+        kind: PointerDeviceKind.mouse,
+      ),
+    );
   }
 
   @visibleForTesting

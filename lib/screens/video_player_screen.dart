@@ -6,7 +6,7 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:developer' as developer;
+import '../debug/developer_log.dart' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -15,6 +15,7 @@ import 'package:cross_file/cross_file.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:path/path.dart' as p;
 import '../services/embedded_subtitle_service.dart';
+import '../services/bilibili/bilibili_video_shot_backfill.dart';
 import '../services/media_playback_service.dart';
 import '../services/playback_navigation_service.dart';
 import '../services/playback_behavior_policy.dart';
@@ -434,6 +435,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     SettingsService settings,
   ) {
     return _canShowGhostSidebarControls(context) && settings.isGhostModeEnabled;
+  }
+
+  /// Preset captions can be dragged only in landscape video ghost editing.
+  /// This does not require the subtitle list sidebar to stay open.
+  bool _presetMoveSurfaceAllowsGhost(BuildContext context) {
+    final isLandscape =
+        MediaQuery.of(context).orientation == Orientation.landscape;
+    return !_isAudio && isLandscape && !_subtitleStyleFromCompose;
+  }
+
+  bool _presetGhostMoveActive(BuildContext context, SettingsService settings) {
+    return SubtitleDebugSession.instance.usesPresets &&
+        _isGhostDragMode &&
+        settings.isGhostModeEnabled &&
+        _presetMoveSurfaceAllowsGhost(context);
   }
 
   SidebarType _normalizedSidebarForRestore(SidebarType sidebar) {
@@ -1551,15 +1567,29 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _isGhostDragMode ||
             _isStyleSidebarDragMode ||
             _activeSidebar == SidebarType.subtitlePosition)) {
-      final shouldGhost = _canUseGhostSidebarEditing(context, settings);
-      setState(() {
-        _isGhostDragMode = shouldGhost;
-        _isSubtitleDragMode = !shouldGhost;
-        _isSubtitleSnappedX = false;
-        _isSubtitleSnappedY = false;
-        _isSubtitleNearCenterX = false;
-        _isSubtitleNearCenterY = false;
-      });
+      if (SubtitleDebugSession.instance.usesPresets) {
+        final allowGhost =
+            settings.isGhostModeEnabled &&
+            _presetMoveSurfaceAllowsGhost(context);
+        setState(() {
+          _isGhostDragMode = allowGhost;
+          _isSubtitleDragMode = false;
+          _isSubtitleSnappedX = false;
+          _isSubtitleSnappedY = false;
+          _isSubtitleNearCenterX = false;
+          _isSubtitleNearCenterY = false;
+        });
+      } else {
+        final shouldGhost = _canUseGhostSidebarEditing(context, settings);
+        setState(() {
+          _isGhostDragMode = shouldGhost;
+          _isSubtitleDragMode = !shouldGhost;
+          _isSubtitleSnappedX = false;
+          _isSubtitleSnappedY = false;
+          _isSubtitleNearCenterX = false;
+          _isSubtitleNearCenterY = false;
+        });
+      }
     }
 
     if (_initialized) {
@@ -2121,7 +2151,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       final exitControllerOwner = _isControllerOwner;
       final shouldSkipAutoPause = widget.skipAutoPauseOnExit && !_forceExit;
       final sidebarVisible = _isSubtitleSidebarVisible;
-      await settings.saveLandscapeSubtitleSidebarVisible(sidebarVisible);
+      // The value is applied immediately. Notifying here rebuilds the player
+      // on the same turn as the exit zoom is held, which is the stall before
+      // the transition. The next landscape entry reads the field directly.
+      await settings.saveLandscapeSubtitleSidebarVisible(
+        sidebarVisible,
+        notify: false,
+      );
       final suppressRouteCleanup =
           PlaybackNavigationService.instance.suppressAutoPauseOnRouteCleanup;
       final shouldAutoPause =
@@ -2134,7 +2170,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       if (exitController == null) {
         if (itemId != null) {
           if (shouldAutoPause && playbackService.currentItem?.id == itemId) {
-            await playbackService.pause(expectedItemId: itemId);
+            await playbackService.pause(expectedItemId: itemId, notify: false);
           }
           await playbackService.persistCurrentProgress(expectedItemId: itemId);
         }
@@ -2164,6 +2200,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         await playbackService.pause(
           expectedItemId: itemId,
           expectedController: exitController,
+          notify: false,
         );
       } else if (shouldAutoPauseSession) {
         await exitController.pause();
@@ -2173,6 +2210,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         playbackService.updatePlaybackStateFromController(
           expectedItemId: itemId,
           expectedController: exitController,
+          notify: false,
         );
       }
       await _saveProgressForSession(
@@ -2882,6 +2920,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     }
 
     _currentItem = currentItem;
+    if (mounted && currentItem != null) {
+      final item = currentItem!;
+      scheduleBilibiliVideoShotBackfill(
+        context: context,
+        item: item,
+        isStillCurrent: () => mounted && _currentItem?.id == item.id,
+        onUpdated: () {
+          if (mounted) setState(() {});
+        },
+      );
+    }
 
     if (currentItem != null) {
       _applyItemSubtitlePreference(currentItem, force: true);
@@ -3671,7 +3720,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _seekPlaybackPosition(target, source: 'subtitle_hop');
   }
 
-  void _togglePlay() async {
+  void _togglePlay() {
     MediaPlaybackService? playbackService;
     try {
       playbackService = Provider.of<MediaPlaybackService>(
@@ -3682,29 +3731,28 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     if (_isSourceMissing) {
       if (playbackService != null) {
-        await playbackService.resume();
+        unawaited(playbackService.resume());
       }
       return;
     }
 
-    if (playbackService != null && playbackService.controller == _controller) {
-      playbackService.updatePlaybackStateFromController();
-      if (_controller.value.isPlaying) {
-        await playbackService.pause();
+    // Session intent, not the lagging controller flag. A Windows cache-pause
+    // sample can say "not playing" while audio is running; branching on that
+    // called resume() and swallowed the pause.
+    if (playbackService != null &&
+        identical(playbackService.controller, _controller)) {
+      if (playbackService.desiredPlaying) {
+        unawaited(playbackService.pause());
       } else {
-        await playbackService.resume();
+        unawaited(playbackService.resume());
       }
       return;
     }
 
     if (_controller.value.isPlaying) {
-      await _controller.pause();
+      unawaited(_controller.pause());
     } else {
-      await _controller.play();
-    }
-
-    if (playbackService != null && playbackService.controller == _controller) {
-      playbackService.updatePlaybackStateFromController();
+      unawaited(_controller.play());
     }
   }
 
@@ -4133,12 +4181,35 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   // --- Drag Logic ---
   void _enterSubtitleDragMode() {
-    // Preset layout locks ordinary overlay dragging, but the move-subtitle
-    // sidebar must still open. Ghost editing is only available while the
-    // subtitle sidebar is visible, so closing that sidebar takes this path.
+    if (SubtitleDebugSession.instance.usesPresets) {
+      _enterPresetMove();
+      return;
+    }
     setState(() {
       _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
       _isSubtitleDragMode = true;
+      _isGhostDragMode = false;
+      _activeSidebar = SidebarType.subtitlePosition;
+      _isSubtitleSnappedX = false;
+      _isSubtitleSnappedY = false;
+      _isSubtitleNearCenterX = false;
+      _isSubtitleNearCenterY = false;
+    });
+  }
+
+  void _enterPresetMove() {
+    if (!_presetMoveSurfaceAllowsGhost(context)) {
+      AppToast.show('预设排版位置固定，可在横屏视频的幽灵模式中拖动', type: AppToastType.info);
+      return;
+    }
+    final settings = Provider.of<SettingsService>(context, listen: false);
+    if (settings.isGhostModeEnabled) {
+      _enterGhostDragMode();
+      return;
+    }
+    setState(() {
+      _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
+      _isSubtitleDragMode = false;
       _isGhostDragMode = false;
       _activeSidebar = SidebarType.subtitlePosition;
       _isSubtitleSnappedX = false;
@@ -4181,6 +4252,18 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   }
 
   void _enableStyleSidebarDragMode({required bool isGhost}) {
+    if (SubtitleDebugSession.instance.usesPresets && !isGhost) {
+      setState(() {
+        _isStyleSidebarDragMode = true;
+        _isSubtitleDragMode = false;
+        _isGhostDragMode = false;
+        _isSubtitleSnappedX = false;
+        _isSubtitleSnappedY = false;
+        _isSubtitleNearCenterX = false;
+        _isSubtitleNearCenterY = false;
+      });
+      return;
+    }
     setState(() {
       _isStyleSidebarDragMode = true;
       _isSubtitleDragMode = !isGhost;
@@ -4723,14 +4806,22 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                           context,
                                           settings,
                                         );
+                                    final presetGhostMove =
+                                        _presetGhostMoveActive(
+                                          context,
+                                          settings,
+                                        );
                                     final isGhostActive =
-                                        canEditGhostStyle &&
                                         !_subtitleStyleFromCompose &&
-                                        ((_activeSidebar ==
-                                                SidebarType.subtitles) ||
-                                            _isGhostDragMode ||
-                                            _activeSidebar ==
-                                                SidebarType.subtitleStyle);
+                                        (presetGhostMove ||
+                                            (canEditGhostStyle &&
+                                                ((_activeSidebar ==
+                                                        SidebarType
+                                                            .subtitles) ||
+                                                    _isGhostDragMode ||
+                                                    _activeSidebar ==
+                                                        SidebarType
+                                                            .subtitleStyle)));
                                     final SubtitleStyle activeSubtitleStyle =
                                         _isAudio
                                         ? (isLandscape
@@ -6294,9 +6385,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         );
 
       case SidebarType.subtitlePosition:
-        final canShowGhostControls = _canShowGhostSidebarControls(context);
         final canEditGhostStyle = _canUseGhostSidebarEditing(context, settings);
-        final isGhost = canEditGhostStyle && _isGhostDragMode;
+        final presetGhostMove = _presetGhostMoveActive(context, settings);
+        final isGhost =
+            (canEditGhostStyle && _isGhostDragMode) || presetGhostMove;
+        final lockPresetPosition =
+            SubtitleDebugSession.instance.usesPresets && !isGhost;
+        final canShowGhostControls =
+            _canShowGhostSidebarControls(context) ||
+            (SubtitleDebugSession.instance.usesPresets &&
+                _presetMoveSurfaceAllowsGhost(context));
         final currentAlign = isGhost
             ? settings.ghostModeAlignment
             : (_isAudio
@@ -6305,13 +6403,20 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
         return SubtitlePositionSidebar(
           currentAlignment: currentAlign,
-          onAlignmentChanged: (align) => isGhost
-              ? settings.saveGhostModeAlignment(align)
-              : (_isAudio
-                    ? settings.saveAudioSubtitleAlignment(align)
-                    : settings.saveSubtitleAlignment(align)),
+          lockPositionEditing: lockPresetPosition,
+          onAlignmentChanged: (align) {
+            if (lockPresetPosition) return;
+            if (isGhost) {
+              settings.saveGhostModeAlignment(align);
+            } else if (_isAudio) {
+              settings.saveAudioSubtitleAlignment(align);
+            } else {
+              settings.saveSubtitleAlignment(align);
+            }
+          },
           presets: settings.subtitlePresets,
           onSavePreset: () {
+            if (lockPresetPosition) return;
             final newPresets = List<Map<String, double>>.from(
               settings.subtitlePresets,
             );
@@ -6319,15 +6424,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             if (newPresets.length > 10) newPresets.removeLast();
             settings.saveSubtitlePresets(newPresets);
           },
-          onReset: () => isGhost
-              ? settings.saveGhostModeAlignment(const Alignment(0.0, 0.9))
-              : (_isAudio
-                    ? settings.saveAudioSubtitleAlignment(
-                        const Alignment(0.0, 0.9),
-                      )
-                    : settings.saveSubtitleAlignment(
-                        const Alignment(0.0, 0.9),
-                      )),
+          onReset: () {
+            if (lockPresetPosition) return;
+            if (isGhost) {
+              settings.saveGhostModeAlignment(const Alignment(0.0, 0.9));
+            } else if (_isAudio) {
+              settings.saveAudioSubtitleAlignment(const Alignment(0.0, 0.9));
+            } else {
+              settings.saveSubtitleAlignment(const Alignment(0.0, 0.9));
+            }
+          },
           onConfirm: _exitSubtitleDragMode,
           isGhostModeEnabled: settings.isGhostModeEnabled,
           onGhostModeToggle: (val) {

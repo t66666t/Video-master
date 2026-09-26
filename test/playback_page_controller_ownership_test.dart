@@ -94,8 +94,14 @@ void main() {
       'lib/services/media_playback_service.dart',
     ).readAsStringSync();
     expect(service, contains('shouldDeferPlayForActiveSession('));
-    expect(landscape, contains('shouldDeferPlayForActiveSession(currentItem.id)'));
-    expect(portrait, contains('shouldDeferPlayForActiveSession(currentItem.id)'));
+    expect(
+      landscape,
+      contains('shouldDeferPlayForActiveSession(currentItem.id)'),
+    );
+    expect(
+      portrait,
+      contains('shouldDeferPlayForActiveSession(currentItem.id)'),
+    );
     expect(landscape, contains('startPositionForCurrentSession('));
     expect(portrait, contains('startPositionForCurrentSession('));
   });
