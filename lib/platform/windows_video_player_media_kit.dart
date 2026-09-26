@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:collection';
 import 'dart:math' as math;
 
@@ -286,13 +287,38 @@ class NativeVideoPlayerMediaKit {
   /// when it can reject an unsupported decoder up front. Some Android codec
   /// implementations fail only after MediaCodec has been selected, so the
   /// platform wrapper also performs one explicit software retry in that case.
+  /// Linux GPU-less / broken CUDA hosts blue-screen when media_kit keeps HW
+  /// VO + Impeller GLES. Prefer software decode (`hwdec=no`) on Linux always.
   @visibleForTesting
   static String decoderOptionFor({
     required bool useHardwareDecoding,
     required String operatingSystem,
   }) {
-    if (!useHardwareDecoding) return 'no';
+    if (!useHardwareDecoding || operatingSystem == 'linux') return 'no';
     return operatingSystem == 'android' ? 'auto-safe' : 'auto';
+  }
+
+  /// Whether media_kit should enable GPU texture output (`enableHardwareAcceleration`).
+  /// Always false on Linux; also false when `/dev/dri` is missing (injectable).
+  @visibleForTesting
+  static bool shouldEnableHardwareVideoOutput(
+    String operatingSystem, {
+    bool? hasDriDevices,
+  }) {
+    if (operatingSystem == 'linux') return false;
+    if (hasDriDevices == false) return false;
+    return true;
+  }
+
+  /// Detects DRM render nodes. Only meaningful on Linux; injectable for tests.
+  @visibleForTesting
+  static bool linuxHasDriDevices({bool Function()? directoryExists}) {
+    final exists = directoryExists ?? () => Directory('/dev/dri').existsSync();
+    try {
+      return exists();
+    } catch (_) {
+      return false;
+    }
   }
 
   @visibleForTesting
@@ -390,6 +416,17 @@ class NativeVideoPlayerMediaKit {
   }) {
     if (!controllerInitialized) return true;
     return duration <= Duration.zero && !hasUsableMediaTrack;
+  }
+
+
+  /// Hosts without an ALSA/Pulse sound card make libmpv report
+  /// "Could not open/initialize audio device -> no sound." That is not a
+  /// fatal video failure: L3 requires silent degrade while video continues.
+  @visibleForTesting
+  static bool isRecoverableMissingAudioDeviceError(Object error) {
+    final message = '$error'.toLowerCase();
+    return message.contains('could not open/initialize audio device') ||
+        message.contains('no sound');
   }
 
   /// Identifies sources whose visual track can only be embedded cover art.
@@ -530,15 +567,26 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
   }
 
   VideoController _createVideoController(Player player) {
+    final operatingSystem = UniversalPlatform.operatingSystem;
+    final useHardwareDecoding = SettingsService().useHardwareVideoDecoding;
+    final hasDri = operatingSystem == 'linux'
+        ? NativeVideoPlayerMediaKit.linuxHasDriDevices()
+        : null;
+    final enableHardwareOutput =
+        NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput(
+      operatingSystem,
+      hasDriDevices: hasDri,
+    );
     return VideoController(
       player,
       configuration: VideoControllerConfiguration(
         hwdec: NativeVideoPlayerMediaKit.decoderOptionFor(
-          useHardwareDecoding: SettingsService().useHardwareVideoDecoding,
-          operatingSystem: UniversalPlatform.operatingSystem,
+          useHardwareDecoding: useHardwareDecoding && enableHardwareOutput,
+          operatingSystem: operatingSystem,
         ),
-        // This controls GPU texture rendering independently of decoder choice.
-        enableHardwareAcceleration: true,
+        // GPU texture VO is independent of decoder choice. Force software on
+        // Linux (and when /dev/dri is absent) to avoid solid/blue frames.
+        enableHardwareAcceleration: enableHardwareOutput,
       ),
     );
   }
@@ -1059,6 +1107,21 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
         _readyVideoOutputs.add(textureId);
       }
 
+      // Linux hosts without a sound card must keep video playing (silent).
+      // Prefer libmpv's null AO fallback before opening media so AO init
+      // failure does not abort the graph; the error listener still ignores
+      // residual "no sound" logs as non-fatal.
+      if (UniversalPlatform.isLinux) {
+        final platform = player.platform;
+        if (platform is NativePlayer) {
+          await platform.setProperty(
+            'audio-fallback-to-null',
+            'yes',
+            waitForInitialization: false,
+          );
+        }
+      }
+
       // Install the latency, clock, and pitch pipeline before opening media so
       // the first decoded frame enters the final graph. Replacing `af` after open
       // is inaudible while paused, but still needlessly rebuilds the native graph.
@@ -1569,6 +1632,15 @@ class _NativeMediaKitVideoPlayer extends VideoPlayerPlatform
       );
       streamSubscriptions.add(
         player.stream.error.listen((event) {
+          if (NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+            event,
+          )) {
+            debugPrint(
+              'MediaKit ignored missing audio device (video continues silently): '
+              '$event',
+            );
+            return;
+          }
           final state = decoderFallbackState;
           if (state != null && state.knownAudioOnly && !completer.isCompleted) {
             state.lastError = event;

@@ -369,8 +369,9 @@ class OcrSubtitleManager extends ChangeNotifier {
           'image2',
           output,
         ];
-        if (Platform.isWindows) {
+        if (FFmpegUtils.preferSystemFfmpeg) {
           try {
+            await FFmpegUtils.ensureAvailable();
             final ffmpegPath = await FFmpegUtils.ffmpegPath;
             final result = await Process.run(
               ffmpegPath,
@@ -902,18 +903,21 @@ class OcrSubtitleManager extends ChangeNotifier {
       '6',
       p.join(output.path, '%06d.jpg'),
     ];
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       final ffmpegPath = await FFmpegUtils.ffmpegPath;
       final process = await Process.start(ffmpegPath, args);
       _activeProcess = process;
-      unawaited(
-        Process.run('powershell.exe', <String>[
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          '(Get-Process -Id ${process.pid}).PriorityClass = "BelowNormal"',
-        ]).then<void>((_) {}).catchError((_) {}),
-      );
+      if (Platform.isWindows) {
+        unawaited(
+          Process.run('powershell.exe', <String>[
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            '(Get-Process -Id ${process.pid}).PriorityClass = "BelowNormal"',
+          ]).then<void>((_) {}).catchError((_) {}),
+        );
+      }
       final stdoutFuture = process.stdout.drain<void>();
       final stderrFuture = process.stderr
           .transform(systemEncoding.decoder)

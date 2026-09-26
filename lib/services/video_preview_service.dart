@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
@@ -168,7 +169,35 @@ class VideoPreviewService {
           _cache[key] = result;
         }
       } else {
-        if (request.precise) {
+        // Linux/desktop Process path: video_thumbnail has no Linux plugin —
+        // prefer system ffmpeg first so logs are not flooded with MissingPlugin.
+        if (FFmpegUtils.preferSystemFfmpeg) {
+          if (request.precise) {
+            result = await _extractFrameAccurate(
+              request.videoPath,
+              request.timeMs,
+              request.anchorTimeMs,
+            );
+            result ??= await _extractFrameFast(
+              request.videoPath,
+              request.timeMs,
+              maxWidth: _precisePreviewWidth,
+              quality: _precisePreviewQuality,
+            );
+          } else {
+            result = await _extractFrameFast(
+              request.videoPath,
+              request.timeMs,
+              maxWidth: _fastPreviewWidth,
+              quality: _fastPreviewQuality,
+            );
+            result ??= await _extractFrameAccurate(
+              request.videoPath,
+              request.timeMs,
+              request.anchorTimeMs,
+            );
+          }
+        } else if (request.precise) {
           result = await _extractFrameAccurate(
             request.videoPath,
             request.timeMs,
@@ -244,7 +273,7 @@ class VideoPreviewService {
 
   Future<List<int>> _loadKeyframeIndex(String videoPath) async {
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobePath, [
           '-v', 'error',
@@ -318,7 +347,7 @@ class VideoPreviewService {
 
   Future<double?> _loadFrameIntervalMs(String videoPath) async {
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobePath, [
           '-v', 'error',
@@ -472,14 +501,103 @@ class VideoPreviewService {
     int timeMs, {
     required int maxWidth,
     required int quality,
-  }) {
-    return VideoThumbnail.thumbnailData(
-      video: videoPath,
-      imageFormat: ImageFormat.JPEG,
-      maxWidth: maxWidth,
-      timeMs: timeMs,
-      quality: quality,
-    );
+  }) async {
+    // video_thumbnail has no Linux plugin; prefer system ffmpeg first.
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      return _extractFrameFfmpegSimple(
+        videoPath,
+        timeMs,
+        maxWidth: maxWidth,
+        quality: quality,
+      );
+    }
+    try {
+      return await VideoThumbnail.thumbnailData(
+        video: videoPath,
+        imageFormat: ImageFormat.JPEG,
+        maxWidth: maxWidth,
+        timeMs: timeMs,
+        quality: quality,
+      );
+    } on MissingPluginException catch (e) {
+      debugPrint(
+        'VideoPreviewService: video_thumbnail missing, falling back to ffmpeg: $e',
+      );
+      return _extractFrameFfmpegSimple(
+        videoPath,
+        timeMs,
+        maxWidth: maxWidth,
+        quality: quality,
+      );
+    }
+  }
+
+  /// Fast single-seek frame extract via ffmpeg (Linux / MissingPlugin fallback).
+  Future<Uint8List?> _extractFrameFfmpegSimple(
+    String videoPath,
+    int timeMs, {
+    required int maxWidth,
+    required int quality,
+  }) async {
+    File? outputFile;
+    try {
+      final tempDir = await _getTempDirectoryCached();
+      final outputPath = p.join(
+        tempDir.path,
+        'seek_preview_fast_${DateTime.now().microsecondsSinceEpoch}.jpg',
+      );
+      outputFile = File(outputPath);
+      final seekSec = (timeMs / 1000.0).toStringAsFixed(3);
+      // VideoThumbnail quality ~0-100; map roughly to ffmpeg -q:v (2..31).
+      final qv = (((100 - quality.clamp(1, 100)) / 100.0) * 29 + 2)
+          .round()
+          .clamp(2, 31);
+      final scale = maxWidth > 0 ? 'scale=$maxWidth:-1' : 'scale=176:-1';
+      final args = [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-ss',
+        seekSec,
+        '-i',
+        videoPath,
+        '-frames:v',
+        '1',
+        '-vf',
+        scale,
+        '-q:v',
+        '$qv',
+        '-y',
+        outputPath,
+      ];
+
+      if (FFmpegUtils.preferSystemFfmpeg) {
+        final ffmpegPath = await FFmpegUtils.ffmpegPath;
+        final result = await Process.run(ffmpegPath, args)
+            .timeout(const Duration(seconds: 20));
+        if (result.exitCode != 0) return null;
+      } else {
+        final session = await FFmpegKit.executeWithArguments(args);
+        final returnCode = await session.getReturnCode();
+        if (!ReturnCode.isSuccess(returnCode)) return null;
+      }
+
+      if (await outputFile.exists()) {
+        final bytes = await outputFile.readAsBytes();
+        if (bytes.isEmpty) return null;
+        return bytes;
+      }
+    } catch (_) {
+    } finally {
+      if (outputFile != null) {
+        try {
+          if (await outputFile.exists()) {
+            await outputFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+    return null;
   }
 
   Future<Uint8List?> _extractFrameAccurate(String videoPath, int targetTimeMs, int anchorTimeMs) async {
@@ -505,7 +623,7 @@ class VideoPreviewService {
         outputPath
       ];
 
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffmpegPath = await FFmpegUtils.ffmpegPath;
         final result = await Process.run(ffmpegPath, args).timeout(const Duration(seconds: 30));
         if (result.exitCode != 0) return null;

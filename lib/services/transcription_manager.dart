@@ -1,10 +1,12 @@
 import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
+import 'package:universal_platform/universal_platform.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import '../utils/app_data_paths.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
@@ -21,6 +23,7 @@ import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/temporary_storage_cleanup_models.dart';
 import 'package:video_player_app/services/task_subtitle_storage_service.dart';
 import 'package:video_player_app/utils/ffmpeg_utils.dart';
+import 'package:video_player_app/utils/linux_audio_device.dart';
 
 class TranscriptionManager extends ChangeNotifier {
   static const String _managedTempAudioDirName = 'ai_transcription_temp_audio';
@@ -255,7 +258,7 @@ class TranscriptionManager extends ChangeNotifier {
 
   Future<void> _initPersistenceDir() async {
     try {
-      final appDir = await getApplicationDocumentsDirectory();
+      final appDir = await resolveAppDataDirectory();
       _persistenceDirPath = appDir.path;
     } catch (e) {
       debugPrint('初始化持久化目录失败: $e');
@@ -922,7 +925,7 @@ class TranscriptionManager extends ChangeNotifier {
     final isAudioInput = _looksLikeAudioInput(mediaPath);
     Object? lastError;
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobePath = await FFmpegUtils.ffprobePath;
         final probeProcess = await Process.start(ffprobePath, [
           '-v',
@@ -1017,7 +1020,7 @@ class TranscriptionManager extends ChangeNotifier {
     } catch (e) {
       if (e is _JobCancelledException) rethrow;
       lastError = e;
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final fallbackInfo = await _probeMediaWithFfmpegCli(
           mediaPath,
           isAudioInput: isAudioInput,
@@ -1154,7 +1157,7 @@ class TranscriptionManager extends ChangeNotifier {
     final probe = await _probeMedia(mediaPath, cancellation);
     cancellation.throwIfCancelled();
     if (!probe.hasAudioStream) {
-      throw Exception("未检测到可用于转录的音频流");
+      throw Exception("媒体无音轨，无法生成字幕");
     }
 
     if (_canDirectlyUploadAudio(mediaPath, probe)) {
@@ -1337,7 +1340,8 @@ class TranscriptionManager extends ChangeNotifier {
       "准备音频: codec=${probe.codec}, isAudio=${probe.isAudioInput}, useCopy=$useCopy, timeout=${timeout.inSeconds}s",
     );
 
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       await _runWindowsFfmpeg(
         args,
         timeout: timeout,
@@ -1628,6 +1632,18 @@ class TranscriptionManager extends ChangeNotifier {
     return "$h:$m:$s,$ms";
   }
 
+
+  /// Clarify empty-SRT failures: no ASR text vs Linux host with no sound card.
+  Future<String> _emptyTranscriptionFailureMessage() async {
+    if (UniversalPlatform.isLinux) {
+      final hasOutput = await LinuxAudioDevice.hasLinuxAudioOutput();
+      if (!hasOutput) {
+        return '本机无音频设备，抽音频/识别可能失败';
+      }
+    }
+    return '识别结果为空，无法生成字幕（可能为无声或静音）';
+  }
+
   // 保存 SRT 文件
   Future<String> _saveSrtFile(
     String videoPath,
@@ -1636,7 +1652,7 @@ class TranscriptionManager extends ChangeNotifier {
   }) async {
     try {
       if (srtContent.trim().isEmpty) {
-        throw Exception("生成的字幕内容为空");
+        throw Exception(await _emptyTranscriptionFailureMessage());
       }
 
       if (_currentJobIsExternal) {
@@ -2386,7 +2402,8 @@ class TranscriptionManager extends ChangeNotifier {
 
     args.add(outputPath);
 
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       await _runEmbedFfmpegWindows(
         args,
         totalSeconds: totalSeconds,

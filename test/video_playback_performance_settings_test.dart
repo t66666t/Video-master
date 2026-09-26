@@ -1,10 +1,12 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/platform/windows_video_player_media_kit.dart';
+import 'package:video_player_app/utils/linux_audio_device.dart';
 import 'package:video_player_app/platform/local_playback_backend_policy.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_platform_interface/video_player_platform_interface.dart'
@@ -52,12 +54,7 @@ void main() {
       ),
       'auto-safe',
     );
-    for (final operatingSystem in <String>[
-      'ios',
-      'macos',
-      'windows',
-      'linux',
-    ]) {
+    for (final operatingSystem in <String>['ios', 'macos', 'windows']) {
       expect(
         NativeVideoPlayerMediaKit.decoderOptionFor(
           useHardwareDecoding: true,
@@ -73,6 +70,65 @@ void main() {
         'no',
       );
     }
+    // Linux always forces software decode to avoid CUDA/Impeller blue frames.
+    expect(
+      NativeVideoPlayerMediaKit.decoderOptionFor(
+        useHardwareDecoding: true,
+        operatingSystem: 'linux',
+      ),
+      'no',
+    );
+    expect(
+      NativeVideoPlayerMediaKit.decoderOptionFor(
+        useHardwareDecoding: false,
+        operatingSystem: 'linux',
+      ),
+      'no',
+    );
+  });
+
+  test('Linux disables hardware video output; missing /dev/dri also forces soft', () {
+    expect(
+      NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput('linux'),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput('linux', hasDriDevices: true),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput('windows'),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.shouldEnableHardwareVideoOutput(
+        'macos',
+        hasDriDevices: false,
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.linuxHasDriDevices(directoryExists: () => true),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.linuxHasDriDevices(directoryExists: () => false),
+      isFalse,
+    );
+  });
+
+  test('ALSA cards parser treats empty/missing cards as no output', () {
+    expect(LinuxAudioDevice.parseHasUsableAlsaCard(''), isFalse);
+    expect(
+      LinuxAudioDevice.parseHasUsableAlsaCard('--- no soundcards ---\n'),
+      isFalse,
+    );
+    expect(
+      LinuxAudioDevice.parseHasUsableAlsaCard(
+        ' 0 [PCH            ]: HDA-Intel - HDA Intel PCH\n',
+      ),
+      isTrue,
+    );
   });
 
   test('Android retries software only once before the first frame', () {
@@ -467,6 +523,37 @@ void main() {
         clockAfter: const Duration(milliseconds: 12080),
       ),
       const Duration(milliseconds: 12080),
+    );
+  });
+
+
+  test('missing audio device errors are recoverable without fatal forward', () {
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Could not open/initialize audio device -> no sound.',
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        PlatformException(
+          code: 'media_kit_error',
+          message: 'COULD NOT OPEN/INITIALIZE AUDIO DEVICE -> NO SOUND.',
+        ),
+      ),
+      isTrue,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Failed to open video decoder',
+      ),
+      isFalse,
+    );
+    expect(
+      NativeVideoPlayerMediaKit.isRecoverableMissingAudioDeviceError(
+        'Network timeout while buffering',
+      ),
+      isFalse,
     );
   });
 

@@ -1,7 +1,7 @@
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:video_player_app/utils/app_data_paths.dart';
 import 'dart:convert';
 import '../../debug/developer_log.dart' as developer;
 import 'dart:io' show ZLibDecoder, gzip;
@@ -44,7 +44,7 @@ class BilibiliApiService {
   }
 
   Future<void> init() async {
-    final appDocDir = await getApplicationDocumentsDirectory();
+    final appDocDir = await resolveAppDataDirectory();
     final cookiePath = "${appDocDir.path}/.bilibili_cookies";
     _cookieJar = PersistCookieJar(storage: FileStorage(cookiePath));
     _dio.interceptors.add(CookieManager(_cookieJar));

@@ -527,7 +527,7 @@ class BilibiliDownloadManager {
       final File mergedFile = File(outputPath);
       bool isCompatible = true;
       final requiresStrictCheck =
-          !Platform.isWindows &&
+          !FFmpegUtils.preferSystemFfmpeg &&
           _requiresStrictCompatibilityCheck(
             sourceCodec: videoStream.codecs,
             outputCodec: mergedProbe?.videoCodec,
@@ -1752,7 +1752,7 @@ class BilibiliDownloadManager {
       throw DownloadIntegrityException('$label 过小：$length bytes');
     }
 
-    final BilibiliMediaProbeResult? probe = Platform.isWindows
+    final BilibiliMediaProbeResult? probe = FFmpegUtils.preferSystemFfmpeg
         ? await _probeMediaOnWindows(file)
         : _fromMediaInformation(await _probeMediaWithKit(file));
     if (probe == null) {
@@ -1948,7 +1948,7 @@ class BilibiliDownloadManager {
     await _enqueueRepair(() async {
       _throwIfCancelled(cancelToken);
       ReturnCode returnCode;
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffmpegPath = await FFmpegUtils.ffmpegPath;
         final process = await Process.start(ffmpegPath, args);
         final stdoutDrain = process.stdout.drain<void>();
@@ -2027,7 +2027,7 @@ class BilibiliDownloadManager {
         requireVideo: true,
         requireAudio: true,
       );
-      if (!Platform.isWindows && !await _verifyVideo(repairedFile)) {
+      if (!FFmpegUtils.preferSystemFfmpeg && !await _verifyVideo(repairedFile)) {
         throw const DownloadIntegrityException('修复文件仍无法通过播放器检查');
       }
 
@@ -2095,7 +2095,7 @@ class BilibiliDownloadManager {
     CancelToken? cancelToken,
   }) async {
     _throwIfCancelled(cancelToken);
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
       final ffmpegPath = await FFmpegUtils.ffmpegPath;
       final process = await Process.start(ffmpegPath, args);
       final stdoutDrain = process.stdout.drain<void>();

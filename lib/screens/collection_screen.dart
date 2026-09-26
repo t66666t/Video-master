@@ -55,6 +55,7 @@ import '../services/playback_navigation_service.dart';
 import '../services/playlist_manager.dart';
 import 'home_screen.dart';
 import '../utils/app_toast.dart';
+import '../utils/reveal_in_file_manager.dart';
 import '../utils/media_library_range_selection.dart';
 import '../utils/android_hardware_input_bridge.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
@@ -1122,7 +1123,8 @@ class _CollectionScreenState extends State<CollectionScreen>
         settings.toggleFullScreen();
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.openLargeDataDirectory:
-        if (_isSelectionMode || !Platform.isWindows) {
+        if (_isSelectionMode ||
+            !(Platform.isWindows || Platform.isLinux)) {
           return KeyEventResult.handled;
         }
         _showLargeDataPathDialog(context);
@@ -1725,7 +1727,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                                   ),
                                   onPressed: () => settings.toggleFullScreen(),
                                 ),
-                              if (Platform.isWindows)
+                              if (Platform.isWindows || Platform.isLinux)
                                 ResponsiveIconButton(
                                   icon: Icons.folder_open,
                                   tooltip: _managementTooltip(
@@ -3465,11 +3467,13 @@ class _CollectionScreenState extends State<CollectionScreen>
   }
 
   Future<void> _showLargeDataPathDialog(BuildContext context) async {
-    if (!Platform.isWindows) return;
+    if (!(Platform.isWindows || Platform.isLinux)) return;
     final settings = Provider.of<SettingsService>(context, listen: false);
     final library = Provider.of<LibraryService>(context, listen: false);
     final defaultPath = await settings.getDefaultLargeDataRootPath();
-    String tempPath = settings.largeDataRootPath ?? defaultPath;
+    String tempPath = Platform.isWindows
+        ? (settings.largeDataRootPath ?? defaultPath)
+        : (await settings.resolveLargeDataRootDir()).path;
 
     if (!context.mounted) return;
     showDialog(
@@ -3490,52 +3494,84 @@ class _CollectionScreenState extends State<CollectionScreen>
               const SizedBox(height: 6),
               Text(defaultPath, style: const TextStyle(color: Colors.white)),
               const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: () async {
-                        try {
-                          final result = await FilePicker.platform
-                              .getDirectoryPath();
-                          if (result != null && result.isNotEmpty) {
-                            setDialogState(() {
-                              tempPath = result;
-                            });
+              if (Platform.isWindows)
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () async {
+                          try {
+                            final result = await FilePicker.platform
+                                .getDirectoryPath();
+                            if (result != null && result.isNotEmpty) {
+                              setDialogState(() {
+                                tempPath = result;
+                              });
+                            }
+                          } catch (e) {
+                            debugPrint('选择目录失败: $e');
+                            AppToast.show(
+                              '选择目录失败: $e',
+                              type: AppToastType.error,
+                            );
                           }
-                        } catch (e) {
-                          debugPrint('选择目录失败: $e');
-                          AppToast.show('选择目录失败: $e', type: AppToastType.error);
-                        }
-                      },
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF3A3A3A),
-                        foregroundColor: Colors.white,
-                      ),
-                      child: const Text("选择目录"),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: TextButton(
-                      onPressed: () {
-                        setDialogState(() {
-                          tempPath = defaultPath;
-                        });
-                      },
-                      child: const Text(
-                        "恢复默认",
-                        style: TextStyle(color: Colors.white70),
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF3A3A3A),
+                          foregroundColor: Colors.white,
+                        ),
+                        child: const Text("选择目录"),
                       ),
                     ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextButton(
+                        onPressed: () {
+                          setDialogState(() {
+                            tempPath = defaultPath;
+                          });
+                        },
+                        child: const Text(
+                          "恢复默认",
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              if (Platform.isWindows) const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: TextButton(
+                  onPressed: () async {
+                    final opened = await revealInFileManager(tempPath);
+                    if (!opened && context.mounted) {
+                      AppToast.show(
+                        '无法在文件管理器中显示',
+                        type: AppToastType.error,
+                      );
+                    }
+                  },
+                  child: const Text(
+                    "在文件管理器中显示",
+                    style: TextStyle(color: Colors.white70),
                   ),
-                ],
+                ),
               ),
-              const SizedBox(height: 8),
-              const Text(
-                "修改后会迁移媒体库视频、缩略图和字幕到新目录。",
-                style: TextStyle(color: Colors.white54, fontSize: 12),
-              ),
+              if (Platform.isWindows) ...[
+                const SizedBox(height: 8),
+                const Text(
+                  "修改后会迁移媒体库视频、缩略图和字幕到新目录。",
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+              if (Platform.isLinux) ...[
+                const SizedBox(height: 8),
+                const Text(
+                  "Linux 使用应用数据目录；此处可在文件管理器中打开当前路径。目录迁移仍仅支持 Windows。",
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
             ],
           ),
           actions: [
@@ -3543,23 +3579,33 @@ class _CollectionScreenState extends State<CollectionScreen>
               onPressed: () => Navigator.pop(context),
               child: const Text("取消", style: TextStyle(color: Colors.grey)),
             ),
-            ElevatedButton(
-              onPressed: () async {
-                final ok = await library.migrateLargeDataRoot(tempPath);
-                if (!context.mounted) return;
-                if (ok) {
-                  AppToast.show("迁移完成", type: AppToastType.success);
-                  Navigator.pop(context);
-                } else {
-                  AppToast.show("迁移失败，请检查目录权限", type: AppToastType.error);
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF4F7BF5),
-                foregroundColor: Colors.white,
+            if (Platform.isWindows)
+              ElevatedButton(
+                onPressed: () async {
+                  final ok = await library.migrateLargeDataRoot(tempPath);
+                  if (!context.mounted) return;
+                  if (ok) {
+                    AppToast.show("迁移完成", type: AppToastType.success);
+                    Navigator.pop(context);
+                  } else {
+                    AppToast.show("迁移失败，请检查目录权限", type: AppToastType.error);
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF4F7BF5),
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text("应用并迁移"),
+              )
+            else
+              ElevatedButton(
+                onPressed: () => Navigator.pop(context),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF4F7BF5),
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text("关闭"),
               ),
-              child: const Text("应用并迁移"),
-            ),
           ],
         ),
       ),

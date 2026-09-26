@@ -34,6 +34,7 @@ import '../services/task_subtitle_storage_service.dart';
 import '../services/subtitle_timeline_resolver.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/subtitle_hop_seek_policy.dart';
+import '../utils/linux_audio_device.dart';
 import '../utils/pgs_parser.dart';
 import '../utils/subtitle_converter.dart';
 import '../utils/subtitle_parser.dart';
@@ -3788,6 +3789,8 @@ class MediaPlaybackService extends ChangeNotifier {
     bool userInitiatedWatch = true,
     bool keepBookmarkOnFailure = false,
   }) async {
+    // Once-per-session UX hint on silent Linux hosts (no ALSA card).
+    unawaited(LinuxAudioDevice.maybeShowNoAudioDeviceHint());
     _streamQualitySwitchRequestId++;
     _isSwitchingStreamQuality = false;
     final int playRequestId = ++_playRequestId;

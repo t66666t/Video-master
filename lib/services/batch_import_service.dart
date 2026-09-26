@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import '../utils/app_data_paths.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 import 'settings_service.dart';
@@ -92,7 +93,7 @@ class BatchImportService extends ChangeNotifier {
 
   Future<void> init() async {
     if (_initialized) return;
-    _appDocDir = await getApplicationDocumentsDirectory();
+    _appDocDir = await resolveAppDataDirectory();
     await _loadState();
     _initialized = true;
     notifyListeners();

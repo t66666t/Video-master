@@ -1,7 +1,7 @@
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import '../../utils/app_data_paths.dart';
 
 class VideoComposeOutputPathService {
   const VideoComposeOutputPathService();
@@ -41,8 +41,8 @@ class VideoComposeOutputPathService {
       if (await downloadDir.exists()) {
         return downloadDir;
       }
-      return getApplicationDocumentsDirectory();
+      return resolveAppDataDirectory();
     }
-    return getApplicationDocumentsDirectory();
+    return resolveAppDataDirectory();
   }
 }

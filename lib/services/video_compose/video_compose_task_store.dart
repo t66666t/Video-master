@@ -3,7 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import '../../utils/app_data_paths.dart';
 
 import '../../models/video_compose_models.dart';
 
@@ -45,7 +45,7 @@ class VideoComposeTaskStore {
   }
 
   Future<File> _taskFile() async {
-    final Directory dir = await getApplicationDocumentsDirectory();
+    final Directory dir = await resolveAppDataDirectory();
     return File(p.join(dir.path, 'compose_tasks.json'));
   }
 }

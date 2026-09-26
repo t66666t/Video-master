@@ -5,7 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import 'utils/app_data_paths.dart';
 import 'package:provider/provider.dart';
 import 'dart:io';
 import 'package:window_manager/window_manager.dart';
@@ -472,7 +472,7 @@ String? _crashLogPath;
 /// 仅丢失日志能力，不影响应用启动。
 Future<void> _initCrashLogPath() async {
   try {
-    final dir = await getApplicationSupportDirectory();
+    final dir = await resolveAppDataDirectory();
     _crashLogPath = p.join(dir.path, 'crash_log.txt');
   } catch (e) {
     debugPrint('初始化崩溃日志路径失败: $e');

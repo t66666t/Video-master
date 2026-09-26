@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/foundation.dart';
+import 'package:video_player_app/utils/ffmpeg_utils.dart';
 
 class FFmpegService {
   // Singleton pattern
@@ -85,6 +86,32 @@ class FFmpegService {
     // However, we can fake it or just set it to 'indeterminate'. 
     // For now, we'll just set 0.5 when running and 1.0 when done.
     onProgress(0.1);
+
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      try {
+        await FFmpegUtils.ensureAvailable();
+        final ffmpegPath = await FFmpegUtils.ffmpegPath;
+        final result = await Process.run(ffmpegPath, [
+          '-i', videoPath,
+          '-i', audioPath,
+          '-c', 'copy',
+          '-y',
+          outputPath,
+        ]);
+        if (result.exitCode == 0) {
+          debugPrint("FFmpeg Success (system)");
+          onProgress(1.0);
+          onComplete(true, null);
+        } else {
+          final logs = result.stderr.toString();
+          debugPrint("FFmpeg Failed: $logs");
+          onComplete(false, "FFmpeg 失败: $logs");
+        }
+      } catch (e) {
+        onComplete(false, e.toString());
+      }
+      return;
+    }
 
     await FFmpegKit.executeAsync(command, (session) async {
       final returnCode = await session.getReturnCode();

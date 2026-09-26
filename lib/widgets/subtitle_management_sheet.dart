@@ -404,6 +404,11 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       } catch (e) {
         // Fallback
       }
+      return;
+    }
+    if (Platform.isLinux || Platform.isMacOS) {
+      // Resolved asynchronously when opening; placeholder for the path bar.
+      _defaultDownloadPath = 'Downloads';
     }
   }
 
@@ -3131,7 +3136,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
             ],
           ),
 
-          if (Platform.isWindows) ...[
+          if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) ...[
             SizedBox(height: layout.sectionGap),
             Container(
               padding: EdgeInsets.symmetric(

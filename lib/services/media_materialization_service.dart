@@ -1121,7 +1121,8 @@ class MediaMaterializationService extends ChangeNotifier {
   }
 
   Future<void> _executeFfmpeg(String itemId, List<String> args) async {
-    if (Platform.isWindows) {
+    if (FFmpegUtils.preferSystemFfmpeg) {
+      await FFmpegUtils.ensureAvailable();
       final ffmpeg = await FFmpegUtils.ffmpegPath;
       final process = await Process.start(ffmpeg, args);
       _activeMuxProcesses[itemId] = process;
@@ -1149,7 +1150,7 @@ class MediaMaterializationService extends ChangeNotifier {
     if (validator != null) return validator(path, expectedType);
     if (!await _isNonEmpty(File(path))) return false;
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobe = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobe, <String>[
           '-v',
@@ -1174,7 +1175,7 @@ class MediaMaterializationService extends ChangeNotifier {
   Future<bool> _probeHasVideoAndAudio(String path) async {
     if (!await _isNonEmpty(File(path))) return false;
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobe = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobe, <String>[
           '-v',
@@ -1202,7 +1203,7 @@ class MediaMaterializationService extends ChangeNotifier {
 
   Future<int?> _probeDurationMs(String path) async {
     try {
-      if (Platform.isWindows) {
+      if (FFmpegUtils.preferSystemFfmpeg) {
         final ffprobe = await FFmpegUtils.ffprobePath;
         final result = await Process.run(ffprobe, <String>[
           '-v',
