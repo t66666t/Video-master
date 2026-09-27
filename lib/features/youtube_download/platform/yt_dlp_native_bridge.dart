@@ -599,10 +599,24 @@ class YtDlpNativeBridge {
       );
       return;
     }
-    final producedPaths = await _findLinuxProducedPaths(request);
-    final outputPath =
-        _linuxOutputPaths.remove(request.taskId) ??
+    
+    // Collect producedPaths from directory scan
+    var producedPaths = await _findLinuxProducedPaths(request);
+    
+    // Retrieve AFTER_MOVE hook path if available
+    final hookOutputPath = _linuxOutputPaths.remove(request.taskId);
+    
+    // When exitCode is 0 but scan found no files, trust the AFTER_MOVE hook path
+    // if it exists on disk (aligns with Win/macOS behavior that trust hook paths)
+    if (exitCode == 0 && producedPaths.isEmpty && hookOutputPath != null) {
+      if (await File(hookOutputPath).exists()) {
+        producedPaths = [hookOutputPath];
+      }
+    }
+    
+    final outputPath = hookOutputPath ??
         (producedPaths.isEmpty ? null : producedPaths.first);
+    
     if (exitCode == 0 && producedPaths.isNotEmpty) {
       _emitLinuxEvent(
         DownloadTaskEvent(
@@ -614,12 +628,14 @@ class YtDlpNativeBridge {
         ),
       );
     } else {
+      // Filter internal markers from user-facing error message
+      final userMessage = _buildLinuxErrorMessage(messages, exitCode);
       _emitLinuxEvent(
         DownloadTaskEvent(
           taskId: request.taskId,
           type: 'task_failed',
           errorCode: 'YT_DLP_EXIT_$exitCode',
-          message: messages.isEmpty ? 'yt-dlp 下载失败' : messages.last,
+          message: userMessage,
           outputPath: outputPath,
           producedPaths: producedPaths,
         ),
@@ -671,6 +687,26 @@ class YtDlpNativeBridge {
         ),
       );
     }
+  }
+
+  /// Build user-facing error message, filtering out internal progress hook markers
+  String _buildLinuxErrorMessage(List<String> messages, int exitCode) {
+    if (messages.isEmpty) return 'yt-dlp 下载失败 (退出代码 $exitCode)';
+    
+    // Filter messages backwards to find the first non-internal-marker line
+    for (int i = messages.length - 1; i >= 0; i--) {
+      final line = messages[i];
+      // Skip internal hook markers that should not be shown to users
+      if (line.contains('__YTDLP_AFTER_MOVE__:') ||
+          line.contains('__YTDLP_BEFORE_DL__:')) {
+        continue;
+      }
+      // Return first meaningful message
+      return line;
+    }
+    
+    // Fallback if all messages were internal markers
+    return 'yt-dlp 下载失败 (退出代码 $exitCode)';
   }
 
   Future<List<String>> _findLinuxProducedPaths(
