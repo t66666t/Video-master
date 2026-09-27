@@ -22,8 +22,8 @@ class MediaLibraryRecentView extends StatefulWidget {
     required this.cardBottomPadding,
     required this.onOpenMedia,
     required this.onLocateMedia,
-    this.onOpenFolder,
-    this.onLocateFolder,
+    required this.onOpenFolder,
+    required this.onLocateFolder,
     this.expandBatchId,
     this.isActive = true,
   });
@@ -32,8 +32,8 @@ class MediaLibraryRecentView extends StatefulWidget {
   final double cardBottomPadding;
   final ValueChanged<VideoItem> onOpenMedia;
   final ValueChanged<VideoItem> onLocateMedia;
-  final ValueChanged<VideoCollection>? onOpenFolder;
-  final ValueChanged<VideoCollection>? onLocateFolder;
+  final ValueChanged<VideoCollection> onOpenFolder;
+  final ValueChanged<VideoCollection> onLocateFolder;
   final String? expandBatchId;
 
   /// Hidden keep-alive copies skip Provider watches and reuse the last tree.
@@ -47,21 +47,12 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   final MediaLibraryGroupExpandMemory _expand = MediaLibraryGroupExpandMemory();
   final Map<String, GlobalKey> _headerKeys = <String, GlobalKey>{};
   String? _appliedExpandBatchId;
-  String? _topRowId;
-  bool _userScrolled = false;
-  bool _showNewContentHint = false;
   Widget? _frozenSubtree;
   LibraryService? _library;
   bool _libraryChangedWhileAway = false;
   bool _tryReuseFrozen = false;
   int? _frozenViewMode;
   double? _frozenBottomPadding;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.scrollController.addListener(_onScroll);
-  }
 
   @override
   void didChangeDependencies() {
@@ -77,10 +68,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   @override
   void didUpdateWidget(covariant MediaLibraryRecentView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.scrollController != widget.scrollController) {
-      oldWidget.scrollController.removeListener(_onScroll);
-      widget.scrollController.addListener(_onScroll);
-    }
     if (oldWidget.expandBatchId != widget.expandBatchId) {
       _appliedExpandBatchId = null;
       _tryReuseFrozen = false;
@@ -93,20 +80,12 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   @override
   void dispose() {
     _library?.removeListener(_onLibraryQuiet);
-    widget.scrollController.removeListener(_onScroll);
     super.dispose();
   }
 
   void _onLibraryQuiet() {
     if (!mounted || widget.isActive) return;
     _libraryChangedWhileAway = true;
-  }
-
-  void _onScroll() {
-    if (!widget.scrollController.hasClients) return;
-    if (widget.scrollController.offset > 24) {
-      _userScrolled = true;
-    }
   }
 
   void _expandRequestedBatch(List<RecentAddedEntry> entries) {
@@ -119,45 +98,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
         _expand.forceOpen(entry.rowId);
       }
     }
-  }
-
-  void _syncNewContentHint(List<RecentAddedEntry> entries) {
-    final nextTop = entries.isEmpty ? null : entries.first.rowId;
-    if (_topRowId == null) {
-      _topRowId = nextTop;
-      return;
-    }
-    if (nextTop == _topRowId) return;
-    final atTop =
-        !widget.scrollController.hasClients ||
-        widget.scrollController.offset <= 24;
-    if (atTop && !_userScrolled) {
-      setState(() {
-        _topRowId = nextTop;
-        _showNewContentHint = false;
-      });
-      return;
-    }
-    if (!_showNewContentHint) {
-      setState(() => _showNewContentHint = true);
-    }
-  }
-
-  Future<void> _jumpToNewContent() async {
-    if (!widget.scrollController.hasClients) return;
-    await widget.scrollController.animateTo(
-      0,
-      duration: const Duration(milliseconds: 280),
-      curve: Curves.easeOutCubic,
-    );
-    if (!mounted) return;
-    setState(() {
-      _showNewContentHint = false;
-      _userScrolled = false;
-      final library = context.read<LibraryService>();
-      final entries = library.activityProjection.recentAddedEntries();
-      _topRowId = entries.isEmpty ? null : entries.first.rowId;
-    });
   }
 
   bool _canReuseFrozen(SettingsService settings) {
@@ -187,10 +127,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     _libraryChangedWhileAway = false;
     final entries = library.activityProjection.recentAddedEntries();
     _expandRequestedBatch(entries);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !widget.isActive) return;
-      _syncNewContentHint(entries);
-    });
 
     if (entries.isEmpty) {
       _frozenViewMode = settings.mediaLibraryViewMode;
@@ -207,56 +143,24 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     final flow = _flowSpacing(settings, screenSize, useList);
     _frozenViewMode = settings.mediaLibraryViewMode;
     _frozenBottomPadding = widget.cardBottomPadding;
-    _frozenSubtree = Stack(
-      children: [
-        CustomScrollView(
-          controller: widget.scrollController,
-          slivers: [
-            if (flow.gap(flow.leading) case final leading?) leading,
-            ..._sliversForEntries(
-              context: context,
-              library: library,
-              settings: settings,
-              entries: entries,
-              useList: useList,
-              flow: flow,
-            ),
-            SliverToBoxAdapter(
-              child: SizedBox(height: 24 + widget.cardBottomPadding),
-            ),
-          ],
+    _frozenSubtree = CustomScrollView(
+      controller: widget.scrollController,
+      slivers: [
+        if (flow.gap(flow.leading) case final leading?) leading,
+        ..._sliversForEntries(
+          context: context,
+          library: library,
+          settings: settings,
+          entries: entries,
+          useList: useList,
+          flow: flow,
         ),
-        if (_showNewContentHint)
-          Positioned(
-            top: 12,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: Material(
-                color: const Color(0xFF2A2A2A),
-                borderRadius: BorderRadius.circular(20),
-                child: InkWell(
-                  onTap: () => unawaitedJump(),
-                  borderRadius: BorderRadius.circular(20),
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                    child: Text(
-                      '有新添加内容',
-                      style: TextStyle(color: Colors.white, fontSize: 13),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
+        SliverToBoxAdapter(
+          child: SizedBox(height: 24 + widget.cardBottomPadding),
+        ),
       ],
     );
     return _frozenSubtree!;
-  }
-
-  void unawaitedJump() {
-    // Ignore the Future; scroll completion updates state in [_jumpToNewContent].
-    _jumpToNewContent();
   }
 
   List<Widget> _sliversForEntries({
@@ -599,8 +503,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required bool useList,
     MediaListStyleSettings? listStyle,
   }) {
-    final open = widget.onOpenFolder;
-    final locate = widget.onLocateFolder;
     if (useList) {
       final style =
           listStyle ?? settings.listStyleFor(MediaQuery.sizeOf(context));
@@ -612,10 +514,8 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
         isSelected: false,
         isSelectionMode: false,
         titleScale: style.titleScale,
-        onTap: () => open?.call(collection),
-        onShowInParentFolder: locate == null
-            ? null
-            : () => locate(collection),
+        onTap: () => widget.onOpenFolder(collection),
+        onShowInParentFolder: () => widget.onLocateFolder(collection),
         showActivityMenu: true,
         allowHide: false,
       );
@@ -625,8 +525,8 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
       titleScale: settings
           .collectionCardStyleFor(MediaQuery.sizeOf(context))
           .titleScale,
-      onTap: () => open?.call(collection),
-      onLocate: locate == null ? null : () => locate(collection),
+      onTap: () => widget.onOpenFolder(collection),
+      onLocate: () => widget.onLocateFolder(collection),
     );
   }
 

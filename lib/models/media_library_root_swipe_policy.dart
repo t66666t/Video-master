@@ -3,12 +3,15 @@ import 'package:flutter/gestures.dart';
 import 'media_library_root_entry.dart';
 import 'media_library_root_entry_order.dart';
 
-/// Strict adjacent-tab swipe for 继续学习 / 最近添加 / 文件夹.
+/// Swipe between 继续学习 / 最近添加 / 文件夹.
 ///
-/// Mouse and trackpad are never eligible: desktop box-select, file drops,
-/// and wheel/trackpad pans would mis-fire. System back lives on the screen
-/// edges, so those strips are also ignored. The recognizer itself is a
-/// horizontal drag so a vertical list scroll keeps the arena.
+/// One move still tracks the finger. Travel past a full page keeps going
+/// into the page after that, and a flick back toward the page under the
+/// finger returns there. Mouse and trackpad are never eligible: desktop
+/// box-select, file drops, and wheel/trackpad pans would mis-fire. System
+/// back lives on the screen edges, so those strips are also ignored. The
+/// recognizer itself is a horizontal drag so a vertical list scroll keeps
+/// the arena.
 class MediaLibraryRootSwipePolicy {
   const MediaLibraryRootSwipePolicy._();
 
@@ -65,10 +68,11 @@ class MediaLibraryRootSwipePolicy {
 
   /// Page to show after the finger lifts. Null stays on [current].
   ///
-  /// [shouldCommit] only accepts a flick that points the same way as
-  /// [dragDx]. Past [commitFraction] that locks the first direction, so a
-  /// halfway drag that reverses still lands on the page being left. A flick
-  /// against the current offset picks the other neighbor instead.
+  /// A flick in the same direction as [dragDx], or a drag past
+  /// [commitFraction], opens the neighbor on that side. A flick back
+  /// toward [current] cancels, including after the drag has passed
+  /// [commitFraction]. The finger has to actually cross onto the other
+  /// side before that side can win.
   static MediaLibraryRootEntry? settleTarget({
     required MediaLibraryRootEntry current,
     required double dragDx,
@@ -78,17 +82,38 @@ class MediaLibraryRootSwipePolicy {
   }) {
     if (width <= 0) return null;
     if (_isOpposingFlick(dragDx: dragDx, velocityDx: velocityDx)) {
-      final direction = velocityDx > 0 ? 1.0 : -1.0;
-      return neighbor(current: current, dx: direction, order: order);
+      return null;
     }
-    if (!shouldCommit(
-      dragDx: dragDx,
-      width: width,
-      velocityDx: velocityDx,
-    )) {
+    if (!shouldCommit(dragDx: dragDx, width: width, velocityDx: velocityDx)) {
       return null;
     }
     return neighbor(current: current, dx: dragDx, order: order);
+  }
+
+  /// Moves the origin when the finger has traveled a full page.
+  ///
+  /// [indexDelta] is +1 when [dragDx] has reached the next chip
+  /// (`<= -width`). [residualDx] is the same on-screen position measured
+  /// from that chip, so the gesture can continue into the page after it.
+  /// The caller repeats this once per page a single move crosses.
+  static MediaLibraryRootSwipeShift? shiftOrigin({
+    required double dragDx,
+    required double width,
+  }) {
+    if (width <= 0) return null;
+    if (dragDx <= -width) {
+      return MediaLibraryRootSwipeShift(
+        indexDelta: 1,
+        residualDx: dragDx + width,
+      );
+    }
+    if (dragDx >= width) {
+      return MediaLibraryRootSwipeShift(
+        indexDelta: -1,
+        residualDx: dragDx - width,
+      );
+    }
+    return null;
   }
 
   static bool _isOpposingFlick({
@@ -132,4 +157,18 @@ class MediaLibraryRootSwipePolicy {
   }) {
     return (1.0 - (highlightIndex - entryIndex).abs()).clamp(0.0, 1.0);
   }
+}
+
+/// One full page of travel, measured from the page the finger is now on.
+class MediaLibraryRootSwipeShift {
+  const MediaLibraryRootSwipeShift({
+    required this.indexDelta,
+    required this.residualDx,
+  });
+
+  /// +1 moves toward the next chip. -1 moves toward the previous chip.
+  final int indexDelta;
+
+  /// Finger offset after the origin moves, in the same coordinate space.
+  final double residualDx;
 }

@@ -144,4 +144,89 @@ void main() {
       await tester.pumpAndSettle();
     },
   );
+
+  testWidgets('custom item count can be scheduled from the dialog', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(800, 600);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final settings = SettingsService();
+    await settings.init();
+    final playback = MediaPlaybackService();
+    await playback.sleepTimer.initialize(
+      playbackListenable: playback,
+      isPlaybackRunning: () => false,
+      onExpired: () async {},
+    );
+
+    await tester.pumpWidget(
+      MultiProvider(
+        providers: [
+          ChangeNotifierProvider<SettingsService>.value(value: settings),
+          ChangeNotifierProvider<MediaPlaybackService>.value(value: playback),
+        ],
+        child: MaterialApp(
+          theme: ThemeData.dark(),
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: FilledButton(
+                  onPressed: () => showSleepTimerDialog(context),
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    expect(find.text('再播 1 个'), findsOneWidget);
+    expect(find.text('再播 3 个'), findsNothing);
+
+    await tester.tap(find.text('再播 1 个'));
+    await tester.pumpAndSettle();
+    expect(playback.sleepTimer.scheduledItemCount, 1);
+    expect(playback.sleepTimer.statusText, '当前结束后再播放 1 个');
+
+    await tester.enterText(
+      find.byKey(const Key('sleepTimerCustomItemCount')),
+      '5',
+    );
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pumpAndSettle();
+    expect(playback.sleepTimer.scheduledItemCount, 5);
+    expect(playback.sleepTimer.remainingItemCount, 5);
+    expect(playback.sleepTimer.awaitingCurrentItemEnd, isTrue);
+    expect(playback.sleepTimer.statusText, '当前结束后再播放 5 个');
+
+    await tester.enterText(
+      find.byKey(const Key('sleepTimerCustomItemCount')),
+      '8',
+    );
+    FocusManager.instance.primaryFocus?.unfocus();
+    await tester.pump();
+    await tester.tap(find.byTooltip('设置再播数量'));
+    await tester.pumpAndSettle();
+    expect(playback.sleepTimer.scheduledItemCount, 8);
+    expect(playback.sleepTimer.statusText, '当前结束后再播放 8 个');
+
+    await tester.enterText(
+      find.byKey(const Key('sleepTimerCustomItemCount')),
+      '0',
+    );
+    FocusManager.instance.primaryFocus?.unfocus();
+    await tester.pump();
+    await tester.tap(find.byTooltip('设置再播数量'));
+    await tester.pump();
+    expect(playback.sleepTimer.scheduledItemCount, 8);
+
+    await tester.tap(find.byTooltip('关闭'));
+    await tester.pumpAndSettle();
+  });
 }

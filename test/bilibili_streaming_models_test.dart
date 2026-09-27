@@ -127,6 +127,85 @@ class _BackupOnlyQualityApiService extends BilibiliApiService {
   }
 }
 
+class _SwitchingPlayUrlApi extends BilibiliApiService {
+  _SwitchingPlayUrlApi({
+    required this.origin,
+    required this.firstVideoPath,
+    required this.secondVideoPath,
+    this.firstDeadline,
+    this.secondDeadline,
+  });
+
+  final Uri origin;
+  final String firstVideoPath;
+  final String secondVideoPath;
+  final int? firstDeadline;
+  final int? secondDeadline;
+  int fetchPlayUrlCalls = 0;
+
+  @override
+  Future<Map<String, dynamic>?> fetchVideoShot(String bvid, int cid) async =>
+      null;
+
+  @override
+  Future<BilibiliStreamInfo> fetchPlayUrl(String bvid, int cid) async {
+    final first = fetchPlayUrlCalls == 0;
+    fetchPlayUrlCalls++;
+    return _switchableStreamInfo(
+      origin,
+      first ? firstVideoPath : secondVideoPath,
+      deadline: first ? firstDeadline : secondDeadline,
+    );
+  }
+}
+
+BilibiliStreamInfo _switchableStreamInfo(
+  Uri origin,
+  String videoPath, {
+  int? deadline,
+}) {
+  String url(String path) {
+    final signed = origin.replace(path: path);
+    if (deadline == null) return signed.toString();
+    return signed
+        .replace(queryParameters: {'deadline': '$deadline'})
+        .toString();
+  }
+
+  return BilibiliStreamInfo(
+    durationMs: 120000,
+    qualityMap: const {80: '1080P 高清'},
+    videoStreams: [
+      StreamItem(
+        id: 80,
+        baseUrl: url(videoPath),
+        bandwidth: 800000,
+        codecs: 'avc1.640028',
+        codecid: 7,
+        mimeType: 'video/mp4',
+        qualityName: '1080P 高清',
+        width: 1920,
+        height: 1080,
+        frameRate: '30',
+        initializationRange: '0-999',
+        indexRange: '1000-1999',
+      ),
+    ],
+    audioStreams: [
+      StreamItem(
+        id: 30280,
+        baseUrl: url('/audio.m4s'),
+        bandwidth: 128000,
+        codecs: 'mp4a.40.2',
+        codecid: 0,
+        mimeType: 'audio/mp4',
+        initializationRange: '0-899',
+        indexRange: '900-1799',
+      ),
+    ],
+  );
+}
+
 VideoItem _streamItem(String id) => VideoItem(
   id: id,
   path: 'bilibili://stream/BV1xx411c7mD?cid=456',
@@ -693,6 +772,194 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 400));
       expect(service.relayedBodyBytes, lessThan(videoBytes.length));
       expect(service.relayedBodyBytes - afterRelease, lessThan(64 * 1024));
+    },
+  );
+
+  test('gateway refreshes a playurl before its CDN deadline', () async {
+    final requested = <String>[];
+    final payload = List<int>.generate(32, (index) => index + 1);
+    final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final upstreamTask = () async {
+      await for (final request in upstream) {
+        requested.add(request.uri.path);
+        request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+        request.response.contentLength = payload.length;
+        if (request.method != 'HEAD') request.response.add(payload);
+        await request.response.close();
+      }
+    }();
+    addTearDown(() async {
+      await upstream.close(force: true);
+      await upstreamTask;
+    });
+    final origin = Uri(
+      scheme: 'http',
+      host: InternetAddress.loopbackIPv4.address,
+      port: upstream.port,
+    );
+    final expired = DateTime.now().toUtc().subtract(const Duration(hours: 1));
+    final fresh = DateTime.now().toUtc().add(const Duration(hours: 2));
+    final api = _SwitchingPlayUrlApi(
+      origin: origin,
+      firstVideoPath: '/stale-video.m4s',
+      secondVideoPath: '/fresh-video.m4s',
+      firstDeadline: expired.millisecondsSinceEpoch ~/ 1000,
+      secondDeadline: fresh.millisecondsSinceEpoch ~/ 1000,
+    );
+    final tempCache = await Directory.systemTemp.createTemp(
+      'bilibili-stream-deadline-',
+    );
+    addTearDown(() => tempCache.delete(recursive: true));
+    final service = BilibiliStreamingService(
+      api,
+      mediaUriValidator: (uri) => uri.host == origin.host,
+      cacheDirectory: tempCache,
+    );
+    addTearDown(service.shutdown);
+    final prepared = await service.prepare(_streamItem('deadline-refresh'));
+    expect(api.fetchPlayUrlCalls, 1);
+
+    final client = HttpClient();
+    addTearDown(() => client.close(force: true));
+    final response = await (await client.getUrl(prepared.videoUri)).close();
+    final body = await response.fold<List<int>>(
+      <int>[],
+      (buffer, chunk) => buffer..addAll(chunk),
+    );
+    expect(response.statusCode, HttpStatus.ok);
+    expect(body, payload);
+    expect(api.fetchPlayUrlCalls, 2);
+    expect(requested, contains('/fresh-video.m4s'));
+    expect(requested, isNot(contains('/stale-video.m4s')));
+  });
+
+  test(
+    'gateway retries once when the CDN closes before sending a body',
+    () async {
+      final payload = List<int>.generate(32, (index) => index + 3);
+      var videoGets = 0;
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final upstreamTask = () async {
+        await for (final request in upstream) {
+          try {
+            final isVideoGet =
+                request.method == 'GET' && request.uri.path.contains('video');
+            if (isVideoGet) videoGets++;
+            if (isVideoGet && videoGets == 1) {
+              request.response.statusCode = HttpStatus.ok;
+              request.response.contentLength = payload.length;
+              final socket = await request.response.detachSocket(
+                writeHeaders: true,
+              );
+              socket.destroy();
+              continue;
+            }
+            request.response.headers.set(
+              HttpHeaders.acceptRangesHeader,
+              'bytes',
+            );
+            request.response.contentLength = payload.length;
+            if (request.method != 'HEAD') request.response.add(payload);
+            await request.response.close();
+          } catch (_) {}
+        }
+      }();
+      addTearDown(() async {
+        await upstream.close(force: true);
+        await upstreamTask;
+      });
+      final origin = Uri(
+        scheme: 'http',
+        host: InternetAddress.loopbackIPv4.address,
+        port: upstream.port,
+      );
+      final api = _SwitchingPlayUrlApi(
+        origin: origin,
+        firstVideoPath: '/video.m4s',
+        secondVideoPath: '/video.m4s',
+      );
+      final tempCache = await Directory.systemTemp.createTemp(
+        'bilibili-stream-reset-',
+      );
+      addTearDown(() => tempCache.delete(recursive: true));
+      final service = BilibiliStreamingService(
+        api,
+        mediaUriValidator: (uri) => uri.host == origin.host,
+        cacheDirectory: tempCache,
+      );
+      addTearDown(service.shutdown);
+      final prepared = await service.prepare(_streamItem('cdn-reset'));
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      final response = await (await client.getUrl(prepared.videoUri)).close();
+      final body = await response.fold<List<int>>(
+        <int>[],
+        (buffer, chunk) => buffer..addAll(chunk),
+      );
+      expect(response.statusCode, HttpStatus.ok);
+      expect(body, payload);
+      expect(api.fetchPlayUrlCalls, 2);
+      expect(videoGets, 2);
+    },
+  );
+
+  test(
+    'a playurl fetched for subtitles replaces the live gateway address',
+    () async {
+      final requested = <String>[];
+      final payload = List<int>.generate(16, (index) => index + 7);
+      final upstream = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final upstreamTask = () async {
+        await for (final request in upstream) {
+          requested.add(request.uri.path);
+          request.response.contentLength = payload.length;
+          if (request.method != 'HEAD') request.response.add(payload);
+          await request.response.close();
+        }
+      }();
+      addTearDown(() async {
+        await upstream.close(force: true);
+        await upstreamTask;
+      });
+      final origin = Uri(
+        scheme: 'http',
+        host: InternetAddress.loopbackIPv4.address,
+        port: upstream.port,
+      );
+      final api = _SwitchingPlayUrlApi(
+        origin: origin,
+        firstVideoPath: '/original-video.m4s',
+        secondVideoPath: '/original-video.m4s',
+      );
+      final tempCache = await Directory.systemTemp.createTemp(
+        'bilibili-stream-adopt-',
+      );
+      addTearDown(() => tempCache.delete(recursive: true));
+      final service = BilibiliStreamingService(
+        api,
+        mediaUriValidator: (uri) => uri.host == origin.host,
+        cacheDirectory: tempCache,
+      );
+      addTearDown(service.shutdown);
+      final item = _streamItem('subtitle-playurl');
+      final prepared = await service.prepare(item);
+      service.noteFreshPlayUrl(
+        item.id,
+        _switchableStreamInfo(origin, '/adopted-video.m4s'),
+      );
+
+      final client = HttpClient();
+      addTearDown(() => client.close(force: true));
+      final response = await (await client.getUrl(prepared.videoUri)).close();
+      final body = await response.fold<List<int>>(
+        <int>[],
+        (buffer, chunk) => buffer..addAll(chunk),
+      );
+      expect(response.statusCode, HttpStatus.ok);
+      expect(body, payload);
+      expect(api.fetchPlayUrlCalls, 1);
+      expect(requested, contains('/adopted-video.m4s'));
+      expect(requested, isNot(contains('/original-video.m4s')));
     },
   );
 }

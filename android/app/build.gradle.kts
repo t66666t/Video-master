@@ -9,6 +9,27 @@ plugins {
 import java.util.Properties
 import java.io.FileInputStream
 
+fun resolveChaquopyPython313(): String {
+    val candidates = mutableListOf<File>()
+    val localAppData = System.getenv("LOCALAPPDATA")
+    if (!localAppData.isNullOrBlank()) {
+        candidates += File(localAppData, "Programs/Python/Python313/python.exe")
+    }
+    val appData = System.getenv("APPDATA")
+    if (!appData.isNullOrBlank()) {
+        File(appData, "uv/python").listFiles()
+            ?.filter { it.isDirectory && it.name.startsWith("cpython-3.13") }
+            ?.sortedBy { it.name }
+            ?.lastOrNull()
+            ?.let { candidates += File(it, "python.exe") }
+    }
+    return candidates.firstOrNull { it.isFile }?.absolutePath
+        ?: throw GradleException(
+            "Building the Android runtime requires Python 3.13. " +
+                "Install it for the current user, then rebuild.",
+        )
+}
+
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
@@ -42,6 +63,9 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         ndk {
+            // Flutter would otherwise add 32-bit ARM and x86_64. The embedded
+            // runtime and its browser impersonation library only ship arm64.
+            abiFilters.clear()
             abiFilters += listOf("arm64-v8a")
         }
     }
@@ -84,12 +108,21 @@ android {
 
 chaquopy {
     defaultConfig {
-        version = "3.11"
-        buildPython("py", "-3.11")
+        // The Windows build is one executable that already contains browser
+        // impersonation. Android has no equivalent executable, so the embedded
+        // Python runtime must include that library itself. Its Android build
+        // is published for CPython 3.13 on arm64, which matches this app.
+        version = "3.13"
+        buildPython(resolveChaquopyPython313())
         pip {
             // Keep the embedded Android runtime reproducible and in sync with
             // YtDlpVersions.androidBundled in Dart.
             install("yt-dlp==2026.8.19")
+            install(
+                "third_party/curl_cffi-0.16.3-cp313-cp313-android_24_arm64_v8a.whl",
+            )
+            // Segment decryption for streams that would otherwise need ffmpeg.
+            install("pycryptodomex==3.21.0")
         }
     }
 }

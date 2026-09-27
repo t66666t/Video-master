@@ -4,6 +4,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import traceback
 import zipfile
@@ -51,6 +52,7 @@ def configure_runtime(archive_path=None):
         yt_dlp = importlib.import_module("yt_dlp")
         DownloadError = importlib.import_module("yt_dlp.utils").DownloadError
         _ACTIVE_RUNTIME_ARCHIVE = normalized
+        _install_embedded_http_fallback()
         return get_yt_dlp_version()
     except Exception:
         if normalized:
@@ -97,6 +99,321 @@ def _apply_embedded_http_identity(ydl_opts):
     ydl_opts["http_headers"] = headers
 
 
+_PLATFORM_HTTP_LOCAL = threading.local()
+
+
+def _platform_http_available():
+    try:
+        from java.net import HttpURLConnection  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _platform_http_depth():
+    return getattr(_PLATFORM_HTTP_LOCAL, "depth", 0)
+
+
+def _set_platform_http_depth(depth):
+    _PLATFORM_HTTP_LOCAL.depth = depth
+
+
+def _install_embedded_http_fallback():
+    """Send impersonated requests through the device HTTP stack.
+
+    The embedded interpreter has no browser TLS impersonation library. Those
+    requests otherwise keep the interpreter's TLS fingerprint and are rejected.
+    """
+    if _browser_impersonation_available() or not _platform_http_available():
+        return
+    if getattr(yt_dlp, "_platform_http_ready", False):
+        return
+
+    from yt_dlp.extractor.common import InfoExtractor
+    from yt_dlp.networking._urllib import UrllibRH
+
+    original_request_webpage = InfoExtractor._request_webpage
+    original_urllib_send = UrllibRH._send
+
+    def _request_webpage(
+        self,
+        url_or_request,
+        video_id,
+        note=None,
+        errnote=None,
+        fatal=True,
+        data=None,
+        headers=None,
+        query=None,
+        expected_status=None,
+        impersonate=None,
+        require_impersonation=False,
+    ):
+        if not impersonate:
+            return original_request_webpage(
+                self,
+                url_or_request,
+                video_id,
+                note=note,
+                errnote=errnote,
+                fatal=fatal,
+                data=data,
+                headers=headers,
+                query=query,
+                expected_status=expected_status,
+                impersonate=impersonate,
+                require_impersonation=require_impersonation,
+            )
+        prepared_headers = dict(headers or {})
+        prepared_headers.setdefault("User-Agent", _BROWSER_USER_AGENT)
+        prepared_headers.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        prepared_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        _set_platform_http_depth(_platform_http_depth() + 1)
+        try:
+            return original_request_webpage(
+                self,
+                url_or_request,
+                video_id,
+                note=note,
+                errnote=errnote,
+                fatal=fatal,
+                data=data,
+                headers=prepared_headers,
+                query=query,
+                expected_status=expected_status,
+                impersonate=None,
+                require_impersonation=False,
+            )
+        finally:
+            _set_platform_http_depth(_platform_http_depth() - 1)
+
+    def _send(self, request):
+        if _platform_http_depth() <= 0:
+            return original_urllib_send(self, request)
+        try:
+            return _send_with_platform_http(self, request)
+        except _PlatformHttpUnavailable:
+            return original_urllib_send(self, request)
+
+    InfoExtractor._request_webpage = _request_webpage
+    UrllibRH._send = _send
+    yt_dlp._platform_http_ready = True
+
+
+class _PlatformHttpUnavailable(Exception):
+    pass
+
+
+def _send_with_platform_http(handler, request):
+    from email.message import Message
+
+    from java.io import ByteArrayOutputStream
+    from yt_dlp.networking.common import Response
+    from yt_dlp.networking.exceptions import HTTPError, TransportError
+
+    proxies = handler._get_proxies(request)
+    proxy = _java_http_proxy(proxies, request.url)
+    if proxy is False:
+        raise _PlatformHttpUnavailable()
+
+    headers = dict(handler._get_headers(request))
+    headers.pop("Accept-Encoding", None)
+    headers.pop("accept-encoding", None)
+    headers.setdefault("User-Agent", _BROWSER_USER_AGENT)
+    try:
+        return _open_platform_http(
+            url=request.url,
+            method=(request.method or "GET").upper(),
+            payload=_request_payload_bytes(request.data),
+            headers=headers,
+            cookiejar=handler._get_cookiejar(request),
+            timeout_ms=max(1000, int(handler._calculate_timeout(request) * 1000)),
+            proxy=proxy,
+            output_type=ByteArrayOutputStream,
+            message_type=Message,
+            response_type=Response,
+            http_error_type=HTTPError,
+            transport_error_type=TransportError,
+        )
+    except (HTTPError, TransportError, _PlatformHttpUnavailable):
+        raise
+    except Exception as exc:
+        raise TransportError(cause=exc) from exc
+
+
+def _open_platform_http(
+    *,
+    url,
+    method,
+    payload,
+    headers,
+    cookiejar,
+    timeout_ms,
+    proxy,
+    output_type,
+    message_type,
+    response_type,
+    http_error_type,
+    transport_error_type,
+):
+    import urllib.parse
+
+    from java.net import URL
+
+    current_url = url
+    current_method = method
+    current_payload = payload
+    for _ in range(10):
+        connection = (
+            URL(current_url).openConnection(proxy)
+            if proxy
+            else URL(current_url).openConnection()
+        )
+        connection.setInstanceFollowRedirects(False)
+        connection.setConnectTimeout(timeout_ms)
+        connection.setReadTimeout(timeout_ms)
+        connection.setRequestMethod(current_method)
+        for name, value in headers.items():
+            if name is None or value is None:
+                continue
+            if str(name).lower() == "cookie":
+                continue
+            connection.setRequestProperty(str(name), str(value))
+        _apply_cookie_header(connection, cookiejar, current_url, headers)
+        if current_payload:
+            connection.setDoOutput(True)
+            output = connection.getOutputStream()
+            output.write(current_payload)
+            output.close()
+
+        status = int(connection.getResponseCode())
+        _store_response_cookies(cookiejar, connection, current_url)
+        if status in (301, 302, 303, 307, 308):
+            location = connection.getHeaderField("Location")
+            connection.disconnect()
+            if not location:
+                break
+            current_url = urllib.parse.urljoin(current_url, str(location))
+            if status in (301, 302, 303) and current_method not in ("GET", "HEAD"):
+                current_method = "GET"
+                current_payload = None
+            continue
+
+        stream = connection.getErrorStream() if status >= 400 else connection.getInputStream()
+        body = _read_java_stream(stream, output_type)
+        final_url = str(connection.getURL().toString())
+        response_headers = _java_header_message(connection, message_type)
+        connection.disconnect()
+        response = response_type(
+            fp=io.BytesIO(body),
+            url=final_url,
+            headers=response_headers,
+            status=status,
+        )
+        if status >= 400:
+            raise http_error_type(response)
+        return response
+
+    raise transport_error_type("too many redirects")
+
+
+def _java_http_proxy(proxies, url):
+    import urllib.parse
+
+    from java.net import InetSocketAddress, Proxy
+
+    proxies = proxies or {}
+    parsed = urllib.parse.urlparse(url)
+    proxy_url = proxies.get(parsed.scheme) or proxies.get("all")
+    if not proxy_url or proxy_url == "__noproxy__":
+        return None
+    proxy = urllib.parse.urlparse(proxy_url)
+    if proxy.scheme in ("socks4", "socks4a", "socks5", "socks5h"):
+        return False
+    if not proxy.hostname:
+        return None
+    port = proxy.port or (443 if proxy.scheme == "https" else 80)
+    return Proxy(Proxy.Type.HTTP, InetSocketAddress(proxy.hostname, int(port)))
+
+
+def _request_payload_bytes(data):
+    if not data:
+        return None
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    try:
+        return b"".join(data)
+    except TypeError:
+        return bytes(data)
+
+
+def _apply_cookie_header(connection, cookiejar, url, headers):
+    import urllib.request
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        cookiejar.add_cookie_header(request)
+    except Exception:
+        return
+    cookie = request.get_header("Cookie")
+    if cookie:
+        connection.setRequestProperty("Cookie", cookie)
+
+
+def _store_response_cookies(cookiejar, connection, url):
+    import urllib.request
+    from email.message import Message
+
+    message = _java_header_message(connection, Message)
+
+    class _CookieResponse:
+        def info(self):
+            return message
+
+    try:
+        cookiejar.extract_cookies(_CookieResponse(), urllib.request.Request(url))
+    except Exception:
+        return
+
+
+def _java_header_message(connection, message_type):
+    message = message_type()
+    fields = connection.getHeaderFields()
+    if fields is None:
+        return message
+    iterator = fields.entrySet().iterator()
+    while iterator.hasNext():
+        entry = iterator.next()
+        name = entry.getKey()
+        if name is None:
+            continue
+        values = entry.getValue().iterator()
+        while values.hasNext():
+            message.add_header(str(name), str(values.next()))
+    return message
+
+
+def _read_java_stream(stream, output_type):
+    if stream is None:
+        return b""
+    import jarray
+
+    output = output_type()
+    buffer = jarray.zeros(8192, "b")
+    while True:
+        count = stream.read(buffer, 0, 8192)
+        if count is None or int(count) < 0:
+            break
+        output.write(buffer, 0, int(count))
+    stream.close()
+    return bytes(output.toByteArray())
+
+
 def get_yt_dlp_version():
     return getattr(yt_dlp, "__version__", None) or getattr(yt_dlp.version, "__version__", None)
 
@@ -112,6 +429,7 @@ def resolve_meta(url, session_config_json=None):
     ydl_opts["quiet"] = True
     ydl_opts["no_warnings"] = True
     _apply_embedded_http_identity(ydl_opts)
+    _install_embedded_http_fallback()
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -146,6 +464,7 @@ def download(request_json, callback=None):
     ydl_opts["simulate"] = False
     ydl_opts["logger"] = logger
     _apply_embedded_http_identity(ydl_opts)
+    _install_embedded_http_fallback()
 
     with _redirect_streams(forwarder):
         try:

@@ -269,6 +269,11 @@ class BilibiliStreamingService extends ChangeNotifier {
   static const _preferredQualityPreferenceKey =
       'bilibili_stream_preferred_quality';
   static const _refreshAge = Duration(minutes: 90);
+
+  /// Refresh before the CDN signature actually expires. Players keep requesting
+  /// byte ranges long after the manifest was served, and Bilibili closes those
+  /// sockets once `deadline` has passed.
+  static const _deadlineRefreshMargin = Duration(minutes: 2);
   static const _userAgent =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -541,6 +546,8 @@ class BilibiliStreamingService extends ChangeNotifier {
     final session = _sessionForPlayback(playback);
     if (session == null || session.isClosed || session.cdnWarmStarted) return;
     session.cdnWarmStarted = true;
+    await _refreshSessionIfUrlsStale(session);
+    if (session.isClosed) return;
     await Future.wait<void>([
       _warmCdnTrack(session, session.selectedAudio),
       _warmCdnTrack(session, session.selectedVideo),
@@ -618,8 +625,9 @@ class BilibiliStreamingService extends ChangeNotifier {
     return 4095;
   }
 
-  /// Bilibili CDN URLs stay valid well past [_refreshAge]. Reusing a fresh
-  /// playurl avoids a blocking API round-trip when re-opening the same card.
+  /// Reusing a fresh playurl avoids a blocking API round-trip when re-opening
+  /// the same card. A cached document is stale once its CDN `deadline` is
+  /// inside [_deadlineRefreshMargin], even if it is younger than [_refreshAge].
   Future<BilibiliStreamInfo> _playUrlFor(
     String bvid,
     int cid, {
@@ -629,13 +637,51 @@ class BilibiliStreamingService extends ChangeNotifier {
     if (!forceRefresh) {
       final cached = _playUrlCache[key];
       if (cached != null &&
-          DateTime.now().difference(cached.obtainedAt) < _refreshAge) {
+          DateTime.now().difference(cached.obtainedAt) < _refreshAge &&
+          !_playUrlExpiresSoon(cached.info)) {
         return cached.info;
       }
     }
     final info = await apiService.fetchPlayUrl(bvid, cid);
     _playUrlCache[key] = (info: info, obtainedAt: DateTime.now());
     return info;
+  }
+
+  /// Installs a playurl another feature just fetched (AI subtitles, OCR,
+  /// compose) into any live playback session for [itemId]. In-flight range
+  /// requests keep the socket they already opened; the next range uses this
+  /// document instead of a signature that is about to expire.
+  void noteFreshPlayUrl(String itemId, BilibiliStreamInfo info) {
+    if (itemId.isEmpty) return;
+    for (final session in _sessions.values.toList(growable: false)) {
+      if (session.isClosed || session.itemId != itemId) continue;
+      final bvid = session.source.bvid;
+      final cid = session.source.cid;
+      if (bvid != null && bvid.isNotEmpty && cid != null) {
+        _playUrlCache[_playUrlCacheKey(bvid, cid)] = (
+          info: info,
+          obtainedAt: DateTime.now(),
+        );
+      }
+      try {
+        _replaceSessionTracks(session, info);
+      } catch (error) {
+        debugPrint('Bilibili playback ignored a refreshed playurl: $error');
+      }
+    }
+  }
+
+  void _replaceSessionTracks(_GatewaySession session, BilibiliStreamInfo info) {
+    final video = _selectVideo(info, session.selectedVideo.id);
+    final audio = _selectCompatibleAudio(info);
+    session
+      ..obtainedAt = DateTime.now()
+      ..streamInfo = info
+      ..selectedVideo = video
+      ..selectedAudio = audio
+      ..durationMs = info.durationMs > 0 ? info.durationMs : session.durationMs
+      ..urlsMarkedStale = false
+      ..skipStaleRefreshUntil = null;
   }
 
   double? _displayAspectRatioFor(BilibiliStreamInfo info) {
@@ -795,6 +841,7 @@ class BilibiliStreamingService extends ChangeNotifier {
     try {
       final source = item.sourceRef!;
       final info = await apiService.fetchPlayUrl(source.bvid!, source.cid!);
+      noteFreshPlayUrl(item.id, info);
       final compatibleAudio =
           info.audioStreams.where(_hasAllowedMediaUri).toList()..sort((a, b) {
             int codecRank(StreamItem track) {
@@ -1292,25 +1339,7 @@ class BilibiliStreamingService extends ChangeNotifier {
       throw StateError('当前账号没有可播放的 Bilibili 音视频轨道');
     }
     final video = _selectVideo(resolvedStreamInfo, requestedQualityId);
-    final compatibleAudio =
-        resolvedStreamInfo.audioStreams.where(_hasAllowedMediaUri).toList()
-          ..sort((a, b) {
-            // AAC is the cross-platform baseline. Prefer it over Dolby/FLAC when
-            // multiple Bilibili audio classes are returned, then choose bitrate.
-            int codecRank(StreamItem item) {
-              final codec = item.codecs.toLowerCase();
-              if (codec.startsWith('mp4a')) return 0;
-              if (codec.contains('opus')) return 1;
-              if (codec.contains('ec-3') || codec.contains('eac3')) return 2;
-              if (codec.contains('flac')) return 3;
-              return 4;
-            }
-
-            final codec = codecRank(a).compareTo(codecRank(b));
-            return codec != 0 ? codec : b.bandwidth.compareTo(a.bandwidth);
-          });
-    final audio = compatibleAudio.isEmpty ? null : compatibleAudio.first;
-    if (audio == null) throw StateError('Bilibili 未返回可用音轨');
+    final audio = _selectCompatibleAudio(resolvedStreamInfo);
     return _GatewaySession(
       token: _uuid.v4().replaceAll('-', ''),
       itemId: itemId,
@@ -1324,6 +1353,27 @@ class BilibiliStreamingService extends ChangeNotifier {
           ? resolvedStreamInfo.durationMs
           : fallbackDurationMs,
     );
+  }
+
+  StreamItem _selectCompatibleAudio(BilibiliStreamInfo info) {
+    final compatibleAudio =
+        info.audioStreams.where(_hasAllowedMediaUri).toList()..sort((a, b) {
+          // AAC is the cross-platform baseline. Prefer it over Dolby/FLAC when
+          // multiple Bilibili audio classes are returned, then choose bitrate.
+          int codecRank(StreamItem item) {
+            final codec = item.codecs.toLowerCase();
+            if (codec.startsWith('mp4a')) return 0;
+            if (codec.contains('opus')) return 1;
+            if (codec.contains('ec-3') || codec.contains('eac3')) return 2;
+            if (codec.contains('flac')) return 3;
+            return 4;
+          }
+
+          final codec = codecRank(a).compareTo(codecRank(b));
+          return codec != 0 ? codec : b.bandwidth.compareTo(a.bandwidth);
+        });
+    if (compatibleAudio.isEmpty) throw StateError('Bilibili 未返回可用音轨');
+    return compatibleAudio.first;
   }
 
   StreamItem _selectVideo(BilibiliStreamInfo info, int? requestedQualityId) {
@@ -1405,9 +1455,7 @@ class BilibiliStreamingService extends ChangeNotifier {
     HttpRequest request,
     _GatewaySession session,
   ) async {
-    if (DateTime.now().difference(session.obtainedAt) >= _refreshAge) {
-      await _refreshSession(session);
-    }
+    await _refreshSessionIfUrlsStale(session);
     final origin = Uri(
       scheme: 'http',
       host: InternetAddress.loopbackIPv4.address,
@@ -1473,27 +1521,91 @@ class BilibiliStreamingService extends ChangeNotifier {
       return;
     }
 
+    await _refreshSessionIfUrlsStale(session);
+    if (session.isClosed) {
+      try {
+        await downstream.response.close();
+      } catch (_) {}
+      return;
+    }
+
     var track = video ? session.selectedVideo : session.selectedAudio;
     HttpClientResponse? upstream;
+    _UpstreamTap? tap;
     for (var attempt = 0; attempt < 2; attempt++) {
-      upstream = await _openUpstream(downstream, track, session.mediaClient);
-      if (![
-        HttpStatus.unauthorized,
-        HttpStatus.forbidden,
-        HttpStatus.notFound,
-      ].contains(upstream.statusCode)) {
-        break;
+      if (session.isClosed) break;
+      await _discardTap(tap);
+      tap = null;
+      upstream = null;
+      Object? failure;
+      try {
+        upstream = await _openUpstream(downstream, track, session.mediaClient);
+      } catch (error) {
+        failure = error;
+        upstream = null;
       }
-      await upstream.drain<void>();
-      if (attempt == 0 && !session.didRefreshAfterFailure) {
+      final authFailure =
+          upstream != null &&
+          const {
+            HttpStatus.unauthorized,
+            HttpStatus.forbidden,
+            HttpStatus.notFound,
+          }.contains(upstream.statusCode);
+      if (authFailure) {
+        final rejected = upstream!;
+        await rejected.drain<void>();
+        failure = HttpException('CDN returned ${rejected.statusCode}');
+        upstream = null;
+      }
+      if (upstream != null && downstream.method != 'HEAD') {
+        tap = await _tapFirstUpstreamEvent(upstream, session);
+        if (tap.aborted || session.isClosed) {
+          await _discardTap(tap);
+          tap = null;
+          try {
+            await downstream.response.close();
+          } catch (_) {}
+          return;
+        }
+        final failedBeforeBody =
+            !tap.sawData &&
+            (tap.firstError != null ||
+                (tap.done && upstream.contentLength > 0));
+        if (failedBeforeBody) {
+          failure = tap.firstError ?? StateError('Bilibili 媒体源在发送数据前关闭了连接');
+          await _discardTap(tap);
+          tap = null;
+          upstream = null;
+        }
+      }
+      if (upstream != null) break;
+      if (attempt == 0 &&
+          !session.didRefreshAfterFailure &&
+          !session.isClosed) {
         session.didRefreshAfterFailure = true;
-        await _refreshSession(session);
+        final current = video ? session.selectedVideo : session.selectedAudio;
+        // AI subtitle (or another feature) may already have installed a new
+        // playurl. Retry that URL before asking Bilibili for yet another one.
+        if (current.baseUrl == track.baseUrl) {
+          await _refreshSession(session);
+        }
         track = video ? session.selectedVideo : session.selectedAudio;
         continue;
       }
+      if (failure != null) throw failure;
       break;
     }
-    if (upstream == null) throw StateError('无法连接 Bilibili 媒体源');
+    if (session.isClosed) {
+      await _discardTap(tap);
+      try {
+        await downstream.response.close();
+      } catch (_) {}
+      return;
+    }
+    if (upstream == null) {
+      await _discardTap(tap);
+      throw StateError('无法连接 Bilibili 媒体源');
+    }
     if (upstream.statusCode >= 200 && upstream.statusCode < 400) {
       // Allow a future CDN expiry to perform its own single bounded refresh.
       session.didRefreshAfterFailure = false;
@@ -1586,10 +1698,14 @@ class BilibiliStreamingService extends ChangeNotifier {
         }
       } catch (_) {}
     }
+    final bodyTap = tap;
+    if (bodyTap == null) {
+      throw StateError('Bilibili 媒体源没有可转发的响应体');
+    }
     try {
       await _relayUpstreamBody(
         downstream: downstream,
-        upstream: upstream,
+        tap: bodyTap,
         session: session,
         onBytes: (bytes) {
           if (!cacheDisabled) sink?.add(bytes);
@@ -1614,14 +1730,15 @@ class BilibiliStreamingService extends ChangeNotifier {
   /// the next open cannot be served a short 206 that ends the track.
   Future<void> _relayUpstreamBody({
     required HttpRequest downstream,
-    required HttpClientResponse upstream,
+    required _UpstreamTap tap,
     required _GatewaySession session,
     required void Function(List<int> bytes) onBytes,
   }) async {
-    Object? upstreamError;
-    StreamSubscription<List<int>>? subscription;
+    Object? upstreamError = tap.firstError;
     var cancelled = false;
+    var delivered = false;
     late final StreamController<List<int>> controller;
+    final subscription = tap.subscription;
 
     Future<void> cancelUpstream() {
       if (cancelled) return Future<void>.value();
@@ -1639,28 +1756,43 @@ class BilibiliStreamingService extends ChangeNotifier {
       onResume: () => subscription?.resume(),
       onCancel: cancelUpstream,
     );
-    subscription = upstream.listen(
-      (bytes) {
-        if (controller.isClosed) return;
-        onBytes(bytes);
-        if (!controller.isClosed) controller.add(bytes);
-      },
-      onError: (Object error, StackTrace stack) {
-        upstreamError ??= error;
-        if (!controller.isClosed) controller.addError(error, stack);
-      },
-      onDone: () {
-        if (!controller.isClosed) controller.close();
-      },
-      cancelOnError: false,
-    );
+    tap.onData = (bytes) {
+      if (controller.isClosed) return;
+      onBytes(bytes);
+      delivered = true;
+      if (!controller.isClosed) controller.add(bytes);
+    };
+    tap.onError = (Object error, StackTrace stack) {
+      upstreamError ??= error;
+      if (!controller.isClosed) controller.addError(error, stack);
+    };
+    tap.onDone = () {
+      if (!controller.isClosed) controller.close();
+    };
     final unbindAbort = session.bindTransferAbort(abort);
     try {
-      await downstream.response.addStream(controller.stream);
+      final relayed = downstream.response.addStream(controller.stream);
+      final firstChunk = tap.firstChunk;
+      if (firstChunk != null) {
+        onBytes(firstChunk);
+        delivered = true;
+        if (!controller.isClosed) controller.add(firstChunk);
+      }
+      if (tap.done) {
+        if (!controller.isClosed) controller.close();
+      } else {
+        subscription?.resume();
+      }
+      await relayed;
     } catch (error) {
       // Player seek/switch closes the loopback socket. That is not a CDN
-      // failure; the replacement Range is a new request.
-      if (upstreamError != null && !session.isClosed) rethrow;
+      // failure; the replacement Range is a new request. A CDN socket that
+      // dies after bytes have already been sent cannot be restarted on this
+      // response, so refresh the playurl for the player's next Range.
+      if (upstreamError != null && !session.isClosed) {
+        if (delivered) _schedulePlayUrlRefresh(session);
+        rethrow;
+      }
     } finally {
       unbindAbort();
       await cancelUpstream();
@@ -1705,7 +1837,22 @@ class BilibiliStreamingService extends ChangeNotifier {
     throw StateError('Bilibili 媒体 CDN 不可用: ${lastError.runtimeType}');
   }
 
-  Future<void> _refreshSession(_GatewaySession session) async {
+  Future<void> _refreshSession(_GatewaySession session) {
+    if (session.isClosed) return Future<void>.value();
+    final existing = session.refreshFuture;
+    if (existing != null) return existing;
+    late final Future<void> refresh;
+    refresh = _refreshSessionUnlocked(session).whenComplete(() {
+      if (identical(session.refreshFuture, refresh)) {
+        session.refreshFuture = null;
+      }
+    });
+    session.refreshFuture = refresh;
+    return refresh;
+  }
+
+  Future<void> _refreshSessionUnlocked(_GatewaySession session) async {
+    final startedAt = DateTime.now();
     final refreshed = await _createSession(
       itemId: session.itemId,
       source: session.source,
@@ -1714,12 +1861,150 @@ class BilibiliStreamingService extends ChangeNotifier {
       mediaClient: session.mediaClient,
       forcePlayUrlRefresh: true,
     );
+    if (session.isClosed || session.obtainedAt.isAfter(startedAt)) return;
     session
       ..obtainedAt = refreshed.obtainedAt
       ..streamInfo = refreshed.streamInfo
       ..selectedVideo = refreshed.selectedVideo
       ..selectedAudio = refreshed.selectedAudio
-      ..durationMs = refreshed.durationMs;
+      ..durationMs = refreshed.durationMs
+      ..urlsMarkedStale = false;
+  }
+
+  Future<void> _refreshSessionIfUrlsStale(_GatewaySession session) async {
+    final pending = session.refreshFuture;
+    if (pending != null) await pending;
+    if (session.isClosed || !_shouldRefreshUrls(session)) return;
+    try {
+      await _refreshSession(session);
+    } catch (error) {
+      debugPrint('Bilibili playurl refresh failed: $error');
+      session.skipStaleRefreshUntil = DateTime.now().add(
+        const Duration(seconds: 20),
+      );
+      return;
+    }
+    session.urlsMarkedStale = false;
+    if (_trackExpiresSoon(session.selectedVideo) ||
+        _trackExpiresSoon(session.selectedAudio)) {
+      session.skipStaleRefreshUntil = DateTime.now().add(
+        const Duration(minutes: 2),
+      );
+    } else {
+      session.skipStaleRefreshUntil = null;
+    }
+  }
+
+  void _schedulePlayUrlRefresh(_GatewaySession session) {
+    if (session.isClosed) return;
+    session.urlsMarkedStale = true;
+    unawaited(
+      _refreshSessionIfUrlsStale(session).catchError((Object error) {
+        debugPrint('Bilibili playurl refresh failed: $error');
+      }),
+    );
+  }
+
+  bool _shouldRefreshUrls(_GatewaySession session) {
+    final skipUntil = session.skipStaleRefreshUntil;
+    if (skipUntil != null && DateTime.now().isBefore(skipUntil)) return false;
+    if (session.urlsMarkedStale) return true;
+    if (_trackExpiresSoon(session.selectedVideo) ||
+        _trackExpiresSoon(session.selectedAudio)) {
+      return true;
+    }
+    if (_trackHasDeadline(session.selectedVideo) ||
+        _trackHasDeadline(session.selectedAudio)) {
+      return false;
+    }
+    return DateTime.now().difference(session.obtainedAt) >= _refreshAge;
+  }
+
+  bool _playUrlExpiresSoon(BilibiliStreamInfo info) {
+    final videos = info.videoStreams.where(_hasAllowedMediaUri);
+    final audios = info.audioStreams.where(_hasAllowedMediaUri);
+    final videosSoon = videos.isNotEmpty && videos.every(_trackExpiresSoon);
+    final audiosSoon = audios.isNotEmpty && audios.every(_trackExpiresSoon);
+    return videosSoon || audiosSoon;
+  }
+
+  bool _trackHasDeadline(StreamItem track) =>
+      _deadlineOf(Uri.tryParse(track.baseUrl)) != null;
+
+  bool _trackExpiresSoon(StreamItem track) {
+    final deadline = _deadlineOf(Uri.tryParse(track.baseUrl));
+    if (deadline == null) return false;
+    return !deadline.isAfter(
+      DateTime.now().toUtc().add(_deadlineRefreshMargin),
+    );
+  }
+
+  DateTime? _deadlineOf(Uri? uri) {
+    if (uri == null) return null;
+    final raw = uri.queryParameters['deadline'];
+    if (raw == null || raw.isEmpty) return null;
+    final seconds = int.tryParse(raw);
+    if (seconds == null || seconds <= 0) return null;
+    return DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true);
+  }
+
+  Future<_UpstreamTap> _tapFirstUpstreamEvent(
+    HttpClientResponse upstream,
+    _GatewaySession session,
+  ) async {
+    final tap = _UpstreamTap();
+    final first = Completer<void>();
+    void finish() {
+      if (!first.isCompleted) first.complete();
+    }
+
+    tap.subscription = upstream.listen(
+      (bytes) {
+        if (bytes.isEmpty) return;
+        if (!tap.sawData) {
+          tap.sawData = true;
+          tap.firstChunk = bytes;
+          tap.subscription?.pause();
+          finish();
+          return;
+        }
+        tap.onData?.call(bytes);
+      },
+      onError: (Object error, StackTrace stack) {
+        if (!tap.sawData && !first.isCompleted) {
+          tap.firstError = error;
+          finish();
+          return;
+        }
+        tap.onError?.call(error, stack);
+      },
+      onDone: () {
+        tap.done = true;
+        finish();
+        tap.onDone?.call();
+      },
+      cancelOnError: false,
+    );
+    final unbind = session.bindTransferAbort(() {
+      tap.aborted = true;
+      finish();
+      final subscription = tap.subscription;
+      if (subscription != null) unawaited(subscription.cancel());
+    });
+    try {
+      await first.future;
+    } finally {
+      unbind();
+    }
+    return tap;
+  }
+
+  Future<void> _discardTap(_UpstreamTap? tap) async {
+    final subscription = tap?.subscription;
+    if (subscription == null) return;
+    try {
+      await subscription.cancel();
+    } catch (_) {}
   }
 
   bool _isAllowedMediaUri(Uri? uri) {
@@ -2118,6 +2403,20 @@ class BilibiliStreamingService extends ChangeNotifier {
   ).convert(input).replaceAll('"', '&quot;');
 }
 
+/// First CDN body event, captured before the gateway commits a player
+/// response so a signature failure can refresh the playurl and retry.
+class _UpstreamTap {
+  StreamSubscription<List<int>>? subscription;
+  List<int>? firstChunk;
+  Object? firstError;
+  bool sawData = false;
+  bool done = false;
+  bool aborted = false;
+  void Function(List<int> bytes)? onData;
+  void Function(Object error, StackTrace stack)? onError;
+  void Function()? onDone;
+}
+
 /// Disk slice to copy to a gateway client. Built under the cache IO lock,
 /// then streamed without holding that lock.
 class _CachedTrackServePlan {
@@ -2151,6 +2450,9 @@ class _GatewaySession {
   final HttpClient mediaClient;
   int durationMs;
   bool didRefreshAfterFailure = false;
+  bool urlsMarkedStale = false;
+  DateTime? skipStaleRefreshUntil;
+  Future<void>? refreshFuture;
   bool _closed = false;
   bool _cachingEnabled = false;
   bool cdnWarmStarted = false;

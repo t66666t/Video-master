@@ -217,11 +217,13 @@ class MediaMaterializationService extends ChangeNotifier {
   // Future，避免两个流程对同一目标文件并发写入。
   final Map<String, Future<_MaterializationManifest>> _audioDownloads = {};
   // 本地可播放文件构建完成通知（供播放页自动切换本地素材档）。
-  final List<void Function(String itemId)> _playbackMaterializedListeners =
-      [];
+  final List<void Function(String itemId)> _playbackMaterializedListeners = [];
 
   void Function(String itemId)? onCacheChanged;
   void Function(String itemId)? onPlaybackMaterialized;
+
+  /// 其它功能刚拿到的播放地址。在线播放会话用它换掉即将过期的 CDN 签名。
+  void Function(String itemId, BilibiliStreamInfo info)? onPlayUrlResolved;
   Future<void> Function(String itemId)? onDeferredClearCompleted;
   Future<bool> Function(String itemId)? onRequestPlaybackRelease;
 
@@ -1276,12 +1278,14 @@ class MediaMaterializationService extends ChangeNotifier {
     );
   }
 
-  Future<BilibiliStreamInfo> _fetchStreamInfo(VideoItem item) {
+  Future<BilibiliStreamInfo> _fetchStreamInfo(VideoItem item) async {
     final source = item.sourceRef;
     if (source?.bvid?.isNotEmpty != true || source?.cid == null) {
       throw const FormatException('在线视频卡片缺少 BVID 或 CID');
     }
-    return apiService.fetchPlayUrl(source!.bvid!, source.cid!);
+    final info = await apiService.fetchPlayUrl(source!.bvid!, source.cid!);
+    onPlayUrlResolved?.call(item.id, info);
+    return info;
   }
 
   Future<int?> _resolveTargetHeight(

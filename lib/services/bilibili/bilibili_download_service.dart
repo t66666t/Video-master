@@ -135,7 +135,8 @@ class BilibiliDownloadService extends ChangeNotifier {
     : apiService = apiService ?? BilibiliApiService() {
     _downloadManager = BilibiliDownloadManager(this.apiService);
     streamingService = BilibiliStreamingService(this.apiService);
-    materializationService = MediaMaterializationService(this.apiService);
+    materializationService = MediaMaterializationService(this.apiService)
+      ..onPlayUrlResolved = streamingService.noteFreshPlayUrl;
   }
 
   /// Downloads, converts and replaces a library item's danmaku sidecar.

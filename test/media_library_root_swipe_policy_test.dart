@@ -29,7 +29,10 @@ void main() {
       isFalse,
     );
     expect(
-      MediaLibraryRootSwipePolicy.isAwayFromSystemEdges(localX: 392, width: 400),
+      MediaLibraryRootSwipePolicy.isAwayFromSystemEdges(
+        localX: 392,
+        width: 400,
+      ),
       isFalse,
     );
     expect(
@@ -76,7 +79,7 @@ void main() {
     );
   });
 
-  test('a reverse flick settles on the other page, not the one already approached', () {
+  test('a reverse flick returns to the current page', () {
     expect(
       MediaLibraryRootSwipePolicy.settleTarget(
         current: MediaLibraryRootEntry.folders,
@@ -84,7 +87,7 @@ void main() {
         width: 400,
         velocityDx: 1400,
       ),
-      MediaLibraryRootEntry.continueLearning,
+      isNull,
     );
     expect(
       MediaLibraryRootSwipePolicy.settleTarget(
@@ -93,7 +96,16 @@ void main() {
         width: 400,
         velocityDx: -1400,
       ),
-      MediaLibraryRootEntry.recent,
+      isNull,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.settleTarget(
+        current: MediaLibraryRootEntry.folders,
+        dragDx: 200,
+        width: 400,
+        velocityDx: 1400,
+      ),
+      MediaLibraryRootEntry.continueLearning,
     );
     expect(
       MediaLibraryRootSwipePolicy.settleTarget(
@@ -131,6 +143,39 @@ void main() {
       ),
       isNull,
     );
+  });
+
+  test('travel past a full page continues from that page', () {
+    final shift = MediaLibraryRootSwipePolicy.shiftOrigin(
+      dragDx: -480,
+      width: 400,
+    );
+    expect(shift, isNotNull);
+    expect(shift!.indexDelta, 1);
+    expect(shift.residualDx, -80);
+
+    final before = MediaLibraryRootSwipePolicy.highlightIndex(
+      current: MediaLibraryRootEntry.continueLearning,
+      dragDx: -480,
+      width: 400,
+    );
+    final after = MediaLibraryRootSwipePolicy.highlightIndex(
+      current: MediaLibraryRootEntry.folders,
+      dragDx: shift.residualDx,
+      width: 400,
+    );
+    expect(before, closeTo(after, 0.001));
+
+    expect(
+      MediaLibraryRootSwipePolicy.shiftOrigin(dragDx: -200, width: 400),
+      isNull,
+    );
+    final back = MediaLibraryRootSwipePolicy.shiftOrigin(
+      dragDx: 450,
+      width: 400,
+    );
+    expect(back!.indexDelta, -1);
+    expect(back.residualDx, 50);
   });
 
   test('commit needs a real fraction or a flick, not a twitch', () {

@@ -3067,8 +3067,28 @@ class _HomeScreenState extends State<HomeScreen>
                                                         controller,
                                                   );
                                                 },
+                                                onOpenFolder: (collection) {
+                                                  Navigator.of(context).push(
+                                                    buildMediaLibraryFolderRoute<
+                                                      void
+                                                    >(
+                                                      folderId: collection.id,
+                                                      builder: (_) =>
+                                                          CollectionScreen(
+                                                            collectionId:
+                                                                collection.id,
+                                                          ),
+                                                    ),
+                                                  );
+                                                },
                                                 onLocateMedia:
                                                     _locateLibraryItem,
+                                                onLocateFolder: (collection) =>
+                                                    _locateLibraryEntry(
+                                                      id: collection.id,
+                                                      parentId:
+                                                          collection.parentId,
+                                                    ),
                                               );
                                             },
                                             foldersBuilder: (context, active) {

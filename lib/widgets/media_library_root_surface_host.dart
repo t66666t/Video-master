@@ -30,8 +30,10 @@ const Duration kMediaLibraryRootSwipeSnapDuration = Duration(milliseconds: 280);
 /// lay them out again. The other pages are prewarmed once the first frame
 /// has settled, so the first tap is already on the warm path.
 ///
-/// Touch/stylus may also slide to an adjacent tab. Mouse and trackpad cannot:
-/// they would fight box-select, file drops, and scrolling.
+/// Touch/stylus may slide between tabs. A drag that passes a full page keeps
+/// going into the next one, and a flick back returns to the page the gesture
+/// started on. Mouse and trackpad cannot: they would fight box-select, file
+/// drops, and scrolling.
 class MediaLibraryRootSurfaceHost extends StatefulWidget {
   const MediaLibraryRootSurfaceHost({
     super.key,
@@ -101,6 +103,7 @@ class _MediaLibraryRootSurfaceHostState
   MediaLibraryRootEntry? _dragTarget;
   bool _dragging = false;
   bool _incomingNeedsLiveLayout = false;
+  bool _originNeedsLiveLayout = false;
   double _lastWidth = 0;
   VoidCallback? _snapTick;
 
@@ -353,9 +356,9 @@ class _MediaLibraryRootSurfaceHostState
     if (_opacity[_paintedEntry]!.value != 1) {
       _opacity[_paintedEntry]!.value = 1;
     }
-    // A reverse swipe during the snap keeps the page where it is and follows
-    // the finger. Jumping to the destination, or ignoring the finger until
-    // the snap ends, is the hitch.
+    // A swipe that starts during the snap keeps the offset and follows the
+    // finger. Travel past a full page is carried in the update, so the new
+    // move can reach the page after the one already on screen.
     if (handoff) {
       _publishSettled();
       return;
@@ -364,6 +367,7 @@ class _MediaLibraryRootSurfaceHostState
       _dragging = true;
       _dragTarget = null;
       _incomingNeedsLiveLayout = false;
+      _originNeedsLiveLayout = false;
       _fadingOutEntry = null;
       _fade.value = 1;
     });
@@ -374,14 +378,17 @@ class _MediaLibraryRootSurfaceHostState
   void _onSwipeUpdate(DragUpdateDetails details) {
     if (!_dragging) return;
     final width = _hostWidth();
-    final tentative = _dragDx.value + details.delta.dx;
+    final carried = _carryPastFullPages(
+      _dragDx.value + details.delta.dx,
+      width,
+    );
     final neighbor = MediaLibraryRootSwipePolicy.neighbor(
       current: _paintedEntry,
-      dx: tentative,
+      dx: carried,
       order: widget.entryOrder,
     );
     final clamped = MediaLibraryRootSwipePolicy.clampDrag(
-      dx: tentative,
+      dx: carried,
       width: width,
       hasNeighbor: neighbor != null,
     );
@@ -389,8 +396,55 @@ class _MediaLibraryRootSurfaceHostState
     _setDx(clamped);
   }
 
-  /// Keeps the page beside the finger in sync while a snap crosses zero.
-  /// A reverse flick animates through the current page onto the other side.
+  /// Adopts each page the finger has fully crossed so the leftover distance
+  /// can open the page after it. Stops at the first or last chip.
+  double _carryPastFullPages(double dx, double width) {
+    var remaining = dx;
+    for (var n = 0; n < widget.entryOrder.length; n++) {
+      final shift = MediaLibraryRootSwipePolicy.shiftOrigin(
+        dragDx: remaining,
+        width: width,
+      );
+      if (shift == null) return remaining;
+      final index = widget.entryOrder.indexOf(_paintedEntry);
+      final nextIndex = index + shift.indexDelta;
+      if (index < 0 || nextIndex < 0 || nextIndex >= widget.entryOrder.length) {
+        return remaining;
+      }
+      _promoteDragOrigin(widget.entryOrder[nextIndex]);
+      remaining = shift.residualDx;
+    }
+    return remaining;
+  }
+
+  void _promoteDragOrigin(MediaLibraryRootEntry next) {
+    if (next == _paintedEntry) return;
+    final previous = _paintedEntry;
+    final cold = !_rasterReady.contains(next);
+    _paintedEntry = next;
+    _opacity[next]!.value = 1;
+    _opacity[previous]!.value = 0;
+    _visited.add(next);
+    if (_dragTarget == next) _dragTarget = null;
+    if (!cold) {
+      _rasterReady.add(next);
+      _originNeedsLiveLayout = false;
+      return;
+    }
+    _originNeedsLiveLayout = true;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_dragging || !_originNeedsLiveLayout) return;
+      if (_paintedEntry != next) return;
+      setState(() {
+        _originNeedsLiveLayout = false;
+        _rasterReady.add(next);
+      });
+    });
+  }
+
+  /// Keeps the page beside the finger in sync. A reversal slides back
+  /// toward the page the gesture started on.
   void _showDragNeighbor(MediaLibraryRootEntry? neighbor) {
     if (neighbor == _dragTarget) return;
     final firstVisit = neighbor != null && !_rasterReady.contains(neighbor);
@@ -447,13 +501,24 @@ class _MediaLibraryRootSurfaceHostState
         _dragging = false;
         _dragTarget = null;
         _incomingNeedsLiveLayout = false;
+        _originNeedsLiveLayout = false;
+        _rasterReady.add(_paintedEntry);
         if (_warmingEntry != _paintedEntry) {
           _warmingEntry = null;
         }
       });
       _hideParkedPages();
       _setDx(0);
+      _notifyIfOriginChanged();
     });
+  }
+
+  /// A drag that crossed onto another page and then settled there still has
+  /// to tell the chip row. The snap-to-neighbor path notifies from
+  /// [_finishSwipe].
+  void _notifyIfOriginChanged() {
+    if (!mounted || _paintedEntry == widget.displayedEntry) return;
+    widget.onUserSwipe?.call(_paintedEntry);
   }
 
   void _hideParkedPages() {
@@ -470,6 +535,7 @@ class _MediaLibraryRootSurfaceHostState
       _dragging = false;
       _dragTarget = null;
       _incomingNeedsLiveLayout = false;
+      _originNeedsLiveLayout = false;
       _hideParkedPages();
       _setDx(0);
       return;
@@ -480,8 +546,10 @@ class _MediaLibraryRootSurfaceHostState
         _dragging = false;
         _dragTarget = null;
         _incomingNeedsLiveLayout = false;
+        _originNeedsLiveLayout = false;
       });
       _setDx(0);
+      _notifyIfOriginChanged();
     });
   }
 
@@ -542,6 +610,7 @@ class _MediaLibraryRootSurfaceHostState
     _dragging = false;
     _dragTarget = null;
     _incomingNeedsLiveLayout = false;
+    _originNeedsLiveLayout = false;
     _visited.add(next);
     _rasterReady.add(next);
     _fade.value = 1;
@@ -601,6 +670,7 @@ class _MediaLibraryRootSurfaceHostState
 
   bool _entryActive(MediaLibraryRootEntry entry) {
     if (_dragging) {
+      if (_originNeedsLiveLayout && entry == _paintedEntry) return true;
       return _incomingNeedsLiveLayout && entry == _dragTarget;
     }
     return entry == _paintedEntry || entry == _warmingEntry;

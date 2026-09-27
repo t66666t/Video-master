@@ -235,7 +235,50 @@ void main() {
     expect(swiped, isNot(contains(MediaLibraryRootEntry.folders)));
   });
 
-  testWidgets('a halfway drag that flicks back opens the other tab', (
+  testWidgets('a follow-up swipe near the end of a snap opens the next page', (
+    tester,
+  ) async {
+    var displayed = MediaLibraryRootEntry.continueLearning;
+    final swiped = <MediaLibraryRootEntry>[];
+
+    Widget host() {
+      return MediaLibraryRootSurfaceHost(
+        displayedEntry: displayed,
+        onUserSwipe: (entry) {
+          swiped.add(entry);
+          displayed = entry;
+        },
+        continueBuilder: (_, _) => const Center(child: Text('continue')),
+        recentBuilder: (_, _) => const Center(child: Text('recent')),
+        foldersBuilder: (_, _) => const Center(child: Text('folders')),
+      );
+    }
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: SizedBox(width: 400, height: 640, child: host())),
+      ),
+    );
+    await tester.pump();
+
+    await tester.fling(
+      find.byType(MediaLibraryRootSurfaceHost),
+      const Offset(-240, 0),
+      1800,
+    );
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(swiped, isEmpty);
+    await tester.fling(
+      find.byType(MediaLibraryRootSurfaceHost),
+      const Offset(-280, 0),
+      1800,
+    );
+    await tester.pumpAndSettle();
+    expect(displayed, MediaLibraryRootEntry.recent);
+    expect(swiped, contains(MediaLibraryRootEntry.recent));
+  });
+
+  testWidgets('a halfway drag that flicks back returns to the current tab', (
     tester,
   ) async {
     var displayed = MediaLibraryRootEntry.folders;
@@ -287,8 +330,8 @@ void main() {
     await gesture.up(timeStamp: const Duration(milliseconds: 340));
     await tester.pumpAndSettle();
 
-    expect(swiped, MediaLibraryRootEntry.continueLearning);
-    expect(displayed, MediaLibraryRootEntry.continueLearning);
+    expect(swiped, isNull);
+    expect(displayed, MediaLibraryRootEntry.folders);
   });
 
   testWidgets('touch drag publishes a fractional chip highlight', (

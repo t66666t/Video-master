@@ -594,4 +594,48 @@ void main() {
       );
     });
   });
+
+  test('android staged download keeps a direct media url', () {
+    const pageUrl = 'https://x.com/example/status/1001';
+    const mediaUrl = 'https://example.com/media/1001.mp4';
+    const meta = VideoMeta(
+      id: '1001',
+      source: 'twitter',
+      webpageUrl: pageUrl,
+      title: 'Example',
+      uploader: 'Example',
+      rawInfo: {'direct_media': true},
+    );
+
+    expect(
+      YtDlpRequestBuilder.stagedDownloadSkipsFormatSelector(
+        meta: meta,
+        sourceUrl: pageUrl,
+        requestUrl: mediaUrl,
+      ),
+      isTrue,
+    );
+    expect(
+      YtDlpRequestBuilder.stagedDownloadUrl(
+        sourceUrl: pageUrl,
+        requestUrl: mediaUrl,
+        directMedia: true,
+      ),
+      mediaUrl,
+    );
+    expect(
+      YtDlpRequestBuilder.stagedDownloadSkipsFormatSelector(
+        meta: const VideoMeta(
+          id: 'abc',
+          source: 'youtube',
+          webpageUrl: 'https://www.youtube.com/watch?v=abc',
+          title: 'Video',
+          uploader: 'Uploader',
+        ),
+        sourceUrl: 'https://www.youtube.com/watch?v=abc',
+        requestUrl: 'https://www.youtube.com/watch?v=abc',
+      ),
+      isFalse,
+    );
+  });
 }

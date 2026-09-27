@@ -3648,10 +3648,22 @@ class YtDlpDownloadService extends ChangeNotifier {
       }
       args.add(arg);
     }
+    final directMedia = YtDlpRequestBuilder.stagedDownloadSkipsFormatSelector(
+      meta: task.meta,
+      sourceUrl: task.sourceUrl,
+      requestUrl: baseRequest.url,
+    );
+    final downloadUrl = YtDlpRequestBuilder.stagedDownloadUrl(
+      sourceUrl: task.sourceUrl,
+      requestUrl: baseRequest.url,
+      directMedia: directMedia,
+    );
     args.addAll(['--paths', tempDirectoryPath]);
-    args.addAll(_buildAndroidFormatArgs(task, baseRequest));
+    if (!directMedia) {
+      args.addAll(_buildAndroidFormatArgs(task, baseRequest));
+    }
     args.addAll(['-o', outputTemplate]);
-    args.add(task.sourceUrl);
+    args.add(downloadUrl);
     return args;
   }
 
@@ -3679,36 +3691,15 @@ class YtDlpDownloadService extends ChangeNotifier {
     if (task.selection.removeAudio) {
       return ['-f', resolvedVideoId ?? 'bestvideo/best'];
     }
-    final selectedVideo = task.meta?.videoFormats
-        .where((format) => format.formatId == resolvedVideoId)
-        .firstOrNull;
-    final needsSeparateAudio = YtDlpVideoFormatSelector.needsSeparateAudioTrack(
-      selectedVideo,
-    );
-    final audioId = resolvedAudioIds.isNotEmpty
-        ? resolvedAudioIds.first
-        : needsSeparateAudio
-        ? task.meta?.recommendedAudioFormatId
-        : null;
-    final shouldMergeAudio =
-        audioId != null &&
-        audioId.isNotEmpty &&
-        needsSeparateAudio &&
-        !task.selection.removeAudio;
+    // This method is only used when the device has no ffmpeg executable.
+    // A merged selector finishes without leaving a playable file.
     if (resolvedVideoId != null) {
-      return [
-        '-f',
-        YtDlpVideoFormatSelector.downloadFormatSelector(
-          videoId: resolvedVideoId,
-          audioId: audioId,
-          mergeAudio: shouldMergeAudio,
-        ),
-      ];
+      return ['-f', resolvedVideoId];
     }
     if (resolvedAudioIds.isNotEmpty) {
       return ['-f', resolvedAudioIds.first];
     }
-    return ['-f', 'bestvideo+bestaudio/best'];
+    return ['-f', 'best'];
   }
 
   bool _shouldEmbedSubtitlesForAndroid(YtDlpTaskRecord task) {

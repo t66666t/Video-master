@@ -383,7 +383,6 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
   bool _toolbarInsertScheduled = false;
   bool _touchToolbar = false;
   Offset? _toolbarTouchAnchor;
-  TextSelectionToolbarAnchors? _toolbarAnchors;
   final Set<int> _downTouchPointers = <int>{};
   final Map<int, Offset> _downTouchPositions = <int, Offset>{};
   int? _latestDownTouchPointer;
@@ -409,6 +408,8 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
     },
   );
 
+  static const double _logHorizontalInset = 28;
+  static const double _toolbarHandleClearance = 40;
   static const double _edgeEnterZone = 56;
   static const double _edgeExitZone = 72;
   static const double _edgeMinPixelsPerTick = 2;
@@ -773,8 +774,10 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
     }
     final Rect viewport =
         viewportObject.localToGlobal(Offset.zero) & viewportObject.size;
-    final TextSelectionToolbarAnchors anchors = _toolbarAnchors ??=
-        _toolbarAnchorsFor(selection, viewport);
+    final TextSelectionToolbarAnchors anchors = _toolbarAnchorsFor(
+      selection,
+      viewport,
+    );
     return AdaptiveTextSelectionToolbar.buttonItems(
       anchors: anchors,
       buttonItems: <ContextMenuButtonItem>[
@@ -815,9 +818,18 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
     final double inset = viewport.width < 32 ? 0 : 16;
     double clampX(double dx) =>
         dx.clamp(viewport.left + inset, viewport.right - inset).toDouble();
+    // Android handle knobs sit just outside the selection. The toolbar's
+    // bottom edge is the upper anchor and its top edge is the lower one, so
+    // the gap has to clear those knobs instead of sitting on them.
     return TextSelectionToolbarAnchors(
-      primaryAnchor: Offset(clampX(above.dx), above.dy - 6),
-      secondaryAnchor: Offset(clampX(below.dx), below.dy + 6),
+      primaryAnchor: Offset(
+        clampX(above.dx),
+        above.dy - _toolbarHandleClearance,
+      ),
+      secondaryAnchor: Offset(
+        clampX(below.dx),
+        below.dy + _toolbarHandleClearance,
+      ),
     );
   }
 
@@ -830,7 +842,6 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
     _toolbarEntry = null;
     _touchToolbar = false;
     _toolbarTouchAnchor = null;
-    _toolbarAnchors = null;
   }
 
   void _copySelection() {
@@ -902,7 +913,12 @@ class _DebugLogPanelState extends State<_DebugLogPanel> {
         child: SingleChildScrollView(
           key: _viewportKey,
           controller: _scroll,
-          padding: const EdgeInsets.fromLTRB(12, 8, 20, 24),
+          padding: const EdgeInsets.fromLTRB(
+            _logHorizontalInset,
+            8,
+            _logHorizontalInset + 12,
+            24,
+          ),
           child: _LogScrollableCapture(
             onScrollable: _rememberScrollable,
             child: SelectionArea(

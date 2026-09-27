@@ -163,6 +163,7 @@ void main() {
     );
     await first.setCountOnlyWhilePlaying(true);
     await first.setCustomMinutes(75);
+    await first.setCustomItemCount(12);
     await first.cancel();
     first.dispose();
 
@@ -174,6 +175,7 @@ void main() {
     );
     expect(restored.countOnlyWhilePlaying, isTrue);
     expect(restored.customMinutes, 75);
+    expect(restored.customItemCount, 12);
     expect(restored.isActive, isFalse);
     restored.dispose();
   });

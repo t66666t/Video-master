@@ -25,6 +25,9 @@ class SleepTimerController extends ChangeNotifier {
   static const String _awaitingCurrentKey = 'sleepTimer.awaitingCurrentItemEnd';
   static const String _countOnlyKey = 'sleepTimer.countOnlyWhilePlaying';
   static const String _customMinutesKey = 'sleepTimer.customMinutes';
+  static const String _customItemCountKey = 'sleepTimer.customItemCount';
+  static const int minCustomItemCount = 1;
+  static const int maxCustomItemCount = 999;
   static const Duration _heartbeatInterval = Duration(milliseconds: 500);
   static const Duration _playbackPersistInterval = Duration(seconds: 5);
 
@@ -48,6 +51,7 @@ class SleepTimerController extends ChangeNotifier {
   bool _awaitingCurrentItemEnd = false;
   bool _countOnlyWhilePlaying = false;
   int _customMinutes = 30;
+  int _customItemCount = 3;
 
   SleepTimerMode get mode => _mode;
   bool get isActive => _mode != SleepTimerMode.off;
@@ -57,6 +61,7 @@ class SleepTimerController extends ChangeNotifier {
   bool get awaitingCurrentItemEnd => _awaitingCurrentItemEnd;
   bool get countOnlyWhilePlaying => _countOnlyWhilePlaying;
   int get customMinutes => _customMinutes;
+  int get customItemCount => _customItemCount;
 
   bool get tracksItemCompletion =>
       _mode == SleepTimerMode.endOfCurrentItem ||
@@ -114,12 +119,21 @@ class SleepTimerController extends ChangeNotifier {
     _wasPlaybackRunning = isPlaybackRunning();
     _lastSettledAt = _now();
     playbackListenable.addListener(_handlePlaybackStateChanged);
+    // A previous session can leave its preference write unfinished when the
+    // preferences store is replaced. New commands must not wait on that chain.
+    _persistenceTail = Future<void>.value();
 
     final preferences = await SharedPreferences.getInstance();
     _countOnlyWhilePlaying = preferences.getBool(_countOnlyKey) ?? false;
     final storedMinutes = preferences.getInt(_customMinutesKey);
     if (storedMinutes != null && storedMinutes >= 1 && storedMinutes <= 1440) {
       _customMinutes = storedMinutes;
+    }
+    final storedItemCount = preferences.getInt(_customItemCountKey);
+    if (storedItemCount != null &&
+        storedItemCount >= minCustomItemCount &&
+        storedItemCount <= maxCustomItemCount) {
+      _customItemCount = storedItemCount;
     }
 
     final storedMode = preferences.getInt(_modeKey);
@@ -230,6 +244,13 @@ class SleepTimerController extends ChangeNotifier {
     final next = minutes.clamp(1, 1440);
     if (_customMinutes == next) return;
     _customMinutes = next;
+    await _persistPreferences();
+  }
+
+  Future<void> setCustomItemCount(int count) async {
+    final next = count.clamp(minCustomItemCount, maxCustomItemCount);
+    if (_customItemCount == next) return;
+    _customItemCount = next;
     await _persistPreferences();
   }
 
@@ -452,6 +473,7 @@ class SleepTimerController extends ChangeNotifier {
   ) async {
     await preferences.setBool(_countOnlyKey, snapshot.countOnlyWhilePlaying);
     await preferences.setInt(_customMinutesKey, snapshot.customMinutes);
+    await preferences.setInt(_customItemCountKey, snapshot.customItemCount);
   }
 
   Future<void> _writeActiveTimer(
@@ -559,6 +581,7 @@ class _TimerSnapshot {
     required this.awaitingCurrentItemEnd,
     required this.countOnlyWhilePlaying,
     required this.customMinutes,
+    required this.customItemCount,
   });
 
   final SleepTimerMode mode;
@@ -569,6 +592,7 @@ class _TimerSnapshot {
   final bool awaitingCurrentItemEnd;
   final bool countOnlyWhilePlaying;
   final int customMinutes;
+  final int customItemCount;
 
   factory _TimerSnapshot.capture(SleepTimerController timer) {
     return _TimerSnapshot(
@@ -580,6 +604,7 @@ class _TimerSnapshot {
       awaitingCurrentItemEnd: timer._awaitingCurrentItemEnd,
       countOnlyWhilePlaying: timer._countOnlyWhilePlaying,
       customMinutes: timer._customMinutes,
+      customItemCount: timer._customItemCount,
     );
   }
 }

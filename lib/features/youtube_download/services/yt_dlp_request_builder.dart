@@ -6,6 +6,33 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_video
 class YtDlpRequestBuilder {
   const YtDlpRequestBuilder();
 
+  /// A resolved direct file should be downloaded as that file.
+  /// Android's staged rewrite must not send the page URL back to yt-dlp.
+  static bool stagedDownloadSkipsFormatSelector({
+    required VideoMeta? meta,
+    required String sourceUrl,
+    required String requestUrl,
+  }) {
+    if (meta?.rawInfo['direct_media'] == true) {
+      return true;
+    }
+    final source = sourceUrl.trim();
+    final request = requestUrl.trim();
+    return source.isNotEmpty && request.isNotEmpty && source != request;
+  }
+
+  static String stagedDownloadUrl({
+    required String sourceUrl,
+    required String requestUrl,
+    required bool directMedia,
+  }) {
+    final request = requestUrl.trim();
+    if (directMedia && request.isNotEmpty) {
+      return request;
+    }
+    return sourceUrl;
+  }
+
   NativeDownloadRequest build({
     required String taskId,
     required String url,

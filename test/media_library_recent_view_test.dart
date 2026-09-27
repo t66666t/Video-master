@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/library_activity.dart';
+import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
@@ -133,13 +134,87 @@ void main() {
     expect(find.byType(SliverGrid), findsOneWidget);
   });
 
+  testWidgets('nested folder child can be opened and located', (tester) async {
+    library.seedCollectionForTesting(
+      VideoCollection(
+        id: 'root',
+        name: '压缩包',
+        createTime: 1,
+        childrenIds: ['mid'],
+      ),
+    );
+    library.seedCollectionForTesting(
+      VideoCollection(
+        id: 'mid',
+        name: '中间层',
+        createTime: 1,
+        parentId: 'root',
+        childrenIds: ['deep'],
+      ),
+    );
+    library.seedCollectionForTesting(
+      VideoCollection(
+        id: 'deep',
+        name: '最内层',
+        createTime: 1,
+        parentId: 'mid',
+        childrenIds: ['clip'],
+      ),
+    );
+    library.seedVideoForTesting(
+      VideoItem(
+        id: 'clip',
+        path: '/tmp/clip.mp4',
+        title: 'clip',
+        durationMs: 1,
+        lastUpdated: 1,
+        parentId: 'deep',
+        hasProbedChapters: true,
+      ),
+    );
+    final batchId = library.beginImportBatch(
+      title: '压缩包',
+      sourceKind: LibraryImportSourceKind.archive,
+      startedAtMs: 50,
+    )!;
+    library.noteImportedCollection('root', batchId: batchId);
+    library.noteImportedCollection('mid', batchId: batchId);
+    library.noteImportedCollection('deep', batchId: batchId);
+    library.noteImportedMedia('clip', addedAtMs: 50, batchId: batchId);
+    await library.completeImportBatch(batchId, persist: false);
+    library.notifyListeners();
+
+    String? opened;
+    String? located;
+    await tester.pumpWidget(
+      _harness(library, onOpenFolder: (id) => opened = id, onLocateFolder: (id) => located = id),
+    );
+    await tester.pump();
+
+    expect(find.text('压缩包·当前1项'), findsOneWidget);
+    expect(find.text('中间层'), findsOneWidget);
+    expect(find.byKey(const ValueKey('show-in-parent-folder-button')), findsOneWidget);
+
+    await tester.tap(find.text('中间层'));
+    await tester.pump();
+    expect(opened, 'mid');
+
+    await tester.tap(find.byKey(const ValueKey('show-in-parent-folder-button')));
+    await tester.pump();
+    expect(located, 'mid');
+  });
+
   test('查看 intent records the batch without switching by itself', () {
     MediaLibraryRecentIntent.viewBatch('batch-9');
     expect(MediaLibraryRecentIntent.pendingBatchId.value, 'batch-9');
   });
 }
 
-Widget _harness(LibraryService library) {
+Widget _harness(
+  LibraryService library, {
+  ValueChanged<String>? onOpenFolder,
+  ValueChanged<String>? onLocateFolder,
+}) {
   return MultiProvider(
     providers: [
       ChangeNotifierProvider<LibraryService>.value(value: library),
@@ -157,6 +232,8 @@ Widget _harness(LibraryService library) {
           cardBottomPadding: 0,
           onOpenMedia: (_) {},
           onLocateMedia: (_) {},
+          onOpenFolder: (collection) => onOpenFolder?.call(collection.id),
+          onLocateFolder: (collection) => onLocateFolder?.call(collection.id),
         ),
       ),
     ),

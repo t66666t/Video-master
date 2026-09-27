@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../services/media_playback_service.dart';
@@ -43,7 +44,8 @@ class _SleepTimerDialog extends StatefulWidget {
 
 class _SleepTimerDialogState extends State<_SleepTimerDialog> {
   final TextEditingController _minutesController = TextEditingController();
-  bool _minutesInitialized = false;
+  final TextEditingController _itemCountController = TextEditingController();
+  bool _fieldsInitialized = false;
 
   bool get _isMobile =>
       !kIsWeb &&
@@ -53,15 +55,17 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_minutesInitialized) return;
-    _minutesInitialized = true;
+    if (_fieldsInitialized) return;
+    _fieldsInitialized = true;
     final timer = context.read<MediaPlaybackService>().sleepTimer;
     _minutesController.text = '${timer.customMinutes}';
+    _itemCountController.text = '${timer.customItemCount}';
   }
 
   @override
   void dispose() {
     _minutesController.dispose();
+    _itemCountController.dispose();
     super.dispose();
   }
 
@@ -80,6 +84,21 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
     }
     await timer.setCustomMinutes(minutes);
     await _scheduleDuration(timer, minutes);
+  }
+
+  Future<void> _scheduleCustomItems(SleepTimerController timer) async {
+    final count = int.tryParse(_itemCountController.text.trim());
+    if (count == null ||
+        count < SleepTimerController.minCustomItemCount ||
+        count > SleepTimerController.maxCustomItemCount) {
+      AppToast.show(
+        '请输入 ${SleepTimerController.minCustomItemCount} 至 ${SleepTimerController.maxCustomItemCount} 个',
+        type: AppToastType.info,
+      );
+      return;
+    }
+    await timer.setCustomItemCount(count);
+    await timer.scheduleAfterItems(count);
   }
 
   Future<void> _pickClockTime(SleepTimerController timer) async {
@@ -243,7 +262,13 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              _CompletionCard(timer: timer, dense: metrics.dense),
+              _CompletionCard(
+                timer: timer,
+                dense: metrics.dense,
+                itemCountController: _itemCountController,
+                onCustomItemCountSubmitted: () =>
+                    unawaited(_scheduleCustomItems(timer)),
+              ),
               SizedBox(height: metrics.cardGap),
               _PlaybackSettingsCard(
                 isMobile: _isMobile,
@@ -274,7 +299,13 @@ class _SleepTimerDialogState extends State<_SleepTimerDialog> {
           onPickClockTime: () => unawaited(_pickClockTime(timer)),
         ),
         SizedBox(height: metrics.cardGap),
-        _CompletionCard(timer: timer, dense: metrics.dense),
+        _CompletionCard(
+          timer: timer,
+          dense: metrics.dense,
+          itemCountController: _itemCountController,
+          onCustomItemCountSubmitted: () =>
+              unawaited(_scheduleCustomItems(timer)),
+        ),
         SizedBox(height: metrics.cardGap),
         _PlaybackSettingsCard(
           isMobile: _isMobile,
@@ -551,10 +582,17 @@ class _DurationCard extends StatelessWidget {
 }
 
 class _CompletionCard extends StatelessWidget {
-  const _CompletionCard({required this.timer, required this.dense});
+  const _CompletionCard({
+    required this.timer,
+    required this.dense,
+    required this.itemCountController,
+    required this.onCustomItemCountSubmitted,
+  });
 
   final SleepTimerController timer;
   final bool dense;
+  final TextEditingController itemCountController;
+  final VoidCallback onCustomItemCountSubmitted;
 
   @override
   Widget build(BuildContext context) {
@@ -611,14 +649,11 @@ class _CompletionCard extends StatelessWidget {
                 ),
                 SizedBox(width: dense ? 5 : 7),
                 Expanded(
-                  child: _CompletionButton(
-                    label: '再播 3 个',
-                    icon: Icons.filter_3_outlined,
+                  child: _CustomItemCountButton(
+                    timer: timer,
+                    controller: itemCountController,
                     dense: dense,
-                    selected:
-                        timer.mode == SleepTimerMode.afterItemCount &&
-                        timer.scheduledItemCount == 3,
-                    onPressed: () => unawaited(timer.scheduleAfterItems(3)),
+                    onSubmitted: onCustomItemCountSubmitted,
                   ),
                 ),
               ],
@@ -873,6 +908,156 @@ class _CompletionButton extends StatelessWidget {
             fontSize: dense ? 9.5 : 10.5,
             fontWeight: FontWeight.w500,
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CustomItemCountButton extends StatefulWidget {
+  const _CustomItemCountButton({
+    required this.timer,
+    required this.controller,
+    required this.dense,
+    required this.onSubmitted,
+  });
+
+  final SleepTimerController timer;
+  final TextEditingController controller;
+  final bool dense;
+  final VoidCallback onSubmitted;
+
+  @override
+  State<_CustomItemCountButton> createState() => _CustomItemCountButtonState();
+}
+
+class _CustomItemCountButtonState extends State<_CustomItemCountButton> {
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_handleTextChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant _CustomItemCountButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller == widget.controller) return;
+    oldWidget.controller.removeListener(_handleTextChanged);
+    widget.controller.addListener(_handleTextChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_handleTextChanged);
+    super.dispose();
+  }
+
+  void _handleTextChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _selected {
+    final count = int.tryParse(widget.controller.text.trim());
+    return count != null &&
+        count > 1 &&
+        widget.timer.mode == SleepTimerMode.afterItemCount &&
+        widget.timer.scheduledItemCount == count;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dense = widget.dense;
+    final selected = _selected;
+    final color = selected ? const Color(0xFF82ADFF) : Colors.white60;
+    return SizedBox(
+      height: dense ? 30 : 36,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: selected
+              ? const Color(0xFF397AF2).withValues(alpha: 0.12)
+              : Colors.black.withValues(alpha: 0.1),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected
+                ? const Color(0xFF6B9FFF).withValues(alpha: 0.55)
+                : Colors.white12,
+          ),
+        ),
+        child: Row(
+          children: [
+            SizedBox(width: dense ? 6 : 8),
+            Text(
+              '再播',
+              style: TextStyle(
+                fontFamily: _sleepTimerFontFamily,
+                color: color,
+                fontSize: dense ? 9.5 : 10.5,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            SizedBox(
+              width: dense ? 26 : 32,
+              child: TextField(
+                key: const Key('sleepTimerCustomItemCount'),
+                controller: widget.controller,
+                keyboardType: TextInputType.number,
+                textInputAction: TextInputAction.done,
+                textAlign: TextAlign.center,
+                textAlignVertical: TextAlignVertical.center,
+                onSubmitted: (_) => widget.onSubmitted(),
+                inputFormatters: [
+                  FilteringTextInputFormatter.digitsOnly,
+                  LengthLimitingTextInputFormatter(3),
+                ],
+                style: TextStyle(
+                  fontFamily: _sleepTimerFontFamily,
+                  color: Colors.white,
+                  fontSize: dense ? 11 : 12,
+                  height: 1,
+                  fontWeight: FontWeight.w600,
+                ),
+                decoration: InputDecoration(
+                  isCollapsed: true,
+                  isDense: true,
+                  contentPadding: EdgeInsets.symmetric(
+                    vertical: dense ? 7 : 10,
+                  ),
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                ),
+              ),
+            ),
+            Text(
+              '个',
+              style: TextStyle(
+                fontFamily: _sleepTimerFontFamily,
+                color: color,
+                fontSize: dense ? 9.5 : 10.5,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+            const Spacer(),
+            Tooltip(
+              message: '设置再播数量',
+              child: TextButton(
+                onPressed: widget.onSubmitted,
+                style: TextButton.styleFrom(
+                  minimumSize: Size(0, dense ? 30 : 36),
+                  padding: EdgeInsets.symmetric(horizontal: dense ? 6 : 8),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
+                  foregroundColor: const Color(0xFF84AFFF),
+                  textStyle: TextStyle(
+                    fontFamily: _sleepTimerFontFamily,
+                    fontSize: dense ? 9.5 : 10.5,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                child: const Text('设置'),
+              ),
+            ),
+          ],
         ),
       ),
     );
