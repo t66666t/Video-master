@@ -17,6 +17,7 @@ import 'services/settings_service.dart';
 import 'services/transcription_manager.dart';
 import 'services/media_materialization_service.dart';
 import 'services/batch_import_service.dart';
+import 'services/bilibili/bilibili_cache_limit_service.dart';
 import 'services/embedded_subtitle_service.dart';
 import 'services/bilibili/bilibili_download_service.dart';
 import 'services/bilibili/bilibili_streaming_service.dart';
@@ -437,6 +438,15 @@ Future<void> _initializeDeferredServices({
   // Playback restoration needs the library and Android media session, but
   // neither is allowed to delay the first Flutter frame.
   await Future.wait<void>(<Future<void>>[libraryFuture, mediaSessionFuture]);
+
+  // Keeps the online playback cache under the user's cap (Bilibili settings).
+  BilibiliCacheManager.install(
+    BilibiliCacheManager.forApp(
+      library: library,
+      streaming: bilibiliService.streamingService,
+      playback: mediaPlaybackService,
+    ),
+  );
 }
 
 void _configureImageCaches() {

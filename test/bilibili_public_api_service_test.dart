@@ -6,7 +6,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/wbi_signer.dart';
-import 'package:video_player_app/utils/bilibili_url_parser.dart';
 
 const _bvid = 'BV1GJ411x7h7';
 
@@ -277,9 +276,11 @@ void main() {
     expect(adapter.requests.single.headers.containsKey('cookie'), isFalse);
     expect(adapter.requests.single.followRedirects, isFalse);
 
+    // An http start is upgraded; the request itself goes out over https.
     final http = await api.resolveShortLink(Uri.parse('http://b23.tv/abc'));
-    expect(http.failure, BilibiliShortLinkFailure.insecureScheme);
-    expect(adapter.requests, hasLength(1));
+    expect(http.target!.bvid, _bvid);
+    expect(adapter.requests, hasLength(2));
+    expect(adapter.requests.last.uri.scheme, 'https');
   });
 
   test('wbi signing keeps ascii-only parameters unchanged', () {

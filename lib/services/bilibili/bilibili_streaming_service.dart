@@ -331,6 +331,19 @@ class BilibiliStreamingService extends ChangeNotifier {
   @visibleForTesting
   int get activePlaybackSessionCount => _sessions.length;
 
+  /// Cards whose cache is in use right now (a playback session or a running
+  /// transcription audio download); size trimming must leave them alone.
+  Set<String> get cacheItemIdsInUse => <String>{
+    for (final session in _sessions.values) session.itemId,
+    ..._transcriptionAudioDownloads.keys,
+  };
+
+  /// The cache root this service writes to.
+  Future<Directory> resolveCacheDirectory() => _resolveCacheDirectory();
+
+  /// Folder name a card's cache lives under inside the cache root.
+  static String cacheEntryName(String itemId) => _safeNameStatic(itemId);
+
   /// Bytes copied from a CDN body to a player. Tests use this to see that a
   /// disconnected player stops the read, not merely that the kernel buffer
   /// stopped accepting writes.

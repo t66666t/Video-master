@@ -346,15 +346,27 @@ class BilibiliShortLinkResult {
   String? get message => failure?.message;
 }
 
+/// `http://b23.tv/...` (or another short-link host) as https; any other
+/// link is returned unchanged. Only the address the user supplied is
+/// upgraded, never a redirect target.
+Uri upgradeBilibiliShortLink(Uri link) {
+  if (link.scheme.toLowerCase() == 'http' && isBilibiliShortHost(link.host)) {
+    return link.replace(scheme: 'https');
+  }
+  return link;
+}
+
 /// One request of the redirect chain: the `Location` it points to, or null
 /// when the response is not a redirect. Throws on network errors.
 typedef BilibiliRedirectFetcher = Future<Uri?> Function(Uri url);
 
 /// Follows [link] with [fetchRedirect] until it reaches a Bilibili video.
 ///
-/// Every hop must be https and stay on b23.tv / bili2233.cn / bilibili.com;
-/// at most [maxRedirects] redirects are followed and the whole chain must
-/// finish within [timeout]. Never throws; failures come back as a result.
+/// A starting `http://` short link (b23.tv / bili2233.cn) is upgraded to
+/// https first. After that every hop must be https and stay on b23.tv /
+/// bili2233.cn / bilibili.com; at most [maxRedirects] redirects are followed
+/// and the whole chain must finish within [timeout]. Never throws; failures
+/// come back as a result.
 Future<BilibiliShortLinkResult> resolveBilibiliShortLink(
   Uri link, {
   required BilibiliRedirectFetcher fetchRedirect,
@@ -362,8 +374,9 @@ Future<BilibiliShortLinkResult> resolveBilibiliShortLink(
   Duration timeout = kBilibiliShortLinkTimeout,
 }) async {
   final fromLink = _parseUrl(link) ?? const BilibiliLinkTarget();
+  final start = upgradeBilibiliShortLink(link);
   Future<BilibiliShortLinkResult> follow() async {
-    var current = link;
+    var current = start;
     var redirects = 0;
     while (true) {
       if (current.scheme.toLowerCase() != 'https') {

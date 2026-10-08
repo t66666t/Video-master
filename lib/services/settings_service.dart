@@ -828,6 +828,39 @@ class SettingsService extends ChangeNotifier {
   /// history. Turning it off keeps existing entries.
   bool bilibiliRecordWatchHistory = true;
 
+  /// Bilibili account read-only mode, on by default. While on, nothing that
+  /// changes the account (like, coin, favourite, follow, ...) may be sent to
+  /// Bilibili. Callers that would write check [bilibiliAccountWritesAllowed]
+  /// and listen to this service for changes.
+  bool bilibiliAccountReadOnly = true;
+
+  /// False while [bilibiliAccountReadOnly] is on.
+  bool get bilibiliAccountWritesAllowed => !bilibiliAccountReadOnly;
+
+  /// Size cap for the online playback cache (`bilibili_stream_cache`), one of
+  /// [bilibiliCacheLimitOptions].
+  int bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
+
+  static const int _mib = 1024 * 1024;
+  static const List<int> bilibiliCacheLimitOptions = <int>[
+    128 * _mib,
+    256 * _mib,
+    512 * _mib,
+    1024 * _mib,
+    2048 * _mib,
+  ];
+  static const int bilibiliCacheLimitDefault = 1024 * _mib;
+
+  /// Nearest allowed cache cap at or below [value] (smallest option if below
+  /// all of them).
+  static int normalizeBilibiliCacheLimit(int value) {
+    var result = bilibiliCacheLimitOptions.first;
+    for (final option in bilibiliCacheLimitOptions) {
+      if (option <= value) result = option;
+    }
+    return result;
+  }
+
   /// Latest clipboard text whose parse attempt finished. This is not a user
   /// setting and is omitted from settings export so a backup does not carry
   /// clipboard contents to another device.
@@ -1674,6 +1707,17 @@ class SettingsService extends ChangeNotifier {
         defaultValue: true,
         apply: (service, value) => service.bilibiliRecordWatchHistory = value,
       ),
+      _boolSetting(
+        key: 'bilibiliAccountReadOnly',
+        defaultValue: true,
+        apply: (service, value) => service.bilibiliAccountReadOnly = value,
+      ),
+      _intSetting(
+        key: 'bilibiliCacheLimitBytes',
+        defaultValue: bilibiliCacheLimitDefault,
+        normalize: normalizeBilibiliCacheLimit,
+        apply: (service, value) => service.bilibiliCacheLimitBytes = value,
+      ),
       _stringSetting(
         key: 'structuredImportSortField',
         defaultValue: 'fileName',
@@ -2178,6 +2222,8 @@ class SettingsService extends ChangeNotifier {
     clipboardLastHandledText = null;
     bilibiliRecordSearchHistory = true;
     bilibiliRecordWatchHistory = true;
+    bilibiliAccountReadOnly = true;
+    bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
     importSourceFolderNamesJson = '{}';
     importSourceFolderIdsJson = '{}';
@@ -3565,6 +3611,8 @@ class SettingsService extends ChangeNotifier {
         'skipRepeatedClipboardText': skipRepeatedClipboardText,
         'bilibiliRecordSearchHistory': bilibiliRecordSearchHistory,
         'bilibiliRecordWatchHistory': bilibiliRecordWatchHistory,
+        'bilibiliAccountReadOnly': bilibiliAccountReadOnly,
+        'bilibiliCacheLimitBytes': bilibiliCacheLimitBytes,
         'structuredImportSortField': structuredImportSortField,
         'structuredImportSortDirection': structuredImportSortDirection,
       },

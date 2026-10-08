@@ -3,12 +3,14 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
@@ -79,6 +81,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
   bool _accountChecked = false;
   String? _avatarUrl;
   bool _loggedIn = false;
+  final SettingsService _settings = SettingsService();
 
   @override
   void initState() {
@@ -87,6 +90,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     _userScroll.addListener(() => _maybeLoadMore(1));
     _inputFocus.addListener(_handleFocusChange);
     _history.addListener(_handleHistoryChanged);
+    _settings.addListener(_handleHistoryChanged);
     unawaited(_history.ensureLoaded());
     if (widget.isActive) _scheduleAccountCheck();
   }
@@ -108,6 +112,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
   void dispose() {
     _suggestDebounce?.cancel();
     _history.removeListener(_handleHistoryChanged);
+    _settings.removeListener(_handleHistoryChanged);
     _input.dispose();
     _inputFocus.dispose();
     _videoScroll.dispose();
@@ -239,6 +244,12 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       _keyword.isNotEmpty &&
       _inputFocus.hasFocus &&
       _input.text.trim().isEmpty &&
+      _hasVisibleSearchHistory;
+
+  /// Turning search history off in the Bilibili settings hides it here; the
+  /// saved keywords stay until cleared.
+  bool get _hasVisibleSearchHistory =>
+      _settings.bilibiliRecordSearchHistory &&
       _history.searchHistory.isNotEmpty;
 
   void _jumpToTop() {
@@ -474,9 +485,32 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
             },
             icon: const Icon(Icons.history, size: 24, color: AppTokens.text2),
           ),
-          IconButton(
+          PopupMenuButton<_AccountMenuAction>(
+            key: const ValueKey('bilibili-account-menu'),
             tooltip: _loggedIn ? 'B 站账号' : '登录 B 站',
-            onPressed: _openAccount,
+            color: AppTokens.bgOverlay,
+            onOpened: _inputFocus.unfocus,
+            onSelected: (action) {
+              switch (action) {
+                case _AccountMenuAction.account:
+                  unawaited(_openAccount());
+                case _AccountMenuAction.settings:
+                  unawaited(openBilibiliSettings(context));
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: _AccountMenuAction.account,
+                child: _accountMenuItem(
+                  Icons.account_circle_outlined,
+                  _loggedIn ? 'B 站账号' : '登录 B 站',
+                ),
+              ),
+              PopupMenuItem(
+                value: _AccountMenuAction.settings,
+                child: _accountMenuItem(Icons.settings_outlined, 'B 站设置'),
+              ),
+            ],
             icon: _avatarUrl == null
                 ? const Icon(
                     Icons.account_circle_outlined,
@@ -487,6 +521,19 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _accountMenuItem(IconData icon, String label) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: AppTokens.text2),
+        const SizedBox(width: 10),
+        Text(
+          label,
+          style: const TextStyle(color: AppTokens.text1, fontSize: 14),
+        ),
+      ],
     );
   }
 
@@ -789,7 +836,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
         '输入关键词搜索 B 站内容',
         '也可以直接粘贴 BV 号或视频链接打开详情',
       );
-      if (_history.searchHistory.isEmpty) return hint;
+      if (!_hasVisibleSearchHistory) return hint;
       return ListView(
         padding: EdgeInsets.only(bottom: 16 + widget.bottomPadding),
         children: [_buildSearchHistory(overlay: false), hint],
@@ -1043,3 +1090,5 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     );
   }
 }
+
+enum _AccountMenuAction { account, settings }

@@ -378,11 +378,11 @@ void main() {
         isNot(contains('cookie')),
       );
 
-      await expectLater(
-        service.parseSingleLine('http://b23.tv/abc'),
-        throwsA(predicate((e) => e.toString().contains('https'))),
-      );
-      expect(adapter.requests, hasLength(1));
+      // An http short link is upgraded to https first.
+      final upgraded = await service.parseSingleLine('http://b23.tv/abc');
+      expect(upgraded!.singleVideoInfo!.bvid, _bvid);
+      expect(adapter.requests, hasLength(2));
+      expect(adapter.requests.last.uri.scheme, 'https');
     });
   });
 }

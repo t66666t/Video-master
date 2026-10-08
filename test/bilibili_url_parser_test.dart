@@ -246,16 +246,28 @@ void main() {
       expect(endless.requests, hasLength(kBilibiliShortLinkMaxRedirects));
     });
 
-    test('rejects non-https links and redirects', () async {
-      final fetch = _FakeRedirects({});
-      final plain = await resolveBilibiliShortLink(
+    test('an http short link is upgraded to https before resolving', () async {
+      final fetch = _FakeRedirects({
+        'https://b23.tv/abc': 'https://www.bilibili.com/video/$_bvid?p=2',
+      });
+      final result = await resolveBilibiliShortLink(
         Uri.parse('http://b23.tv/abc'),
         fetchRedirect: fetch.call,
       );
-      expect(plain.failure, BilibiliShortLinkFailure.insecureScheme);
-      expect(plain.message, contains('https'));
-      expect(fetch.requests, isEmpty);
+      expect(result.target?.bvid, _bvid);
+      expect(result.target?.page, 2);
+      expect(fetch.requests.single.scheme, 'https');
+      expect(
+        upgradeBilibiliShortLink(Uri.parse('http://bili2233.cn/x')).scheme,
+        'https',
+      );
+      expect(
+        upgradeBilibiliShortLink(Uri.parse('http://example.com/x')).scheme,
+        'http',
+      );
+    });
 
+    test('a redirect down to http still fails', () async {
       final downgraded = await resolveBilibiliShortLink(
         Uri.parse('https://b23.tv/abc'),
         fetchRedirect: _FakeRedirects({
@@ -263,6 +275,15 @@ void main() {
         }).call,
       );
       expect(downgraded.failure, BilibiliShortLinkFailure.insecureScheme);
+      expect(downgraded.message, contains('https'));
+
+      final viaHttpStart = await resolveBilibiliShortLink(
+        Uri.parse('http://b23.tv/abc'),
+        fetchRedirect: _FakeRedirects({
+          'https://b23.tv/abc': 'http://b23.tv/next',
+        }).call,
+      );
+      expect(viaHttpStart.failure, BilibiliShortLinkFailure.insecureScheme);
     });
 
     test('leaving Bilibili fails', () async {
