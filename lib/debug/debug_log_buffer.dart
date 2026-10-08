@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
+import 'log_redaction.dart';
+
 /// One kept console line. Repeats that only differ by numbers share an entry.
 class DebugLogEntry {
   DebugLogEntry(this.text, this.shape);
@@ -93,7 +95,7 @@ class DebugLogBuffer extends ChangeNotifier {
 
   void add(String? message) {
     if (_suppressDepth > 0 || message == null) return;
-    final raw = message.trimRight();
+    final raw = redactSensitiveLogText(message).trimRight();
     if (raw.trim().isEmpty) return;
     if (_firstFrameIsOwn(raw)) return;
     final stored = _isFlutterDump(raw) ? _summarizeDump(raw) : raw;

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:developer' as developer;
 
 import 'debug_log_buffer.dart';
+import 'log_redaction.dart';
 
 export 'dart:developer' hide log;
 
@@ -19,6 +20,7 @@ void log(
   Object? error,
   StackTrace? stackTrace,
 }) {
+  message = redactSensitiveLogText(message);
   final text = StringBuffer();
   if (name.isNotEmpty) text.write('[$name] ');
   text.write(message);

@@ -16,28 +16,38 @@ Future<void> showBilibiliLoginDialog(
   final service = context.read<BilibiliDownloadService>();
   final cookieController = TextEditingController();
   try {
-    final hasCookie = await service.apiService.hasCookie();
-    var loginStatus = BilibiliLoginStatus.loggedOut;
-    if (hasCookie) {
-      loginStatus = await service.apiService.checkLoginStatusDetailed();
-    }
+    final loginState = await service.apiService.fetchLoginState();
     if (!context.mounted) return;
 
-    final (statusText, statusColor) = switch (loginStatus) {
-      BilibiliLoginStatus.loggedIn => ('已登录', Colors.green),
-      BilibiliLoginStatus.loggedOut => (
-        hasCookie ? '已失效' : '未登录',
-        hasCookie ? Colors.orange : Colors.grey,
+    final account = loginState.account;
+    final (statusText, statusColor) = switch (loginState.status) {
+      BilibiliLoginStatus.loggedIn => (
+        account == null ? '已登录' : '已登录：${account.name}',
+        Colors.green,
       ),
-      BilibiliLoginStatus.unavailable => ('已保存（当前无法联网验证）', Colors.orange),
+      BilibiliLoginStatus.loggedOut => ('未登录', Colors.grey),
+      BilibiliLoginStatus.expired => ('已过期，请重新登录', Colors.orange),
+      BilibiliLoginStatus.networkError => ('已保存（当前无法联网验证）', Colors.orange),
     };
+    final canLogout = loginState.status != BilibiliLoginStatus.loggedOut;
 
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => _ResponsiveLoginDialog(
         statusText: statusText,
         statusColor: statusColor,
+        avatarUrl: account?.avatarUrl ?? '',
         cookieController: cookieController,
+        onLogout: canLogout
+            ? () async {
+                await service.apiService.logout();
+                if (!dialogContext.mounted) return;
+                if (!suppressToasts) {
+                  AppToast.show('已退出 B 站登录', type: AppToastType.success);
+                }
+                Navigator.of(dialogContext).pop();
+              }
+            : null,
         onQrLogin: () {
           Navigator.of(dialogContext).pop();
           WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -47,12 +57,18 @@ Future<void> showBilibiliLoginDialog(
           });
         },
         onSave: () async {
-          final sessData = cookieController.text.trim();
-          if (sessData.isEmpty) return;
-          await service.apiService.setCookie(sessData);
+          final input = cookieController.text.trim();
+          if (input.isEmpty) return;
+          try {
+            // Verified with nav first; only saved when Bilibili confirms.
+            await service.apiService.loginWithCookieInput(input);
+          } on BilibiliAuthException catch (error) {
+            AppToast.show(error.message, type: AppToastType.error);
+            return;
+          }
           if (!dialogContext.mounted) return;
           if (!suppressToasts) {
-            AppToast.show('Cookie 已更新', type: AppToastType.success);
+            AppToast.show('登录成功，Cookie 已安全保存', type: AppToastType.success);
           }
           unawaited(
             dialogContext.read<SettingsService>().updateSetting(
@@ -69,20 +85,45 @@ Future<void> showBilibiliLoginDialog(
   }
 }
 
-class _ResponsiveLoginDialog extends StatelessWidget {
+class _ResponsiveLoginDialog extends StatefulWidget {
   final String statusText;
   final Color statusColor;
+  final String avatarUrl;
   final TextEditingController cookieController;
   final VoidCallback onQrLogin;
   final Future<void> Function() onSave;
+  final Future<void> Function()? onLogout;
 
   const _ResponsiveLoginDialog({
     required this.statusText,
     required this.statusColor,
+    required this.avatarUrl,
     required this.cookieController,
     required this.onQrLogin,
     required this.onSave,
+    required this.onLogout,
   });
+
+  @override
+  State<_ResponsiveLoginDialog> createState() => _ResponsiveLoginDialogState();
+}
+
+class _ResponsiveLoginDialogState extends State<_ResponsiveLoginDialog> {
+  bool _busy = false;
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await action();
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  String get statusText => widget.statusText;
+  Color get statusColor => widget.statusColor;
+  TextEditingController get cookieController => widget.cookieController;
 
   @override
   Widget build(BuildContext context) {
@@ -100,13 +141,13 @@ class _ResponsiveLoginDialog extends StatelessWidget {
             autocorrect: false,
             decoration: const InputDecoration(
               labelText: 'SESSDATA',
-              hintText: '粘贴你的 SESSDATA',
+              hintText: '粘贴 SESSDATA 或完整 Cookie',
               border: OutlineInputBorder(),
               isDense: true,
             ),
           );
           final qrButton = ElevatedButton.icon(
-            onPressed: onQrLogin,
+            onPressed: _busy ? null : widget.onQrLogin,
             icon: const Icon(Icons.qr_code_rounded),
             label: const Text('扫码登录'),
           );
@@ -139,6 +180,14 @@ class _ResponsiveLoginDialog extends StatelessWidget {
                   SizedBox(height: compact ? 2 : 6),
                   Row(
                     children: [
+                      if (widget.avatarUrl.isNotEmpty) ...[
+                        CircleAvatar(
+                          radius: 12,
+                          backgroundImage: NetworkImage(widget.avatarUrl),
+                          onBackgroundImageError: (_, _) {},
+                        ),
+                        const SizedBox(width: 8),
+                      ],
                       const Text('状态：'),
                       Flexible(
                         child: Text(
@@ -171,14 +220,23 @@ class _ResponsiveLoginDialog extends StatelessWidget {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
+                      if (widget.onLogout != null) ...[
+                        TextButton(
+                          onPressed: _busy
+                              ? null
+                              : () => _run(widget.onLogout!),
+                          child: const Text('退出登录'),
+                        ),
+                        const Spacer(),
+                      ],
                       TextButton(
                         onPressed: () => Navigator.of(context).pop(),
                         child: const Text('取消'),
                       ),
                       const SizedBox(width: 8),
                       ElevatedButton(
-                        onPressed: onSave,
-                        child: const Text('保存'),
+                        onPressed: _busy ? null : () => _run(widget.onSave),
+                        child: Text(_busy ? '验证中…' : '保存'),
                       ),
                     ],
                   ),
@@ -218,6 +276,7 @@ class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
   String status = '正在生成二维码…';
   Timer? pollTimer;
   String? errorMessage;
+  bool _pollInFlight = false;
 
   @override
   void initState() {
@@ -266,8 +325,16 @@ class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
         timer.cancel();
         return;
       }
-      final result = await service.apiService.pollQrCode(qrKey!);
-      if (!mounted) return;
+      // A confirmed scan triggers nav verification; never overlap polls.
+      if (_pollInFlight) return;
+      _pollInFlight = true;
+      final Map<String, dynamic> result;
+      try {
+        result = await service.apiService.pollQrCode(qrKey!);
+      } finally {
+        _pollInFlight = false;
+      }
+      if (!mounted || !timer.isActive) return;
       if (result['success'] == true) {
         timer.cancel();
         unawaited(
@@ -288,6 +355,14 @@ class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
         });
       } else if (result['code'] == 86090) {
         setState(() => status = '已扫码，请在手机上确认');
+      } else if (result['code'] == -2) {
+        // Scan confirmed but nav verification or secure saving failed.
+        timer.cancel();
+        setState(() {
+          status = '登录未完成';
+          errorMessage = (result['message'] ?? '登录验证失败，请重试').toString();
+          qrUrl = null;
+        });
       }
     });
   }

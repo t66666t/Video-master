@@ -1922,19 +1922,20 @@ class _HomeScreenState extends State<HomeScreen>
             const Duration(seconds: 5),
             onTimeout: () {
               debugPrint('B站登录状态检查超时');
-              return BilibiliLoginStatus.unavailable;
+              return BilibiliLoginStatus.networkError;
             },
           );
 
       // Offline, timeout and Bilibili service failures cannot prove that the
       // persisted login has expired. Keep the cookie and do not disturb users
       // who only want to use local/offline features.
-      if (loginStatus == BilibiliLoginStatus.unavailable) {
+      if (loginStatus == BilibiliLoginStatus.networkError) {
         debugPrint('暂时无法验证B站登录状态，保留本地登录信息并跳过提示');
         return;
       }
 
-      if (loginStatus == BilibiliLoginStatus.loggedOut) {
+      if (loginStatus == BilibiliLoginStatus.loggedOut ||
+          loginStatus == BilibiliLoginStatus.expired) {
         if (!mounted) return;
 
         bool dontShowAgain = false;

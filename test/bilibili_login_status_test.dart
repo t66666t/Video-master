@@ -15,7 +15,7 @@ void main() {
       expect(status, BilibiliLoginStatus.loggedIn);
     });
 
-    test('recognizes an explicit logged-out response', () {
+    test('isLogin false with a cookie means the login expired', () {
       final status = BilibiliApiService.classifyLoginResponse(
         statusCode: 200,
         responseData: {
@@ -24,24 +24,61 @@ void main() {
         },
       );
 
-      expect(status, BilibiliLoginStatus.loggedOut);
+      expect(status, BilibiliLoginStatus.expired);
     });
 
-    test('does not misclassify an unavailable response as logged out', () {
+    test('code -101 means the login expired', () {
+      expect(
+        BilibiliApiService.classifyLoginResponse(
+          statusCode: 200,
+          responseData: {'code': -101, 'message': '账号未登录'},
+        ),
+        BilibiliLoginStatus.expired,
+      );
+    });
+
+    test('does not misclassify an unavailable response as expired', () {
       expect(
         BilibiliApiService.classifyLoginResponse(
           statusCode: null,
           responseData: null,
         ),
-        BilibiliLoginStatus.unavailable,
+        BilibiliLoginStatus.networkError,
       );
       expect(
         BilibiliApiService.classifyLoginResponse(
           statusCode: 200,
           responseData: {'code': -1},
         ),
-        BilibiliLoginStatus.unavailable,
+        BilibiliLoginStatus.networkError,
       );
+      expect(
+        BilibiliApiService.classifyLoginResponse(
+          statusCode: 412,
+          responseData: {'code': -412},
+        ),
+        BilibiliLoginStatus.networkError,
+      );
+      expect(
+        BilibiliApiService.classifyLoginResponse(
+          statusCode: 200,
+          responseData: '<html>blocked</html>',
+        ),
+        BilibiliLoginStatus.networkError,
+      );
+    });
+
+    test('parses account info and normalizes the avatar to https', () {
+      final state = BilibiliApiService.parseNavResponse(
+        statusCode: 200,
+        responseData:
+            '{"code":0,"data":{"isLogin":true,"mid":42,"uname":"tester",'
+            '"face":"http://i0.hdslb.com/bfs/face/a.jpg"}}',
+      );
+      expect(state.status, BilibiliLoginStatus.loggedIn);
+      expect(state.account?.mid, 42);
+      expect(state.account?.name, 'tester');
+      expect(state.account?.avatarUrl, 'https://i0.hdslb.com/bfs/face/a.jpg');
     });
   });
 }
