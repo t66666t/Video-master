@@ -39,21 +39,31 @@ typedef BilibiliVideoWatcher =
 /// import on play" on, the library card is reused or created as before. [page]
 /// null continues the part saved in the watch history, [startAt] overrides
 /// the saved position.
+///
+/// [replaceCurrent] plays it on a page that takes the place of the open
+/// playback page instead of one more page on top (the Bilibili panel of the
+/// playback page, and Bilibili pages opened above it). Null decides by
+/// itself: replace whenever a playback page is on the stack. The video being
+/// left has its position saved first.
 Future<void> watchBilibiliVideo(
   BuildContext context, {
   required String bvid,
   int? page,
   Duration? startAt,
+  bool? replaceCurrent,
 }) async {
   if (_cardActionRunning) return;
   _cardActionRunning = true;
   final service = context.read<BilibiliDownloadService>();
   final library = context.read<LibraryService>();
   final playback = context.read<MediaPlaybackService>();
+  final replace =
+      replaceCurrent ?? PlaybackNavigationService.instance.hasPlaybackPage;
   final loading = AppToast.showLoading('正在准备播放…');
   BilibiliWatchPlan plan;
   try {
     await service.init();
+    if (replace) await saveCurrentWatchPosition(playback);
     plan = await prepareBilibiliWatch(
       service: service,
       library: library,
@@ -74,7 +84,11 @@ Future<void> watchBilibiliVideo(
   }
   await loading.dismiss(immediate: true);
   if (!context.mounted) return;
-  openLibraryItemPlayback(context, plan.item, queue: plan.queue);
+  if (replace) {
+    replaceLibraryItemPlayback(context, plan.item, queue: plan.queue);
+  } else {
+    openLibraryItemPlayback(context, plan.item, queue: plan.queue);
+  }
   if (!plan.imported) return;
 
   final partCount = plan.videoInfo.pages.length;
@@ -243,6 +257,50 @@ void openLibraryItemPlayback(
       existingController: existingController,
     ),
   );
+}
+
+/// [openLibraryItemPlayback] on a page that takes the place of the open
+/// playback page (see [PlaybackNavigationService.replaceCurrentPlayback]).
+void replaceLibraryItemPlayback(
+  BuildContext context,
+  VideoItem item, {
+  List<VideoItem>? queue,
+}) {
+  final playback = context.read<MediaPlaybackService>();
+  final existingController = playback.currentItem?.id == item.id
+      ? playback.controller
+      : null;
+  context.read<PlaylistManager>().prepareLibraryPlayback(
+    item,
+    searchItems: queue,
+    useSearchResultsAsQueue: queue != null,
+  );
+  final navigation = PlaybackNavigationService.instance;
+  navigation.primeLibraryPlaybackEntry(
+    playbackService: playback,
+    item: item,
+    existingController: existingController,
+  );
+  unawaited(navigation.replaceCurrentPlayback(item));
+}
+
+/// Saves where the current video is before another one takes its page: the
+/// card's position, and for a Bilibili video its watch history entry. The
+/// left watch-only card is then removed by the usual clean-up once its page
+/// is gone.
+Future<void> saveCurrentWatchPosition(
+  MediaPlaybackService playback, {
+  BilibiliWatchCards? cards,
+}) async {
+  final current = playback.currentItem;
+  if (current == null) return;
+  try {
+    await playback.persistCurrentProgress(expectedItemId: current.id);
+    await (cards ?? BilibiliWatchCards.instance)?.recorder.flush(current.id);
+  } catch (error) {
+    // Saving is best effort and never blocks the next video.
+    developer.log('Position before switching not saved', error: error);
+  }
 }
 
 /// "Download": hands the BV + part to the existing Bilibili download page.

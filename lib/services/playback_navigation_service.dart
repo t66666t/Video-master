@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player/video_player.dart' show VideoPlayerController;
@@ -107,6 +107,8 @@ class PlaybackNavigationService {
     VideoItem item, {
     VideoPlayerController? existingController,
   }) {
+    final override = entryRouteOverrideForTesting;
+    if (override != null) return override(item);
     final autoPlayOnEntry = SettingsService().autoPlayOnPageEntry;
     if (entrySkipsPortraitPlayer) {
       return buildPlaybackPageRoute<void>(
@@ -127,6 +129,11 @@ class PlaybackNavigationService {
     );
   }
 
+  /// Replaces the playback page [buildPlaybackEntryRoute] builds, so tests
+  /// can check the navigator stack without a player.
+  @visibleForTesting
+  static Route<void> Function(VideoItem item)? entryRouteOverrideForTesting;
+
   /// 视频播放页路由。缩放照常播放，但不把这一页拍成快照。
   ///
   /// 快照会把正在显示的视频纹理从 GPU 读回。Windows 上这次回读会堵住光栅线程，
@@ -140,6 +147,23 @@ class PlaybackNavigationService {
       settings: settings,
       allowSnapshotting: false,
     );
+  }
+
+  /// Whether a playback page is on the app navigator's stack.
+  bool get hasPlaybackPage =>
+      observer.routes.any((route) => isPlaybackRouteName(route.settings.name));
+
+  /// Shows [item] on a playback page that takes the place of the open one:
+  /// every playback page on the stack is removed (without pausing the
+  /// session, which has already moved on to [item]) and one page for [item]
+  /// is pushed on top. Playing another video from a page's Bilibili panel, or
+  /// from a Bilibili page opened above the player, so never piles playback
+  /// pages up. Nothing happens when the top page already shows [item].
+  Future<void> replaceCurrentPlayback(VideoItem item) {
+    _navigationQueue = _navigationQueue.then(
+      (_) => _openPlaybackInternal(item),
+    );
+    return _navigationQueue;
   }
 
   Future<void> openPortraitFromNotification(VideoItem item) async {
