@@ -62,10 +62,23 @@ BilibiliWatchStart resolveBilibiliWatchStart({
   return BilibiliWatchStart(page: asked);
 }
 
+/// Thrown by [prepareBilibiliWatch] when its caller gave up on the watch
+/// (back pressed on the loading page, or the time limit passed).
+class BilibiliWatchCancelledException implements Exception {
+  const BilibiliWatchCancelledException();
+
+  @override
+  String toString() => 'BilibiliWatchCancelledException';
+}
+
 /// Result of [prepareBilibiliWatch].
 class BilibiliWatchPlan {
   final VideoItem item;
   final BilibiliVideoInfo videoInfo;
+
+  /// Watch-only cards this watch made (the card and new episode-list
+  /// entries). A watch that is given up removes them again.
+  final Set<String> createdItemIds;
 
   /// True when the library card was reused or created because "auto import
   /// on play" is on.
@@ -81,6 +94,7 @@ class BilibiliWatchPlan {
     required this.videoInfo,
     required this.imported,
     this.queue,
+    this.createdItemIds = const <String>{},
   });
 
   /// Whether the playback page gets [queue] instead of the folder queue.
@@ -103,6 +117,15 @@ String _partTitle(BilibiliVideoInfo info, int page) {
 /// BV + part is reused, or a watch-only card is used. A watch-only card that
 /// is not playing right now starts at the resolved history position through
 /// its regular saved position. The watch history entry is written here.
+///
+/// [loadInfo] replaces the video info request (a cache in front of it).
+/// [onInfo] runs as soon as the info and the part are known, before any card
+/// work, so the play address can be fetched alongside. [deferPlayerData]
+/// makes a new watch-only card without waiting for its cover, subtitles,
+/// danmaku and chapters (see [BilibiliDownloadService.obtainWatchCard]).
+/// [isCancelled] is checked between the steps; once it answers true a
+/// [BilibiliWatchCancelledException] is thrown and the history is left
+/// alone. [onStep] names each finished step (for timing).
 Future<BilibiliWatchPlan> prepareBilibiliWatch({
   required BilibiliDownloadService service,
   required LibraryService library,
@@ -113,18 +136,39 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
   SettingsService? settings,
   BilibiliWatchCards? cards,
   String? playingItemId,
+  Future<BilibiliVideoInfo> Function(String bvid)? loadInfo,
+  void Function(BilibiliVideoInfo info, BilibiliPage part)? onInfo,
+  bool deferPlayerData = false,
+  bool Function()? isCancelled,
+  void Function(String step)? onStep,
 }) async {
+  void checkCancelled() {
+    if (isCancelled?.call() ?? false) {
+      throw const BilibiliWatchCancelledException();
+    }
+  }
+
   final watchHistory = history ?? BilibiliHistoryService.instance;
   final prefs = settings ?? SettingsService();
   await watchHistory.ensureLoaded();
+  onStep?.call('history loaded');
   final start = resolveBilibiliWatchStart(
     entry: watchHistory.watchEntryOf(bvid),
     requestedPage: page,
     startAt: startAt,
     historyEnabled: prefs.bilibiliRecordWatchHistory,
   );
-  final info = await service.apiService.fetchVideoInfo(bvid);
+  final info = await (loadInfo ?? service.apiService.fetchVideoInfo)(bvid);
+  onStep?.call('video info');
+  checkCancelled();
+  for (final part in info.pages) {
+    if (part.page == start.page) {
+      onInfo?.call(info, part);
+      break;
+    }
+  }
 
+  final created = <String>{};
   final VideoItem item;
   final bool imported;
   if (prefs.bilibiliAutoImportOnPlay) {
@@ -142,14 +186,17 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
       bvid: bvid,
       page: start.page,
       videoInfo: info,
+      deferPlayerData: deferPlayerData,
     );
     item = result.item;
     imported = false;
+    if (result.created && item.isTransient) created.add(item.id);
     if (item.isTransient && item.id != playingItemId) {
       item.lastPositionMs = start.positionMs;
     }
   }
   cards?.track(item);
+  onStep?.call('card ready');
 
   final playedPage = item.sourceRef?.page ?? start.page;
   List<VideoItem>? queue;
@@ -161,10 +208,15 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
       bvid: bvid,
       current: item,
       currentPage: playedPage,
+      created: created,
     );
     for (final entry in queue) {
       cards?.track(entry);
     }
+  }
+  if (isCancelled?.call() ?? false) {
+    await _discardCreated(library, created);
+    throw const BilibiliWatchCancelledException();
   }
   try {
     await watchHistory.recordWatch(
@@ -183,12 +235,24 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
     // History is best effort and never blocks playback.
     developer.log('Watch history not recorded', error: error);
   }
+  onStep?.call('history written');
   return BilibiliWatchPlan(
     item: item,
     videoInfo: info,
     imported: imported,
     queue: queue,
+    createdItemIds: Set<String>.unmodifiable(created),
   );
+}
+
+Future<void> _discardCreated(LibraryService library, Set<String> ids) async {
+  for (final id in ids) {
+    try {
+      await library.discardTransientVideo(id);
+    } catch (error) {
+      developer.log('Watch-only card not removed', error: error);
+    }
+  }
 }
 
 /// The episode list of a watch-only card: for every part the library card or
@@ -202,6 +266,7 @@ Future<List<VideoItem>> _watchQueue({
   required String bvid,
   required VideoItem current,
   required int currentPage,
+  Set<String>? created,
 }) async {
   if (info.pages.length <= 1) return <VideoItem>[current];
   final videoBvid = info.bvid.trim().isNotEmpty ? info.bvid.trim() : bvid;
@@ -229,6 +294,7 @@ Future<List<VideoItem>> _watchQueue({
     videoInfo: info,
     pages: missing,
   )) {
+    created?.add(entry.id);
     final page = entry.sourceRef?.page;
     if (page != null) slots[page] = entry;
   }

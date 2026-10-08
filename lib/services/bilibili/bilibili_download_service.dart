@@ -3786,6 +3786,22 @@ class BilibiliDownloadService extends ChangeNotifier {
     return items;
   }
 
+  Future<BilibiliStreamCardResult> _addLightWatchCard(
+    LibraryService library, {
+    required BilibiliVideoInfo info,
+    required BilibiliPage part,
+  }) async {
+    final added = await addWatchParts(
+      library,
+      videoInfo: info,
+      pages: <BilibiliPage>[part],
+    );
+    if (added.isEmpty) {
+      throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
+    }
+    return BilibiliStreamCardResult(item: added.first, created: true);
+  }
+
   /// Whether [itemId] is an episode-list entry still without player data.
   bool isPendingWatchPart(String itemId) =>
       _pendingWatchParts.containsKey(itemId);
@@ -3825,6 +3841,10 @@ class BilibiliDownloadService extends ChangeNotifier {
         transient: true,
         cardId: itemId,
         register: false,
+        // The entry may already be playing, and playback fetches the preview
+        // frames of a card without them; a second download into the same
+        // folder would race it.
+        withVideoShot: false,
       )).item;
     } catch (error, stack) {
       developer.log(
@@ -3849,7 +3869,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       ..managedSubtitleAssets = built.managedSubtitleAssets
       ..usesManagedAssociatedSubtitles = built.usesManagedAssociatedSubtitles
       ..danmakuPath = built.danmakuPath
-      ..bilibiliVideoShot = built.bilibiliVideoShot
+      ..bilibiliVideoShot = built.bilibiliVideoShot ?? target.bilibiliVideoShot
       ..chapters = built.chapters
       ..hasProbedChapters = built.hasProbedChapters;
     await library.noteCardDataChanged(itemId);
@@ -3864,11 +3884,18 @@ class BilibiliDownloadService extends ChangeNotifier {
   /// Otherwise a new watch-only card is built with the same player data as a
   /// library card and registered through [LibraryService.addTransientVideo];
   /// concurrent calls for the same part share one creation.
+  ///
+  /// With [deferPlayerData] the card is ready as soon as the video info is:
+  /// a new card holds only what the info says, like an episode-list entry
+  /// ([addWatchParts]), and an entry still without player data is returned
+  /// as is. Its cover, subtitles, danmaku and chapters come from
+  /// [completeWatchPart] once it plays, so they never hold up playback.
   Future<BilibiliStreamCardResult> obtainWatchCard(
     LibraryService library, {
     required String bvid,
     required int page,
     BilibiliVideoInfo? videoInfo,
+    bool deferPlayerData = false,
   }) async {
     final info = videoInfo ?? await apiService.fetchVideoInfo(bvid);
     final videoBvid = info.bvid.trim().isNotEmpty ? info.bvid.trim() : bvid;
@@ -3896,8 +3923,9 @@ class BilibiliDownloadService extends ChangeNotifier {
       // swept away between here and the playback page opening.
       if (existing.isTransient) {
         existing.lastUpdated = DateTime.now().millisecondsSinceEpoch;
-        // An episode-list entry opened directly gets its player data first.
-        await completeWatchPart(library, existing.id);
+        // An episode-list entry opened directly gets its player data first,
+        // unless the caller lets it arrive while it plays.
+        if (!deferPlayerData) await completeWatchPart(library, existing.id);
       }
       return BilibiliStreamCardResult(item: existing, created: false);
     }
@@ -3906,6 +3934,17 @@ class BilibiliDownloadService extends ChangeNotifier {
     if (inFlight != null) {
       final shared = await inFlight;
       return BilibiliStreamCardResult(item: shared.item, created: false);
+    }
+    if (deferPlayerData) {
+      final light = _addLightWatchCard(library, info: info, part: part);
+      _streamCardsInFlight[key] = light;
+      try {
+        return await light;
+      } finally {
+        if (identical(_streamCardsInFlight[key], light)) {
+          _streamCardsInFlight.remove(key);
+        }
+      }
     }
     final future = _createStreamCard(
       library,
@@ -4183,6 +4222,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     bool transient = false,
     String? cardId,
     bool register = true,
+    bool withVideoShot = true,
   }) async {
     onStage?.call('正在准备视频信息...', 0.12);
     final metadata = await apiService.fetchPlayerMetadata(
@@ -4285,13 +4325,15 @@ class BilibiliDownloadService extends ChangeNotifier {
     if (bvid.isEmpty || page.cid <= 0) {
       throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
     }
-    final videoShot = await BilibiliVideoShotService.instance.downloadForCard(
-      apiService: apiService,
-      videoId: uuid,
-      bvid: bvid,
-      cid: page.cid,
-      dataRootOverride: dirs.dataRoot,
-    );
+    final videoShot = withVideoShot
+        ? await BilibiliVideoShotService.instance.downloadForCard(
+            apiService: apiService,
+            videoId: uuid,
+            bvid: bvid,
+            cid: page.cid,
+            dataRootOverride: dirs.dataRoot,
+          )
+        : null;
     final sourceRef = MediaSourceRef(
       value: bvid,
       kind: MediaSourceKind.bilibiliStream,
