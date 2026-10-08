@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
+import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_interaction_gate.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
@@ -17,6 +18,7 @@ const _bvid = 'BV1xx411c7mD';
 
 BilibiliVideoDetail _detail() => const BilibiliVideoDetail(
   bvid: _bvid,
+  aid: 170001,
   title: '面板标题',
   description: '简介正文',
   owner: BilibiliVideoOwner(mid: 7, name: '测试UP'),
@@ -217,6 +219,119 @@ void main() {
     await finish(tester);
   });
 
+  testWidgets(
+    'not logged in: no account reads, every action shows its default',
+    (tester) async {
+      final reads = <String>[];
+      final actions = BilibiliVideoActions(
+        readData: (uri) async {
+          reads.add(uri.path);
+          throw StateError('must not be called');
+        },
+        gate: BilibiliInteractionGate(
+          loginCookies: () async => const <String, String>{},
+          writesAllowed: () => false,
+          httpClientAdapter: _RefusingAdapter(),
+          log: (_) {},
+        ),
+        hasLogin: () async => false,
+        accountMid: () async => 0,
+      );
+      final cache = BilibiliVideoDetailCache(fetch: (_) async => _detail());
+      await pumpPanel(tester, cache: cache, actions: actions);
+      await tester.pumpAndSettle();
+      expect(reads, isEmpty);
+      expect(find.text('点赞'), findsOneWidget);
+      expect(find.text('投币'), findsOneWidget);
+      expect(find.text('收藏'), findsOneWidget);
+      expect(find.text('关注'), findsOneWidget);
+      await finish(tester);
+    },
+  );
+
+  testWidgets('logged in: like / coin / favourite / follow load with the '
+      'account (cookie) reads and light up', (tester) async {
+    final reads = <String>[];
+    final cache = BilibiliVideoDetailCache(fetch: (_) async => _detail());
+    await pumpPanel(
+      tester,
+      cache: cache,
+      actions: _loggedInActions(reads: reads),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      reads.toSet(),
+      containsAll(<String>{
+        '/x/web-interface/archive/has/like',
+        '/x/web-interface/archive/coins',
+        '/x/v2/fav/video/favoured',
+        '/x/relation',
+      }),
+    );
+    expect(find.text('已赞'), findsOneWidget);
+    expect(find.text('已投 1'), findsOneWidget);
+    expect(find.text('已收藏'), findsOneWidget);
+    expect(find.text('已关注'), findsOneWidget);
+    await finish(tester);
+  });
+
+  testWidgets('account read-only still shows the states, marks the bar and '
+      'sends no write', (tester) async {
+    SettingsService().bilibiliAccountReadOnly = true;
+    final writes = _CountingAdapter();
+    final cache = BilibiliVideoDetailCache(fetch: (_) async => _detail());
+    await pumpPanel(
+      tester,
+      cache: cache,
+      actions: _loggedInActions(
+        answers: <String, Object?>{'/x/web-interface/archive/has/like': 0},
+        writes: writes,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('bilibili-action-read-only')), findsOne);
+    expect(find.text('已收藏'), findsOneWidget, reason: 'reads still run');
+    await tester.tap(find.byKey(const ValueKey('bilibili-action-like')));
+    await tester.pumpAndSettle();
+    expect(writes.requests, 0);
+    expect(find.text('点赞'), findsOneWidget);
+    expect(find.text(BilibiliInteractionGate.readOnlyMessage), findsOneWidget);
+    await finish(tester);
+  });
+
+  testWidgets('an expired login (-101) shows the defaults, never "already"', (
+    tester,
+  ) async {
+    final cache = BilibiliVideoDetailCache(fetch: (_) async => _detail());
+    await pumpPanel(
+      tester,
+      cache: cache,
+      actions: _loggedInActions(
+        answers: <String, Object?>{
+          '/x/web-interface/archive/has/like':
+              const BilibiliAccountReadException('过期', code: -101),
+          '/x/web-interface/archive/coins': const BilibiliAccountReadException(
+            '过期',
+            code: -101,
+          ),
+          '/x/v2/fav/video/favoured': const BilibiliAccountReadException(
+            '过期',
+            code: -101,
+          ),
+          '/x/relation': const BilibiliAccountReadException('过期', code: -101),
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('点赞'), findsOneWidget);
+    expect(find.text('投币'), findsOneWidget);
+    expect(find.text('收藏'), findsOneWidget);
+    expect(find.text('关注'), findsOneWidget);
+    expect(find.text('已赞'), findsNothing);
+    expect(find.text('已关注'), findsNothing);
+    await finish(tester);
+  });
+
   testWidgets('reopening the panel uses the kept detail', (tester) async {
     var asked = 0;
     final cache = BilibiliVideoDetailCache(
@@ -236,6 +351,41 @@ void main() {
   });
 }
 
+BilibiliVideoActions _loggedInActions({
+  Map<String, Object?>? answers,
+  List<String>? reads,
+  bool Function()? writesAllowed,
+  HttpClientAdapter? writes,
+}) {
+  final map = <String, Object?>{
+    '/x/web-interface/archive/has/like': 1,
+    '/x/web-interface/archive/coins': {'multiply': 1},
+    '/x/v2/fav/video/favoured': {'count': 1, 'favoured': true},
+    '/x/relation': {'attribute': 1},
+    ...?answers,
+  };
+  return BilibiliVideoActions(
+    readData: (uri) async {
+      reads?.add(uri.path);
+      final answer = map[uri.path];
+      if (answer is Exception) throw answer;
+      if (answer == null) {
+        throw const BilibiliAccountReadException('no answer');
+      }
+      return answer;
+    },
+    gate: BilibiliInteractionGate(
+      loginCookies: () async => const {'SESSDATA': 'sess', 'bili_jct': 'jct'},
+      // Null: the app's account read-only setting decides.
+      writesAllowed: writesAllowed,
+      httpClientAdapter: writes ?? _RefusingAdapter(),
+      log: (_) {},
+    ),
+    hasLogin: () async => true,
+    accountMid: () async => 42,
+  );
+}
+
 class _RefusingAdapter implements HttpClientAdapter {
   @override
   Future<ResponseBody> fetch(
@@ -243,6 +393,23 @@ class _RefusingAdapter implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    throw StateError('no network in tests');
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _CountingAdapter implements HttpClientAdapter {
+  int requests = 0;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests++;
     throw StateError('no network in tests');
   }
 

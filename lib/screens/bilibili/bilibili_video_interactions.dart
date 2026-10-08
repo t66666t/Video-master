@@ -3,6 +3,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_write_feedback.dart';
+import 'package:video_player_app/services/bilibili/bilibili_api_service.dart'
+    show BilibiliAccountReadException;
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -14,7 +16,8 @@ enum BilibiliVideoAction { like, coin, favorite, follow }
 /// With a stored login the four states load separately; a failed one stays
 /// null ("unknown") and its button still works. Without a login nothing is
 /// requested and every state shows its default; a tap then reaches the write
-/// gate, which answers "log in first".
+/// gate, which answers "log in first". A login Bilibili answers as expired
+/// (-101) shows the defaults as well.
 class BilibiliVideoInteractions extends ChangeNotifier {
   BilibiliVideoInteractions({required this.actions, required this.detail})
     : likeCount = detail.stat.like,
@@ -80,15 +83,19 @@ class BilibiliVideoInteractions extends ChangeNotifier {
     favorited = null;
     following = null;
     _changed();
+    var loginExpired = false;
     Future<void> read<T>(
       Future<T> Function() fetch,
       void Function(T) set,
     ) async {
       try {
         final value = await fetch();
-        if (_disposed) return;
+        if (_disposed || loginExpired) return;
         set(value);
         _changed();
+      } on BilibiliAccountReadException catch (e) {
+        // -101: the stored login has expired, which reads as logged out.
+        if (e.code == -101) loginExpired = true;
       } catch (_) {
         // Stays unknown; the button still works.
       }
@@ -107,6 +114,15 @@ class BilibiliVideoInteractions extends ChangeNotifier {
           (v) => following = v,
         ),
     ]);
+    if (loginExpired && !_disposed) {
+      // Like no login at all: nothing shows as done.
+      loggedIn = false;
+      liked = false;
+      coins = 0;
+      favorited = false;
+      following = false;
+      _changed();
+    }
   }
 
   /// Ignores taps while the same action is still running.
