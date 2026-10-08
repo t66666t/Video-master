@@ -14,6 +14,7 @@ import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_loading_page.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_watch_page_layout.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
@@ -22,6 +23,7 @@ import 'package:video_player_app/services/bilibili/bilibili_public_api_service.d
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_orientation.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_playlist.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
@@ -821,6 +823,8 @@ void main() {
         title: '测试视频',
         coverUrl: _cover,
       ),
+      BilibiliWatchPageShape? shape,
+      BilibiliWatchOrientation orientation = const _NoOrientation(),
     }) {
       unawaited(
         AppToast.navigatorKey.currentState!.push(
@@ -846,11 +850,121 @@ void main() {
                 discarded?.add(plan);
                 discardLog?.add('${plan.item.id}<-${kept?.item.id}');
               },
+              shape: shape,
+              orientation: orientation,
             ),
           ),
         ),
       );
     }
+
+    group('skipping the portrait page on a phone', () {
+      const phoneLandscape = BilibiliWatchPageShape(
+        landscape: true,
+        isMobilePlatform: true,
+      );
+
+      testWidgets('landscape is asked for on entry and kept into the '
+          'player, with no turn back to portrait', (tester) async {
+        await pumpHost(tester);
+        final orientation = _FakeOrientation();
+        final ready = Completer<BilibiliWatchPlan>();
+        final opened = <BilibiliWatchPlan>[];
+        push(
+          (_) => ready.future,
+          opened: opened,
+          shape: phoneLandscape,
+          orientation: orientation,
+        );
+        await showRoute(tester);
+        expect(orientation.calls, ['landscape']);
+
+        ready.complete(_plan('watch-1'));
+        await tester.pumpAndSettle();
+        expect(find.text('player watch-1'), findsOneWidget);
+        expect(orientation.calls, ['landscape']);
+      });
+
+      for (final how in const <String>['back button', 'system back']) {
+        testWidgets('$how gives the orientation back, once', (tester) async {
+          await pumpHost(tester);
+          final orientation = _FakeOrientation();
+          final opened = <BilibiliWatchPlan>[];
+          push(
+            (_) => Completer<BilibiliWatchPlan>().future,
+            opened: opened,
+            shape: phoneLandscape,
+            orientation: orientation,
+          );
+          await showRoute(tester);
+          if (how == 'back button') {
+            await tester.tap(
+              find.byKey(const ValueKey('bilibili-watch-loading-back')),
+            );
+          } else {
+            await AppToast.navigatorKey.currentState!.maybePop();
+          }
+          await tester.pumpAndSettle();
+          expect(find.text('list'), findsOneWidget);
+          expect(orientation.calls, ['landscape', 'restore']);
+          expect(opened, isEmpty);
+        });
+      }
+
+      testWidgets('a retry asks for nothing again; back after it gives the '
+          'orientation back', (tester) async {
+        await pumpHost(tester);
+        final orientation = _FakeOrientation();
+        final answers = <Completer<BilibiliWatchPlan>>[];
+        push(
+          (_) {
+            final answer = Completer<BilibiliWatchPlan>();
+            answers.add(answer);
+            return answer.future;
+          },
+          opened: <BilibiliWatchPlan>[],
+          shape: phoneLandscape,
+          orientation: orientation,
+        );
+        await showRoute(tester);
+        answers.single.completeError(StateError('无法播放'));
+        await tester.pump();
+        await tester.pump();
+        expect(find.byKey(const ValueKey('bilibili-watch-retry')), findsOne);
+        await tester.tap(find.byKey(const ValueKey('bilibili-watch-retry')));
+        await tester.pump();
+        expect(answers, hasLength(2));
+        expect(orientation.calls, ['landscape']);
+
+        await tester.tap(
+          find.byKey(const ValueKey('bilibili-watch-loading-back')),
+        );
+        await tester.pumpAndSettle();
+        expect(orientation.calls, ['landscape', 'restore']);
+      });
+
+      testWidgets('the portrait page next, or a desktop: nothing is asked', (
+        tester,
+      ) async {
+        for (final shape in const <BilibiliWatchPageShape>[
+          BilibiliWatchPageShape(landscape: false, isMobilePlatform: true),
+          BilibiliWatchPageShape(landscape: true, isDesktop: true),
+        ]) {
+          await pumpHost(tester);
+          final orientation = _FakeOrientation();
+          push(
+            (_) => Completer<BilibiliWatchPlan>().future,
+            opened: <BilibiliWatchPlan>[],
+            shape: shape,
+            orientation: orientation,
+          );
+          await showRoute(tester);
+          await AppToast.navigatorKey.currentState!.maybePop();
+          await tester.pumpAndSettle();
+          expect(orientation.calls, isEmpty);
+        }
+      });
+    });
 
     void expectNoLoadingNotice() {
       for (final text in _oldLoadingNotices) {
@@ -1710,4 +1824,26 @@ class _TempPathProvider extends PathProviderPlatform {
 
   @override
   Future<String?> getDownloadsPath() async => rootPath;
+}
+
+/// Records what the loading page asks of the screen orientation.
+class _FakeOrientation implements BilibiliWatchOrientation {
+  final List<String> calls = <String>[];
+
+  @override
+  Future<void> requestLandscape() async => calls.add('landscape');
+
+  @override
+  Future<void> restore() async => calls.add('restore');
+}
+
+/// Asks nothing (the tests above run as a desktop anyway).
+class _NoOrientation implements BilibiliWatchOrientation {
+  const _NoOrientation();
+
+  @override
+  Future<void> requestLandscape() async {}
+
+  @override
+  Future<void> restore() async {}
 }

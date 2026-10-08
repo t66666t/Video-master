@@ -9,6 +9,7 @@ import '../../services/bilibili/bilibili_player_panel_memory.dart';
 import '../../services/bilibili/bilibili_player_panel_policy.dart';
 import '../../services/bilibili/bilibili_watch_cards.dart';
 import '../../services/bilibili/bilibili_watch_launch.dart';
+import '../../services/bilibili/bilibili_watch_orientation.dart';
 import '../../services/settings_service.dart';
 import '../../theme/app_tokens.dart';
 import '../../widgets/bilibili_cover_image.dart';
@@ -47,6 +48,7 @@ class BilibiliWatchLoadingPage extends StatefulWidget {
     this.onClosed,
     this.timeLimit = kBilibiliWatchTimeLimit,
     this.shape,
+    this.orientation = const BilibiliWatchOrientation(),
   });
 
   static const String routeName = '/bilibili/watch-loading';
@@ -69,6 +71,10 @@ class BilibiliWatchLoadingPage extends StatefulWidget {
   /// How the playback page will be laid out; null reads the settings.
   final BilibiliWatchPageShape? shape;
 
+  /// On a phone, turns the screen to landscape while the landscape playback
+  /// page is coming, and back when the page is left without it.
+  final BilibiliWatchOrientation orientation;
+
   @override
   State<BilibiliWatchLoadingPage> createState() =>
       _BilibiliWatchLoadingPageState();
@@ -88,6 +94,9 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
   /// The Bilibili panel was collapsed on this page.
   bool _panelCollapsed = false;
 
+  /// Landscape was asked for and not given back yet.
+  bool _holdsLandscape = false;
+
   @override
   void initState() {
     super.initState();
@@ -99,6 +108,12 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
       onReady: _openPlayback,
     )..addListener(_onLaunchChanged);
     _launch.start();
+    final shape = widget.shape ?? BilibiliWatchPageShape.current();
+    if (shape.landscape && shape.isMobilePlatform) {
+      // Once, as the landscape playback page does; a retry asks nothing.
+      _holdsLandscape = true;
+      unawaited(widget.orientation.requestLandscape());
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _launch.timeline?.mark('loading page shown');
     });
@@ -169,8 +184,17 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
     }
   }
 
+  /// Left without the playback page: the orientation goes back to what it
+  /// was before the tap. The playback page keeps landscape when it opens.
+  void _giveBackOrientation() {
+    if (!_holdsLandscape || _opening) return;
+    _holdsLandscape = false;
+    unawaited(widget.orientation.restore());
+  }
+
   @override
   void dispose() {
+    _giveBackOrientation();
     _launch
       ..removeListener(_onLaunchChanged)
       ..dispose();
@@ -180,6 +204,7 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
 
   void _back() {
     _launch.cancel();
+    _giveBackOrientation();
     Navigator.of(context).maybePop();
   }
 
@@ -200,7 +225,10 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
     }
     return PopScope<Object?>(
       onPopInvokedWithResult: (didPop, _) {
-        if (didPop && !_opening) _launch.cancel();
+        if (didPop && !_opening) {
+          _launch.cancel();
+          _giveBackOrientation();
+        }
       },
       child: CallbackShortcuts(
         bindings: <ShortcutActivator, VoidCallback>{
