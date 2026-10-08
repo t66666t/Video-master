@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/video_item.dart';
+import '../services/bilibili/bilibili_watch_playlist.dart';
 import 'cached_thumbnail_widget.dart';
 
 /// 播放列表底部弹窗组件
@@ -70,6 +71,7 @@ class PlaylistBottomSheet extends StatelessWidget {
 
   /// 构建标题栏
   Widget _buildHeader() {
+    final bilibiliList = BilibiliWatchPlaylistSession.instance;
     return Padding(
       padding: const EdgeInsets.all(16.0),
       child: Row(
@@ -80,14 +82,27 @@ class PlaylistBottomSheet extends StatelessWidget {
             size: 24.0,
           ),
           const SizedBox(width: 12.0),
-          Text(
-            '播放列表 (${playlist.length})',
-            style: const TextStyle(
-              fontSize: 18.0,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
+          Expanded(
+            child: Text(
+              '播放列表 (${playlist.length})',
+              style: const TextStyle(
+                fontSize: 18.0,
+                fontWeight: FontWeight.bold,
+                color: Colors.white,
+              ),
             ),
           ),
+          // Same clear as the episode panel: keeps what is playing.
+          if (bilibiliList != null && bilibiliList.isActive)
+            TextButton(
+              key: const ValueKey('bilibili-playlist-clear'),
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white70,
+                visualDensity: VisualDensity.compact,
+              ),
+              onPressed: () => clearBilibiliWatchPlaylist(bilibiliList),
+              child: const Text('清空'),
+            ),
         ],
       ),
     );
@@ -288,7 +303,7 @@ class PlaylistBottomSheet extends StatelessWidget {
       children: [
         // 标题
         Text(
-          item.title,
+          BilibiliWatchPlaylistSession.titleOf(item),
           style: TextStyle(
             color: isCurrent ? Colors.blue : Colors.white,
             fontSize: 14.0,

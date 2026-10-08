@@ -19,7 +19,9 @@ import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playlist_manager.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/widgets/episode_picker_panel.dart';
+import 'package:video_player_app/widgets/playlist_bottom_sheet.dart';
 
 import 'test_dir_cleanup.dart';
 
@@ -338,6 +340,9 @@ void main() {
       await tester.pump();
       expect(list.entries.map((e) => e.bvid), ['BVb']);
       expect(titles(), ['BVb 第1部分', 'BVb 第2部分', 'BVb 第3部分']);
+      // The 撤销 offer runs out.
+      await tester.pump(session.undoWindow + const Duration(seconds: 1));
+      expect(session.canUndoClear, isFalse);
 
       // Not shown for a library queue.
       queue.setPlaylist(<VideoItem>[
@@ -351,6 +356,170 @@ void main() {
       ]);
       await tester.pump();
       expect(clear, findsNothing);
+    });
+
+    test('清空, its entries cleaned up, then 撤销: the whole list comes back '
+        'in order, playable', () async {
+      final a = await open('BVa');
+      final b = await open('BVb');
+      final c = await open('BVc');
+      await settled();
+      // A and B were watched: their cards are cleaned up and come back as
+      // lightweight entries.
+      await library.discardTransientVideo(a.item.id);
+      await library.discardTransientVideo(b.item.id);
+      await until(
+        () =>
+            queue.playlist.length == 3 &&
+            queue.playlist
+                .take(2)
+                .every((item) => service.isWatchPlaceholder(item.id)),
+      );
+
+      await session.clear();
+      await until(() => queue.playlist.length == 1);
+      expect(list.entries.map((e) => e.bvid), ['BVc']);
+      expect(session.canUndoClear, isTrue);
+      // The cleaner removes what left the queue.
+      for (final item in library.transientVideos.toList()) {
+        if (item.id != c.item.id) await library.discardTransientVideo(item.id);
+      }
+      expect(library.transientVideos.map((v) => v.id), [c.item.id]);
+
+      expect(await session.undoClear(), isTrue);
+      await until(() => queue.playlist.length == 3);
+      expect(list.entries.map((e) => e.bvid), ['BVa', 'BVb', 'BVc']);
+      // The list shows a collapsed multi-part video under its own title.
+      BilibiliWatchPlaylistSession.install(session);
+      addTearDown(() => BilibiliWatchPlaylistSession.install(null));
+      expect(
+        queue.playlist.map(BilibiliWatchPlaylistSession.titleOf).toList(),
+        ['视频 BVa', '视频 BVb', '视频 BVc'],
+      );
+      expect(queue.currentItem!.id, c.item.id);
+      for (final (index, bvid) in ['BVa', 'BVb'].indexed) {
+        final item = queue.playlist[index];
+        expect(item.sourceRef?.bvid, bvid);
+        expect(
+          service.isWatchPlaceholder(item.id),
+          isTrue,
+          reason: 'made again as an entry that gets its data when played',
+        );
+      }
+      // Playable: switching to it moves the list there.
+      playing.value = queue.playlist.first;
+      await until(() => list.currentBvid == 'BVa');
+      expect(await session.undoClear(), isFalse, reason: 'used once only');
+    });
+
+    test('after the hint is gone 撤销 does nothing', () async {
+      session.dispose();
+      session = BilibiliWatchPlaylistSession(
+        list: list,
+        service: service,
+        library: library,
+        queue: queue,
+        playbackChanges: playing,
+        currentItem: () => playing.value,
+        undoWindow: const Duration(milliseconds: 50),
+      );
+      await open('BVa');
+      await open('BVb');
+      await settled();
+      await session.clear();
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      expect(session.canUndoClear, isFalse);
+      expect(await session.undoClear(), isFalse);
+      expect(list.entries.map((e) => e.bvid), ['BVb']);
+    });
+
+    testWidgets('迷你播放器的播放列表也显示「清空」, keeps the playing video '
+        'and does not restart it', (tester) async {
+      VideoItem? playingItem;
+      await tester.runAsync(() async {
+        await open('BVa');
+        playingItem = (await open('BVb')).item;
+        await settled();
+      });
+      expect(playingItem, isNotNull);
+      final keptId = playingItem!.id;
+      BilibiliWatchPlaylistSession.install(session);
+      addTearDown(() => BilibiliWatchPlaylistSession.install(null));
+      // The player itself: clearing must not ask it for anything.
+      final playback = MediaPlaybackService();
+      final positionBefore = playback.position;
+      final playerItemBefore = playback.currentItem?.id;
+      final stateBefore = playback.state;
+      var tapped = 0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          navigatorKey: AppToast.navigatorKey,
+          home: Scaffold(
+            body: PlaylistBottomSheet(
+              playlist: queue.playlist,
+              currentItemId: keptId,
+              onItemTap: (_) => tapped++,
+            ),
+          ),
+        ),
+      );
+      final clear = find.byKey(const ValueKey('bilibili-playlist-clear'));
+      expect(clear, findsOneWidget);
+      await tester.tap(clear);
+      await tester.runAsync(() => until(() => list.entries.length == 1));
+      await tester.pump();
+      expect(list.entries.map((e) => e.bvid), ['BVb']);
+      expect(queue.currentItem!.id, keptId);
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(find.text('已清空播放列表'), findsOneWidget);
+      expect(find.text('撤销'), findsOneWidget);
+      // Nothing was played, stopped or sought: the position stays.
+      expect(tapped, 0);
+      expect(playback.position, positionBefore);
+      expect(playback.currentItem?.id, playerItemBefore);
+      expect(playback.state, stateBefore);
+      expect(playing.value?.id, keptId);
+      // The playing card is still the queue's current entry.
+      expect(queue.currentIndex, queue.indexOfItem(keptId));
+
+      // 「撤销」 in the hint brings the list back, order and all.
+      await tester.tap(find.text('撤销'));
+      await tester.runAsync(() => until(() => list.entries.length == 2));
+      await tester.runAsync(() => until(() => queue.playlist.length == 4));
+      await tester.pump();
+      expect(list.entries.map((e) => e.bvid), ['BVa', 'BVb']);
+      expect(queue.currentItem!.id, keptId);
+      expect(playback.position, positionBefore);
+      await AppToast.dismiss(immediate: true);
+      await tester.pump(const Duration(seconds: 1));
+
+      // A library queue never shows the button.
+      queue.setPlaylist(<VideoItem>[
+        VideoItem(
+          id: 'local',
+          path: '/videos/local.mp4',
+          title: 'local',
+          durationMs: 0,
+          lastUpdated: 0,
+        ),
+      ]);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: PlaylistBottomSheet(
+              playlist: queue.playlist,
+              currentItemId: 'local',
+              onItemTap: (_) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('bilibili-playlist-clear')),
+        findsNothing,
+      );
     });
   });
 }

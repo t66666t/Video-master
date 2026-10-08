@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../../debug/developer_log.dart' as developer;
+import '../../utils/app_toast.dart';
 import '../../models/bilibili_models.dart';
 import '../../models/media_source_ref.dart';
 import '../../models/video_item.dart';
@@ -115,9 +116,42 @@ class BilibiliWatchPlaylist extends ChangeNotifier {
   }
 
   /// Empties the list except for the video that plays ([keepBvid]).
-  void clear({String? keepBvid}) {
+  /// Returns what the list held before, for [restore].
+  List<BilibiliWatchPlaylistEntry> clear({String? keepBvid}) {
+    final before = <BilibiliWatchPlaylistEntry>[
+      for (final entry in _entries)
+        BilibiliWatchPlaylistEntry(
+          bvid: entry.bvid,
+          page: entry.page,
+          info: entry.info,
+        ),
+    ];
     _entries.removeWhere((entry) => entry.bvid != keepBvid);
     if (_entries.isEmpty) _currentBvid = null;
+    notifyListeners();
+    return before;
+  }
+
+  /// Puts back the videos a [clear] took away, in their order. Videos
+  /// opened since stay (after them, unless they were listed before); the
+  /// playing one is untouched.
+  void restore(List<BilibiliWatchPlaylistEntry> before) {
+    final now = <String, BilibiliWatchPlaylistEntry>{
+      for (final entry in _entries) entry.bvid: entry,
+    };
+    final merged = <BilibiliWatchPlaylistEntry>[
+      for (final entry in before) now[entry.bvid] ?? entry,
+    ];
+    final listed = <String>{for (final entry in before) entry.bvid};
+    merged.addAll(_entries.where((entry) => !listed.contains(entry.bvid)));
+    while (merged.length > capacity) {
+      final index = merged.indexWhere((entry) => entry.bvid != _currentBvid);
+      if (index < 0) break;
+      merged.removeAt(index);
+    }
+    _entries
+      ..clear()
+      ..addAll(merged);
     notifyListeners();
   }
 
@@ -145,6 +179,7 @@ class BilibiliWatchPlaylistSession {
     required this.playbackChanges,
     required this.currentItem,
     BilibiliHistoryService? history,
+    this.undoWindow = defaultUndoWindow,
   }) : history = history ?? BilibiliHistoryService.instance {
     playbackChanges.addListener(_onPlayback);
     library.addListener(_onLibrary);
@@ -183,6 +218,20 @@ class BilibiliWatchPlaylistSession {
     ]);
   }
 
+  /// The title the playlist panels show for [item]: a listed video other
+  /// than the playing one stands for the whole video (all its parts), so it
+  /// shows the video's title rather than that of its first part. Anything
+  /// else keeps its own title.
+  static String titleOf(VideoItem item) {
+    final session = _instance;
+    if (session == null || !session.isActive) return item.title;
+    if (!session._queueIds!.contains(item.id)) return item.title;
+    final bvid = _bvidOf(item);
+    if (bvid == null || bvid == session.list.currentBvid) return item.title;
+    final title = session.list.entryOf(bvid)?.title.trim() ?? '';
+    return title.isEmpty ? item.title : title;
+  }
+
   /// Entries of the list's queue that have no files yet; they stay while
   /// the list plays on (the mini player's previous / next use them).
   Iterable<String> placeholderIds() {
@@ -216,13 +265,47 @@ class BilibiliWatchPlaylistSession {
     if (isActive && anchored != null) unawaited(_project(anchored));
   }
 
-  /// The list's "clear": every video goes except the playing one.
+  /// How long the 「撤销」 of a clear is offered.
+  static const Duration defaultUndoWindow = Duration(seconds: 5);
+
+  final Duration undoWindow;
+
+  List<BilibiliWatchPlaylistEntry>? _undoSnapshot;
+  Timer? _undoTimer;
+
+  /// Whether the last clear can still be undone.
+  bool get canUndoClear => _undoSnapshot != null;
+
+  /// The list's "clear": every video goes except the playing one. The
+  /// playing card and its place in the queue stay, so playback is neither
+  /// stopped nor restarted. For [undoWindow] [undoClear] puts it back.
   Future<void> clear() async {
     final current = currentItem();
-    list.clear(keepBvid: current == null ? null : _bvidOf(current));
+    final keep = current == null ? null : _bvidOf(current);
+    _undoTimer?.cancel();
+    _undoSnapshot = list.clear(keepBvid: keep);
+    _undoTimer = Timer(undoWindow, () {
+      _undoSnapshot = null;
+      _undoTimer = null;
+    });
     final anchored = queue.currentItem;
     if (anchored != null && isActive) await _project(anchored);
     BilibiliWatchCards.instance?.janitor.scheduleSweep();
+  }
+
+  /// Undoes the last [clear] within [undoWindow]: the videos come back in
+  /// their order, as lightweight entries where their cards were cleaned up
+  /// meanwhile. False when it is too late.
+  Future<bool> undoClear() async {
+    final snapshot = _undoSnapshot;
+    if (snapshot == null) return false;
+    _undoSnapshot = null;
+    _undoTimer?.cancel();
+    _undoTimer = null;
+    list.restore(snapshot);
+    final anchored = queue.currentItem;
+    if (anchored != null && isActive) await _project(anchored);
+    return true;
   }
 
   void _onPlayback() {
@@ -394,7 +477,26 @@ class BilibiliWatchPlaylistSession {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _undoTimer?.cancel();
     playbackChanges.removeListener(_onPlayback);
     library.removeListener(_onLibrary);
   }
+}
+
+/// The 「清空」 of the playlist panels (episode panel, mini player list):
+/// clears the temporary Bilibili playlist except the playing video, without
+/// asking, and offers 「撤销」 for a few seconds.
+Future<void> clearBilibiliWatchPlaylist(
+  BilibiliWatchPlaylistSession session,
+) async {
+  await session.clear();
+  AppToast.show(
+    '已清空播放列表',
+    type: AppToastType.success,
+    duration: session.undoWindow,
+    action: AppToastAction(
+      label: '撤销',
+      onPressed: () => unawaited(session.undoClear()),
+    ),
+  );
 }

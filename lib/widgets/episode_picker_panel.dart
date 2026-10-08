@@ -305,7 +305,8 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                             foregroundColor: Colors.white70,
                             visualDensity: VisualDensity.compact,
                           ),
-                          onPressed: () => bilibiliList.clear(),
+                          onPressed: () =>
+                              clearBilibiliWatchPlaylist(bilibiliList),
                           child: Text(
                             '清空',
                             style: TextStyle(fontSize: subFontSize),
@@ -518,7 +519,9 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                                           CrossAxisAlignment.start,
                                       children: [
                                         Text(
-                                          item.title,
+                                          BilibiliWatchPlaylistSession.titleOf(
+                                            item,
+                                          ),
                                           maxLines: 2,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(

@@ -553,18 +553,22 @@ class _MiniPlaybackCardState extends State<MiniPlaybackCard>
           maxChildSize: 0.9,
           expand: false,
           builder: (context, scrollController) {
-            return PlaylistBottomSheet(
-              playlist: playlistManager.playlist,
-              currentItemId: playbackService.currentItem?.id,
-              scrollController: scrollController,
-              onItemTap: (item) {
-                Navigator.pop(context);
-                final index = playlistManager.indexOfItem(item.id);
-                if (index >= 0) {
-                  playlistManager.setCurrentIndex(index);
-                }
-                playbackService.playPlaylistItem(item);
-              },
+            // Follows the queue while open (the Bilibili list's 「清空」).
+            return ListenableBuilder(
+              listenable: playlistManager,
+              builder: (context, _) => PlaylistBottomSheet(
+                playlist: playlistManager.playlist,
+                currentItemId: playbackService.currentItem?.id,
+                scrollController: scrollController,
+                onItemTap: (item) {
+                  Navigator.pop(context);
+                  final index = playlistManager.indexOfItem(item.id);
+                  if (index >= 0) {
+                    playlistManager.setCurrentIndex(index);
+                  }
+                  playbackService.playPlaylistItem(item);
+                },
+              ),
             );
           },
         );
