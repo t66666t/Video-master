@@ -185,7 +185,7 @@ Future<BilibiliImportPick?> showBilibiliImportPicker(
 
 /// "导入" with a small folder button next to it, or "已导入" once the part
 /// has a library card. Used on search results, uploader posts, collections,
-/// the watch history and the video detail page.
+/// the watch history and the player's Bilibili panel.
 class BilibiliImportButtons extends StatelessWidget {
   const BilibiliImportButtons({
     super.key,
@@ -194,7 +194,6 @@ class BilibiliImportButtons extends StatelessWidget {
     this.onImport,
     this.library,
     this.history,
-    this.large = false,
   });
 
   final String bvid;
@@ -204,9 +203,6 @@ class BilibiliImportButtons extends StatelessWidget {
   final BilibiliQuickImporter? onImport;
   final LibraryService? library;
   final BilibiliHistoryService? history;
-
-  /// Detail page size instead of the compact list size.
-  final bool large;
 
   /// The app's library from the widget tree; pages pumped on their own in
   /// tests have none and simply show the import button.
@@ -233,8 +229,8 @@ class BilibiliImportButtons extends StatelessWidget {
         final imported = lib == null
             ? null
             : findImportedBilibiliCard(lib, bvid: bvid, page: part);
-        final height = large ? 36.0 : 28.0;
-        final fontSize = large ? 14.0 : 12.0;
+        const height = 28.0;
+        const fontSize = 12.0;
         final radius = BorderRadius.circular(height / 2);
         if (imported != null) {
           return Material(
@@ -253,7 +249,7 @@ class BilibiliImportButtons extends StatelessWidget {
               child: SizedBox(
                 height: height,
                 child: Padding(
-                  padding: EdgeInsets.symmetric(horizontal: large ? 14 : 10),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -293,10 +289,7 @@ class BilibiliImportButtons extends StatelessWidget {
                     run(context, bvid: bvid, page: page, pickPlace: false),
                   ),
                   child: Padding(
-                    padding: EdgeInsets.only(
-                      left: large ? 14 : 10,
-                      right: large ? 10 : 8,
-                    ),
+                    padding: const EdgeInsets.only(left: 10, right: 8),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -331,7 +324,7 @@ class BilibiliImportButtons extends StatelessWidget {
                       run(context, bvid: bvid, page: page, pickPlace: true),
                     ),
                     child: Padding(
-                      padding: EdgeInsets.symmetric(horizontal: large ? 10 : 7),
+                      padding: const EdgeInsets.symmetric(horizontal: 7),
                       child: Icon(
                         Icons.drive_folder_upload_outlined,
                         size: fontSize + 3,

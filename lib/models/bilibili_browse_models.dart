@@ -1,7 +1,8 @@
 import '../utils/bilibili_image_url.dart';
 import '../utils/bilibili_text.dart';
 
-/// Models for browsing Bilibili (search results and the video detail page).
+/// Models for browsing Bilibili (search results and the player's Bilibili
+/// panel).
 ///
 /// Every parser tolerates missing or mistyped fields and falls back to safe
 /// defaults, so a partial API response never crashes the UI.

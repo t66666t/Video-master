@@ -6,14 +6,15 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_interactions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_interaction_gate.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/widgets/bilibili_player_panel.dart';
 
 const _bvid = 'BV1GJ411x7h7';
 const _aid = 170001;
@@ -281,7 +282,7 @@ void main() {
     });
   });
 
-  group('detail page', () {
+  group('the player\'s Bilibili panel', () {
     Future<void> pumpDetail(
       WidgetTester tester,
       _Harness h, {
@@ -295,15 +296,21 @@ void main() {
         'bilibiliAccountReadOnly',
         !h.writesAllowed,
       );
+      final api = BilibiliPublicApiService(
+        httpClientAdapter: _DetailAdapter(copyright: copyright),
+      );
       await tester.pumpWidget(
         MaterialApp(
           navigatorKey: AppToast.navigatorKey,
-          home: BilibiliVideoDetailScreen(
-            bvid: _bvid,
-            api: BilibiliPublicApiService(
-              httpClientAdapter: _DetailAdapter(copyright: copyright),
+          home: Scaffold(
+            body: BilibiliPlayerPanel(
+              bvid: _bvid,
+              api: api,
+              cache: BilibiliVideoDetailCache(
+                fetch: (bvid) => api.fetchVideoDetail(bvid: bvid),
+              ),
+              actions: h.actions,
             ),
-            actions: h.actions,
           ),
         ),
       );
@@ -315,6 +322,18 @@ void main() {
       await tester.pumpWidget(const SizedBox());
       await tester.pump(const Duration(seconds: 10));
     }
+
+    /// The count the panel shows next to [label] (as its tooltip).
+    String stat(WidgetTester tester, String label) => tester
+        .widget<Text>(
+          find.descendant(
+            of: find.byWidgetPredicate(
+              (w) => w is Tooltip && w.message == label,
+            ),
+            matching: find.byType(Text),
+          ),
+        )
+        .data!;
 
     BilibiliActionButton button(WidgetTester tester, String name) =>
         tester.widget<BilibiliActionButton>(
@@ -440,7 +459,7 @@ void main() {
       expect(h.writes.forms.single['multiply'], '1');
       expect(h.writes.forms.single['select_like'], '0');
       expect(button(tester, 'coin').label, '已投满');
-      expect(find.text('6 投币'), findsOneWidget);
+      expect(stat(tester, '投币'), '6');
 
       // Full: no dialog, no request.
       await tester.tap(find.byKey(const ValueKey('bilibili-action-coin')));
@@ -499,7 +518,7 @@ void main() {
       expect(h.writes.forms.single['multiply'], '2');
       expect(h.writes.forms.single['select_like'], '1');
       expect(button(tester, 'like').active, isTrue);
-      expect(find.text('21 点赞'), findsOneWidget);
+      expect(stat(tester, '点赞'), '21');
       await finish(tester);
     });
 
@@ -567,7 +586,7 @@ void main() {
     ) async {
       final h = _Harness();
       await pumpDetail(tester, h);
-      expect(find.text('20 点赞'), findsOneWidget);
+      expect(stat(tester, '点赞'), '20');
       h.writes.hold = Completer<void>();
 
       await tester.tap(find.byKey(const ValueKey('bilibili-action-like')));
@@ -585,7 +604,7 @@ void main() {
       h.writes.hold!.complete();
       await tester.pumpAndSettle();
       expect(button(tester, 'like').active, isTrue);
-      expect(find.text('21 点赞'), findsOneWidget);
+      expect(stat(tester, '点赞'), '21');
       expect(h.writes.forms.single['like'], '1');
       await finish(tester);
     });

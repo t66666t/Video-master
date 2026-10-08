@@ -9,10 +9,11 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_uploader_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_home_page.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/widgets/bilibili_player_panel.dart';
 
 const _mid = 9527;
 const _detailBvid = 'BV1GJ411x7h7';
@@ -515,7 +516,6 @@ void main() {
     await tester.tap(find.text('投稿 1-0'));
     await tester.pumpAndSettle();
     expect(env.watched, hasLength(1));
-    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     expect(find.byType(BilibiliUploaderScreen), findsOneWidget);
   });
 
@@ -606,27 +606,31 @@ void main() {
     await tester.tap(find.text('合集视频一'));
     await tester.pumpAndSettle();
     expect(env.watched, <String>[_detailBvid]);
-    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     expect(find.byType(BilibiliUploaderCollectionScreen), findsOneWidget);
   });
 
-  testWidgets('the UP block on the detail page opens the uploader page', (
-    tester,
-  ) async {
+  testWidgets('the UP block in the player\'s Bilibili panel opens the '
+      'uploader page', (tester) async {
     tester.view.physicalSize = const Size(900, 1600);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     final bili = _FakeBili();
+    final api = BilibiliPublicApiService(httpClientAdapter: bili);
     await tester.pumpWidget(
       MaterialApp(
-        home: BilibiliVideoDetailScreen(
-          bvid: _detailBvid,
-          api: BilibiliPublicApiService(httpClientAdapter: bili),
+        home: Scaffold(
+          body: BilibiliPlayerPanel(
+            bvid: _detailBvid,
+            api: api,
+            cache: BilibiliVideoDetailCache(
+              fetch: (bvid) => api.fetchVideoDetail(bvid: bvid),
+            ),
+          ),
         ),
       ),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey('bilibili-detail-owner')));
+    await tester.tap(find.byKey(const ValueKey('bilibili-panel-owner')));
     await tester.pumpAndSettle();
     expect(find.byType(BilibiliUploaderScreen), findsOneWidget);
     expect(
@@ -684,7 +688,6 @@ void main() {
     await tester.tap(find.text('作者UP'));
     await tester.pumpAndSettle();
     expect(find.byType(BilibiliUploaderScreen), findsOneWidget);
-    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     await tester.pageBack();
     await tester.pumpAndSettle();
 

@@ -17,7 +17,7 @@ class BilibiliFavoriteFolder {
   });
 }
 
-/// Like / coin / favourite / follow for the video detail page.
+/// Like / coin / favourite / follow for the player's Bilibili panel.
 ///
 /// State reads are GETs with the login cookies (never the cookie-free public
 /// client) and are not affected by read-only mode. Every write goes through

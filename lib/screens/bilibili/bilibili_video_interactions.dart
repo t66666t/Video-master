@@ -11,7 +11,8 @@ import 'package:video_player_app/utils/app_toast.dart';
 
 enum BilibiliVideoAction { like, coin, favorite, follow }
 
-/// Like / coin / favourite / follow state of one video on the detail page.
+/// Like / coin / favourite / follow state of one video in the player's
+/// Bilibili panel.
 ///
 /// With a stored login the four states load separately; a failed one stays
 /// null ("unknown") and its button still works. Without a login nothing is

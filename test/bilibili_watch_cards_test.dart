@@ -13,7 +13,6 @@ import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/library_activity.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/video_item.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/screens/home_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
@@ -1077,7 +1076,6 @@ void main() {
       await tester.pumpAndSettle();
       expect(opened.single.page, 2);
       expect(opened.single.positionMs, 125000);
-      expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     });
 
     test('a copied link plays its own video', () {

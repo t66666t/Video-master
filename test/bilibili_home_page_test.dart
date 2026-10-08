@@ -6,7 +6,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_home_page.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
@@ -185,7 +184,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(watched, <(String, int?)>[(_bvid, null)]);
-    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     expect(
       adapter.requests.where((r) => r.path.endsWith('/x/web-interface/view')),
       isEmpty,
@@ -227,7 +225,6 @@ void main() {
     expect(watched, <(String, int?, Duration?)>[
       (_bvid, 2, const Duration(seconds: 75)),
     ]);
-    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     expect(
       adapter.requests.where((r) => r.path.endsWith('/wbi/search/type')),
       isEmpty,
