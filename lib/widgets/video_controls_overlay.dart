@@ -13,6 +13,7 @@ import 'experimental_tap_gateway.dart';
 import 'package:volume_controller/volume_controller.dart';
 import '../models/subtitle_style.dart';
 import '../models/subtitle_model.dart';
+import '../theme/app_tokens.dart';
 import '../widgets/subtitle_overlay.dart';
 import '../services/media_playback_service.dart';
 import '../services/bilibili/bilibili_streaming_service.dart';
@@ -52,6 +53,13 @@ class VideoControlsOverlay extends StatefulWidget {
   final VoidCallback? onToggleFloatingSubtitleSettings;
   final VoidCallback? onOpenVideoCompose; // New parameter
   final VoidCallback? onOpenOcrSubtitle;
+
+  /// Opens or closes the Bilibili panel; the button is shown only when set
+  /// (Bilibili videos).
+  final VoidCallback? onToggleBilibiliPanel;
+
+  /// The Bilibili panel is showing (the button is highlighted).
+  final bool bilibiliPanelOpen;
   final VoidCallback onToggleLock;
   final bool showDanmakuControls;
   final bool danmakuEnabled;
@@ -131,6 +139,8 @@ class VideoControlsOverlay extends StatefulWidget {
     this.onToggleFloatingSubtitleSettings,
     this.onOpenVideoCompose,
     this.onOpenOcrSubtitle,
+    this.onToggleBilibiliPanel,
+    this.bilibiliPanelOpen = false,
     required this.onToggleLock,
     this.showDanmakuControls = false,
     this.danmakuEnabled = true,
@@ -1713,6 +1723,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         if (widget.onOpenOcrSubtitle == null) return;
         _startAutoHideTimer();
         widget.onOpenOcrSubtitle!();
+        return;
+      case DesktopPlayerShortcutAction.toggleBilibiliPanel:
+        if (widget.onToggleBilibiliPanel == null) return;
+        _startAutoHideTimer();
+        widget.onToggleBilibiliPanel!();
         return;
       case DesktopPlayerShortcutAction.openStreamQuality:
         final playbackService = Provider.of<MediaPlaybackService>(
@@ -3359,6 +3374,27 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                 onPressed: () {
                   _startAutoHideTimer();
                   widget.onOpenOcrSubtitle!();
+                },
+                iconSize: topActionIconSize,
+                padding: topActionPadding,
+                constraints: topActionConstraints,
+              ),
+            if (widget.onToggleBilibiliPanel != null)
+              IconButton(
+                key: const ValueKey('video-controls-top-bilibili-panel'),
+                icon: Icon(
+                  Icons.smart_display_outlined,
+                  color: widget.bilibiliPanelOpen
+                      ? AppTokens.brandBilibili
+                      : Colors.white,
+                ),
+                tooltip: _tooltipWithShortcut(
+                  widget.bilibiliPanelOpen ? '收起哔哩哔哩' : '哔哩哔哩',
+                  DesktopPlayerShortcutAction.toggleBilibiliPanel,
+                ),
+                onPressed: () {
+                  _startAutoHideTimer();
+                  widget.onToggleBilibiliPanel!();
                 },
                 iconSize: topActionIconSize,
                 padding: topActionPadding,

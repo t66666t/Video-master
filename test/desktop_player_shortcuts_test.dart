@@ -46,6 +46,8 @@ void main() {
         LogicalKeyboardKey.keyK: DesktopPlayerShortcutAction.toggleLock,
         LogicalKeyboardKey.keyX: DesktopPlayerShortcutAction.openDanmakuSettings,
         LogicalKeyboardKey.keyO: DesktopPlayerShortcutAction.openOcrSubtitle,
+        LogicalKeyboardKey.keyI:
+            DesktopPlayerShortcutAction.toggleBilibiliPanel,
         LogicalKeyboardKey.keyQ: DesktopPlayerShortcutAction.openStreamQuality,
         LogicalKeyboardKey.keyR: DesktopPlayerShortcutAction.resetScreen,
         LogicalKeyboardKey.keyZ: DesktopPlayerShortcutAction.openSleepTimer,
@@ -66,7 +68,7 @@ void main() {
         isNull,
       );
       expect(
-        DesktopPlayerShortcuts.matchAction(LogicalKeyboardKey.keyI),
+        DesktopPlayerShortcuts.matchAction(LogicalKeyboardKey.keyU),
         isNull,
       );
       expect(

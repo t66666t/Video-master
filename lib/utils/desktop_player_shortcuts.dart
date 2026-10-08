@@ -28,6 +28,7 @@ enum DesktopPlayerShortcutAction {
   toggleDanmaku,
   openDanmakuSettings,
   openOcrSubtitle,
+  toggleBilibiliPanel,
   openStreamQuality,
   resetScreen,
   openSleepTimer,
@@ -182,6 +183,10 @@ class DesktopPlayerShortcuts {
         DesktopPlayerShortcutAction.openOcrSubtitle:
             <DesktopPlayerShortcutBinding>[
               DesktopPlayerShortcutBinding(LogicalKeyboardKey.keyO),
+            ],
+        DesktopPlayerShortcutAction.toggleBilibiliPanel:
+            <DesktopPlayerShortcutBinding>[
+              DesktopPlayerShortcutBinding(LogicalKeyboardKey.keyI),
             ],
         DesktopPlayerShortcutAction.openStreamQuality:
             <DesktopPlayerShortcutBinding>[

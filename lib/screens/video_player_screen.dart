@@ -58,9 +58,12 @@ import '../widgets/ocr_subtitle_panel.dart';
 import '../widgets/chapter_sidebar.dart';
 import '../widgets/landscape_sidebar_layout.dart';
 import '../widgets/desktop_player_sidebar.dart';
+import '../widgets/bilibili_player_panel.dart';
 import '../services/transcription_manager.dart';
 import '../services/ocr_subtitle_manager.dart';
+import '../services/bilibili/bilibili_player_panel_memory.dart';
 import '../services/bilibili/bilibili_player_panel_policy.dart';
+import '../services/bilibili/bilibili_player_video.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
@@ -83,6 +86,7 @@ enum SidebarType {
   aiTranscription,
   videoCompose,
   ocrSubtitle,
+  bilibili,
 }
 
 @visibleForTesting
@@ -466,18 +470,47 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       case LandscapeSidebarTarget.videoCompose:
         return SidebarType.videoCompose;
       case LandscapeSidebarTarget.bilibili:
-      // Not offered on this page yet: never asked for.
+        return _isBilibiliVideo ? SidebarType.bilibili : SidebarType.none;
       case LandscapeSidebarTarget.none:
         return SidebarType.none;
     }
   }
 
-  /// The panel shown when no other one is asked for.
-  SidebarType get _defaultSidebar => _sidebarOf(
-    landscapeDefaultSidebar(
-      subtitleSidebarRemembered: _isSubtitleSidebarVisible,
-    ),
+  /// The Bilibili video playing, or null for any other media.
+  BilibiliPlayerVideo? get _bilibiliVideo =>
+      bilibiliPlayerVideoOf(_currentItem);
+
+  bool get _isBilibiliVideo => _bilibiliVideo != null;
+
+  late final BilibiliPlayerPanelMemory _bilibiliPanelMemory =
+      BilibiliPlayerPanelMemory.of(SettingsService());
+
+  /// Whether the window leaves room to open the Bilibili panel by itself.
+  bool get _bilibiliPanelMayAutoOpen {
+    final dispatcher = WidgetsBinding.instance.platformDispatcher;
+    final view =
+        dispatcher.implicitView ??
+        (dispatcher.views.isEmpty ? null : dispatcher.views.first);
+    if (view == null || view.devicePixelRatio <= 0) return false;
+    final size = view.physicalSize / view.devicePixelRatio;
+    return bilibiliPanelMayAutoOpen(
+      windowWidth: size.width,
+      panelWidth: LandscapeSidebarLayout.functionalWidthFor(size),
+      isMobilePlatform: !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+      shortestSide: size.shortestSide,
+    );
+  }
+
+  /// What the page shows when no other panel is asked for.
+  LandscapeSidebarTarget get _defaultTarget => landscapeDefaultSidebar(
+    subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+    isBilibiliVideo: _isBilibiliVideo,
+    bilibiliPanelRemembered: _bilibiliPanelMemory.remembered,
+    allowAutoOpen: _bilibiliPanelMayAutoOpen,
   );
+
+  /// The panel shown when no other one is asked for.
+  SidebarType get _defaultSidebar => _sidebarOf(_defaultTarget);
 
   /// The panel to show once the open one closes.
   SidebarType _sidebarAfterClosing([
@@ -487,8 +520,67 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       closing: closing,
       hasPrevious: _previousSidebarType != SidebarType.none,
       subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+      isBilibiliVideo: _isBilibiliVideo,
+      bilibiliPanelRemembered: _bilibiliPanelMemory.remembered,
+      allowAutoOpen: _bilibiliPanelMayAutoOpen,
     ),
   );
+
+  /// The panel button or its shortcut: opens or closes the Bilibili panel
+  /// and remembers that for every Bilibili video.
+  void _toggleBilibiliPanel() {
+    if (!_isBilibiliVideo) return;
+    final open = _bilibiliPanelMemory.userToggled(
+      showing: _activeSidebar == SidebarType.bilibili,
+    );
+    setState(() {
+      _previousSidebarType = SidebarType.none;
+      _activeSidebar = open
+          ? SidebarType.bilibili
+          : _sidebarOf(
+              landscapeSidebarAfterBilibiliClosed(
+                subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+              ),
+            );
+    });
+    _returnFocusToVideo();
+  }
+
+  /// The panel's own collapse button: closed, and remembered closed.
+  void _collapseBilibiliPanel() {
+    _bilibiliPanelMemory.userCollapsed();
+    setState(() {
+      _previousSidebarType = SidebarType.none;
+      _activeSidebar = _sidebarOf(
+        landscapeSidebarAfterBilibiliClosed(
+          subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+        ),
+      );
+    });
+    _returnFocusToVideo();
+  }
+
+  /// Keeps the Bilibili panel in step after the video changed on this page.
+  void _followVideoChangeForBilibiliPanel(bool showingDefaultBefore) {
+    final next = landscapeSidebarOnVideoChange(
+      showingBilibili: _activeSidebar == SidebarType.bilibili,
+      showingDefaultBefore: showingDefaultBefore,
+      isBilibiliVideo: _isBilibiliVideo,
+      newDefault: _defaultTarget,
+    );
+    if (next != null) _activeSidebar = _sidebarOf(next);
+    if (_previousSidebarType == SidebarType.bilibili && !_isBilibiliVideo) {
+      _previousSidebarType = SidebarType.none;
+    }
+  }
+
+  void _returnFocusToVideo() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _videoFocusNode.canRequestFocus) {
+        _videoFocusNode.requestFocus();
+      }
+    });
+  }
 
   SidebarType _normalizedSidebarForRestore(SidebarType sidebar) {
     if (sidebar == SidebarType.subtitlePosition) {
@@ -2009,8 +2101,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         }
       }
 
+      final showingDefaultBefore = _activeSidebar == _sidebarOf(_defaultTarget);
       setState(() {
         _currentItem = service.currentItem;
+        _followVideoChangeForBilibiliPanel(showingDefaultBefore);
         _isSourceMissing = false;
         _initialized = false;
         _isPlaying = false; // Reset play state until init
@@ -4532,7 +4626,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         });
         return;
       }
-      if (_activeSidebar != SidebarType.subtitles) {
+      if (_activeSidebar != SidebarType.subtitles &&
+          _activeSidebar != SidebarType.bilibili) {
         if (_activeSidebar == SidebarType.videoCompose) {
           _clearVideoComposePreview();
         }
@@ -5350,6 +5445,13 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                     _supportsOcrSubtitle
                                                     ? _showOcrSubtitle
                                                     : null,
+                                                onToggleBilibiliPanel:
+                                                    _isBilibiliVideo
+                                                    ? _toggleBilibiliPanel
+                                                    : null,
+                                                bilibiliPanelOpen:
+                                                    _activeSidebar ==
+                                                    SidebarType.bilibili,
                                                 onToggleFloatingSubtitleSettings:
                                                     _toggleFloatingSubtitleSettingsSidebar,
                                                 onToggleSidebar: () {
@@ -5365,7 +5467,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                         _isSubtitleSidebarVisible =
                                                             false;
                                                         _activeSidebar =
-                                                            SidebarType.none;
+                                                            _sidebarOf(
+                                                              _defaultTarget,
+                                                            );
                                                       } else {
                                                         _activeSidebar =
                                                             SidebarType
@@ -6182,6 +6286,17 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onSeek: _seekPlaybackPosition,
           onClose: _toggleChapterSidebar,
           playerFocusNode: _videoFocusNode,
+        );
+
+      case SidebarType.bilibili:
+        final video = _bilibiliVideo;
+        if (video == null) return null;
+        return BilibiliPlayerPanel(
+          bvid: video.bvid,
+          page: video.page,
+          fallbackTitle: _currentItem?.title ?? '',
+          onCollapse: _collapseBilibiliPanel,
+          onOpenEpisodes: () => setState(() => _showEpisodePicker = true),
         );
 
       case SidebarType.subtitles:
