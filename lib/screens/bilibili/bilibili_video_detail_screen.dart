@@ -2,10 +2,16 @@ import 'dart:async';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_video_interactions.dart';
+import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -42,12 +48,17 @@ class BilibiliVideoDetailScreen extends StatefulWidget {
     this.aid,
     this.initialPage = 1,
     this.api,
+    this.actions,
   });
 
   final String? bvid;
   final int? aid;
   final int initialPage;
   final BilibiliPublicApiService? api;
+
+  /// Like / coin / favourite / follow; defaults to the app's Bilibili
+  /// service. Without either, those buttons are not shown.
+  final BilibiliVideoActions? actions;
 
   @override
   State<BilibiliVideoDetailScreen> createState() =>
@@ -63,12 +74,51 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
   int _selectedPage = 1;
   bool _showAllEpisodes = false;
   bool _openingLink = false;
+  final SettingsService _settings = SettingsService();
+  BilibiliVideoInteractions? _interactions;
 
   @override
   void initState() {
     super.initState();
     _selectedPage = widget.initialPage < 1 ? 1 : widget.initialPage;
+    _settings.addListener(_rebuild);
     unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _settings.removeListener(_rebuild);
+    _interactions?.dispose();
+    super.dispose();
+  }
+
+  void _rebuild() {
+    if (mounted) setState(() {});
+  }
+
+  BilibiliVideoActions? _resolveActions() {
+    final own = widget.actions;
+    if (own != null) return own;
+    try {
+      return BilibiliVideoActions.forService(
+        context.read<BilibiliDownloadService>(),
+      );
+    } on ProviderNotFoundException {
+      return null;
+    }
+  }
+
+  void _startInteractions(BilibiliVideoDetail detail) {
+    _interactions?.dispose();
+    _interactions = null;
+    final actions = _resolveActions();
+    if (actions == null) return;
+    final interactions = BilibiliVideoInteractions(
+      actions: actions,
+      detail: detail,
+    )..addListener(_rebuild);
+    _interactions = interactions;
+    unawaited(interactions.load());
   }
 
   Future<void> _load() async {
@@ -88,6 +138,7 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
         final maxPage = detail.parts.isEmpty ? 1 : detail.parts.length;
         if (_selectedPage > maxPage) _selectedPage = 1;
       });
+      _startInteractions(detail);
     } on BilibiliPublicApiException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -273,6 +324,14 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
             _buildOwner(detail),
             const SizedBox(height: 12),
             _buildStats(detail),
+            if (_interactions case final interactions?) ...[
+              const SizedBox(height: 14),
+              BilibiliVideoInteractionBar(
+                interactions: interactions,
+                readOnly: _settings.bilibiliAccountReadOnly,
+                onReadOnlyTap: () => unawaited(openBilibiliSettings(context)),
+              ),
+            ],
             const SizedBox(height: 16),
             _buildActions(),
             if (detail.parts.length > 1) ...[
@@ -356,6 +415,11 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
                 formatBilibiliDate(detail.publishedAt),
                 style: const TextStyle(color: AppTokens.text3, fontSize: 12),
               ),
+            if (_interactions case final interactions?
+                when interactions.hasOwner) ...[
+              const SizedBox(width: 10),
+              BilibiliFollowButton(interactions: interactions),
+            ],
           ],
         ),
       ),
@@ -364,12 +428,18 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
 
   Widget _buildStats(BilibiliVideoDetail detail) {
     final stat = detail.stat;
+    // Like / coin / favourite counts follow the user's own actions here.
+    final interactions = _interactions;
     final items = <(IconData, String, int)>[
       (Icons.play_circle_outline, '播放', stat.view),
       (Icons.subtitles_outlined, '弹幕', stat.danmaku),
-      (Icons.thumb_up_alt_outlined, '点赞', stat.like),
-      (Icons.monetization_on_outlined, '投币', stat.coin),
-      (Icons.star_border, '收藏', stat.favorite),
+      (Icons.thumb_up_alt_outlined, '点赞', interactions?.likeCount ?? stat.like),
+      (
+        Icons.monetization_on_outlined,
+        '投币',
+        interactions?.coinCount ?? stat.coin,
+      ),
+      (Icons.star_border, '收藏', interactions?.favoriteCount ?? stat.favorite),
       (Icons.share_outlined, '分享', stat.share),
       (Icons.chat_bubble_outline, '评论', stat.reply),
     ];

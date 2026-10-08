@@ -243,4 +243,72 @@ void main() {
     expect(find.text('账号只读模式'), findsWidgets);
     await closeScreen(tester);
   });
+
+  testWidgets('other login methods open the old dialog and refresh', (
+    tester,
+  ) async {
+    final api = _FakeApi(
+      const BilibiliLoginState(BilibiliLoginStatus.loggedOut),
+    );
+    tester.view.physicalSize = const Size(900, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await SettingsService().init();
+    final seen = <BilibiliLoginState>[];
+    var opened = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BilibiliAccountScreen(
+          api: api,
+          onStateChanged: seen.add,
+          openOtherLogin: (context) async {
+            opened++;
+            api.state = const BilibiliLoginState(
+              BilibiliLoginStatus.loggedIn,
+              account: _account,
+            );
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    await tester.tap(
+      find.byKey(const ValueKey('bilibili-account-other-login')),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(opened, 1);
+    expect(statusText(tester), '已登录');
+    expect(seen.last.status, BilibiliLoginStatus.loggedIn);
+    expect(
+      find.byKey(const ValueKey('bilibili-account-other-login')),
+      findsNothing,
+    );
+    await closeScreen(tester);
+  });
+
+  testWidgets('expired shows other login methods too', (tester) async {
+    final api = _FakeApi(const BilibiliLoginState(BilibiliLoginStatus.expired));
+    tester.view.physicalSize = const Size(900, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await SettingsService().init();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BilibiliAccountScreen(
+          api: api,
+          openOtherLogin: (context) async {},
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('bilibili-account-other-login-expired')),
+      findsOneWidget,
+    );
+    await closeScreen(tester);
+  });
 }

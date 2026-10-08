@@ -142,6 +142,57 @@ class BilibiliInteractionGate {
   static void _defaultLog(String line) =>
       developer.log(line, name: 'BilibiliWrite');
 
+  /// Runs the same read-only / login / csrf checks as [post] without sending
+  /// anything. Returns the blocking result, or null when a write could go
+  /// out. Use it before opening a dialog (coins, favourites, unfollow) so a
+  /// blocked user is not asked to choose first.
+  Future<BilibiliWriteResult?> precheck() async =>
+      (await _checkAccess('precheck')).$1;
+
+  Future<(BilibiliWriteResult?, Map<String, String>)> _checkAccess(
+    String name,
+  ) async {
+    const none = <String, String>{};
+    if (!_writesAllowed()) {
+      _log('$name -> readOnly');
+      return (
+        const BilibiliWriteResult(
+          BilibiliWriteOutcome.readOnly,
+          message: readOnlyMessage,
+        ),
+        none,
+      );
+    }
+    Map<String, String> cookies;
+    try {
+      cookies = await _loginCookies();
+    } catch (e) {
+      _log('$name -> login unavailable (${e.runtimeType})');
+      cookies = none;
+    }
+    if ((cookies['SESSDATA'] ?? '').isEmpty) {
+      _log('$name -> notLoggedIn');
+      return (
+        const BilibiliWriteResult(
+          BilibiliWriteOutcome.notLoggedIn,
+          message: notLoggedInMessage,
+        ),
+        none,
+      );
+    }
+    if ((cookies['bili_jct'] ?? '').isEmpty) {
+      _log('$name -> missingCsrf');
+      return (
+        const BilibiliWriteResult(
+          BilibiliWriteOutcome.missingCsrf,
+          message: missingCsrfMessage,
+        ),
+        none,
+      );
+    }
+    return (null, cookies);
+  }
+
   /// Posts [form] to [endpoint] (https, a bilibili.com host) as the logged-in
   /// user. `csrf` is added from bili_jct; callers never pass it.
   Future<BilibiliWriteResult> post(
@@ -156,35 +207,9 @@ class BilibiliInteractionGate {
         message: '不支持的 B 站接口',
       );
     }
-    if (!_writesAllowed()) {
-      _log('$name -> readOnly');
-      return const BilibiliWriteResult(
-        BilibiliWriteOutcome.readOnly,
-        message: readOnlyMessage,
-      );
-    }
-    Map<String, String> cookies;
-    try {
-      cookies = await _loginCookies();
-    } catch (e) {
-      _log('$name -> login unavailable (${e.runtimeType})');
-      cookies = const <String, String>{};
-    }
-    if ((cookies['SESSDATA'] ?? '').isEmpty) {
-      _log('$name -> notLoggedIn');
-      return const BilibiliWriteResult(
-        BilibiliWriteOutcome.notLoggedIn,
-        message: notLoggedInMessage,
-      );
-    }
-    final csrf = cookies['bili_jct'] ?? '';
-    if (csrf.isEmpty) {
-      _log('$name -> missingCsrf');
-      return const BilibiliWriteResult(
-        BilibiliWriteOutcome.missingCsrf,
-        message: missingCsrfMessage,
-      );
-    }
+    final (blocked, cookies) = await _checkAccess(name);
+    if (blocked != null) return blocked;
+    final csrf = cookies['bili_jct']!;
 
     final body = <String, String>{...form, 'csrf': csrf};
     final Response<dynamic> response;

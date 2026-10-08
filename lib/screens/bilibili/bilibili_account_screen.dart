@@ -14,6 +14,7 @@ import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
+import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 
 /// Opens the account page. [api] defaults to the app's Bilibili service;
 /// [onStateChanged] hears every login state the page shows, so the caller's
@@ -39,11 +40,16 @@ class BilibiliAccountScreen extends StatefulWidget {
     this.api,
     this.settings,
     this.onStateChanged,
+    this.openOtherLogin,
   });
 
   final BilibiliApiService? api;
   final SettingsService? settings;
   final ValueChanged<BilibiliLoginState>? onStateChanged;
+
+  /// Other ways to log in (pasting a cookie); defaults to the existing login
+  /// dialog when the app's Bilibili service is available.
+  final Future<void> Function(BuildContext context)? openOtherLogin;
 
   @override
   State<BilibiliAccountScreen> createState() => _BilibiliAccountScreenState();
@@ -192,6 +198,28 @@ class _BilibiliAccountScreenState extends State<BilibiliAccountScreen> {
     _syncQr();
   }
 
+  Future<void> Function(BuildContext context)? get _otherLogin {
+    final own = widget.openOtherLogin;
+    if (own != null) return own;
+    try {
+      context.read<BilibiliDownloadService>();
+    } on ProviderNotFoundException {
+      return null;
+    }
+    return (context) => showBilibiliLoginDialog(context);
+  }
+
+  /// The old dialog (SESSDATA / cookie). Afterwards the page and the caller's
+  /// avatar follow whatever login it left.
+  Future<void> _openOtherLogin() async {
+    final open = _otherLogin;
+    if (open == null) return;
+    await open(context);
+    if (!mounted) return;
+    _relogin = false;
+    await _refresh();
+  }
+
   void _cancelRelogin() {
     setState(() => _relogin = false);
     _syncQr();
@@ -320,6 +348,18 @@ class _BilibiliAccountScreenState extends State<BilibiliAccountScreen> {
                     onPressed: () => unawaited(_refresh()),
                     child: const Text('重试'),
                   ),
+                if (state.status == BilibiliLoginStatus.expired &&
+                    !_relogin &&
+                    _otherLogin != null)
+                  TextButton(
+                    key: const ValueKey('bilibili-account-other-login-expired'),
+                    onPressed: () => unawaited(_openOtherLogin()),
+                    style: TextButton.styleFrom(
+                      foregroundColor: AppTokens.text3,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    child: const Text('其他登录方式', style: TextStyle(fontSize: 12)),
+                  ),
                 OutlinedButton(
                   key: const ValueKey('bilibili-account-logout'),
                   style: OutlinedButton.styleFrom(
@@ -398,6 +438,16 @@ class _BilibiliAccountScreenState extends State<BilibiliAccountScreen> {
               fontSize: 13,
             ),
           ),
+          if (_otherLogin != null)
+            TextButton(
+              key: const ValueKey('bilibili-account-other-login'),
+              onPressed: () => unawaited(_openOtherLogin()),
+              style: TextButton.styleFrom(
+                foregroundColor: AppTokens.text3,
+                visualDensity: VisualDensity.compact,
+              ),
+              child: const Text('其他登录方式', style: TextStyle(fontSize: 12)),
+            ),
           if (_relogin) ...[
             const SizedBox(height: 6),
             TextButton(

@@ -52,6 +52,17 @@ class BilibiliAuthException implements Exception {
   String toString() => message;
 }
 
+/// An account state read (liked, coins, favourites, following) failed.
+class BilibiliAccountReadException implements Exception {
+  final String message;
+  final int? code;
+
+  const BilibiliAccountReadException(this.message, {this.code});
+
+  @override
+  String toString() => message;
+}
+
 class BilibiliPlayerMetadata {
   final List<BilibiliSubtitle> subtitles;
   final List<MediaChapter> chapters;
@@ -159,6 +170,47 @@ class BilibiliApiService {
       for (final cookie in cookies)
         if (cookie.value.isNotEmpty) cookie.name: cookie.value,
     };
+  }
+
+  /// GET on an account endpoint (has-liked, coins, favourites, relation...)
+  /// with the live login cookies. Returns `data` of a code-0 answer and
+  /// throws [BilibiliAccountReadException] otherwise. Logs only the path and
+  /// the code.
+  Future<Object?> fetchAccountData(Uri endpoint) async {
+    await init();
+    final Response<dynamic> response;
+    try {
+      response = await _dio.getUri<dynamic>(
+        endpoint,
+        options: Options(validateStatus: (_) => true),
+      );
+    } catch (e) {
+      developer.log(
+        'Account read ${endpoint.path} failed',
+        error: e.runtimeType,
+      );
+      throw const BilibiliAccountReadException('网络异常');
+    }
+    dynamic payload = response.data;
+    if (payload is String) {
+      try {
+        payload = jsonDecode(payload);
+      } on FormatException {
+        payload = null;
+      }
+    }
+    final code = payload is Map ? (payload['code'] as num?)?.toInt() : null;
+    if (response.statusCode != 200 || code != 0) {
+      developer.log(
+        'Account read ${endpoint.path} -> http=${response.statusCode} '
+        'code=$code',
+      );
+      throw BilibiliAccountReadException(
+        payload is Map ? (payload['message'] ?? '').toString() : '',
+        code: code,
+      );
+    }
+    return (payload as Map)['data'];
   }
 
   /// Interprets a nav response. Only an explicit "not logged in" from
