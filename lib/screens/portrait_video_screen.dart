@@ -14,7 +14,11 @@ import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/ocr_subtitle_models.dart';
+import '../services/bilibili/bilibili_player_panel_memory.dart';
 import '../services/bilibili/bilibili_player_panel_policy.dart';
+import '../services/bilibili/bilibili_player_video.dart';
+import '../widgets/bilibili_player_panel.dart';
+import '../widgets/bilibili_portrait_tabs.dart';
 import '../services/bilibili/bilibili_video_shot_backfill.dart';
 import '../services/library_service.dart';
 import '../services/task_subtitle_storage_service.dart';
@@ -59,6 +63,10 @@ import '../widgets/subtitle_editor_panel.dart';
 
 enum PortraitPanel {
   subtitles,
+
+  /// The Bilibili details tab of a Bilibili video. Like [subtitles] this is
+  /// the panel shown when no other one is open.
+  bilibili,
   settings,
   subtitleStyle,
   ai,
@@ -197,6 +205,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _isSubtitleNearCenterY = false;
   bool _isStylePanelDragMode = false;
   PortraitPanel _activePanel = _panelOf(portraitDefaultPanel());
+
+  /// The 「详情 | 字幕」 tab the loading page left this page on; it wins over
+  /// the remembered one until the switch here is tapped.
+  PortraitBilibiliTab? _portraitTabHandedOff;
   bool get _suppressSubtitleOverlayForOcr =>
       _activePanel == PortraitPanel.ocrSubtitle;
   bool _isSubtitleEditorExpanded = false;
@@ -277,6 +289,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   void initState() {
     super.initState();
     _currentItem = widget.videoItem;
+    _portraitTabHandedOff = BilibiliPortraitTabMemory.takeHandOff(
+      widget.videoItem.id,
+    );
     WidgetsBinding.instance.addObserver(this);
     FocusManager.instance.addEarlyKeyEventHandler(_handlePlaybackEarlyKeyEvent);
     _showSystemBars();
@@ -966,7 +981,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           !_isPortraitSidebarViewportReady()) {
         return;
       }
-      if (_activePanel != PortraitPanel.subtitles) {
+      if (_shownPanel != PortraitPanel.subtitles) {
         _pendingSubtitleSidebarViewportRestore = false;
         return;
       }
@@ -1579,7 +1594,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
 
     _subtitleSeekTimer?.cancel();
     _subtitleSeekTimer = null;
-    if (syncSubtitleSidebar && _activePanel == PortraitPanel.subtitles) {
+    if (syncSubtitleSidebar && _shownPanel == PortraitPanel.subtitles) {
       _subtitleSidebarKey.currentState?.locateToTime(clamped);
     }
     try {
@@ -2069,7 +2084,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       case PortraitPanelTarget.videoCompose:
         return PortraitPanel.videoCompose;
       case PortraitPanelTarget.bilibili:
-      // Not offered on this page yet: never asked for.
+        return PortraitPanel.bilibili;
       case PortraitPanelTarget.subtitles:
         return PortraitPanel.subtitles;
     }
@@ -2078,7 +2093,50 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   /// The panel to show once the open one closes.
   PortraitPanel _panelAfterClosing([
     PortraitPanelClosing closing = PortraitPanelClosing.toolPanel,
-  ]) => _panelOf(portraitPanelAfterClose(closing: closing));
+  ]) => _panelOf(
+    portraitPanelAfterClose(
+      closing: closing,
+      isBilibiliVideo: _isBilibiliVideo,
+      rememberedTab: _portraitTab,
+    ),
+  );
+
+  bool get _isBilibiliVideo => bilibiliPlayerVideoOf(_currentItem) != null;
+
+  BilibiliPortraitTabMemory get _portraitTabMemory =>
+      BilibiliPortraitTabMemory.of(
+        Provider.of<SettingsService>(context, listen: false),
+      );
+
+  /// The 「详情 | 字幕」 tab shown for Bilibili videos.
+  PortraitBilibiliTab get _portraitTab =>
+      _portraitTabHandedOff ?? _portraitTabMemory.remembered;
+
+  /// Whether the panel shown when no other one is open is up.
+  bool get _isDefaultPanel =>
+      _activePanel == PortraitPanel.subtitles ||
+      _activePanel == PortraitPanel.bilibili;
+
+  /// The panel actually shown: the default one follows the current video and
+  /// the 「详情 | 字幕」 tab.
+  PortraitPanel get _shownPanel => _isDefaultPanel
+      ? _panelOf(
+          portraitDefaultPanel(
+            isBilibiliVideo: _isBilibiliVideo,
+            rememberedTab: _portraitTab,
+          ),
+        )
+      : _activePanel;
+
+  void _pickPortraitTab(PortraitBilibiliTab tab) {
+    _portraitTabMemory.userPicked(tab);
+    setState(() {
+      _portraitTabHandedOff = null;
+      _activePanel = tab == PortraitBilibiliTab.details
+          ? PortraitPanel.bilibili
+          : PortraitPanel.subtitles;
+    });
+  }
 
   void _closeSubtitleStyleSettings() {
     _disableStylePanelDragMode();
@@ -2603,7 +2661,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
       return;
     }
 
-    if (_activePanel != PortraitPanel.subtitles) {
+    if (!_isDefaultPanel) {
       if (!mounted) return;
       if (_activePanel == PortraitPanel.videoCompose) {
         _clearVideoComposePreview();
@@ -5429,8 +5487,10 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           onClose: _closeSubtitleStyleSettings,
           onBack: _closeSubtitleStyleSettings,
         );
+      case PortraitPanel.bilibili:
       case PortraitPanel.subtitles:
-        return SubtitleSidebar(
+        final bilibiliVideo = bilibiliPlayerVideoOf(_currentItem);
+        final subtitleList = SubtitleSidebar(
           key: _subtitleSidebarKey,
           subtitles: _subtitles,
           secondarySubtitles: _secondarySubtitles,
@@ -5459,12 +5519,30 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           isCompact: true,
           isPortrait: true,
           focusNode: _videoFocusNode,
-          isVisible: _activePanel == PortraitPanel.subtitles,
+          isVisible: _shownPanel == PortraitPanel.subtitles,
           showEmbeddedLoadingMessage:
               _embeddedSubtitleDetected &&
               _isLoadingEmbeddedSubtitle &&
               _subtitles.isEmpty &&
               _secondarySubtitles.isEmpty,
+        );
+        // One widget for both tabs and for other videos, so switching does
+        // not slide the panel in again nor rebuild the subtitle list.
+        return BilibiliPortraitTabs(
+          key: const ValueKey('portrait-default-panel'),
+          tab: _portraitTab,
+          onSelect: _pickPortraitTab,
+          details: bilibiliVideo == null
+              ? null
+              : BilibiliPlayerPanel(
+                  bvid: bilibiliVideo.bvid,
+                  page: bilibiliVideo.page,
+                  fallbackTitle: _currentItem.title,
+                  onOpenEpisodes: () => setState(
+                    () => _activePanel = PortraitPanel.episodePicker,
+                  ),
+                ),
+          subtitles: subtitleList,
         );
     }
   }

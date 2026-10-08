@@ -919,6 +919,11 @@ class SettingsService extends ChangeNotifier {
   /// not.
   bool bilibiliPlayerPanelOpen = true;
 
+  /// Whether the portrait player's 「详情 | 字幕」 switch of Bilibili videos was
+  /// left on 字幕 (one choice for all Bilibili videos); false is 详情. Only a
+  /// tap on the switch in the player changes it.
+  bool bilibiliPortraitShowsSubtitles = false;
+
   // New: AI Model Selection
   String lastSelectedModelType = 'base';
 
@@ -1849,6 +1854,12 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) => service.bilibiliPlayerPanelOpen = value,
       ),
       _boolSetting(
+        key: 'bilibiliPortraitShowsSubtitles',
+        defaultValue: false,
+        apply: (service, value) =>
+            service.bilibiliPortraitShowsSubtitles = value,
+      ),
+      _boolSetting(
         key: 'isGhostModeEnabled',
         defaultValue: true,
         apply: (service, value) => service.isGhostModeEnabled = value,
@@ -2259,6 +2270,7 @@ class SettingsService extends ChangeNotifier {
     bilibiliImportTarget = '';
     bilibiliAccountReadOnly = true;
     bilibiliPlayerPanelOpen = true;
+    bilibiliPortraitShowsSubtitles = false;
     bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
     importSourceFolderNamesJson = '{}';
@@ -3140,6 +3152,13 @@ class SettingsService extends ChangeNotifier {
 
   Future<void> saveBilibiliPlayerPanelOpen(bool value) async {
     await _updateRegisteredSetting<bool>('bilibiliPlayerPanelOpen', value);
+  }
+
+  Future<void> saveBilibiliPortraitShowsSubtitles(bool value) async {
+    await _updateRegisteredSetting<bool>(
+      'bilibiliPortraitShowsSubtitles',
+      value,
+    );
   }
 
   bool isSamePlaybackSpeed(double first, double second) {
