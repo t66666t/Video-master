@@ -1123,8 +1123,7 @@ class _CollectionScreenState extends State<CollectionScreen>
         settings.toggleFullScreen();
         return KeyEventResult.handled;
       case DesktopMediaManagementShortcutAction.openLargeDataDirectory:
-        if (_isSelectionMode ||
-            !(Platform.isWindows || Platform.isLinux)) {
+        if (_isSelectionMode || !(Platform.isWindows || Platform.isLinux)) {
           return KeyEventResult.handled;
         }
         _showLargeDataPathDialog(context);
@@ -2167,7 +2166,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                     )
                   : null,
               bottomNavigationBar: _isSelectionMode && _selectedIds.isNotEmpty
-                  ? MediaLibrarySelectionBottomBar(
+                  ? MediaLibrarySelectionBottomBar.folders(
                       onMoveToRecycleBin: () {
                         library.moveToRecycleBin(_selectedIds.toList());
                         setState(() {
@@ -3546,10 +3545,7 @@ class _CollectionScreenState extends State<CollectionScreen>
                   onPressed: () async {
                     final opened = await revealInFileManager(tempPath);
                     if (!opened && context.mounted) {
-                      AppToast.show(
-                        '无法在文件管理器中显示',
-                        type: AppToastType.error,
-                      );
+                      AppToast.show('无法在文件管理器中显示', type: AppToastType.error);
                     }
                   },
                   child: const Text(

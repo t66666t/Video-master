@@ -189,7 +189,7 @@ class YtDlpMetaParser {
             fallback: _inferAudioCodec(format),
           ),
           audioSampleRate: _intValue(format['asr']),
-          bitrate: _intValue(format['abr']) ?? _intValue(format['tbr']),
+          bitrate: _bitrateKbps(format),
           fileSize:
               _intValue(format['filesize']) ??
               _intValue(format['filesize_approx']),
@@ -774,6 +774,24 @@ class YtDlpMetaParser {
     if (value == null) return null;
     final text = value.toString().trim();
     return text.isEmpty ? null : text;
+  }
+
+  /// Prefer abr, then tbr. Accept numeric strings like "128" / "128.4" / "128k".
+  int? _bitrateKbps(Map<String, dynamic> format) {
+    return _parseBitrateKbps(format['abr']) ??
+        _parseBitrateKbps(format['tbr']) ??
+        _parseBitrateKbps(format['audio_bitrate']);
+  }
+
+  int? _parseBitrateKbps(Object? value) {
+    final direct = _intValue(value);
+    if (direct != null && direct > 0) return direct;
+    if (value == null) return null;
+    final match = RegExp(r'(\d+(?:\.\d+)?)').firstMatch(value.toString());
+    if (match == null) return null;
+    final parsed = double.tryParse(match.group(1)!);
+    if (parsed == null || parsed <= 0) return null;
+    return parsed.round();
   }
 
   int? _intValue(Object? value) {

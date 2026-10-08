@@ -158,6 +158,40 @@ class YtDlpVideoFormatSelector {
     return '$merged/$videoId';
   }
 
+  /// Android staged post-process (no yt-dlp ffmpeg CLI): never request a
+  /// `video+audio` merge. Download a progressive stream when it already has
+  /// audio, otherwise download video and audio as **separate** files
+  /// (`id,id`) so FFmpegKit can mux them in finalize.
+  static String androidStagedFormatSelector({
+    required String? videoId,
+    required String? audioId,
+    required bool audioOnly,
+    required bool removeAudio,
+    required bool videoHasEmbeddedAudio,
+  }) {
+    if (audioOnly) {
+      final id = audioId?.trim();
+      return (id != null && id.isNotEmpty) ? id : 'bestaudio';
+    }
+    final resolvedVideo = videoId?.trim();
+    if (removeAudio) {
+      return (resolvedVideo != null && resolvedVideo.isNotEmpty)
+          ? resolvedVideo
+          : 'bestvideo/best';
+    }
+    if (resolvedVideo == null || resolvedVideo.isEmpty) {
+      return 'best[acodec!=none]/best';
+    }
+    if (videoHasEmbeddedAudio) {
+      return resolvedVideo;
+    }
+    final resolvedAudio = audioId?.trim();
+    final audioSpec = (resolvedAudio != null && resolvedAudio.isNotEmpty)
+        ? resolvedAudio
+        : 'bestaudio';
+    return '$resolvedVideo,$audioSpec';
+  }
+
   static int _compareWithinQuality(VideoFormat a, VideoFormat b) {
     final compatibility = _broadCompatibilityRank(
       b,

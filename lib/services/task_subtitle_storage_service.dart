@@ -1,9 +1,64 @@
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
 
 import '../utils/subtitle_file_matcher.dart';
 import 'settings_service.dart';
+
+/// One subtitle after its on-screen name has been separated from its file name.
+///
+/// [displayName] is what the app shows and may repeat ("中文", "中文").
+/// [storageKey] is only a map key, so a second copy does not overwrite the first.
+class BoundSubtitleLabel {
+  final String storageKey;
+  final String displayName;
+  final String path;
+
+  const BoundSubtitleLabel({
+    required this.storageKey,
+    required this.displayName,
+    required this.path,
+  });
+}
+
+/// Keeps every file even when several share one display name.
+List<BoundSubtitleLabel> bindSubtitleLabels(
+  Iterable<({String label, String path})> entries,
+) {
+  final usedKeys = <String>{};
+  final bound = <BoundSubtitleLabel>[];
+  for (final entry in entries) {
+    final displayName = subtitleDisplayLabel(entry.label);
+    var key = displayName;
+    if (usedKeys.contains(key)) {
+      final baseName = p.basename(entry.path);
+      key = baseName;
+      var serial = 2;
+      while (usedKeys.contains(key)) {
+        final extension = p.extension(baseName);
+        final stem = p.basenameWithoutExtension(baseName);
+        key = '$stem ($serial)$extension';
+        serial++;
+      }
+    }
+    usedKeys.add(key);
+    bound.add(
+      BoundSubtitleLabel(
+        storageKey: key,
+        displayName: displayName,
+        path: entry.path,
+      ),
+    );
+  }
+  return bound;
+}
+
+/// The name shown in subtitle management. It is not a file name.
+String subtitleDisplayLabel(String label) {
+  final trimmed = label.trim();
+  return trimmed.isEmpty ? '字幕' : trimmed;
+}
 
 class TaskSubtitleStorageService {
   final Directory? _dataRootOverride;
@@ -52,6 +107,44 @@ class TaskSubtitleStorageService {
       }
     }
     return files;
+  }
+
+  /// File name inside a card's subtitle folder.
+  ///
+  /// The folder is already `subtitles/tasks/{videoId}`, so the video title is
+  /// not repeated here. The readable label stays in the name for browsing,
+  /// and the short id only stops two "中文.srt" files from overwriting each other.
+  static String readableSubtitleFileName({
+    required String label,
+    required String extension,
+    String? uniqueId,
+  }) {
+    var suffix = extension.trim().toLowerCase();
+    if (suffix.isEmpty) suffix = '.srt';
+    if (!suffix.startsWith('.')) suffix = '.$suffix';
+    final safeLabel = _readableStorageLabel(label);
+    final id = _shortStorageId(uniqueId);
+    return '$safeLabel.$id$suffix';
+  }
+
+  static String _readableStorageLabel(String label) {
+    var cleaned = label
+        .trim()
+        .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim()
+        .replaceAll(RegExp(r'[. ]+$'), '');
+    if (cleaned.length > 80) {
+      cleaned = cleaned.substring(0, 80).replaceAll(RegExp(r'[. ]+$'), '');
+    }
+    return cleaned.isEmpty ? '字幕' : cleaned;
+  }
+
+  static String _shortStorageId(String? uniqueId) {
+    final raw = (uniqueId ?? const Uuid().v4()).replaceAll('-', '');
+    final hex = raw.replaceAll(RegExp(r'[^a-fA-F0-9]'), '');
+    if (hex.length >= 8) return hex.substring(0, 8).toLowerCase();
+    return '${hex}00000000'.substring(0, 8).toLowerCase();
   }
 
   Future<String> allocatePath(String videoId, String preferredFileName) async {

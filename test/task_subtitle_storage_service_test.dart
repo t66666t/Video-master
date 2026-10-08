@@ -20,6 +20,38 @@ void main() {
       }
     });
 
+    test('readable subtitle names keep the label and separate duplicates', () {
+      final first = TaskSubtitleStorageService.readableSubtitleFileName(
+        label: '中文(简体) (自动)',
+        extension: 'srt',
+        uniqueId: 'abcd1234ef',
+      );
+      final second = TaskSubtitleStorageService.readableSubtitleFileName(
+        label: '中文(简体) (自动)',
+        extension: '.srt',
+        uniqueId: '9999aaaa',
+      );
+      expect(first, '中文(简体) (自动).abcd1234.srt');
+      expect(second, '中文(简体) (自动).9999aaaa.srt');
+      expect(
+        TaskSubtitleStorageService.readableSubtitleFileName(
+          label: 'a/b:c',
+          extension: '.ass',
+          uniqueId: '1234abcd',
+        ),
+        'a b c.1234abcd.ass',
+      );
+
+      final bound = bindSubtitleLabels(const <({String label, String path})>[
+        (label: '中文', path: r'C:\tasks\中文.aaaa1111.srt'),
+        (label: '中文', path: r'C:\tasks\中文.bbbb2222.srt'),
+      ]);
+      expect(bound.map((entry) => entry.displayName), <String>['中文', '中文']);
+      expect(bound[0].storageKey, '中文');
+      expect(bound[1].storageKey, isNot('中文'));
+      expect(bound[0].path, isNot(bound[1].path));
+    });
+
     test('isolates files by media card id', () async {
       final taskAPath = await storage.allocatePath('task-a', 'translated.srt');
       final taskBPath = await storage.allocatePath('task-b', 'translated.srt');

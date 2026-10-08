@@ -195,9 +195,22 @@ class AudioFormat {
     final codec = (audioCodec == null || audioCodec!.isEmpty)
         ? ext
         : audioCodec!;
-    final rate = bitrate != null ? '${bitrate}k' : '未知码率';
-    return '$codec + $rate';
+    if (bitrate != null) {
+      return '$codec + ${bitrate}k';
+    }
+    if (audioSampleRate != null && audioSampleRate! > 0) {
+      final khz = audioSampleRate! >= 1000
+          ? (audioSampleRate! / 1000).toStringAsFixed(
+              audioSampleRate! % 1000 == 0 ? 0 : 1,
+            )
+          : audioSampleRate!.toString();
+      return '$codec + ${khz}kHz';
+    }
+    // Prefer codec/ext over a fake "unknown bitrate" label when abr/tbr is
+    // missing from yt-dlp metadata (common for some YouTube audio formats).
+    return codec;
   }
+
 
   Map<String, dynamic> toJson() => {
     'formatId': formatId,

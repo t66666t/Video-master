@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import 'package:video_player_app/models/library_activity.dart';
+import 'package:video_player_app/models/managed_subtitle_asset.dart';
 import 'package:video_player_app/models/import_card_placement.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
@@ -2856,6 +2857,71 @@ class BilibiliDownloadService extends ChangeNotifier {
     await source.delete();
   }
 
+  String _bilibiliSubtitleLabel(String lanDoc, String lan) {
+    final doc = lanDoc.trim();
+    if (doc.isNotEmpty) return doc;
+    final code = lan.trim();
+    if (code.isNotEmpty) return code;
+    return '字幕';
+  }
+
+  Future<String> _writeTaskSubtitle({
+    required String videoId,
+    required String label,
+    required String contents,
+  }) async {
+    final output = await _allocateTaskSubtitle(videoId: videoId, label: label);
+    await File(output).writeAsString(contents, flush: true);
+    return output;
+  }
+
+  Future<String> _storeTaskSubtitleFile({
+    required String videoId,
+    required String label,
+    required String sourcePath,
+  }) {
+    return const TaskSubtitleStorageService().copyIntoTask(
+      videoId,
+      sourcePath,
+      preferredFileName: TaskSubtitleStorageService.readableSubtitleFileName(
+        label: label,
+        extension: p.extension(sourcePath).isEmpty
+            ? '.srt'
+            : p.extension(sourcePath),
+      ),
+    );
+  }
+
+  Future<String> _allocateTaskSubtitle({
+    required String videoId,
+    required String label,
+    String extension = '.srt',
+  }) {
+    return const TaskSubtitleStorageService().allocatePath(
+      videoId,
+      TaskSubtitleStorageService.readableSubtitleFileName(
+        label: label,
+        extension: extension,
+      ),
+    );
+  }
+
+  List<ManagedSubtitleAsset> _downloadedSubtitleAssets(
+    List<BoundSubtitleLabel> bound,
+  ) {
+    final createdAt = DateTime.now().millisecondsSinceEpoch;
+    return <ManagedSubtitleAsset>[
+      for (final entry in bound)
+        ManagedSubtitleAsset(
+          assetId: _uuid.v4(),
+          path: p.normalize(entry.path),
+          kind: ManagedSubtitleAssetKind.downloaded,
+          displayName: entry.displayName,
+          createdAt: createdAt,
+        ),
+    ];
+  }
+
   Future<void> _deleteFileIfExists(String path) async {
     try {
       final file = File(path);
@@ -3756,9 +3822,7 @@ class BilibiliDownloadService extends ChangeNotifier {
             }
           }
 
-          final subtitleDir = await const TaskSubtitleStorageService()
-              .taskDirectory(uuid, create: true);
-          final extraSubtitles = <String, String>{};
+          final labeledSubtitles = <({String label, String path})>[];
           String? defaultSubtitlePath;
           for (final subtitle in metadata.subtitles) {
             try {
@@ -3767,19 +3831,13 @@ class BilibiliDownloadService extends ChangeNotifier {
               );
               final srt = SubtitleUtil.convertJsonToSrt(payload);
               if (srt.isEmpty) continue;
-              final safeLanguage = subtitle.lan.replaceAll(
-                RegExp(r'[^A-Za-z0-9_-]'),
-                '_',
+              final label = _bilibiliSubtitleLabel(subtitle.lanDoc, subtitle.lan);
+              final output = await _writeTaskSubtitle(
+                videoId: uuid,
+                label: label,
+                contents: srt,
               );
-              final output = p.join(
-                subtitleDir.path,
-                'stream_${safeLanguage.isEmpty ? 'subtitle' : safeLanguage}.srt',
-              );
-              await File(output).writeAsString(srt, flush: true);
-              var label = subtitle.lanDoc.trim();
-              if (label.isEmpty) label = subtitle.lan.trim();
-              if (label.isEmpty) label = '字幕';
-              extraSubtitles[label] = output;
+              labeledSubtitles.add((label: label, path: output));
               if (ep.selectedSubtitle == subtitle ||
                   (ep.selectedSubtitle?.id.isNotEmpty == true &&
                       ep.selectedSubtitle!.id == subtitle.id)) {
@@ -3789,6 +3847,11 @@ class BilibiliDownloadService extends ChangeNotifier {
               debugPrint('Bilibili stream subtitle export failed: $error');
             }
           }
+          final boundSubtitles = bindSubtitleLabels(labeledSubtitles);
+          final extraSubtitles = <String, String>{
+            for (final entry in boundSubtitles) entry.storageKey: entry.path,
+          };
+          final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
 
           String? danmakuPath;
           try {
@@ -3851,6 +3914,7 @@ class BilibiliDownloadService extends ChangeNotifier {
             parentId: targetParentId,
             subtitlePath: defaultSubtitlePath,
             additionalSubtitles: extraSubtitles,
+            managedSubtitleAssets: subtitleAssets,
             danmakuPath: danmakuPath,
             usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
             isBilibiliExported: true,
@@ -4061,8 +4125,6 @@ class BilibiliDownloadService extends ChangeNotifier {
         // --- End Hierarchy Logic ---
 
         final uuid = const Uuid().v4();
-        final taskSubtitleDir = await const TaskSubtitleStorageService()
-            .taskDirectory(uuid, create: true);
         final extension = file.path.split('.').last;
 
         // Sanitize and truncate for filename to avoid OS limits (max 255 bytes)
@@ -4127,33 +4189,26 @@ class BilibiliDownloadService extends ChangeNotifier {
           debugPrint("Failed to download cover: $e");
         }
 
-        Map<String, String> extraSubtitles = {};
+        final labeledSubtitles = <({String label, String path})>[];
         final srtPath = ep.outputPath!.replaceAll(RegExp(r'\.mp4$'), '.srt');
         final srtFile = File(srtPath);
         String? defaultSubtitlePath;
 
         final hasLocalSubtitle = await srtFile.exists();
         if (hasLocalSubtitle) {
-          final finalSrtPath = p.join(taskSubtitleDir.path, 'downloaded.srt');
-          await srtFile.copy(finalSrtPath);
-          defaultSubtitlePath = finalSrtPath;
-          await _deleteTempArtifacts(srtFile.path);
-        }
-
-        if (defaultSubtitlePath != null) {
           final selected = ep.selectedSubtitle;
-          if (selected != null) {
-            String label = selected.lanDoc;
-            if (label.isEmpty) {
-              label = selected.lan;
-            }
-            if (label.isEmpty) {
-              label = "默认字幕";
-            }
-            if (!extraSubtitles.containsKey(label)) {
-              extraSubtitles[label] = defaultSubtitlePath;
-            }
-          }
+          final label = _bilibiliSubtitleLabel(
+            selected?.lanDoc ?? '',
+            selected?.lan ?? '',
+          );
+          final finalSrtPath = await _storeTaskSubtitleFile(
+            videoId: uuid,
+            label: label,
+            sourcePath: srtFile.path,
+          );
+          defaultSubtitlePath = finalSrtPath;
+          labeledSubtitles.add((label: label, path: finalSrtPath));
+          await _deleteTempArtifacts(srtFile.path);
         }
 
         if (ep.availableSubtitles.isNotEmpty) {
@@ -4170,26 +4225,29 @@ class BilibiliDownloadService extends ChangeNotifier {
                   continue;
                 }
               }
-              final lang = sub.lan;
               final url = sub.url;
               final resp = await apiService.dio.get(url);
               final srtContent = SubtitleUtil.convertJsonToSrt(resp.data);
 
               if (srtContent.isNotEmpty) {
-                final safeLanguage = lang.replaceAll(
-                  RegExp(r'[^A-Za-z0-9_-]'),
-                  '_',
+                final label = _bilibiliSubtitleLabel(sub.lanDoc, sub.lan);
+                final subPath = await _writeTaskSubtitle(
+                  videoId: uuid,
+                  label: label,
+                  contents: srtContent,
                 );
-                final subPath = await const TaskSubtitleStorageService()
-                    .allocatePath(uuid, 'downloaded.$safeLanguage.srt');
-                await File(subPath).writeAsString(srtContent);
-                extraSubtitles[sub.lanDoc] = subPath;
+                labeledSubtitles.add((label: label, path: subPath));
               }
             } catch (e) {
               debugPrint("Failed to download subtitle ${sub.lanDoc}: $e");
             }
           }
         }
+        final boundSubtitles = bindSubtitleLabels(labeledSubtitles);
+        final extraSubtitles = <String, String>{
+          for (final entry in boundSubtitles) entry.storageKey: entry.path,
+        };
+        final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
 
         String? finalDanmakuPath;
         final sourceDanmakuPath = ep.danmakuPath;
@@ -4253,6 +4311,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           parentId: targetParentId,
           subtitlePath: defaultSubtitlePath,
           additionalSubtitles: extraSubtitles,
+          managedSubtitleAssets: subtitleAssets,
           danmakuPath: finalDanmakuPath,
           usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
           codec: codec,

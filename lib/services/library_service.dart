@@ -520,6 +520,10 @@ class LibraryService extends ChangeNotifier {
   List<String> get pinnedItemIds =>
       List<String>.unmodifiable(_activity.pinnedIds);
 
+  /// Cards removed from 最近添加. Media and folder ids share this list.
+  List<String> get recentDismissedIds =>
+      List<String>.unmodifiable(_activity.recentDismissedIds);
+
   bool get _canMutateActivity => !_activityUnknownFuture;
 
   void _bumpActivity({required bool notifyLibrary}) {
@@ -545,10 +549,12 @@ class LibraryService extends ChangeNotifier {
     for (final batch in _openImportBatches.values) {
       batch.createdMediaIds.remove(mediaId);
     }
+    _activity.recentDismissedIds.remove(mediaId);
   }
 
   void _purgeActivityForDeletedCollection(String collectionId) {
     _activity.pinnedIds.remove(collectionId);
+    _activity.recentDismissedIds.remove(collectionId);
   }
 
   Future<void> registerImportedMedia(
@@ -673,6 +679,47 @@ class LibraryService extends ChangeNotifier {
     if (record == null || !record.hidden) return;
     record.hidden = false;
     await _persistActivity(notifyLibrary: true);
+  }
+
+  /// Hides one 最近添加 card. [id] may be a media item or a folder.
+  ///
+  /// Leaves the file, folder, progress, continue-learning row, and history
+  /// in place. A later play does not put the card back; only
+  /// [restoreRecentAdded] does.
+  Future<bool> dismissFromRecentAdded(String id) async {
+    if (!_canMutateActivity) return false;
+    final trimmed = id.trim();
+    if (trimmed.isEmpty) return false;
+    if (!_videos.containsKey(trimmed) && !_collections.containsKey(trimmed)) {
+      developer.log(
+        'Skipped recent dismiss for unknown id $trimmed',
+        name: 'LibraryActivity',
+        level: 500,
+      );
+      return false;
+    }
+    if (!_activity.recentDismissedIds.add(trimmed)) return false;
+    developer.log(
+      'Dismissed $trimmed from recent added',
+      name: 'LibraryActivity',
+      level: 800,
+    );
+    await _persistActivity(notifyLibrary: true);
+    return true;
+  }
+
+  /// Puts a previously dismissed 最近添加 card back on that page.
+  Future<bool> restoreRecentAdded(String id) async {
+    if (!_canMutateActivity) return false;
+    final trimmed = id.trim();
+    if (!_activity.recentDismissedIds.remove(trimmed)) return false;
+    developer.log(
+      'Restored $trimmed to recent added',
+      name: 'LibraryActivity',
+      level: 800,
+    );
+    await _persistActivity(notifyLibrary: true);
+    return true;
   }
 
   void recordValidPlaybackProgress(
@@ -2879,34 +2926,33 @@ class LibraryService extends ChangeNotifier {
     if (eligible.isEmpty) return;
 
     final storage = TaskSubtitleStorageService(dataRootOverride: _dataRootDir);
-    final localSubtitles = <String, String>{};
-    final managedAssets = <ManagedSubtitleAsset>[];
+    final labeled = <({String label, String path})>[];
     for (final subtitle in eligible) {
       final copiedPath = await storage.copyIntoTask(
         item.id,
         subtitle.path,
         preferredFileName: p.basename(subtitle.path),
       );
-      var displayName = p.basename(subtitle.path);
-      if (localSubtitles.containsKey(displayName)) {
-        final baseName = displayName;
-        var serial = 2;
-        while (localSubtitles.containsKey('$baseName（$serial）')) {
-          serial++;
-        }
-        displayName = '$baseName（$serial）';
-      }
-      localSubtitles[displayName] = copiedPath;
-      managedAssets.add(
+      // The on-screen name is the original stem, without ".srt" and without
+      // a "（2）" suffix. Two files both named 中文.srt both display as 中文.
+      final stem = p.basenameWithoutExtension(subtitle.path).trim();
+      labeled.add((label: stem.isEmpty ? '字幕' : stem, path: copiedPath));
+    }
+    final bound = bindSubtitleLabels(labeled);
+    final createdAt = DateTime.now().millisecondsSinceEpoch;
+    final localSubtitles = <String, String>{
+      for (final entry in bound) entry.storageKey: entry.path,
+    };
+    final managedAssets = <ManagedSubtitleAsset>[
+      for (final entry in bound)
         ManagedSubtitleAsset(
           assetId: const Uuid().v4(),
-          path: p.normalize(copiedPath),
+          path: p.normalize(entry.path),
           kind: ManagedSubtitleAssetKind.imported,
-          displayName: displayName,
-          createdAt: DateTime.now().millisecondsSinceEpoch,
+          displayName: entry.displayName,
+          createdAt: createdAt,
         ),
-      );
-    }
+    ];
 
     item.localSubtitles = localSubtitles;
     item.managedSubtitleAssets = managedAssets;
@@ -5650,17 +5696,25 @@ class LibraryService extends ChangeNotifier {
     if (!await storage.isTaskOwnedPath(path, videoId)) {
       throw StateError('只能登记当前媒体任务目录内的字幕');
     }
-    var name = displayName.trim().isEmpty
-        ? p.basename(path)
-        : displayName.trim();
+    final visible = subtitleDisplayLabel(
+      displayName.trim().isEmpty
+          ? p.basenameWithoutExtension(path)
+          : displayName,
+    );
     final local = <String, String>{...?item.localSubtitles};
-    if (local.containsKey(name) && !_samePath(local[name]!, path)) {
-      final base = name;
+    // The map key has to be unique. The stored display name stays [visible],
+    // so a second "中文" is not renamed to "中文（2）" in the app.
+    var key = visible;
+    if (local.containsKey(key) && !_samePath(local[key]!, path)) {
+      final baseName = p.basename(path);
+      key = baseName;
       var serial = 2;
-      while (local.containsKey('$base（$serial）')) {
+      while (local.containsKey(key) && !_samePath(local[key]!, path)) {
+        final extension = p.extension(baseName);
+        final stem = p.basenameWithoutExtension(baseName);
+        key = '$stem ($serial)$extension';
         serial++;
       }
-      name = '$base（$serial）';
     }
     var asset = managedSubtitleAssetForPath(videoId, path);
     if (asset == null) {
@@ -5668,7 +5722,7 @@ class LibraryService extends ChangeNotifier {
         assetId: const Uuid().v4(),
         path: p.normalize(path),
         kind: kind,
-        displayName: name,
+        displayName: visible,
         language: language,
         createdAt: DateTime.now().millisecondsSinceEpoch,
       );
@@ -5677,7 +5731,7 @@ class LibraryService extends ChangeNotifier {
         asset,
       ];
     }
-    local[name] = p.normalize(path);
+    local[key] = p.normalize(path);
     item.localSubtitles = local;
     item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
     _invalidateVideoSizeCache(videoId);

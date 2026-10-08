@@ -37,6 +37,7 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onMoveToParent,
     this.showActivityMenu = false,
     this.allowHide = false,
+    this.allowDismissFromRecent = false,
     this.relativePath,
   }) : _video = item,
        _collection = null;
@@ -63,6 +64,7 @@ class MediaLibraryListTile extends StatelessWidget {
     this.onMoveToParent,
     this.showActivityMenu = false,
     this.allowHide = false,
+    this.allowDismissFromRecent = false,
     this.relativePath,
   }) : _collection = collection,
        _video = null;
@@ -90,13 +92,16 @@ class MediaLibraryListTile extends StatelessWidget {
   final VoidCallback? onMoveToParent;
   final bool showActivityMenu;
   final bool allowHide;
+
+  /// 最近添加 card menu. Folders can use this; [allowHide] cannot.
+  final bool allowDismissFromRecent;
   final String? relativePath;
 
   bool get _isCollection => _collection != null;
 
   @override
   Widget build(BuildContext context) {
-        final accent = AppTokens.accent;
+    final accent = AppTokens.accent;
     return LayoutBuilder(
       builder: (context, constraints) {
         final metrics = MediaListLayoutMetrics.forTile(
@@ -191,10 +196,7 @@ class MediaLibraryListTile extends StatelessWidget {
                           top: metrics.verticalPadding,
                           bottom: metrics.verticalPadding,
                         ),
-                        child: _buildInformation(
-                          metrics,
-                          textInset: textInset,
-                        ),
+                        child: _buildInformation(metrics, textInset: textInset),
                       ),
                     ),
                     if (isSelectionMode)
@@ -203,17 +205,14 @@ class MediaLibraryListTile extends StatelessWidget {
                           right: metrics.trailingPadding,
                         ),
                         child: GestureDetector(
-                          key: const ValueKey(
-                            'media-list-selection-handle',
-                          ),
+                          key: const ValueKey('media-list-selection-handle'),
                           behavior: HitTestBehavior.opaque,
                           onTap: onSelectionTap,
                           onPanStart: onSelectionPanStart,
                           onPanUpdate: onSelectionPanUpdate,
                           onPanEnd: onSelectionPanEnd,
                           onLongPressStart: onSelectionLongPressStart,
-                          onLongPressMoveUpdate:
-                              onSelectionLongPressMoveUpdate,
+                          onLongPressMoveUpdate: onSelectionLongPressMoveUpdate,
                           onLongPressEnd: onSelectionLongPressEnd,
                           child: Icon(
                             isSelected
@@ -249,6 +248,7 @@ class MediaLibraryListTile extends StatelessWidget {
                             targetId: _video?.id ?? _collection!.id,
                             isCollection: _isCollection,
                             allowHide: allowHide && !_isCollection,
+                            allowDismissFromRecent: allowDismissFromRecent,
                             onLocate: onShowInParentFolder,
                             onMoveToParent: onMoveToParent,
                             fillSlot: true,

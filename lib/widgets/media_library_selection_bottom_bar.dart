@@ -2,24 +2,56 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_tokens.dart';
 import '../utils/desktop_media_management_shortcuts.dart';
+import '../utils/media_library_virtual_selection_actions.dart';
 import 'media_library_compact_app_bar.dart';
 
 /// Selection-mode actions under the media library on phone and desktop.
 ///
 /// Phone widths used to overflow because the FluentPack action spelled out the
 /// full product name and the row scrolled. Compact mode shortens the label and
-/// shares the bar evenly so all three actions stay on one screen.
+/// shares the bar evenly so all actions stay on one screen.
 class MediaLibrarySelectionBottomBar extends StatelessWidget {
-  final VoidCallback onMoveToRecycleBin;
-  final VoidCallback onExportFluentPack;
-  final VoidCallback? onRename;
-
   const MediaLibrarySelectionBottomBar({
     super.key,
-    required this.onMoveToRecycleBin,
-    required this.onExportFluentPack,
-    this.onRename,
+    required this.actions,
+    required this.onAction,
   });
+
+  /// Folder / collection selection: recycle, export, optional rename.
+  factory MediaLibrarySelectionBottomBar.folders({
+    Key? key,
+    required VoidCallback onMoveToRecycleBin,
+    required VoidCallback onExportFluentPack,
+    VoidCallback? onRename,
+  }) {
+    final actions = MediaLibraryVirtualSelectionActions.forFolders(
+      selectedIds: onRename == null
+          ? const <String>{'a', 'b'}
+          : const <String>{'only'},
+    );
+    return MediaLibrarySelectionBottomBar(
+      key: key,
+      actions: actions,
+      onAction: (kind) {
+        switch (kind) {
+          case MediaLibraryVirtualSelectionActionKind.recycle:
+            onMoveToRecycleBin();
+          case MediaLibraryVirtualSelectionActionKind.export:
+            onExportFluentPack();
+          case MediaLibraryVirtualSelectionActionKind.rename:
+            onRename?.call();
+          case MediaLibraryVirtualSelectionActionKind.pin:
+          case MediaLibraryVirtualSelectionActionKind.unpin:
+          case MediaLibraryVirtualSelectionActionKind.hideContinue:
+          case MediaLibraryVirtualSelectionActionKind.dismissRecent:
+            break;
+        }
+      },
+    );
+  }
+
+  final List<MediaLibraryVirtualSelectionAction> actions;
+  final ValueChanged<MediaLibraryVirtualSelectionActionKind> onAction;
 
   @override
   Widget build(BuildContext context) {
@@ -35,49 +67,53 @@ class MediaLibrarySelectionBottomBar extends StatelessWidget {
             ? MainAxisAlignment.start
             : MainAxisAlignment.spaceEvenly,
         children: [
-          _action(
-            compact: compact,
-            icon: Icons.delete,
-            color: AppTokens.danger,
-            label: DesktopMediaManagementShortcuts.buildTooltip(
-              '移入回收站',
-              DesktopMediaManagementShortcutAction.openRecycleBin,
-            ),
-            onPressed: onMoveToRecycleBin,
-          ),
-          _action(
-            compact: compact,
-            icon: Icons.unarchive_outlined,
-            color: AppTokens.text1,
-            label: compact
-                ? DesktopMediaManagementShortcuts.buildTooltip(
-                    '导出',
-                    DesktopMediaManagementShortcutAction.exportFluentPack,
-                  )
-                : DesktopMediaManagementShortcuts.buildTooltip(
-                    '导出',
-                    DesktopMediaManagementShortcutAction.exportFluentPack,
-                  ),
-            tooltip: DesktopMediaManagementShortcuts.buildTooltip(
-              '导出为 Fluent Pack 或 Zip',
-              DesktopMediaManagementShortcutAction.exportFluentPack,
-            ),
-            onPressed: onExportFluentPack,
-          ),
-          if (onRename != null)
+          for (final action in actions)
             _action(
               compact: compact,
-              icon: Icons.edit,
-              color: AppTokens.text1,
-              label: DesktopMediaManagementShortcuts.buildTooltip(
-                '重命名',
-                DesktopMediaManagementShortcutAction.createCollection,
-              ),
-              onPressed: onRename,
+              icon: action.icon,
+              color: action.color,
+              label: _labelFor(action),
+              tooltip: action.tooltip ?? _tooltipFor(action),
+              onPressed: () => onAction(action.kind),
             ),
         ],
       ),
     );
+  }
+
+  String _labelFor(MediaLibraryVirtualSelectionAction action) {
+    switch (action.kind) {
+      case MediaLibraryVirtualSelectionActionKind.recycle:
+        return DesktopMediaManagementShortcuts.buildTooltip(
+          action.label,
+          DesktopMediaManagementShortcutAction.openRecycleBin,
+        );
+      case MediaLibraryVirtualSelectionActionKind.export:
+        return DesktopMediaManagementShortcuts.buildTooltip(
+          action.label,
+          DesktopMediaManagementShortcutAction.exportFluentPack,
+        );
+      case MediaLibraryVirtualSelectionActionKind.rename:
+        return DesktopMediaManagementShortcuts.buildTooltip(
+          action.label,
+          DesktopMediaManagementShortcutAction.createCollection,
+        );
+      case MediaLibraryVirtualSelectionActionKind.pin:
+      case MediaLibraryVirtualSelectionActionKind.unpin:
+      case MediaLibraryVirtualSelectionActionKind.hideContinue:
+      case MediaLibraryVirtualSelectionActionKind.dismissRecent:
+        return action.label;
+    }
+  }
+
+  String? _tooltipFor(MediaLibraryVirtualSelectionAction action) {
+    if (action.kind == MediaLibraryVirtualSelectionActionKind.export) {
+      return DesktopMediaManagementShortcuts.buildTooltip(
+        '导出为 Fluent Pack 或 Zip',
+        DesktopMediaManagementShortcutAction.exportFluentPack,
+      );
+    }
+    return action.tooltip;
   }
 
   Widget _action({

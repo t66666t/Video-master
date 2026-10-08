@@ -19,6 +19,7 @@ import 'media_library_group_header.dart';
 import 'media_library_item_interaction_wrapper.dart';
 import 'media_library_layout_profile.dart';
 import 'media_library_list_tile.dart';
+import 'media_library_virtual_selection_host.dart';
 import 'media_list_layout_metrics.dart';
 
 /// Continue-learning surface: pins on top, then in-progress groups.
@@ -34,6 +35,7 @@ class MediaLibraryContinueView extends StatefulWidget {
     required this.onGoRecent,
     required this.onGoFolders,
     this.isActive = true,
+    this.selection,
   });
 
   final ScrollController scrollController;
@@ -47,6 +49,9 @@ class MediaLibraryContinueView extends StatefulWidget {
 
   /// Hidden keep-alive copies skip Provider watches and reuse the last tree.
   final bool isActive;
+
+  /// Null keeps the page read-only (tests / keep-alive copies).
+  final MediaLibraryVirtualSelectionBinding? selection;
 
   @override
   State<MediaLibraryContinueView> createState() =>
@@ -67,6 +72,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
   int? _frozenViewMode;
   double? _frozenBottomPadding;
   bool? _frozenSeriousOnly;
+  String? _frozenSelectionToken;
 
   @override
   void didChangeDependencies() {
@@ -158,12 +164,14 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     }
     final library = context.watch<LibraryService>();
     final settings = context.watch<SettingsService>();
+    final selectionToken = widget.selection?.freezeToken ?? 'off';
     if (_tryReuseFrozen &&
         _frozenSubtree != null &&
         !_libraryChangedWhileAway &&
         _frozenViewMode == settings.mediaLibraryViewMode &&
         _frozenBottomPadding == widget.cardBottomPadding &&
-        _frozenSeriousOnly == settings.mediaLibraryContinueSeriousOnly) {
+        _frozenSeriousOnly == settings.mediaLibraryContinueSeriousOnly &&
+        _frozenSelectionToken == selectionToken) {
       _tryReuseFrozen = false;
       _libraryChangedWhileAway = false;
       return _frozenSubtree!;
@@ -191,9 +199,19 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
 
     final useList = settings.mediaLibraryViewMode == 1;
     final flow = _flowSpacing(settings, useList);
+    final ordered = <String>[
+      ...pins,
+      if (seriousOnly) ...[
+        ..._visibleSeriousIds(recent),
+        ..._visibleSeriousIds(unknown),
+      ] else
+        ..._visibleHistoryIds(historyDays),
+    ];
+    widget.selection?.host.updateOrderedIds(ordered);
     _frozenViewMode = settings.mediaLibraryViewMode;
     _frozenBottomPadding = widget.cardBottomPadding;
     _frozenSeriousOnly = seriousOnly;
+    _frozenSelectionToken = selectionToken;
     _frozenSubtree = Material(
       color: Colors.transparent,
       child: CustomScrollView(
@@ -283,6 +301,46 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       cardStyle: settings.collectionCardStyleFor(screenSize),
       listStyle: settings.listStyleFor(screenSize),
     );
+  }
+
+  /// Same visibility rules as the slivers: collapsed groups keep the featured
+  /// card only; collapsed history days contribute nothing.
+  List<String> _visibleSeriousIds(List<ContinueLearningGroup> groups) {
+    final out = <String>[];
+    for (final group in groups) {
+      final count = group.mediaIds.length;
+      final flat = MediaLibraryGroupExpandPolicy.alwaysExpanded(count);
+      if (group.parentId == null || flat) {
+        out.addAll(group.mediaIds);
+        continue;
+      }
+      final expanded = _expand.isExpanded(group.rowId, defaultExpanded: false);
+      out.add(group.featuredMediaId);
+      if (expanded) {
+        out.addAll(group.mediaIds.skip(1));
+      }
+    }
+    return out;
+  }
+
+  List<String> _visibleHistoryIds(List<PlaybackHistoryDayGroup> days) {
+    final out = <String>[];
+    for (final day in days) {
+      final count = day.mediaIds.length;
+      final flat = MediaLibraryGroupExpandPolicy.alwaysExpanded(count);
+      final expanded =
+          flat ||
+          _expand.isExpanded(
+            day.rowId,
+            defaultExpanded:
+                MediaLibraryGroupExpandPolicy.historyDefaultExpanded(
+                  count: count,
+                  dayStartMs: day.dayStartMs,
+                ),
+          );
+      if (expanded) out.addAll(day.mediaIds);
+    }
+    return out;
   }
 
   List<Widget> _sectionSlivers(
@@ -548,7 +606,12 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       tile = _mediaCard(library, settings, item, useList, allowHide: allowHide);
       onOpen = () => widget.onOpenMedia(item);
     }
-    if (pinIndex == null || pinCount < 2) return tile;
+    final keyed = KeyedSubtree(
+      key: widget.selection?.host.keyFor(id),
+      child: tile,
+    );
+    final selecting = widget.selection?.isSelectionMode == true;
+    if (selecting || pinIndex == null || pinCount < 2) return keyed;
     return MediaLibraryPinnedReorderWrapper(
       key: ValueKey('continue-pin-$id'),
       visibleIndex: pinIndex,
@@ -560,7 +623,7 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       onReorder: (from, to) {
         unawaited(library.reorderVisiblePinnedLibraryItems(from, to));
       },
-      child: tile,
+      child: keyed,
     );
   }
 
@@ -570,6 +633,17 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     VideoCollection collection,
     bool useList,
   ) {
+    final selection = widget.selection;
+    final selected = selection?.isSelected(collection.id) ?? false;
+    final selecting = selection?.isSelectionMode ?? false;
+    void open() {
+      if (selecting) {
+        selection!.onToggle(collection.id);
+        return;
+      }
+      widget.onOpenFolder(collection);
+    }
+
     if (useList) {
       return SizedBox(
         height: 72,
@@ -578,14 +652,44 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
           index: 0,
           showIndex: false,
           showThumbnail: true,
-          isSelected: false,
-          isSelectionMode: false,
+          isSelected: selected,
+          isSelectionMode: selecting,
           titleScale: settings
               .listStyleFor(MediaQuery.sizeOf(context))
               .titleScale,
-          onTap: () => widget.onOpenFolder(collection),
+          onTap: open,
+          onSecondaryTap: selection == null
+              ? null
+              : () => selection.onSecondaryTap(collection.id),
+          onSelectionTap: selection == null
+              ? null
+              : () => selection.onToggle(collection.id),
+          onSelectionPanStart: selection == null
+              ? null
+              : (details) => selection.onRangeStart(
+                  collection.id,
+                  details.globalPosition,
+                ),
+          onSelectionPanUpdate: selection == null
+              ? null
+              : (details) => selection.onRangeUpdate(details.globalPosition),
+          onSelectionPanEnd: selection == null
+              ? null
+              : (_) => selection.onRangeEnd(),
+          onSelectionLongPressStart: selection == null
+              ? null
+              : (details) => selection.onRangeStart(
+                  collection.id,
+                  details.globalPosition,
+                ),
+          onSelectionLongPressMoveUpdate: selection == null
+              ? null
+              : (details) => selection.onRangeUpdate(details.globalPosition),
+          onSelectionLongPressEnd: selection == null
+              ? null
+              : (_) => selection.onRangeEnd(),
           onShowInParentFolder: () => widget.onLocateFolder(collection),
-          showActivityMenu: true,
+          showActivityMenu: !selecting,
           allowHide: false,
         ),
       );
@@ -595,8 +699,40 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       titleScale: settings
           .collectionCardStyleFor(MediaQuery.sizeOf(context))
           .titleScale,
-      onTap: () => widget.onOpenFolder(collection),
+      onTap: open,
       onLocate: () => widget.onLocateFolder(collection),
+      showActivityMenu: !selecting,
+      isSelected: selected,
+      isSelectionMode: selecting,
+      onSecondaryTap: selection == null
+          ? null
+          : () => selection.onSecondaryTap(collection.id),
+      onSelectionTap: selection == null
+          ? null
+          : () => selection.onToggle(collection.id),
+      onSelectionPanStart: selection == null
+          ? null
+          : (details) =>
+                selection.onRangeStart(collection.id, details.globalPosition),
+      onSelectionPanUpdate: selection == null
+          ? null
+          : (details) => selection.onRangeUpdate(details.globalPosition),
+      onSelectionPanEnd: selection == null
+          ? null
+          : (_) => selection.onRangeEnd(),
+      onSelectionLongPressStart: selection == null
+          ? null
+          : (details) =>
+                selection.onRangeStart(collection.id, details.globalPosition),
+      onSelectionLongPressMoveUpdate: selection == null
+          ? null
+          : (details) => selection.onRangeUpdate(details.globalPosition),
+      onSelectionLongPressEnd: selection == null
+          ? null
+          : (_) => selection.onRangeEnd(),
+      onLongPress: selection == null || selecting
+          ? null
+          : () => selection.onEnter(collection.id),
     );
   }
 
@@ -753,6 +889,17 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
     bool useList, {
     bool allowHide = true,
   }) {
+    final selection = widget.selection;
+    final selected = selection?.isSelected(item.id) ?? false;
+    final selecting = selection?.isSelectionMode ?? false;
+    void open() {
+      if (selecting) {
+        selection!.onToggle(item.id);
+        return;
+      }
+      widget.onOpenMedia(item);
+    }
+
     final listStyle = settings.listStyleFor(MediaQuery.sizeOf(context));
     if (useList) {
       return MediaLibraryListTile.video(
@@ -760,13 +907,39 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
         index: 0,
         showIndex: listStyle.showIndex,
         showThumbnail: listStyle.showThumbnail,
-        isSelected: false,
-        isSelectionMode: false,
+        isSelected: selected,
+        isSelectionMode: selecting,
         titleScale: listStyle.titleScale,
-        onTap: () => widget.onOpenMedia(item),
+        onTap: open,
+        onSecondaryTap: selection == null
+            ? null
+            : () => selection.onSecondaryTap(item.id),
+        onSelectionTap: selection == null
+            ? null
+            : () => selection.onToggle(item.id),
+        onSelectionPanStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionPanUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionPanEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onSelectionLongPressStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionLongPressMoveUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionLongPressEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
         onShowInParentFolder: () => widget.onLocateMedia(item),
-        showActivityMenu: true,
-        allowHide: allowHide,
+        showActivityMenu: !selecting,
+        allowHide: allowHide && !selecting,
         relativePath: MediaLibraryMediaGridCard.pathFromLibraryRoot(
           library,
           item,
@@ -778,9 +951,41 @@ class _MediaLibraryContinueViewState extends State<MediaLibraryContinueView> {
       titleScale: settings
           .collectionCardStyleFor(MediaQuery.sizeOf(context))
           .titleScale,
-      onTap: () => widget.onOpenMedia(item),
+      onTap: open,
       onLocate: () => widget.onLocateMedia(item),
-      allowHide: allowHide,
+      allowHide: allowHide && !selecting,
+      showActivityMenu: !selecting,
+      isSelected: selected,
+      isSelectionMode: selecting,
+      onSecondaryTap: selection == null
+          ? null
+          : () => selection.onSecondaryTap(item.id),
+      onSelectionTap: selection == null
+          ? null
+          : () => selection.onToggle(item.id),
+      onSelectionPanStart: selection == null
+          ? null
+          : (details) =>
+                selection.onRangeStart(item.id, details.globalPosition),
+      onSelectionPanUpdate: selection == null
+          ? null
+          : (details) => selection.onRangeUpdate(details.globalPosition),
+      onSelectionPanEnd: selection == null
+          ? null
+          : (_) => selection.onRangeEnd(),
+      onSelectionLongPressStart: selection == null
+          ? null
+          : (details) =>
+                selection.onRangeStart(item.id, details.globalPosition),
+      onSelectionLongPressMoveUpdate: selection == null
+          ? null
+          : (details) => selection.onRangeUpdate(details.globalPosition),
+      onSelectionLongPressEnd: selection == null
+          ? null
+          : (_) => selection.onRangeEnd(),
+      onLongPress: selection == null || selecting
+          ? null
+          : () => selection.onEnter(item.id),
       relativePath: MediaLibraryMediaGridCard.pathFromLibraryRoot(
         library,
         item,

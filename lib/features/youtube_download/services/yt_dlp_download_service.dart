@@ -27,6 +27,7 @@ import 'package:video_player_app/features/youtube_download/services/yt_dlp_speed
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_video_format_selector.dart';
 import 'package:video_player_app/models/import_card_placement.dart';
 import 'package:video_player_app/models/library_activity.dart';
+import 'package:video_player_app/models/managed_subtitle_asset.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/models/video_item.dart';
@@ -2199,18 +2200,24 @@ class YtDlpDownloadService extends ChangeNotifier {
       final itemId = _uuid.v4();
       final subtitleDir = await const TaskSubtitleStorageService()
           .taskDirectory(itemId, create: true);
-      final copiedSubtitles = await _copyLibrarySubtitleArtifacts(
+      final boundSubtitles = await _copyLibrarySubtitleArtifacts(
         task: candidate,
         outputPath: outputPath,
         subtitleDir: subtitleDir,
         preferredLanguages: candidate.selection.subtitleLanguages,
       );
+      final copiedSubtitles = <String, String>{
+        for (final entry in boundSubtitles) entry.storageKey: entry.path,
+      };
       final defaultSubtitlePath = copiedSubtitles.isEmpty
           ? null
-          : copiedSubtitles.values.first;
+          : boundSubtitles.first.path;
       final additionalSubtitles = copiedSubtitles.isEmpty
           ? null
-          : Map<String, String>.from(copiedSubtitles);
+          : copiedSubtitles;
+      final subtitleAssets = boundSubtitles.isEmpty
+          ? const <ManagedSubtitleAsset>[]
+          : _downloadedSubtitleAssets(boundSubtitles);
       final thumbnailPath =
           _resolveLibraryMediaType(candidate, outputPath) == MediaType.video
           ? await _copyLibraryThumbnailArtifact(
@@ -2241,6 +2248,7 @@ class YtDlpDownloadService extends ChangeNotifier {
             playlistFolderIds[_playlistGroupKey(candidate)] ?? targetFolderId,
         subtitlePath: defaultSubtitlePath,
         additionalSubtitles: additionalSubtitles,
+        managedSubtitleAssets: subtitleAssets,
         usesManagedAssociatedSubtitles: copiedSubtitles.isNotEmpty,
         codec: _inferLibraryCodec(candidate),
         type: _resolveLibraryMediaType(candidate, outputPath),
@@ -3682,24 +3690,26 @@ class YtDlpDownloadService extends ChangeNotifier {
             .map((item) => item.toString().trim())
             .where((item) => item.isNotEmpty)
             .toList();
-    if (task.selection.audioOnly) {
-      final audioId = resolvedAudioIds.isNotEmpty
-          ? resolvedAudioIds.first
-          : null;
-      return ['-f', audioId ?? 'bestaudio'];
-    }
-    if (task.selection.removeAudio) {
-      return ['-f', resolvedVideoId ?? 'bestvideo/best'];
-    }
-    // This method is only used when the device has no ffmpeg executable.
-    // A merged selector finishes without leaving a playable file.
-    if (resolvedVideoId != null) {
-      return ['-f', resolvedVideoId];
-    }
-    if (resolvedAudioIds.isNotEmpty) {
-      return ['-f', resolvedAudioIds.first];
-    }
-    return ['-f', 'best'];
+    final selectedVideo = task.meta?.videoFormats
+        .where((item) => item.formatId == resolvedVideoId)
+        .cast<VideoFormat?>()
+        .firstOrNull;
+    final videoHasEmbeddedAudio =
+        selectedVideo != null &&
+        !YtDlpVideoFormatSelector.needsSeparateAudioTrack(selectedVideo);
+    // No yt-dlp ffmpeg CLI here. Prefer progressive A+V, otherwise download
+    // video and audio as separate files for FFmpegKit finalize (never ship
+    // silent video-only as success).
+    return [
+      '-f',
+      YtDlpVideoFormatSelector.androidStagedFormatSelector(
+        videoId: resolvedVideoId,
+        audioId: resolvedAudioIds.isNotEmpty ? resolvedAudioIds.first : null,
+        audioOnly: task.selection.audioOnly,
+        removeAudio: task.selection.removeAudio,
+        videoHasEmbeddedAudio: videoHasEmbeddedAudio,
+      ),
+    ];
   }
 
   bool _shouldEmbedSubtitlesForAndroid(YtDlpTaskRecord task) {
@@ -3791,6 +3801,27 @@ class YtDlpDownloadService extends ChangeNotifier {
         }
       } else {
         final source = videoInput ?? mediaFiles.first;
+        final selectedVideo = task.meta?.videoFormats
+            .where(
+              (item) =>
+                  item.formatId ==
+                  task.request?.debugContext['resolvedVideoFormatId']
+                      ?.toString()
+                      .trim(),
+            )
+            .cast<VideoFormat?>()
+            .firstOrNull;
+        final expectedSeparateAudio =
+            !task.selection.audioOnly &&
+            !task.selection.removeAudio &&
+            YtDlpVideoFormatSelector.needsSeparateAudioTrack(selectedVideo);
+        if (expectedSeparateAudio &&
+            (audioInput == null || audioInput.path == source.path)) {
+          throw Exception(
+            'Android 分期下载未拿到独立音轨，无法合成有声视频'
+            '（常见于仅下到 DASH 视频流）。请重试或安装 ffmpeg CLI。',
+          );
+        }
         final needsFfmpeg =
             task.selection.embedSubtitles ||
             (task.meta?.chapters.isNotEmpty ?? false) ||
@@ -5615,7 +5646,7 @@ class YtDlpDownloadService extends ChangeNotifier {
     return p.normalize(left) == p.normalize(right);
   }
 
-  Future<Map<String, String>> _copyLibrarySubtitleArtifacts({
+  Future<List<BoundSubtitleLabel>> _copyLibrarySubtitleArtifacts({
     required YtDlpTaskRecord task,
     required String outputPath,
     required Directory subtitleDir,
@@ -5623,7 +5654,7 @@ class YtDlpDownloadService extends ChangeNotifier {
   }) async {
     final subtitleFiles = await _resolveImportSubtitleFiles(task, outputPath);
     if (subtitleFiles.isEmpty) {
-      return const {};
+      return const <BoundSubtitleLabel>[];
     }
     final sortedFiles = [...subtitleFiles]
       ..sort(
@@ -5659,32 +5690,44 @@ class YtDlpDownloadService extends ChangeNotifier {
       remainingFiles.remove(best);
     }
 
-    final copied = <String, String>{};
-    for (var i = 0; i < sortedFiles.length; i++) {
-      final file = sortedFiles[i];
+    final labeled = <({String label, String path})>[];
+    for (final file in sortedFiles) {
       final matchedTrack = matchedTrackByPath[file.path];
       final label = matchedTrack?.displayName.trim().isNotEmpty == true
           ? matchedTrack!.displayName.trim()
           : _resolveSubtitleImportLabel(
               subtitlePath: file.path,
               outputPath: outputPath,
-              fallbackIndex: i,
+              fallbackIndex: labeled.length,
             );
       final ext = p.extension(file.path).replaceFirst('.', '').toLowerCase();
       final copiedPath = p.join(
         subtitleDir.path,
-        '${_uuid.v4()}_${_sanitizeOutputBaseName(label)}.${ext.isEmpty ? 'srt' : ext}',
+        TaskSubtitleStorageService.readableSubtitleFileName(
+          label: label,
+          extension: ext.isEmpty ? '.srt' : ext,
+        ),
       );
       await file.copy(copiedPath);
-      var uniqueLabel = label;
-      var duplicateIndex = 2;
-      while (copied.containsKey(uniqueLabel)) {
-        uniqueLabel = '$label $duplicateIndex';
-        duplicateIndex += 1;
-      }
-      copied[uniqueLabel] = copiedPath;
+      labeled.add((label: label, path: copiedPath));
     }
-    return copied;
+    return bindSubtitleLabels(labeled);
+  }
+
+  List<ManagedSubtitleAsset> _downloadedSubtitleAssets(
+    List<BoundSubtitleLabel> bound,
+  ) {
+    final createdAt = DateTime.now().millisecondsSinceEpoch;
+    return <ManagedSubtitleAsset>[
+      for (final entry in bound)
+        ManagedSubtitleAsset(
+          assetId: _uuid.v4(),
+          path: p.normalize(entry.path),
+          kind: ManagedSubtitleAssetKind.downloaded,
+          displayName: entry.displayName,
+          createdAt: createdAt,
+        ),
+    ];
   }
 
   int _subtitleTrackImportMatchScore(String fileName, SubtitleTrack track) {

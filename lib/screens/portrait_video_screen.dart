@@ -585,10 +585,28 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           unawaited(previousController.dispose());
         }
       }
-      // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
+      // Same item became mountable again (loading finished / recovery).
       _postInitWorkToken++;
       _initPlayer();
     } else if (service.currentItem?.id == _currentItem.id) {
+      // Service dropped/replaced the controller without a mountable handoff.
+      // Keeping VideoPlayer on a disposed controller paints a white ErrorWidget
+      // in release (repro: sleep timer ends, then reopen the player page).
+      if (_isControllerAssigned &&
+          (service.controller == null ||
+              !identical(_controller, service.controller))) {
+        try {
+          _controller.removeListener(_videoListener);
+        } catch (_) {}
+        setState(() {
+          _isControllerAssigned = false;
+          _isControllerOwner = false;
+          _initialized = false;
+        });
+        _postInitWorkToken++;
+        _initPlayer();
+        return;
+      }
       _syncSubtitlesFromService(service);
     }
   }
@@ -1363,7 +1381,13 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   }
 
   void _videoListener() {
-    final isPlayingNow = _controller.value.isPlaying;
+    if (!_isControllerAssigned) return;
+    final bool isPlayingNow;
+    try {
+      isPlayingNow = _controller.value.isPlaying;
+    } catch (_) {
+      return;
+    }
     if (_lastIsPlayingForServiceSync != isPlayingNow) {
       _lastIsPlayingForServiceSync = isPlayingNow;
       try {
@@ -3025,11 +3049,14 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         return streamRatio;
       }
     } catch (_) {}
-    if (_isControllerAssigned &&
-        _controller.value.isInitialized &&
-        !_controller.value.hasError &&
-        _controller.value.aspectRatio > 0) {
-      return _controller.value.aspectRatio;
+    if (_isControllerAssigned) {
+      try {
+        if (_controller.value.isInitialized &&
+            !_controller.value.hasError &&
+            _controller.value.aspectRatio > 0) {
+          return _controller.value.aspectRatio;
+        }
+      } catch (_) {}
     }
     return 16 / 9;
   }
@@ -4052,11 +4079,11 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               IconButton(
                 icon: Icon(
                   Icons.skip_next,
-                  color: playlistManager.hasNext
+                  color: playbackService.hasPlayableNext
                       ? Colors.white
                       : Colors.white38,
                 ),
-                onPressed: playlistManager.hasNext
+                onPressed: playbackService.hasPlayableNext
                     ? playbackService.playNext
                     : null,
                 iconSize: 32,
@@ -4141,9 +4168,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           IconButton(
             icon: Icon(
               Icons.skip_next,
-              color: playlistManager.hasNext ? Colors.white : Colors.white38,
+              color: playbackService.hasPlayableNext ? Colors.white : Colors.white38,
             ),
-            onPressed: playlistManager.hasNext
+            onPressed: playbackService.hasPlayableNext
                 ? playbackService.playNext
                 : null,
             iconSize: 32,
@@ -5312,6 +5339,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           autoPlayOnCompletionFromStart: settings.autoPlayOnCompletionFromStart,
           onAutoPlayOnCompletionFromStartChanged: (val) =>
               settings.saveAutoPlayOnCompletionFromStart(val),
+          playlistWrapToFirst: settings.playlistWrapToFirst,
+          onPlaylistWrapToFirstChanged: (val) =>
+              settings.savePlaylistWrapToFirst(val),
           enableSeekPreview: settings.enableSeekPreview,
           onEnableSeekPreviewChanged: (val) =>
               settings.saveEnableSeekPreview(val),

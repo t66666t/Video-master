@@ -629,6 +629,18 @@ String reallocateZipCopyPath({
   return names.allocate(media.directory, '${media.stem}$sourceExtension');
 }
 
+/// Path ffmpeg writes before the finished file is renamed into place.
+///
+/// FFmpeg picks the muxer from the final suffix and does not receive an
+/// explicit `-f`. A trailing `.partial` (for example `0_0.mp4.partial`) is
+/// not a container it knows, so every soft-subtitle remux fails and the
+/// exporter falls back to sidecar files. Keep the real extension last.
+String zipInProgressRemuxPath(String outputPath) {
+  final extension = p.extension(outputPath);
+  if (extension.isEmpty) return '$outputPath.partial';
+  return '${p.withoutExtension(outputPath)}.partial$extension';
+}
+
 List<String> buildZipRemuxArguments({
   required String sourcePath,
   required String outputPath,

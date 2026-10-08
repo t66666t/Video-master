@@ -27,6 +27,18 @@ class MediaLibraryMediaGridCard extends StatelessWidget {
     this.showLocate = true,
     this.showActivityMenu = true,
     this.allowHide = false,
+    this.allowDismissFromRecent = false,
+    this.isSelected = false,
+    this.isSelectionMode = false,
+    this.onSecondaryTap,
+    this.onSelectionTap,
+    this.onSelectionPanStart,
+    this.onSelectionPanUpdate,
+    this.onSelectionPanEnd,
+    this.onSelectionLongPressStart,
+    this.onSelectionLongPressMoveUpdate,
+    this.onSelectionLongPressEnd,
+    this.onLongPress,
     this.relativePath,
   });
 
@@ -39,6 +51,22 @@ class MediaLibraryMediaGridCard extends StatelessWidget {
   final bool showLocate;
   final bool showActivityMenu;
   final bool allowHide;
+
+  /// 最近添加 only. Does not use the continue-learning hide flag.
+  final bool allowDismissFromRecent;
+  final bool isSelected;
+  final bool isSelectionMode;
+  final VoidCallback? onSecondaryTap;
+  final VoidCallback? onSelectionTap;
+  final GestureDragStartCallback? onSelectionPanStart;
+  final GestureDragUpdateCallback? onSelectionPanUpdate;
+  final GestureDragEndCallback? onSelectionPanEnd;
+  final GestureLongPressStartCallback? onSelectionLongPressStart;
+  final GestureLongPressMoveUpdateCallback? onSelectionLongPressMoveUpdate;
+  final GestureLongPressEndCallback? onSelectionLongPressEnd;
+
+  /// Enter selection without starting a folder-style drag.
+  final VoidCallback? onLongPress;
   final String? relativePath;
 
   /// Folder names from library root to the file's parent.
@@ -81,13 +109,15 @@ class MediaLibraryMediaGridCard extends StatelessWidget {
       builder: (context, constraints) {
         final cardWidth = constraints.maxWidth;
         final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
-        final showMenu = showActivityMenu;
+        final showMenu = showActivityMenu && !isSelectionMode;
+        final showLocateChip = showLocate && !isSelectionMode;
         final textInset = MediaLibraryActionDockMetrics.textInset(
           chipSize: chipSize,
           showMore: showMenu,
-          showLocate: showLocate,
-          existingPadding:
-              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+          showLocate: showLocateChip,
+          existingPadding: MediaListLayoutMetrics.cardGridContentPadding(
+            cardWidth,
+          ).right,
         );
         final radius = MediaLibraryLayoutDefaults.cardCornerRadius(cardWidth);
         final titleFontSize = MediaLibraryLayoutDefaults.titleFontSize(
@@ -219,31 +249,48 @@ class MediaLibraryMediaGridCard extends StatelessWidget {
           ],
         );
 
-        return MediaLibraryGridCard(
+        final card = MediaLibraryGridCard(
           radius: radius,
-          isSelected: false,
+          isSelected: isSelected,
           onTap: onTap,
+          onSecondaryTap: onSecondaryTap,
           child: Stack(
             fit: StackFit.expand,
             children: [
               cardVisual,
-              MediaLibraryActionDock(
-                chipSize: chipSize,
-                more: showMenu
-                    ? MediaLibraryActivityMenuButton(
-                        targetId: item.id,
-                        isCollection: false,
-                        allowHide: allowHide,
-                        onLocate: onLocate,
-                        fillSlot: true,
-                      )
-                    : null,
-                locate: showLocate
-                    ? MediaLibraryLocateButton(onPressed: onLocate)
-                    : null,
-              ),
+              if (showMenu || showLocateChip)
+                MediaLibraryActionDock(
+                  chipSize: chipSize,
+                  more: showMenu
+                      ? MediaLibraryActivityMenuButton(
+                          targetId: item.id,
+                          isCollection: false,
+                          allowHide: allowHide,
+                          allowDismissFromRecent: allowDismissFromRecent,
+                          onLocate: onLocate,
+                          fillSlot: true,
+                        )
+                      : null,
+                  locate: showLocateChip
+                      ? MediaLibraryLocateButton(onPressed: onLocate)
+                      : null,
+                ),
             ],
           ),
+        );
+        return _GridSelectionChrome(
+          cardWidth: cardWidth,
+          isSelected: isSelected,
+          isSelectionMode: isSelectionMode,
+          onLongPress: onLongPress,
+          onSelectionTap: onSelectionTap,
+          onSelectionPanStart: onSelectionPanStart,
+          onSelectionPanUpdate: onSelectionPanUpdate,
+          onSelectionPanEnd: onSelectionPanEnd,
+          onSelectionLongPressStart: onSelectionLongPressStart,
+          onSelectionLongPressMoveUpdate: onSelectionLongPressMoveUpdate,
+          onSelectionLongPressEnd: onSelectionLongPressEnd,
+          child: card,
         );
       },
     );
@@ -259,6 +306,18 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
     required this.onTap,
     this.onLocate,
     this.showActivityMenu = true,
+    this.allowDismissFromRecent = false,
+    this.isSelected = false,
+    this.isSelectionMode = false,
+    this.onSecondaryTap,
+    this.onSelectionTap,
+    this.onSelectionPanStart,
+    this.onSelectionPanUpdate,
+    this.onSelectionPanEnd,
+    this.onSelectionLongPressStart,
+    this.onSelectionLongPressMoveUpdate,
+    this.onSelectionLongPressEnd,
+    this.onLongPress,
   });
 
   final VideoCollection collection;
@@ -267,20 +326,35 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
   final VoidCallback? onLocate;
   final bool showActivityMenu;
 
+  /// 最近添加 folder cards can leave that page without leaving the library.
+  final bool allowDismissFromRecent;
+  final bool isSelected;
+  final bool isSelectionMode;
+  final VoidCallback? onSecondaryTap;
+  final VoidCallback? onSelectionTap;
+  final GestureDragStartCallback? onSelectionPanStart;
+  final GestureDragUpdateCallback? onSelectionPanUpdate;
+  final GestureDragEndCallback? onSelectionPanEnd;
+  final GestureLongPressStartCallback? onSelectionLongPressStart;
+  final GestureLongPressMoveUpdateCallback? onSelectionLongPressMoveUpdate;
+  final GestureLongPressEndCallback? onSelectionLongPressEnd;
+  final VoidCallback? onLongPress;
+
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final cardWidth = constraints.maxWidth;
         final chipSize = MediaLibraryActionDockMetrics.gridChipSize(cardWidth);
-        final showMenu = showActivityMenu;
-        final showLocate = onLocate != null;
+        final showMenu = showActivityMenu && !isSelectionMode;
+        final showLocateChip = onLocate != null && !isSelectionMode;
         final textInset = MediaLibraryActionDockMetrics.textInset(
           chipSize: chipSize,
           showMore: showMenu,
-          showLocate: showLocate,
-          existingPadding:
-              MediaListLayoutMetrics.cardGridContentPadding(cardWidth).right,
+          showLocate: showLocateChip,
+          existingPadding: MediaListLayoutMetrics.cardGridContentPadding(
+            cardWidth,
+          ).right,
         );
         final radius = MediaLibraryLayoutDefaults.cardCornerRadius(cardWidth);
         final titleFontSize = MediaLibraryLayoutDefaults.titleFontSize(
@@ -291,13 +365,13 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
           titleFontSize,
         );
         final thumbnailPath = collection.thumbnailPath;
-        final hasThumbnail =
-            thumbnailPath != null && thumbnailPath.isNotEmpty;
+        final hasThumbnail = thumbnailPath != null && thumbnailPath.isNotEmpty;
 
-        return MediaLibraryGridCard(
+        final card = MediaLibraryGridCard(
           radius: radius,
-          isSelected: false,
+          isSelected: isSelected,
           onTap: onTap,
+          onSecondaryTap: onSecondaryTap,
           child: Stack(
             fit: StackFit.expand,
             children: [
@@ -401,25 +475,113 @@ class MediaLibraryFolderGridCard extends StatelessWidget {
                   ),
                 ],
               ),
-              MediaLibraryActionDock(
-                chipSize: chipSize,
-                more: showMenu
-                    ? MediaLibraryActivityMenuButton(
-                        targetId: collection.id,
-                        isCollection: true,
-                        allowHide: false,
-                        onLocate: onLocate,
-                        fillSlot: true,
-                      )
-                    : null,
-                locate: showLocate
-                    ? MediaLibraryLocateButton(onPressed: onLocate!)
-                    : null,
-              ),
+              if (showMenu || showLocateChip)
+                MediaLibraryActionDock(
+                  chipSize: chipSize,
+                  more: showMenu
+                      ? MediaLibraryActivityMenuButton(
+                          targetId: collection.id,
+                          isCollection: true,
+                          allowHide: false,
+                          allowDismissFromRecent: allowDismissFromRecent,
+                          onLocate: onLocate,
+                          fillSlot: true,
+                        )
+                      : null,
+                  locate: showLocateChip
+                      ? MediaLibraryLocateButton(onPressed: onLocate!)
+                      : null,
+                ),
             ],
           ),
         );
+        return _GridSelectionChrome(
+          cardWidth: cardWidth,
+          isSelected: isSelected,
+          isSelectionMode: isSelectionMode,
+          onLongPress: onLongPress,
+          onSelectionTap: onSelectionTap,
+          onSelectionPanStart: onSelectionPanStart,
+          onSelectionPanUpdate: onSelectionPanUpdate,
+          onSelectionPanEnd: onSelectionPanEnd,
+          onSelectionLongPressStart: onSelectionLongPressStart,
+          onSelectionLongPressMoveUpdate: onSelectionLongPressMoveUpdate,
+          onSelectionLongPressEnd: onSelectionLongPressEnd,
+          child: card,
+        );
       },
+    );
+  }
+}
+
+/// Checkbox overlay + long-press entry shared by media and folder grid cards.
+class _GridSelectionChrome extends StatelessWidget {
+  const _GridSelectionChrome({
+    required this.child,
+    required this.cardWidth,
+    required this.isSelected,
+    required this.isSelectionMode,
+    this.onLongPress,
+    this.onSelectionTap,
+    this.onSelectionPanStart,
+    this.onSelectionPanUpdate,
+    this.onSelectionPanEnd,
+    this.onSelectionLongPressStart,
+    this.onSelectionLongPressMoveUpdate,
+    this.onSelectionLongPressEnd,
+  });
+
+  final Widget child;
+  final double cardWidth;
+  final bool isSelected;
+  final bool isSelectionMode;
+  final VoidCallback? onLongPress;
+  final VoidCallback? onSelectionTap;
+  final GestureDragStartCallback? onSelectionPanStart;
+  final GestureDragUpdateCallback? onSelectionPanUpdate;
+  final GestureDragEndCallback? onSelectionPanEnd;
+  final GestureLongPressStartCallback? onSelectionLongPressStart;
+  final GestureLongPressMoveUpdateCallback? onSelectionLongPressMoveUpdate;
+  final GestureLongPressEndCallback? onSelectionLongPressEnd;
+
+  @override
+  Widget build(BuildContext context) {
+    final body = onLongPress == null || isSelectionMode
+        ? child
+        : GestureDetector(
+            onLongPress: onLongPress,
+            behavior: HitTestBehavior.deferToChild,
+            child: child,
+          );
+    if (!isSelectionMode) return body;
+    return Stack(
+      children: [
+        body,
+        Positioned(
+          top: 0,
+          right: 0,
+          child: GestureDetector(
+            onTap: onSelectionTap,
+            onPanStart: onSelectionPanStart,
+            onPanUpdate: onSelectionPanUpdate,
+            onPanEnd: onSelectionPanEnd,
+            onLongPressStart: onSelectionLongPressStart,
+            onLongPressMoveUpdate: onSelectionLongPressMoveUpdate,
+            onLongPressEnd: onSelectionLongPressEnd,
+            behavior: HitTestBehavior.opaque,
+            child: Padding(
+              padding: EdgeInsets.all(
+                MediaListLayoutMetrics.gridSelectionHitPadding(cardWidth),
+              ),
+              child: Icon(
+                isSelected ? Icons.check_circle : Icons.circle_outlined,
+                color: isSelected ? Colors.blueAccent : Colors.white70,
+                size: MediaListLayoutMetrics.gridSelectionIconSize(cardWidth),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -437,10 +599,7 @@ class _WatchProgressBar extends StatelessWidget {
         if (!isCurrent) {
           return (isCurrent: false, durationMs: 0);
         }
-        return (
-          isCurrent: true,
-          durationMs: service.duration.inMilliseconds,
-        );
+        return (isCurrent: true, durationMs: service.duration.inMilliseconds);
       },
       builder: (context, data, child) {
         final isCurrent = data.isCurrent;
@@ -462,8 +621,7 @@ class _WatchProgressBar extends StatelessWidget {
         final service = context.read<MediaPlaybackService>();
         return ValueListenableBuilder<Duration>(
           valueListenable: service.coarsePositionNotifier,
-          builder: (_, position, _) =>
-              buildProgress(position.inMilliseconds),
+          builder: (_, position, _) => buildProgress(position.inMilliseconds),
         );
       },
     );

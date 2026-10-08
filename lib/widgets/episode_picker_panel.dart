@@ -341,7 +341,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                       IconButton(
                         icon: Icon(
                           Icons.skip_next,
-                          color: playlistManager.hasNext
+                          color: playbackService.hasPlayableNext
                               ? Colors.white
                               : Colors.white38,
                           size: actionIconSize,
@@ -353,7 +353,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                           width: actionIconSize * 1.8,
                           height: actionIconSize * 1.8,
                         ),
-                        onPressed: playlistManager.hasNext
+                        onPressed: playbackService.hasPlayableNext
                             ? () {
                                 playbackService.playNext();
                               }

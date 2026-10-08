@@ -204,6 +204,19 @@ void main() {
       expect(args[args.indexOf('-disposition:s:3') + 1], '0');
     });
 
+    test('in-progress remux path keeps the container extension last', () {
+      expect(
+        zipInProgressRemuxPath(r'C:\scratch\0_0.mp4'),
+        r'C:\scratch\0_0.partial.mp4',
+      );
+      expect(
+        zipInProgressRemuxPath(r'C:\scratch\0_1.mkv'),
+        r'C:\scratch\0_1.partial.mkv',
+      );
+      expect(p.extension(zipInProgressRemuxPath('/tmp/2_0.m4a')), '.m4a');
+      expect(zipInProgressRemuxPath('noext'), 'noext.partial');
+    });
+
     test('plain subtitles stay in mp4 and chapters already in the file are kept', () async {
       final video = _file(tempDir, 'source.mp4');
       final primary = _file(tempDir, 'primary.srt');

@@ -26,6 +26,12 @@ class LibraryActivityProjection {
 
   bool isMediaHidden(String mediaId) => store.media[mediaId]?.hidden == true;
 
+  /// True when this media or folder card was removed from 最近添加.
+  ///
+  /// Independent of [isMediaHidden]. A later play does not clear it.
+  bool isDismissedFromRecent(String id) =>
+      store.recentDismissedIds.contains(id);
+
   bool isPinned(String id) => store.pinnedIds.contains(id);
 
   bool isVisibleMedia(String mediaId) {
@@ -87,6 +93,10 @@ class LibraryActivityProjection {
   /// direct new files as cards, direct child folders as folder cards.
   /// Bilibili and YT-DLP loose files stay individual cards so a source
   /// name is not used as a collection title.
+  ///
+  /// Ids in [LibraryActivityStore.recentDismissedIds] are omitted after
+  /// coverage is recorded, so hiding a folder card does not spill its files
+  /// out as new singles. The import clock in [recentAddedMediaIds] is unchanged.
   List<RecentAddedEntry> recentAddedEntries() {
     final partition = recentAddedMediaIds();
     final mediaInBatch = <String>{};
@@ -105,6 +115,7 @@ class LibraryActivityProjection {
 
     for (final mediaId in partition.datedIds) {
       if (mediaInBatch.contains(mediaId)) continue;
+      if (isDismissedFromRecent(mediaId)) continue;
       final addedAtMs = store.media[mediaId]?.addedAtMs;
       if (addedAtMs == null) continue;
       dated.add(
@@ -125,7 +136,7 @@ class LibraryActivityProjection {
     });
 
     final unknownIds = partition.unknownAddedIds
-        .where((id) => !mediaInBatch.contains(id))
+        .where((id) => !mediaInBatch.contains(id) && !isDismissedFromRecent(id))
         .toList(growable: false);
     if (unknownIds.isEmpty) {
       return List<RecentAddedEntry>.unmodifiable(dated);
@@ -166,16 +177,20 @@ class LibraryActivityProjection {
           covered.add(child.id);
         }
       }
-      covered.addAll(
-        _descendantBatchMedia(rootId, created, batchMedia),
-      );
+      covered.addAll(_descendantBatchMedia(rootId, created, batchMedia));
+      // Coverage uses the full first layer. Dismissed cards drop out after
+      // that, so a hidden folder keeps its files from reappearing as singles.
+      final shown = <RecentAddedChild>[
+        for (final child in children)
+          if (!isDismissedFromRecent(child.id)) child,
+      ];
+      if (shown.isEmpty) continue;
       final onlyOneFile =
-          children.length == 1 &&
-          children.single.kind == RecentAddedChildKind.media;
+          shown.length == 1 && shown.single.kind == RecentAddedChildKind.media;
       if (onlyOneFile) {
         entries.add(
           RecentAddedEntry.single(
-            mediaId: children.single.id,
+            mediaId: shown.single.id,
             sortKeyMs: batch.startedAtMs,
             sortId: batch.id,
             innerIndex: inner,
@@ -192,7 +207,7 @@ class LibraryActivityProjection {
             sortId: batch.id,
             innerIndex: inner,
             sourceBatchId: batch.id,
-            children: children,
+            children: shown,
           ),
         );
       }
@@ -201,7 +216,7 @@ class LibraryActivityProjection {
 
     final loose = <String>[
       for (final id in visibleMedia)
-        if (!covered.contains(id)) id,
+        if (!covered.contains(id) && !isDismissedFromRecent(id)) id,
     ];
     if (loose.isEmpty) return entries;
 
@@ -219,9 +234,7 @@ class LibraryActivityProjection {
           sortId: batch.id,
           innerIndex: inner,
           sourceBatchId: batch.id,
-          children: [
-            for (final id in loose) RecentAddedChild.media(id),
-          ],
+          children: [for (final id in loose) RecentAddedChild.media(id)],
         ),
       );
       return entries;
@@ -317,7 +330,8 @@ class LibraryActivityProjection {
       if (age > rules.maxAgeDays * 24 * 60 * 60 * 1000) return false;
     }
     var watchMs = record.accumulatedWatchMs;
-    final legacyResume = watchMs <= 0 &&
+    final legacyResume =
+        watchMs <= 0 &&
         rules.useProgressIfNoWatchClock &&
         item.lastPositionMs > 0;
     if (!legacyResume &&
@@ -366,10 +380,7 @@ class LibraryActivityProjection {
       return a.id.compareTo(b.id);
     });
     unknown.sort();
-    return <String>[
-      ...dated.map((entry) => entry.id),
-      ...unknown,
-    ];
+    return <String>[...dated.map((entry) => entry.id), ...unknown];
   }
 
   /// History rows bucketed by local calendar day, newest day first.
@@ -424,15 +435,7 @@ class LibraryActivityProjection {
     if (diff == 0) return '今天';
     if (diff == 1) return '昨天';
     if (diff > 1 && diff < 7) {
-      const names = <String>[
-        '星期一',
-        '星期二',
-        '星期三',
-        '星期四',
-        '星期五',
-        '星期六',
-        '星期日',
-      ];
+      const names = <String>['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'];
       return names[start.weekday - 1];
     }
     return '${start.year}年${start.month}月${start.day}日';
@@ -482,9 +485,7 @@ class LibraryActivityProjection {
       result.add(
         ContinueLearningGroup(
           parentId: parentId,
-          mediaIds: List<String>.unmodifiable(
-            items.map((item) => item.id),
-          ),
+          mediaIds: List<String>.unmodifiable(items.map((item) => item.id)),
         ),
       );
     });
@@ -553,10 +554,7 @@ class ContinueLearningGroup {
 }
 
 class ContinueLearningSections {
-  const ContinueLearningSections({
-    required this.recent,
-    required this.unknown,
-  });
+  const ContinueLearningSections({required this.recent, required this.unknown});
 
   final List<ContinueLearningGroup> recent;
   final List<ContinueLearningGroup> unknown;

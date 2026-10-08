@@ -1332,16 +1332,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
       final srcFile = File(result.files.single.path!);
       final videoId = _requireVideoId();
       final ext = p.extension(srcFile.path).toLowerCase();
+      final originalStem = p.basenameWithoutExtension(srcFile.path).trim();
       final destPath = await const TaskSubtitleStorageService().copyIntoTask(
         videoId,
         srcFile.path,
-        preferredFileName:
-            'imported.${DateTime.now().millisecondsSinceEpoch}$ext',
+        preferredFileName: TaskSubtitleStorageService.readableSubtitleFileName(
+          label: originalStem.isEmpty ? '字幕' : originalStem,
+          extension: ext.isEmpty ? '.srt' : ext,
+        ),
       );
       await _registerManagedSubtitle(
         destPath,
         ManagedSubtitleAssetKind.imported,
-        p.basenameWithoutExtension(srcFile.path),
+        originalStem.isEmpty ? '字幕' : originalStem,
       );
       _loadSubtitles();
       _notifySubtitleFilesChanged();
@@ -1702,6 +1705,19 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
         ),
       ),
     );
+  }
+
+  String _displayNameForPath(String path, {required String fallback}) {
+    final videoId = widget.videoId?.trim() ?? '';
+    if (videoId.isEmpty) return fallback;
+    try {
+      final stored = Provider.of<LibraryService>(
+        context,
+        listen: false,
+      ).managedSubtitleAssetForPath(videoId, path)?.displayName.trim();
+      if (stored != null && stored.isNotEmpty) return stored;
+    } catch (_) {}
+    return fallback;
   }
 
   String _displayEmbeddedTitle(EmbeddedSubtitleTrack track) {
@@ -3279,7 +3295,10 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                                   shownPaths.add(_normalizePath(entry.value)),
                             )
                             .map((entry) {
-                              final label = entry.key;
+                              final label = _displayNameForPath(
+                                entry.value,
+                                fallback: entry.key,
+                              );
                               final path = entry.value;
                               final file = File(path);
                               final exists = file.existsSync();
@@ -3652,14 +3671,15 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                               final isOcr =
                                   managedAsset?.kind ==
                                   ManagedSubtitleAssetKind.ocr;
-                              // 从手动字幕文件名中提取自定义名称
-                              // 格式: {prefix}.manual.{customName}.{timestamp}.{ext}
-                              String displayName = name;
-                              if (managedAsset != null &&
-                                  managedAsset.displayName.trim().isNotEmpty) {
-                                displayName = managedAsset.displayName.trim();
-                              }
-                              if (isManual) {
+                              final storedName =
+                                  managedAsset?.displayName.trim() ?? '';
+                              // A stored name is the accurate label and may be
+                              // shared by several files. Filename markers are
+                              // only a fallback for older files that have none.
+                              String displayName = storedName.isNotEmpty
+                                  ? storedName
+                                  : name;
+                              if (storedName.isEmpty && isManual) {
                                 final parts = name.split('.manual.');
                                 if (parts.length > 1) {
                                   final afterManual = parts

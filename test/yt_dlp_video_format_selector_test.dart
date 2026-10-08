@@ -176,5 +176,77 @@ void main() {
         '313',
       );
     });
+
+    test('android staged selector downloads video+audio separately without merge', () {
+      expect(
+        YtDlpVideoFormatSelector.androidStagedFormatSelector(
+          videoId: '137',
+          audioId: '140',
+          audioOnly: false,
+          removeAudio: false,
+          videoHasEmbeddedAudio: false,
+        ),
+        '137,140',
+      );
+      expect(
+        YtDlpVideoFormatSelector.androidStagedFormatSelector(
+          videoId: '22',
+          audioId: '140',
+          audioOnly: false,
+          removeAudio: false,
+          videoHasEmbeddedAudio: true,
+        ),
+        '22',
+      );
+      expect(
+        YtDlpVideoFormatSelector.androidStagedFormatSelector(
+          videoId: '137',
+          audioId: null,
+          audioOnly: false,
+          removeAudio: false,
+          videoHasEmbeddedAudio: false,
+        ),
+        '137,bestaudio',
+      );
+      expect(
+        YtDlpVideoFormatSelector.androidStagedFormatSelector(
+          videoId: '137',
+          audioId: '140',
+          audioOnly: false,
+          removeAudio: true,
+          videoHasEmbeddedAudio: false,
+        ),
+        '137',
+      );
+      expect(
+        YtDlpVideoFormatSelector.androidStagedFormatSelector(
+          videoId: null,
+          audioId: '140',
+          audioOnly: true,
+          removeAudio: false,
+          videoHasEmbeddedAudio: false,
+        ),
+        '140',
+      );
+    });
+
+    test('needsSeparateAudioTrack is true for video-only DASH', () {
+      expect(
+        YtDlpVideoFormatSelector.needsSeparateAudioTrack(
+          const VideoFormat(
+            formatId: '137',
+            ext: 'mp4',
+            videoCodec: 'avc1',
+            height: 1080,
+          ),
+        ),
+        isTrue,
+      );
+      expect(
+        YtDlpVideoFormatSelector.needsSeparateAudioTrack(h264Muxed720),
+        isFalse,
+      );
+    });
+
   });
 }

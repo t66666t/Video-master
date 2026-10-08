@@ -11,9 +11,11 @@ import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'package:video_player_app/utils/media_library_virtual_selection_actions.dart';
 import 'package:video_player_app/widgets/media_library_continue_view.dart';
 import 'package:video_player_app/widgets/media_library_item_interaction_wrapper.dart';
 import 'package:video_player_app/widgets/media_library_list_tile.dart';
+import 'package:video_player_app/widgets/media_library_virtual_selection_host.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -427,6 +429,93 @@ void main() {
     expect(find.byKey(const ValueKey('continue-pin-loose')), findsNothing);
     expect(find.text('loose'), findsOneWidget);
   });
+
+  testWidgets('long-press selection enters and pin reorder is disabled', (
+    tester,
+  ) async {
+    final selected = <String>{};
+    var selectionMode = false;
+    final host = MediaLibraryVirtualSelectionHost();
+    library.seedVideoForTesting(_clip('pin'));
+    library.seedVideoForTesting(_clip('loose'));
+    library.seedMediaActivityForTesting(
+      MediaActivityRecord(
+        mediaId: 'loose',
+        lastPlayedAtMs: 9,
+        accumulatedWatchMs: 40000,
+      ),
+    );
+    library.seedPinnedIdsForTesting(['pin']);
+    library.notifyListeners();
+
+    MediaLibraryVirtualSelectionBinding binding() {
+      return MediaLibraryVirtualSelectionBinding(
+        isSelectionMode: selectionMode,
+        selectedIds: selected,
+        host: host,
+        onToggle: (id) {
+          if (selected.contains(id)) {
+            selected.remove(id);
+          } else {
+            selected.add(id);
+          }
+        },
+        onEnter: (id) {
+          selectionMode = true;
+          selected.add(id);
+        },
+        onSecondaryTap: (id) {
+          selectionMode = true;
+          if (selected.contains(id)) {
+            selected.remove(id);
+          } else {
+            selected.add(id);
+          }
+        },
+        onRangeStart: (id, _) {
+          selectionMode = true;
+          selected.add(id);
+        },
+        onRangeUpdate: (_) {},
+        onRangeEnd: () {},
+      );
+    }
+
+    await tester.pumpWidget(
+      await _harness(
+        library,
+        scroll,
+        seriousOnly: true,
+        viewMode: 0,
+        selectionBuilder: binding,
+      ),
+    );
+    await tester.pump();
+
+    await tester.longPress(find.text('loose'));
+    await tester.pump();
+    await tester.pumpWidget(
+      await _harness(
+        library,
+        scroll,
+        seriousOnly: true,
+        viewMode: 0,
+        selectionBuilder: binding,
+      ),
+    );
+    await tester.pump();
+
+    expect(selectionMode, isTrue);
+    expect(selected, contains('loose'));
+    expect(find.byKey(const ValueKey('continue-pin-pin')), findsNothing);
+    expect(
+      MediaLibraryVirtualSelectionActions.forContinueLearning(
+        selectedIds: {'pin', 'loose'},
+        pinnedIds: {'pin'},
+      ).map((action) => action.kind),
+      isNot(contains(MediaLibraryVirtualSelectionActionKind.hideContinue)),
+    );
+  });
 }
 
 VideoItem _clip(String id, {String? parentId}) {
@@ -450,6 +539,7 @@ Future<Widget> _harness(
   ValueChanged<String>? onLocateFolder,
   bool seriousOnly = false,
   int viewMode = 1,
+  MediaLibraryVirtualSelectionBinding Function()? selectionBuilder,
 }) async {
   final settings = SettingsService();
   await settings.init();
@@ -468,6 +558,7 @@ Future<Widget> _harness(
         body: MediaLibraryContinueView(
           scrollController: scroll,
           cardBottomPadding: 0,
+          selection: selectionBuilder?.call(),
           onOpenMedia: (item) => onOpen?.call(item.id),
           onOpenFolder: (folder) => onOpenFolder?.call(folder.id),
           onLocateMedia: (_) {},

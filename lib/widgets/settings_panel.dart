@@ -85,6 +85,9 @@ class SettingsPanel extends StatefulWidget {
   final bool autoPlayOnCompletionFromStart;
   final ValueChanged<bool> onAutoPlayOnCompletionFromStartChanged;
 
+  final bool playlistWrapToFirst;
+  final ValueChanged<bool> onPlaylistWrapToFirstChanged;
+
   final bool enableSeekPreview;
   final ValueChanged<bool> onEnableSeekPreviewChanged;
 
@@ -153,6 +156,8 @@ class SettingsPanel extends StatefulWidget {
     required this.onAutoPlayOnCompletionChanged,
     required this.autoPlayOnCompletionFromStart,
     required this.onAutoPlayOnCompletionFromStartChanged,
+    required this.playlistWrapToFirst,
+    required this.onPlaylistWrapToFirstChanged,
     required this.enableSeekPreview,
     required this.onEnableSeekPreviewChanged,
     required this.enableHapticFeedback,
@@ -849,7 +854,7 @@ class _SettingsPanelState extends State<SettingsPanel> {
                   style: TextStyle(color: Colors.white70, fontSize: 13),
                 ),
                 subtitle: const Text(
-                  "当前媒体播放完后自动播放下一个；若已到末尾则回到播放列表第一个",
+                  "当前媒体播放完后自动播放下一集（是否末集回到首集由「列表循环」控制）",
                   style: TextStyle(color: Colors.white30, fontSize: 10),
                 ),
                 value: widget.autoPlayOnCompletion,
@@ -874,6 +879,22 @@ class _SettingsPanelState extends State<SettingsPanel> {
                 onChanged: widget.autoPlayOnCompletion
                     ? widget.onAutoPlayOnCompletionFromStartChanged
                     : null,
+                activeThumbColor: Colors.blueAccent,
+                dense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                visualDensity: VisualDensity.compact,
+              ),
+              SwitchListTile(
+                title: const Text(
+                  "列表循环",
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                subtitle: const Text(
+                  "开启后，列表末集可切到首集；自动连播也会在末集后回到首集。关闭时末集停止且下一集按钮不可用",
+                  style: TextStyle(color: Colors.white30, fontSize: 10),
+                ),
+                value: widget.playlistWrapToFirst,
+                onChanged: widget.onPlaylistWrapToFirstChanged,
                 activeThumbColor: Colors.blueAccent,
                 dense: true,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 12),

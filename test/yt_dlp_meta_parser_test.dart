@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/features/youtube_download/services/yt_dlp_meta_parser.dart';
+import 'package:video_player_app/features/youtube_download/models/youtube_download_models.dart';
 
 void main() {
   group('YtDlpMetaParser', () {
@@ -340,4 +341,53 @@ void main() {
       },
     );
   });
+
+  test('audio displayLabel avoids unknown bitrate when abr missing', () {
+    const withRate = AudioFormat(
+      formatId: '140',
+      ext: 'm4a',
+      audioCodec: 'mp4a.40.2',
+      bitrate: 128,
+    );
+    expect(withRate.displayLabel, 'mp4a.40.2 + 128k');
+
+    const withSampleRate = AudioFormat(
+      formatId: '251',
+      ext: 'webm',
+      audioCodec: 'opus',
+      audioSampleRate: 48000,
+    );
+    expect(withSampleRate.displayLabel, 'opus + 48kHz');
+
+    const codecOnly = AudioFormat(
+      formatId: '139',
+      ext: 'm4a',
+      audioCodec: 'mp4a.40.5',
+    );
+    expect(codecOnly.displayLabel, 'mp4a.40.5');
+    expect(codecOnly.displayLabel.contains('未知'), isFalse);
+  });
+
+  test('parses abr strings like 128k into audio bitrate', () {
+    final meta = const YtDlpMetaParser().parse(<String, dynamic>{
+      'id': 'demo',
+      'title': 'Demo',
+      'webpage_url': 'https://youtu.be/demo',
+      'extractor_key': 'Youtube',
+      'formats': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'format_id': '140',
+          'ext': 'm4a',
+          'acodec': 'mp4a.40.2',
+          'vcodec': 'none',
+          'abr': '128k',
+          'asr': 44100,
+        },
+      ],
+    });
+    expect(meta.audioFormats, isNotEmpty);
+    expect(meta.audioFormats.first.bitrate, 128);
+    expect(meta.audioFormats.first.displayLabel.contains('128k'), isTrue);
+  });
+
 }

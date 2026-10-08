@@ -1,6 +1,10 @@
+import 'dart:collection';
+
 /// Local-only learning activity stored beside library.json, never on VideoItem.
 ///
 /// The block has its own version so media schema 2 migrations stay untouched.
+/// [recentDismissedIds] stays on version 1: a version bump would make an older
+/// build treat the whole activity block as unreadable.
 class LibraryActivityStore {
   static const int currentVersion = 1;
   static const String snapshotKey = 'activity';
@@ -9,15 +13,25 @@ class LibraryActivityStore {
     Map<String, MediaActivityRecord>? media,
     List<ImportBatchRecord>? batches,
     List<String>? pinnedIds,
+    Iterable<String>? recentDismissedIds,
   }) : media = media ?? <String, MediaActivityRecord>{},
        batches = batches ?? <ImportBatchRecord>[],
-       pinnedIds = pinnedIds ?? <String>[];
+       pinnedIds = pinnedIds ?? <String>[],
+       recentDismissedIds = LinkedHashSet<String>.of(
+         recentDismissedIds ?? const <String>[],
+       );
 
   factory LibraryActivityStore.empty() => LibraryActivityStore();
 
   final Map<String, MediaActivityRecord> media;
   final List<ImportBatchRecord> batches;
   final List<String> pinnedIds;
+
+  /// Media and folder ids hidden from 最近添加 only.
+  ///
+  /// Not the continue-learning [MediaActivityRecord.hidden] flag. Playback
+  /// does not remove an id from this set.
+  final LinkedHashSet<String> recentDismissedIds;
 
   MediaActivityRecord ensureMedia(String mediaId) {
     return media.putIfAbsent(
@@ -77,6 +91,7 @@ class LibraryActivityStore {
       'media': media.values.map((record) => record.toJson()).toList(),
       'batches': batches.map((batch) => batch.toJson()).toList(),
       'pinnedIds': List<String>.from(pinnedIds),
+      'recentDismissedIds': recentDismissedIds.toList(growable: false),
     };
   }
 
@@ -131,6 +146,16 @@ class LibraryActivityStore {
         final id = entry.trim();
         if (id.isEmpty || !seen.add(id)) continue;
         store.pinnedIds.add(id);
+      }
+    }
+
+    final dismissedRaw = json['recentDismissedIds'];
+    if (dismissedRaw is List) {
+      for (final entry in dismissedRaw) {
+        if (entry is! String) continue;
+        final id = entry.trim();
+        if (id.isEmpty) continue;
+        store.recentDismissedIds.add(id);
       }
     }
 

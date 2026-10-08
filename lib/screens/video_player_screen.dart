@@ -2041,9 +2041,25 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           unawaited(previousController.dispose());
         }
       }
-      // ID 没变，但之前因为 Loading 等待了，现在 Service 准备好了 -> 重试初始化
+      // ID unchanged; service became mountable again -> retry init.
       _initVideo();
     } else if (service.currentItem?.id == _currentItem?.id) {
+      // Detach disposed/replaced controllers before rebuild. Release builds
+      // otherwise show a white ErrorWidget (sleep-timer end + reopen).
+      if (_controllerAssigned &&
+          (service.controller == null ||
+              !identical(_controller, service.controller))) {
+        try {
+          _controller.removeListener(_videoListener);
+        } catch (_) {}
+        setState(() {
+          _controllerAssigned = false;
+          _isControllerOwner = false;
+          _initialized = false;
+        });
+        _initVideo();
+        return;
+      }
       _syncSubtitlesFromService(service);
     }
   }
@@ -4537,11 +4553,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         return streamRatio;
       }
     } catch (_) {}
-    if (_controllerAssigned &&
-        _controller.value.isInitialized &&
-        !_controller.value.hasError &&
-        _controller.value.aspectRatio > 0) {
-      return _controller.value.aspectRatio;
+    if (_controllerAssigned) {
+      try {
+        if (_controller.value.isInitialized &&
+            !_controller.value.hasError &&
+            _controller.value.aspectRatio > 0) {
+          return _controller.value.aspectRatio;
+        }
+      } catch (_) {}
     }
     return 16 / 9;
   }
@@ -5492,9 +5511,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                                                         .hasPrevious,
                                                 hasNext:
                                                     Provider.of<
-                                                          PlaylistManager
+                                                          MediaPlaybackService
                                                         >(context)
-                                                        .hasNext,
+                                                        .hasPlayableNext,
                                                 mediaTitle:
                                                     _currentItem?.title ?? '',
                                                 chapters:
@@ -6480,6 +6499,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           autoPlayOnCompletionFromStart: settings.autoPlayOnCompletionFromStart,
           onAutoPlayOnCompletionFromStartChanged: (value) =>
               settings.saveAutoPlayOnCompletionFromStart(value),
+          playlistWrapToFirst: settings.playlistWrapToFirst,
+          onPlaylistWrapToFirstChanged: (value) =>
+              settings.savePlaylistWrapToFirst(value),
 
           // Seek Preview
           enableSeekPreview: settings.enableSeekPreview,

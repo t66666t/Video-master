@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/widgets/media_library_activity_menu.dart';
 import 'package:video_player_app/widgets/media_library_anchor_menu.dart';
 
@@ -114,8 +116,61 @@ void main() {
     expect(find.text('移动到上一级'), findsNothing);
   });
 
+  testWidgets('recent dismiss removes a folder card and undo puts it back', (
+    tester,
+  ) async {
+    addTearDown(() => AppToast.dismiss(immediate: true));
+    library.seedCollectionForTesting(
+      VideoCollection(id: 'folder', name: '导入', createTime: 1),
+    );
+    library.writeLibrarySnapshotOverrideForTesting = () async {};
+    await tester.pumpWidget(
+      ChangeNotifierProvider<LibraryService>.value(
+        value: library,
+        child: MaterialApp(
+          navigatorKey: AppToast.navigatorKey,
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.bottomRight,
+              child: MediaLibraryActivityMenuButton(
+                targetId: 'folder',
+                isCollection: true,
+                allowDismissFromRecent: true,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('media-library-activity-menu')));
+    await tester.pumpAndSettle();
+    expect(find.text('从本页移除'), findsOneWidget);
+    expect(find.text('移入回收站'), findsOneWidget);
+
+    await tester.tap(find.text('从本页移除'));
+    // Saving is queued behind the widget-test zone, so let that future finish
+    // before looking for the toast.
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+    await tester.pump();
+    expect(library.recentDismissedIds, ['folder']);
+    expect(find.text('已从本页移除'), findsOneWidget);
+
+    await tester.tap(find.text('撤销'));
+    await tester.runAsync(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    });
+    await tester.pump();
+    expect(library.recentDismissedIds, isEmpty);
+  });
+
   test('menu glyph follows card width instead of a 24px floor', () {
-    expect(MediaLibraryActivityMenuMetrics.glyphSize(103), closeTo(12.36, 0.05));
+    expect(
+      MediaLibraryActivityMenuMetrics.glyphSize(103),
+      closeTo(12.36, 0.05),
+    );
     expect(MediaLibraryActivityMenuMetrics.layoutSize(103) < 24, isTrue);
     expect(MediaLibraryActivityMenuMetrics.hitSize(103), closeTo(37.08, 0.05));
     expect(MediaLibraryActivityMenuMetrics.glyphSize(280), 20);

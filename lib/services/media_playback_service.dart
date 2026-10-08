@@ -1447,15 +1447,21 @@ class MediaPlaybackService extends ChangeNotifier {
   bool get hasMountableController {
     final controller = _controller;
     final item = _currentItem;
-    return controller != null &&
-        item != null &&
-        identical(controller, _sessionController) &&
-        _session.itemId == item.id &&
-        _session.isControllerMountable &&
-        controller.value.isInitialized &&
-        !controller.value.hasError &&
-        (_controllerHasRequiredVideoOutput(item, controller) ||
-            item.sourceRef?.kind == MediaSourceKind.bilibiliStream);
+    if (controller == null ||
+        item == null ||
+        !identical(controller, _sessionController) ||
+        _session.itemId != item.id ||
+        !_session.isControllerMountable) {
+      return false;
+    }
+    try {
+      return controller.value.isInitialized &&
+          !controller.value.hasError &&
+          (_controllerHasRequiredVideoOutput(item, controller) ||
+              item.sourceRef?.kind == MediaSourceKind.bilibiliStream);
+    } catch (_) {
+      return false;
+    }
   }
 
   bool canMountControllerFor(
@@ -1463,16 +1469,25 @@ class MediaPlaybackService extends ChangeNotifier {
     VideoPlayerController? controller,
   }) {
     final candidate = controller ?? _controller;
-    return candidate != null &&
-        identical(candidate, _controller) &&
-        _currentItem?.id == itemId &&
-        _session.itemId == itemId &&
-        identical(candidate, _sessionController) &&
-        _session.isControllerMountable &&
-        candidate.value.isInitialized &&
-        !candidate.value.hasError &&
-        (_controllerHasRequiredVideoOutput(_currentItem!, candidate) ||
-            _currentItem!.sourceRef?.kind == MediaSourceKind.bilibiliStream);
+    if (candidate == null ||
+        !identical(candidate, _controller) ||
+        _currentItem?.id != itemId ||
+        _session.itemId != itemId ||
+        !identical(candidate, _sessionController) ||
+        !_session.isControllerMountable) {
+      return false;
+    }
+    try {
+      if (!candidate.value.isInitialized || candidate.value.hasError) {
+        return false;
+      }
+      return _controllerHasRequiredVideoOutput(_currentItem!, candidate) ||
+          _currentItem!.sourceRef?.kind == MediaSourceKind.bilibiliStream;
+    } catch (_) {
+      // Disposed controllers throw on .value; treat as unmountable so pages
+      // detach instead of painting a white ErrorWidget in release builds.
+      return false;
+    }
   }
 
   /// True when the service already owns an initialized controller for [itemId]
@@ -2101,8 +2116,17 @@ class MediaPlaybackService extends ChangeNotifier {
     return index >= 0 && index < playlist.length ? playlist[index] : null;
   }
 
-  VideoItem? get nextPlayableItem => _findPlayableRelative(next: true);
-  VideoItem? get previousPlayableItem => _findPlayableRelative(next: false);
+  bool get _playlistWrapToFirstEnabled =>
+      SettingsService().playlistWrapToFirst;
+
+  VideoItem? get nextPlayableItem => _findPlayableRelative(
+    next: true,
+    wrap: _playlistWrapToFirstEnabled,
+  );
+  VideoItem? get previousPlayableItem => _findPlayableRelative(
+    next: false,
+    wrap: _playlistWrapToFirstEnabled,
+  );
   bool get hasPlayableNext => nextPlayableItem != null;
   bool get hasPlayablePrevious => previousPlayableItem != null;
 
@@ -5945,11 +5969,15 @@ class MediaPlaybackService extends ChangeNotifier {
     if (snapshot.currentIndex < 0 || snapshot.entries.isEmpty) return;
 
     var targetIndex = snapshot.currentIndex;
+    final length = snapshot.entries.length;
+    final wrap = SettingsService().playlistWrapToFirst;
     for (final command in commands) {
-      targetIndex = (targetIndex + command.delta).clamp(
-        0,
-        snapshot.entries.length - 1,
-      );
+      if (wrap && length > 0) {
+        targetIndex = (targetIndex + command.delta) % length;
+        if (targetIndex < 0) targetIndex += length;
+      } else {
+        targetIndex = (targetIndex + command.delta).clamp(0, length - 1);
+      }
     }
     if (targetIndex == snapshot.currentIndex) return;
     final target = snapshot.entries[targetIndex];
@@ -6586,9 +6614,10 @@ class MediaPlaybackService extends ChangeNotifier {
       // Sleep-timer completion rules take precedence over repeat/auto-play.
       // The controller has naturally reached the end, so parking the session
       // as paused preserves the completed progress without briefly starting
-      // the next item.
+      // the next item. Queue-end detection ignores list-wrap so "end of queue"
+      // still means the literal last item.
       final stopForSleepTimer = sleepTimer.consumeItemCompletion(
-        hasNextItem: nextPlayableItem != null,
+        hasNextItem: _findPlayableRelative(next: true, wrap: false) != null,
       );
       if (stopForSleepTimer) {
         _hasPlaybackCompleted = true;
@@ -6596,6 +6625,9 @@ class MediaPlaybackService extends ChangeNotifier {
         _setDesiredPlaying(false);
         _syncWakelockWithState();
         _stopProgressTracking();
+        try {
+          await completedController.pause();
+        } catch (_) {}
         await _savePlaybackStateSnapshot();
         notifyListeners();
         return;
@@ -6615,10 +6647,11 @@ class MediaPlaybackService extends ChangeNotifier {
 
       _hasPlaybackCompleted = false;
       _playlistManager?.reloadPlaylist();
+      final bool wrap = settings.playlistWrapToFirst;
       final VideoItem? targetItem = _findPlayableRelative(
         next: true,
-        wrap: true,
-        includeCurrentAfterWrap: true,
+        wrap: wrap,
+        includeCurrentAfterWrap: wrap,
       );
       if (targetItem == null) {
         await stop();
@@ -7235,6 +7268,10 @@ class MediaPlaybackService extends ChangeNotifier {
       _controller = null;
       _serviceOwnsController = false;
       _controllerCreatedWithoutVisiblePlaybackPage = false;
+      // Let mounted player pages detach VideoPlayer before the native dispose
+      // finishes. Otherwise Release paints a white ErrorWidget on a disposed
+      // controller (seen after sleep-timer end + re-open).
+      notifyListeners();
 
       if (awaitCompletion) {
         await _detachController(

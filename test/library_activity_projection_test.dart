@@ -205,9 +205,7 @@ void main() {
   });
 
   test('empty library has no recent rows', () {
-    final projection = _projection(
-      store: LibraryActivityStore.empty(),
-    );
+    final projection = _projection(store: LibraryActivityStore.empty());
     expect(projection.recentAddedEntries(), isEmpty);
   });
 
@@ -261,10 +259,7 @@ void main() {
     );
 
     final sections = projection.continueLearningSections();
-    expect(
-      sections.recent.map((group) => group.featuredMediaId),
-      ['b1', 'a1'],
-    );
+    expect(sections.recent.map((group) => group.featuredMediaId), ['b1', 'a1']);
     expect(sections.unknown.single.mediaIds, ['legacy']);
     expect(projection.visiblePinnedIds(), ['pinned']);
   });
@@ -447,10 +442,10 @@ void main() {
     final rows = projection.recentAddedEntries();
     expect(rows, hasLength(1));
     expect(rows.single.groupHeaderLabel(), '课程·当前2项');
-    expect(
-      rows.single.children.map((child) => child.id).toList(),
-      ['loose', 'chapter'],
-    );
+    expect(rows.single.children.map((child) => child.id).toList(), [
+      'loose',
+      'chapter',
+    ]);
     expect(rows.single.children[1].kind, RecentAddedChildKind.folder);
   });
 
@@ -511,6 +506,121 @@ void main() {
       'parts',
       'episode-file',
     ]);
+  });
+
+  test('dismissed recent cards leave the page and keep the import clock', () {
+    final videos = <String, VideoItem>{
+      'loose': _item('loose'),
+      'old': _item('old'),
+      'stay': _item('stay'),
+    };
+    final projection = _projection(
+      videos: videos,
+      store: LibraryActivityStore(
+        media: <String, MediaActivityRecord>{
+          'loose': MediaActivityRecord(
+            mediaId: 'loose',
+            addedAtMs: 30,
+            lastPlayedAtMs: 30,
+            accumulatedWatchMs: 40000,
+          ),
+          'old': MediaActivityRecord(mediaId: 'old'),
+          'stay': MediaActivityRecord(mediaId: 'stay', addedAtMs: 10),
+        },
+        recentDismissedIds: <String>['loose', 'old'],
+      ),
+    );
+
+    expect(projection.recentAddedEntries().map((row) => row.mediaId).toList(), [
+      'stay',
+    ]);
+    expect(
+      projection.recentAddedMediaIds().datedIds,
+      containsAll(<String>['loose', 'stay']),
+    );
+    expect(projection.recentAddedMediaIds().unknownAddedIds, ['old']);
+    expect(projection.isContinueEligible(videos['loose']!), isTrue);
+    expect(projection.isMediaHidden('loose'), isFalse);
+  });
+
+  test('continue-learning hide keeps the recent card', () {
+    final clip = _item('clip');
+    final projection = _projection(
+      videos: <String, VideoItem>{'clip': clip},
+      store: LibraryActivityStore(
+        media: <String, MediaActivityRecord>{
+          'clip': MediaActivityRecord(
+            mediaId: 'clip',
+            addedAtMs: 4,
+            hidden: true,
+            lastPlayedAtMs: 4,
+            accumulatedWatchMs: 40000,
+          ),
+        },
+      ),
+    );
+
+    expect(projection.recentAddedEntries().single.mediaId, 'clip');
+    expect(projection.isContinueEligible(clip), isFalse);
+  });
+
+  test('hiding a recent folder card does not spill nested files', () {
+    final videos = <String, VideoItem>{
+      'loose': _item('loose', parentId: 'root'),
+      'deep': _item('deep', parentId: 'chapter'),
+      'deeper': _item('deeper', parentId: 'section'),
+    };
+    final collections = <String, VideoCollection>{
+      'root': _folder('root', name: '课程', childrenIds: ['loose', 'chapter']),
+      'chapter': _folder(
+        'chapter',
+        name: '第一章',
+        parentId: 'root',
+        childrenIds: ['deep', 'section'],
+      ),
+      'section': _folder(
+        'section',
+        name: '小节',
+        parentId: 'chapter',
+        childrenIds: ['deeper'],
+      ),
+    };
+    final store = LibraryActivityStore(
+      media: <String, MediaActivityRecord>{
+        for (final id in videos.keys)
+          id: MediaActivityRecord(mediaId: id, addedAtMs: 5),
+      },
+      batches: [
+        ImportBatchRecord(
+          id: 'folder-batch',
+          startedAtMs: 5,
+          title: '课程',
+          sourceKind: LibraryImportSourceKind.folder,
+          createdMediaIds: videos.keys.toList(),
+          createdCollectionIds: ['root', 'chapter', 'section'],
+        ),
+      ],
+    );
+    final projection = _projection(
+      videos: videos,
+      collections: collections,
+      store: store,
+    );
+
+    expect(
+      projection.recentAddedEntries().single.children.map((child) => child.id),
+      ['loose', 'chapter'],
+    );
+
+    store.recentDismissedIds.add('chapter');
+    final afterFolder = projection.recentAddedEntries();
+    expect(afterFolder, hasLength(1));
+    expect(afterFolder.single.kind, RecentAddedKind.single);
+    expect(afterFolder.single.mediaId, 'loose');
+
+    store.recentDismissedIds.add('loose');
+    expect(projection.recentAddedEntries(), isEmpty);
+    expect(projection.recentAddedMediaIds().datedIds, contains('deep'));
   });
 }
 

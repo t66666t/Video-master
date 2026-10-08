@@ -21,6 +21,8 @@ import 'media_library_anchor_menu.dart';
 /// Hide never stops playback. Recycle and export act on this card
 /// only. Move-to-parent is shown only when [onMoveToParent] is set, which is
 /// the opened-folder page and not continue, recent, search, or the library root.
+/// [allowHide] is continue-learning only. [allowDismissFromRecent] hides a
+/// recent-added card without touching continue-learning or history.
 /// The visible ⋯ lives on the bottom-right action dock, not on the cover.
 class MediaLibraryActivityMenuMetrics {
   /// Visible "⋯" size. Tracks card width so a 3-column phone stays small.
@@ -45,6 +47,7 @@ class MediaLibraryActivityMenuButton extends StatefulWidget {
     required this.targetId,
     required this.isCollection,
     this.allowHide = false,
+    this.allowDismissFromRecent = false,
     this.onLocate,
     this.onHidden,
     this.onMoveToParent,
@@ -55,6 +58,9 @@ class MediaLibraryActivityMenuButton extends StatefulWidget {
   final String targetId;
   final bool isCollection;
   final bool allowHide;
+
+  /// Shows 「从本页移除」 for a 最近添加 media or folder card.
+  final bool allowDismissFromRecent;
   final VoidCallback? onLocate;
   final VoidCallback? onHidden;
 
@@ -86,9 +92,7 @@ class _MediaLibraryActivityMenuButtonState
       color: Colors.transparent,
       child: InkWell(
         onTap: () => unawaited(_openMenu(library, pinned: pinned)),
-        child: widget.fillSlot
-            ? const SizedBox.expand()
-            : _standaloneGlyph(),
+        child: widget.fillSlot ? const SizedBox.expand() : _standaloneGlyph(),
       ),
     );
     return Semantics(
@@ -129,27 +133,19 @@ class _MediaLibraryActivityMenuButtonState
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          Positioned(
-            top: 0,
-            right: 0,
-            width: hit,
-            height: hit,
-            child: ink,
-          ),
+          Positioned(top: 0, right: 0, width: hit, height: hit, child: ink),
         ],
       ),
     );
   }
 
-  Future<void> _openMenu(
-    LibraryService library, {
-    required bool pinned,
-  }) async {
+  Future<void> _openMenu(LibraryService library, {required bool pinned}) async {
     if (_opening || !mounted) return;
     _opening = true;
     final box = context.findRenderObject() as RenderBox?;
-    final overlay = Overlay.maybeOf(context, rootOverlay: true)?.context
-        .findRenderObject() as RenderBox?;
+    final overlay =
+        Overlay.maybeOf(context, rootOverlay: true)?.context.findRenderObject()
+            as RenderBox?;
     if (box == null || overlay == null || !box.hasSize) {
       _opening = false;
       return;
@@ -159,7 +155,8 @@ class _MediaLibraryActivityMenuButtonState
     final VideoItem? localMedia = !widget.isCollection
         ? library.getVideo(widget.targetId)
         : null;
-    final bool canRevealInOs = localMedia != null &&
+    final bool canRevealInOs =
+        localMedia != null &&
         library.canRelocateLocalMediaSource(localMedia) &&
         _supportsOsFileManagerReveal;
     final items = <MediaLibraryAnchorMenuEntry>[
@@ -197,7 +194,15 @@ class _MediaLibraryActivityMenuButtonState
           icon: CupertinoIcons.folder_open,
           key: ValueKey('reveal-in-file-manager-menu'),
         ),
-      if (!widget.isCollection && widget.allowHide)
+      if (widget.allowDismissFromRecent)
+        const MediaLibraryAnchorMenuEntry(
+          value: 'dismiss_recent',
+          label: '从本页移除',
+          icon: CupertinoIcons.eye_slash,
+        ),
+      if (!widget.isCollection &&
+          widget.allowHide &&
+          !widget.allowDismissFromRecent)
         const MediaLibraryAnchorMenuEntry(
           value: 'hide',
           label: '从本页移除',
@@ -259,6 +264,24 @@ class _MediaLibraryActivityMenuButtonState
         MediaPlaybackService().noteLibraryMediaHidden(widget.targetId);
         await library.hideLibraryMedia(widget.targetId);
         widget.onHidden?.call();
+        return;
+      case 'dismiss_recent':
+        final targetId = widget.targetId;
+        final removed = await library.dismissFromRecentAdded(targetId);
+        if (!removed) return;
+        // The card rebuilds away as soon as the library notifies, so the
+        // undo action closes over the service instead of this State.
+        AppToast.show(
+          '已从本页移除',
+          type: AppToastType.success,
+          duration: const Duration(seconds: 4),
+          action: AppToastAction(
+            label: '撤销',
+            onPressed: () {
+              unawaited(library.restoreRecentAdded(targetId));
+            },
+          ),
+        );
         return;
     }
   }

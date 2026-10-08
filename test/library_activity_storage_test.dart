@@ -285,6 +285,82 @@ void main() {
     },
   );
 
+  test('recent-page dismiss sticks across restart and playback', () async {
+    await _writeLibrary(
+      root,
+      collections: [
+        _folder('course'),
+        _folder('chapter', parentId: 'course'),
+      ],
+      videos: [
+        _item('ep', parentId: 'chapter'),
+        _item('loose'),
+      ],
+    );
+    await library.init();
+    final batchId = library.beginImportBatch(
+      title: '课程',
+      sourceKind: LibraryImportSourceKind.folder,
+    );
+    library.noteImportedCollection('course', batchId: batchId);
+    library.noteImportedCollection('chapter', batchId: batchId);
+    library.noteImportedMedia('ep', addedAtMs: 10, batchId: batchId);
+    library.noteImportedMedia('loose', addedAtMs: 11, batchId: batchId);
+    expect(await library.completeImportBatch(batchId!), isTrue);
+
+    expect(await library.dismissFromRecentAdded('chapter'), isTrue);
+    expect(await library.dismissFromRecentAdded('chapter'), isFalse);
+    expect(
+      library.activityProjection.recentAddedEntries().map((row) => row.mediaId),
+      ['loose'],
+    );
+    expect(
+      library.activityProjection.recentAddedEntries().expand(
+        (row) => row.children.map((child) => child.id),
+      ),
+      isNot(contains('ep')),
+    );
+
+    library.recordValidPlaybackProgress(
+      'loose',
+      deltaWatchMs: 40000,
+      lastPlayedAtMs: 50,
+    );
+    expect(
+      library.activityProjection.isContinueEligible(library.getVideo('loose')!),
+      isTrue,
+    );
+    expect(await library.dismissFromRecentAdded('loose'), isTrue);
+    expect(library.mediaActivity('loose')!.hidden, isFalse);
+    expect(library.activityProjection.recentAddedEntries(), isEmpty);
+    expect(
+      library.activityProjection.recentAddedMediaIds().datedIds,
+      containsAll(<String>['ep', 'loose']),
+    );
+
+    library.resetLibraryForTesting();
+    SettingsService().largeDataRootPath = root.path;
+    await library.init();
+
+    expect(library.recentDismissedIds, ['chapter', 'loose']);
+    expect(library.activityProjection.recentAddedEntries(), isEmpty);
+    expect(
+      library.activityProjection.isContinueEligible(library.getVideo('loose')!),
+      isTrue,
+    );
+
+    expect(await library.restoreRecentAdded('loose'), isTrue);
+    expect(
+      library.activityProjection.recentAddedEntries().map((row) => row.mediaId),
+      ['loose'],
+    );
+
+    await library.moveToRecycleBin(['chapter']);
+    await library.deleteFromRecycleBin(['chapter']);
+    expect(library.recentDismissedIds, isEmpty);
+    expect(library.getCollection('chapter'), isNull);
+  });
+
   test('completed activity survives progress reset writes', () async {
     await _writeLibrary(root, videos: [_item('clip')]);
     await library.init();

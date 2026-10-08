@@ -11,6 +11,7 @@ import 'media_library_browse_grid_cards.dart';
 import 'media_library_group_header.dart';
 import 'media_library_layout_profile.dart';
 import 'media_library_list_tile.dart';
+import 'media_library_virtual_selection_host.dart';
 import 'media_list_layout_metrics.dart';
 
 /// Recently-added surface hosted by HomeScreen. Batches are grouping chrome,
@@ -26,6 +27,7 @@ class MediaLibraryRecentView extends StatefulWidget {
     required this.onLocateFolder,
     this.expandBatchId,
     this.isActive = true,
+    this.selection,
   });
 
   final ScrollController scrollController;
@@ -38,6 +40,9 @@ class MediaLibraryRecentView extends StatefulWidget {
 
   /// Hidden keep-alive copies skip Provider watches and reuse the last tree.
   final bool isActive;
+
+  /// Null keeps the page read-only (tests / keep-alive copies).
+  final MediaLibraryVirtualSelectionBinding? selection;
 
   @override
   State<MediaLibraryRecentView> createState() => _MediaLibraryRecentViewState();
@@ -53,6 +58,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
   bool _tryReuseFrozen = false;
   int? _frozenViewMode;
   double? _frozenBottomPadding;
+  String? _frozenSelectionToken;
 
   @override
   void didChangeDependencies() {
@@ -105,7 +111,8 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
         _frozenSubtree != null &&
         !_libraryChangedWhileAway &&
         _frozenViewMode == settings.mediaLibraryViewMode &&
-        _frozenBottomPadding == widget.cardBottomPadding;
+        _frozenBottomPadding == widget.cardBottomPadding &&
+        _frozenSelectionToken == (widget.selection?.freezeToken ?? 'off');
   }
 
   @override
@@ -127,10 +134,12 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     _libraryChangedWhileAway = false;
     final entries = library.activityProjection.recentAddedEntries();
     _expandRequestedBatch(entries);
+    widget.selection?.host.updateOrderedIds(_visibleChildIds(entries));
 
     if (entries.isEmpty) {
       _frozenViewMode = settings.mediaLibraryViewMode;
       _frozenBottomPadding = widget.cardBottomPadding;
+      _frozenSelectionToken = widget.selection?.freezeToken ?? 'off';
       _frozenSubtree = const Center(
         child: Text('还没有最近添加', style: TextStyle(color: Colors.white54)),
       );
@@ -143,6 +152,7 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     final flow = _flowSpacing(settings, screenSize, useList);
     _frozenViewMode = settings.mediaLibraryViewMode;
     _frozenBottomPadding = widget.cardBottomPadding;
+    _frozenSelectionToken = widget.selection?.freezeToken ?? 'off';
     _frozenSubtree = CustomScrollView(
       controller: widget.scrollController,
       slivers: [
@@ -227,7 +237,6 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required bool useList,
     required MediaLibraryFlowSpacing flow,
   }) {
-
     final newestBatch = _newestMultiItemBatch(entries);
     final count = entry.visibleCount;
     final flat = MediaLibraryGroupExpandPolicy.alwaysExpanded(count);
@@ -288,6 +297,36 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
       return null;
     }
     return null;
+  }
+
+  /// Visible cards only: collapsed batches contribute no children.
+  List<String> _visibleChildIds(List<RecentAddedEntry> entries) {
+    final out = <String>[];
+    final newestBatch = _newestMultiItemBatch(entries);
+    for (final entry in entries) {
+      if (entry.kind == RecentAddedKind.single) {
+        final id = entry.mediaId;
+        if (id != null) out.add(id);
+        continue;
+      }
+      final count = entry.visibleCount;
+      final flat = MediaLibraryGroupExpandPolicy.alwaysExpanded(count);
+      final defaultExpanded =
+          MediaLibraryGroupExpandPolicy.recentDefaultExpanded(
+            isNewestMultiItemBatch:
+                newestBatch != null && newestBatch.rowId == entry.rowId,
+            count: count,
+            isUnknownBucket: entry.kind == RecentAddedKind.unknown,
+          );
+      final expanded =
+          flat ||
+          _expand.isExpanded(entry.rowId, defaultExpanded: defaultExpanded);
+      if (!expanded) continue;
+      for (final child in entry.children) {
+        out.add(child.id);
+      }
+    }
+    return out;
   }
 
   List<VideoItem> _coverItems(LibraryService library, RecentAddedEntry entry) {
@@ -503,30 +542,107 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required bool useList,
     MediaListStyleSettings? listStyle,
   }) {
+    final selection = widget.selection;
+    final selected = selection?.isSelected(collection.id) ?? false;
+    final selecting = selection?.isSelectionMode ?? false;
+    void open() {
+      if (selecting) {
+        selection!.onToggle(collection.id);
+        return;
+      }
+      widget.onOpenFolder(collection);
+    }
+
+    final Widget tile;
     if (useList) {
       final style =
           listStyle ?? settings.listStyleFor(MediaQuery.sizeOf(context));
-      return MediaLibraryListTile.collection(
+      tile = MediaLibraryListTile.collection(
         collection: collection,
         index: 0,
         showIndex: false,
         showThumbnail: style.showThumbnail,
-        isSelected: false,
-        isSelectionMode: false,
+        isSelected: selected,
+        isSelectionMode: selecting,
         titleScale: style.titleScale,
-        onTap: () => widget.onOpenFolder(collection),
+        onTap: open,
+        onSecondaryTap: selection == null
+            ? null
+            : () => selection.onSecondaryTap(collection.id),
+        onSelectionTap: selection == null
+            ? null
+            : () => selection.onToggle(collection.id),
+        onSelectionPanStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(collection.id, details.globalPosition),
+        onSelectionPanUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionPanEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onSelectionLongPressStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(collection.id, details.globalPosition),
+        onSelectionLongPressMoveUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionLongPressEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
         onShowInParentFolder: () => widget.onLocateFolder(collection),
-        showActivityMenu: true,
+        showActivityMenu: !selecting,
         allowHide: false,
+        allowDismissFromRecent: !selecting,
+      );
+    } else {
+      tile = MediaLibraryFolderGridCard(
+        collection: collection,
+        titleScale: settings
+            .collectionCardStyleFor(MediaQuery.sizeOf(context))
+            .titleScale,
+        onTap: open,
+        onLocate: () => widget.onLocateFolder(collection),
+        allowDismissFromRecent: !selecting,
+        showActivityMenu: !selecting,
+        isSelected: selected,
+        isSelectionMode: selecting,
+        onSecondaryTap: selection == null
+            ? null
+            : () => selection.onSecondaryTap(collection.id),
+        onSelectionTap: selection == null
+            ? null
+            : () => selection.onToggle(collection.id),
+        onSelectionPanStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(collection.id, details.globalPosition),
+        onSelectionPanUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionPanEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onSelectionLongPressStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(collection.id, details.globalPosition),
+        onSelectionLongPressMoveUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionLongPressEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onLongPress: selection == null || selecting
+            ? null
+            : () => selection.onEnter(collection.id),
       );
     }
-    return MediaLibraryFolderGridCard(
-      collection: collection,
-      titleScale: settings
-          .collectionCardStyleFor(MediaQuery.sizeOf(context))
-          .titleScale,
-      onTap: () => widget.onOpenFolder(collection),
-      onLocate: () => widget.onLocateFolder(collection),
+    return KeyedSubtree(
+      key: selection?.host.keyFor(collection.id),
+      child: tile,
     );
   }
 
@@ -539,37 +655,111 @@ class _MediaLibraryRecentViewState extends State<MediaLibraryRecentView> {
     required bool useList,
     MediaListStyleSettings? listStyle,
   }) {
+    final selection = widget.selection;
+    final selected = selection?.isSelected(item.id) ?? false;
+    final selecting = selection?.isSelectionMode ?? false;
+    void open() {
+      if (selecting) {
+        selection!.onToggle(item.id);
+        return;
+      }
+      widget.onOpenMedia(item);
+    }
+
+    final Widget tile;
     if (useList) {
       final style =
           listStyle ?? settings.listStyleFor(MediaQuery.sizeOf(context));
-      return MediaLibraryListTile.video(
+      tile = MediaLibraryListTile.video(
         item: item,
         index: index,
         showIndex: style.showIndex,
         showThumbnail: style.showThumbnail,
-        isSelected: false,
-        isSelectionMode: false,
+        isSelected: selected,
+        isSelectionMode: selecting,
         titleScale: style.titleScale,
-        onTap: () => widget.onOpenMedia(item),
+        onTap: open,
+        onSecondaryTap: selection == null
+            ? null
+            : () => selection.onSecondaryTap(item.id),
+        onSelectionTap: selection == null
+            ? null
+            : () => selection.onToggle(item.id),
+        onSelectionPanStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionPanUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionPanEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onSelectionLongPressStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionLongPressMoveUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionLongPressEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
         onShowInParentFolder: () => widget.onLocateMedia(item),
-        showActivityMenu: true,
+        showActivityMenu: !selecting,
+        allowDismissFromRecent: !selecting,
+        relativePath: MediaLibraryMediaGridCard.pathFromLibraryRoot(
+          library,
+          item,
+        ),
+      );
+    } else {
+      tile = MediaLibraryMediaGridCard(
+        item: item,
+        titleScale: settings
+            .collectionCardStyleFor(MediaQuery.sizeOf(context))
+            .titleScale,
+        onTap: open,
+        onLocate: () => widget.onLocateMedia(item),
+        allowDismissFromRecent: !selecting,
+        showActivityMenu: !selecting,
+        isSelected: selected,
+        isSelectionMode: selecting,
+        onSecondaryTap: selection == null
+            ? null
+            : () => selection.onSecondaryTap(item.id),
+        onSelectionTap: selection == null
+            ? null
+            : () => selection.onToggle(item.id),
+        onSelectionPanStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionPanUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionPanEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onSelectionLongPressStart: selection == null
+            ? null
+            : (details) =>
+                  selection.onRangeStart(item.id, details.globalPosition),
+        onSelectionLongPressMoveUpdate: selection == null
+            ? null
+            : (details) => selection.onRangeUpdate(details.globalPosition),
+        onSelectionLongPressEnd: selection == null
+            ? null
+            : (_) => selection.onRangeEnd(),
+        onLongPress: selection == null || selecting
+            ? null
+            : () => selection.onEnter(item.id),
         relativePath: MediaLibraryMediaGridCard.pathFromLibraryRoot(
           library,
           item,
         ),
       );
     }
-    return MediaLibraryMediaGridCard(
-      item: item,
-      titleScale: settings
-          .collectionCardStyleFor(MediaQuery.sizeOf(context))
-          .titleScale,
-      onTap: () => widget.onOpenMedia(item),
-      onLocate: () => widget.onLocateMedia(item),
-      relativePath: MediaLibraryMediaGridCard.pathFromLibraryRoot(
-        library,
-        item,
-      ),
-    );
+    return KeyedSubtree(key: selection?.host.keyFor(item.id), child: tile);
   }
 }

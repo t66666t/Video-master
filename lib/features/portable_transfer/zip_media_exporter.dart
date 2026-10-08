@@ -362,7 +362,7 @@ class ZipMediaExporter {
         );
       } catch (error) {
         await _deleteIfInside(scratch, output.path);
-        await _deleteIfInside(scratch, '${output.path}.partial');
+        await _deleteIfInside(scratch, zipInProgressRemuxPath(output.path));
         if (error is PortableExportCancelled) rethrow;
         failures++;
       }
@@ -412,7 +412,8 @@ class ZipMediaExporter {
       );
       chapterPath = file.path;
     }
-    final partial = File('${output.path}.partial');
+    // Container suffix must stay last; see [zipInProgressRemuxPath].
+    final partial = File(zipInProgressRemuxPath(output.path));
     await _deleteIfInside(scratch, partial.path);
     final args = buildZipRemuxArguments(
       sourcePath: item.sourcePath,

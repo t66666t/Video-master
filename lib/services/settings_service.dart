@@ -1018,6 +1018,10 @@ class SettingsService extends ChangeNotifier {
   // New: When auto continuing, always restart the target media from zero.
   bool autoPlayOnCompletionFromStart = false;
 
+  // When true, reaching the last playlist item can advance/wrap to the first.
+  // Default off so the next-episode button stays disabled on the last item.
+  bool playlistWrapToFirst = false;
+
   // New: Action Buttons Collapsed State
   bool isActionButtonsCollapsed = false;
 
@@ -1383,6 +1387,11 @@ class SettingsService extends ChangeNotifier {
         defaultValue: false,
         apply: (service, value) =>
             service.autoPlayOnCompletionFromStart = value,
+      ),
+      _boolSetting(
+        key: 'playlistWrapToFirst',
+        defaultValue: false,
+        apply: (service, value) => service.playlistWrapToFirst = value,
       ),
       _boolSetting(
         key: 'isActionButtonsCollapsed',
@@ -2996,6 +3005,10 @@ class SettingsService extends ChangeNotifier {
     );
   }
 
+  Future<void> savePlaylistWrapToFirst(bool value) async {
+    await _updateRegisteredSetting<bool>('playlistWrapToFirst', value);
+  }
+
   Future<void> saveEnableSeekPreview(bool value) async {
     await _updateRegisteredSetting<bool>('enableSeekPreview', value);
   }
@@ -3474,6 +3487,7 @@ class SettingsService extends ChangeNotifier {
         'enableVideoPreload': enableVideoPreload,
         'autoPlayOnCompletion': autoPlayOnCompletion,
         'autoPlayOnCompletionFromStart': autoPlayOnCompletionFromStart,
+        'playlistWrapToFirst': playlistWrapToFirst,
         'enableSeekPreview': enableSeekPreview,
         'enableHapticFeedback': enableHapticFeedback,
         'isActionButtonsCollapsed': isActionButtonsCollapsed,

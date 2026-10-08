@@ -469,6 +469,36 @@ class PortableTransferService extends ChangeNotifier {
     return Platform.isWindows ? normalized.toLowerCase() : normalized;
   }
 
+  /// Adds [path] without dropping another file that already uses [label].
+  static void _rememberSubtitlePath(
+    Map<String, String> target,
+    String label,
+    String path,
+  ) {
+    if (target.values.any(
+      (value) => _normalizedTaskPath(value) == _normalizedTaskPath(path),
+    )) {
+      return;
+    }
+    final visible = label.trim().isEmpty ? p.basename(path) : label.trim();
+    final existing = target[visible];
+    if (existing == null ||
+        _normalizedTaskPath(existing) == _normalizedTaskPath(path)) {
+      target[visible] = path;
+      return;
+    }
+    final baseName = p.basename(path);
+    var key = baseName;
+    var serial = 2;
+    while (target.containsKey(key)) {
+      final extension = p.extension(baseName);
+      final stem = p.basenameWithoutExtension(baseName);
+      key = '$stem ($serial)$extension';
+      serial++;
+    }
+    target[key] = path;
+  }
+
   Future<PortableTransferTask> exportSelection({
     required LibraryService library,
     required List<String> rootIds,
@@ -1416,17 +1446,22 @@ class PortableTransferService extends ChangeNotifier {
         final local = _resolveAssetMap(extraction, videoJson['localSubtitles']);
         final rawManagedAssets = videoJson['managedSubtitleAssets'];
         if (rawManagedAssets is List) {
+          final kept = <Map<String, dynamic>>[];
           for (final rawAsset in rawManagedAssets.whereType<Map>()) {
             final asset = Map<String, dynamic>.from(rawAsset);
             final file = _resolveAssetReference(extraction, asset['path']);
-            if (file != null && await file.exists()) {
-              final label = asset['displayName']?.toString().trim();
-              local.putIfAbsent(
-                label?.isNotEmpty == true ? label! : p.basename(file.path),
-                () => file.path,
-              );
-            }
+            if (file == null || !await file.exists()) continue;
+            asset['path'] = file.path;
+            asset['assetId'] = const Uuid().v4();
+            kept.add(asset);
+            final label = asset['displayName']?.toString().trim() ?? '';
+            _rememberSubtitlePath(
+              local,
+              label.isNotEmpty ? label : p.basenameWithoutExtension(file.path),
+              file.path,
+            );
           }
+          videoJson['managedSubtitleAssets'] = kept;
         }
         final primarySubtitle = _resolveAssetReference(
           extraction,
@@ -1437,18 +1472,20 @@ class PortableTransferService extends ChangeNotifier {
           videoJson['secondarySubtitlePath'],
         );
         if (primarySubtitle != null) {
-          additional.putIfAbsent(
-            p.basename(primarySubtitle.path),
-            () => primarySubtitle.path,
+          _rememberSubtitlePath(
+            additional,
+            p.basenameWithoutExtension(primarySubtitle.path),
+            primarySubtitle.path,
           );
           videoJson['subtitlePath'] = primarySubtitle.path;
         } else {
           videoJson['subtitlePath'] = null;
         }
         if (secondarySubtitle != null) {
-          local.putIfAbsent(
-            p.basename(secondarySubtitle.path),
-            () => secondarySubtitle.path,
+          _rememberSubtitlePath(
+            local,
+            p.basenameWithoutExtension(secondarySubtitle.path),
+            secondarySubtitle.path,
           );
           videoJson['secondarySubtitlePath'] = secondarySubtitle.path;
         } else {
@@ -1456,8 +1493,6 @@ class PortableTransferService extends ChangeNotifier {
         }
         videoJson['extraSubtitles'] = additional.isEmpty ? null : additional;
         videoJson['localSubtitles'] = local.isEmpty ? null : local;
-        // addSingleVideo rebuilds card-owned subtitle assets with fresh IDs.
-        videoJson['managedSubtitleAssets'] = <dynamic>[];
 
         final rawShot = videoJson['bilibiliVideoShot'];
         if (rawShot is Map) {
