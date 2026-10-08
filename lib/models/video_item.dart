@@ -48,6 +48,11 @@ class VideoItem {
   List<MediaChapter> chapters;
   bool hasProbedChapters;
 
+  /// A watch-only card: playable like any other card, but never part of the
+  /// media library (no folder, no lists, not saved). It is removed with its
+  /// cache once nothing plays it any more.
+  final bool isTransient;
+
   VideoItem({
     required this.id,
     required this.path,
@@ -89,6 +94,7 @@ class VideoItem {
     this.bilibiliVideoShot,
     this.chapters = const <MediaChapter>[],
     this.hasProbedChapters = false,
+    this.isTransient = false,
   });
 
   Map<String, dynamic> toJson() {

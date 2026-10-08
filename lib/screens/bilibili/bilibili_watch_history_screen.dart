@@ -9,8 +9,8 @@ import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 
-/// Opens a watch history entry. The default goes through the online card
-/// entry (reuse or create the card for BV + part, then the playback page).
+/// Opens a watch history entry. The default plays it through
+/// [watchBilibiliVideo], continuing at the saved part and position.
 typedef BilibiliWatchHistoryOpener =
     Future<void> Function(
       BuildContext context,
@@ -32,7 +32,7 @@ Future<void> _openThroughCard(
   BuildContext context,
   BilibiliWatchHistoryEntry entry,
 ) {
-  return playBilibiliVideoAsCard(context, bvid: entry.bvid, page: entry.page);
+  return watchBilibiliVideo(context, bvid: entry.bvid, page: entry.page);
 }
 
 /// Videos watched from the Bilibili pages, newest first.
@@ -193,7 +193,11 @@ class _BilibiliWatchHistoryScreenState
                       ),
                     ),
                     Text(
-                      formatBilibiliWatchTime(entry.watchedAt),
+                      [
+                        formatBilibiliWatchTime(entry.watchedAt),
+                        if (entry.positionSeconds > 0)
+                          '看到 ${formatBilibiliWatchPosition(entry.positionMs)}',
+                      ].join(' · '),
                       style: const TextStyle(
                         color: AppTokens.text3,
                         fontSize: 11,
@@ -259,4 +263,15 @@ String formatBilibiliWatchTime(DateTime time, {DateTime? now}) {
     return '${two(local.month)}-${two(local.day)} $clock';
   }
   return '${local.year}-${two(local.month)}-${two(local.day)} $clock';
+}
+
+/// "3:07" or "1:02:05" for a playback position in milliseconds.
+String formatBilibiliWatchPosition(int positionMs) {
+  final total = positionMs < 0 ? 0 : positionMs ~/ 1000;
+  final hours = total ~/ 3600;
+  final minutes = (total % 3600) ~/ 60;
+  final seconds = total % 60;
+  String two(int v) => v.toString().padLeft(2, '0');
+  if (hours > 0) return '$hours:${two(minutes)}:${two(seconds)}';
+  return '$minutes:${two(seconds)}';
 }

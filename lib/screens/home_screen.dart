@@ -43,6 +43,7 @@ import '../widgets/media_library_recent_intent.dart';
 import '../widgets/media_library_recent_view.dart';
 import '../widgets/media_library_continue_view.dart';
 import '../widgets/media_library_root_surface_host.dart';
+import 'bilibili/bilibili_card_actions.dart';
 import 'bilibili/bilibili_home_page.dart';
 import '../models/media_library_root_entry.dart';
 import '../models/media_library_root_entry_order.dart';
@@ -2273,6 +2274,10 @@ class _HomeScreenState extends State<HomeScreen>
     if (_isClipboardDialogVisible || !mounted) return;
     final title = displayInfo.title;
     final cover = displayInfo.cover;
+    final watchBvid = clipboardWatchBvid(
+      linkTarget,
+      targetBvid: displayInfo.targetVideo?.videoInfo.bvid,
+    );
 
     final parentContext = context;
     _isClipboardDialogVisible = true;
@@ -2393,6 +2398,38 @@ class _HomeScreenState extends State<HomeScreen>
                 ),
               ),
             ),
+            if (watchBvid != null)
+              FilledButton.icon(
+                key: const ValueKey('clipboard-bilibili-watch'),
+                onPressed: () {
+                  Navigator.pop(dialogContext);
+                  if (!parentContext.mounted) return;
+                  unawaited(
+                    watchBilibiliVideo(
+                      parentContext,
+                      bvid: watchBvid,
+                      page: linkTarget.page,
+                      startAt: linkTarget.startAt,
+                    ),
+                  );
+                },
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.pinkAccent,
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size(0, 42),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  elevation: 0,
+                ),
+                icon: const Icon(Icons.play_arrow_rounded, size: 18),
+                label: const FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    "播放",
+                    maxLines: 1,
+                    style: TextStyle(fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ),
             FilledButton.icon(
               onPressed: () {
                 Navigator.pop(dialogContext);
@@ -4922,4 +4959,14 @@ class _MouseOrPinchScaleRecognizer extends ScaleGestureRecognizer {
     _touchPointers = 0;
     super.didStopTrackingLastPointer(pointer);
   }
+}
+
+/// BV id the clipboard dialog's "播放" plays: the matched video of a
+/// collection link, else the link's own BV (or av converted). Bangumi links
+/// have no plain video to play here.
+String? clipboardWatchBvid(BilibiliLinkTarget link, {String? targetBvid}) {
+  if (link.isBangumi) return null;
+  final matched = targetBvid?.trim();
+  if (matched != null && matched.isNotEmpty) return matched;
+  return link.bvid ?? (link.aid != null ? bvidFromAid(link.aid!) : null);
 }

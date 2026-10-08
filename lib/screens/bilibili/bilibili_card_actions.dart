@@ -9,10 +9,12 @@ import 'package:video_player_app/screens/bilibili_download_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
 import 'package:video_player_app/services/playlist_manager.dart';
+import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -23,6 +25,89 @@ import 'package:video_player_app/utils/app_toast.dart';
 const int kBilibiliAutoFillPartLimit = 50;
 
 bool _cardActionRunning = false;
+
+/// Opens a video from a Bilibili page on the playback page. Pages take one
+/// of these so tests can check the tap without starting playback.
+typedef BilibiliVideoWatcher =
+    Future<void> Function(
+      BuildContext context, {
+      required String bvid,
+      int? page,
+      Duration? startAt,
+    });
+
+/// The tap on a video in search results, watch history, an uploader's posts,
+/// a collection or a pasted link: plays [bvid] right away on the regular
+/// playback page.
+///
+/// By default a watch-only card is used (or the library card when one exists
+/// for the BV + part) and nothing is added to the media library; with "auto
+/// import on play" on, the library card is reused or created as before. [page]
+/// null continues the part saved in the watch history, [startAt] overrides
+/// the saved position.
+Future<void> watchBilibiliVideo(
+  BuildContext context, {
+  required String bvid,
+  int? page,
+  Duration? startAt,
+}) async {
+  if (_cardActionRunning) return;
+  _cardActionRunning = true;
+  final service = context.read<BilibiliDownloadService>();
+  final library = context.read<LibraryService>();
+  final playback = context.read<MediaPlaybackService>();
+  final loading = AppToast.showLoading('正在准备播放…');
+  BilibiliWatchPlan plan;
+  try {
+    await service.init();
+    plan = await prepareBilibiliWatch(
+      service: service,
+      library: library,
+      bvid: bvid,
+      page: page,
+      startAt: startAt,
+      settings: SettingsService(),
+      cards: BilibiliWatchCards.instance,
+      playingItemId: playback.currentItem?.id,
+    );
+  } catch (error, stack) {
+    developer.log('Playing $bvid failed', error: error, stackTrace: stack);
+    await loading.dismiss(immediate: true);
+    AppToast.show(_failureText('播放准备失败', error), type: AppToastType.error);
+    return;
+  } finally {
+    _cardActionRunning = false;
+  }
+  await loading.dismiss(immediate: true);
+  if (!context.mounted) return;
+  openLibraryItemPlayback(
+    context,
+    plan.item,
+    queue: plan.playsAlone ? <VideoItem>[plan.item] : null,
+  );
+  if (!plan.imported) return;
+
+  final partCount = plan.videoInfo.pages.length;
+  if (partCount > 1 && partCount <= kBilibiliAutoFillPartLimit) {
+    final playlist = context.read<PlaylistManager>();
+    unawaited(
+      _fillRemainingParts(
+        service,
+        library,
+        playlist,
+        BilibiliStreamCardBatch(
+          videoInfo: plan.videoInfo,
+          cards: <BilibiliStreamCardResult>[
+            BilibiliStreamCardResult(item: plan.item, created: false),
+          ],
+        ),
+        bvid: bvid,
+      ),
+    );
+  } else if (partCount > kBilibiliAutoFillPartLimit) {
+    AppToast.show('该视频分P较多，可用「导入为卡片」→「全部分P」补全选集');
+  }
+}
 
 /// "Play" on an in-app Bilibili page: reuse or create the online card for
 /// [bvid] part [page], then open it on the regular playback page.
@@ -58,6 +143,7 @@ Future<void> playBilibiliVideoAsCard(
     _cardActionRunning = false;
   }
   await loading.dismiss(immediate: true);
+  BilibiliWatchCards.instance?.track(batch.cards.first.item);
   if (!context.mounted) return;
   openLibraryItemPlayback(context, batch.cards.first.item);
 
@@ -139,14 +225,23 @@ Future<void> _fillRemainingParts(
   }
 }
 
-/// Opens a library card on the regular playback page (portrait or landscape
-/// per settings), with its folder as the episode queue.
-void openLibraryItemPlayback(BuildContext context, VideoItem item) {
+/// Opens a card on the regular playback page (portrait or landscape per
+/// settings), with its folder as the episode queue, or [queue] when given (a
+/// watch-only card has no folder and plays alone).
+void openLibraryItemPlayback(
+  BuildContext context,
+  VideoItem item, {
+  List<VideoItem>? queue,
+}) {
   final playback = context.read<MediaPlaybackService>();
   final existingController = playback.currentItem?.id == item.id
       ? playback.controller
       : null;
-  context.read<PlaylistManager>().prepareLibraryPlayback(item);
+  context.read<PlaylistManager>().prepareLibraryPlayback(
+    item,
+    searchItems: queue,
+    useSearchResultsAsQueue: queue != null,
+  );
   PlaybackNavigationService.instance.primeLibraryPlaybackEntry(
     playbackService: playback,
     item: item,

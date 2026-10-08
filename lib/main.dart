@@ -21,6 +21,7 @@ import 'services/bilibili/bilibili_cache_limit_service.dart';
 import 'services/embedded_subtitle_service.dart';
 import 'services/bilibili/bilibili_download_service.dart';
 import 'services/bilibili/bilibili_streaming_service.dart';
+import 'services/bilibili/bilibili_watch_cards.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/playback_navigation_service.dart';
@@ -447,7 +448,34 @@ Future<void> _initializeDeferredServices({
       playback: mediaPlaybackService,
     ),
   );
+
+  // Watch-only Bilibili cards: progress into the watch history, removed once
+  // neither playing nor shown on a playback page.
+  BilibiliWatchCards.install(
+    BilibiliWatchCards.forApp(
+      library: library,
+      playbackChanges: mediaPlaybackService,
+      currentItemId: () => mediaPlaybackService.currentItem?.id,
+      openPageItemIds: _openPlaybackPageItemIds,
+    ),
+  );
 }
+
+Iterable<String> _openPlaybackPageItemIds() sync* {
+  for (final route in PlaybackNavigationService.instance.observer.routes) {
+    final settings = route.settings;
+    final id = settings.arguments;
+    if (PlaybackNavigationService.isPlaybackRouteName(settings.name) &&
+        id is String) {
+      yield id;
+    }
+  }
+}
+
+final NavigatorObserver _watchCardsRouteObserver =
+    BilibiliWatchCards.routeObserver(
+      isPlaybackRoute: PlaybackNavigationService.isPlaybackRouteName,
+    );
 
 void _configureImageCaches() {
   final imageCache = PaintingBinding.instance.imageCache;
@@ -735,6 +763,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
               AppToast.observer,
               AppToast.routeObserver,
               PlaybackNavigationService.instance.observer,
+              _watchCardsRouteObserver,
               DebugLogNavigatorObserver(),
             ],
             builder: (context, child) {

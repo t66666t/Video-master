@@ -192,6 +192,10 @@ class _StructuredImportAccumulator {
   String? activityBatchId;
 }
 
+/// Told about every playback position written through
+/// [LibraryService.updateVideoProgress], watch-only cards included.
+typedef LibraryProgressObserver = void Function(VideoItem item, int positionMs);
+
 class LibraryService extends ChangeNotifier {
   Future<void> _reportDebugEvent(
     String hypothesisId,
@@ -273,9 +277,131 @@ class LibraryService extends ChangeNotifier {
   MediaMaterializationService? get mediaMaterializationService =>
       _mediaMaterializationService;
 
-  /// All library cards backed by a Bilibili online stream.
-  List<VideoItem> get bilibiliStreamItems =>
+  /// All library cards backed by a Bilibili online stream. Watch-only cards
+  /// are not library cards and are left out.
+  List<VideoItem> get bilibiliStreamItems => _videos.values
+      .where((item) => !item.isTransient && _isBilibiliStreamItem(item))
+      .toList(growable: false);
+
+  /// Every card that can own online cache: library cards and watch-only
+  /// cards. The cache cap and the one-tap clear go through this list.
+  List<VideoItem> get onlineCacheItems =>
       _videos.values.where(_isBilibiliStreamItem).toList(growable: false);
+
+  // --- Watch-only cards ---
+  //
+  // A watch-only card lives next to the library cards so the playback page
+  // can look it up, update its progress and subtitles by id like any card.
+  // It never joins a folder, and every list, the search, the activity
+  // records and library.json skip it. Its ids are written to a small side
+  // file so a card left behind by a crash is cleaned on the next start.
+
+  static const String _transientLedgerName = 'transient_cards.json';
+  final List<LibraryProgressObserver> _progressObservers =
+      <LibraryProgressObserver>[];
+  Future<void> _transientLedgerWrite = Future<void>.value();
+
+  /// Watch-only cards currently alive.
+  List<VideoItem> get transientVideos =>
+      _videos.values.where((item) => item.isTransient).toList(growable: false);
+
+  void addProgressObserver(LibraryProgressObserver observer) {
+    if (!_progressObservers.contains(observer)) {
+      _progressObservers.add(observer);
+    }
+  }
+
+  void removeProgressObserver(LibraryProgressObserver observer) {
+    _progressObservers.remove(observer);
+  }
+
+  /// Registers a watch-only card. It has no folder and is not saved with the
+  /// library.
+  Future<void> addTransientVideo(VideoItem item) async {
+    if (!item.isTransient) {
+      throw ArgumentError.value(item.id, 'item', 'not a watch-only card');
+    }
+    item.parentId = null;
+    _videos[item.id] = item;
+    _invalidateVideoSizeCache(item.id);
+    await _writeTransientLedger();
+  }
+
+  /// Removes a watch-only card together with everything it wrote: online
+  /// cache, cover, danmaku, subtitles and preview frames. Library cards are
+  /// never touched; returns false for them.
+  Future<bool> discardTransientVideo(String id) async {
+    final item = _videos[id];
+    if (item == null || !item.isTransient) return false;
+    _videos.remove(id);
+    _activity.media.remove(id);
+    _invalidateVideoSizeCache(id);
+    await _deleteVideoFiles(item);
+    await _writeTransientLedger();
+    return true;
+  }
+
+  File get _transientLedgerFile =>
+      File(p.join(_dataRootDir.path, _transientLedgerName));
+
+  @visibleForTesting
+  File get transientLedgerFileForTesting => _transientLedgerFile;
+
+  Future<void> _writeTransientLedger() {
+    if (!_initialized) return _transientLedgerWrite;
+    final file = _transientLedgerFile;
+    final cards = <Map<String, dynamic>>[
+      for (final item in _videos.values)
+        if (item.isTransient) item.toJson(),
+    ];
+    final next = _transientLedgerWrite.then((_) async {
+      try {
+        if (cards.isEmpty) {
+          if (await file.exists()) await file.delete();
+          return;
+        }
+        await file.writeAsString(json.encode(cards), flush: true);
+      } catch (error) {
+        developer.log('Watch-only card list not saved', error: error);
+      }
+    });
+    _transientLedgerWrite = next;
+    return next;
+  }
+
+  /// Startup: removes the files of watch-only cards left by the previous
+  /// run. Only online cards listed in the side file are cleaned, and never one
+  /// that is (still) a library card.
+  Future<int> _purgeTransientLeftovers() async {
+    final file = _transientLedgerFile;
+    var removed = 0;
+    try {
+      if (!await file.exists()) return 0;
+      final decoded = json.decode(await file.readAsString());
+      if (decoded is List) {
+        for (final raw in decoded) {
+          if (raw is! Map) continue;
+          final VideoItem item;
+          try {
+            item = VideoItem.fromJson(Map<String, dynamic>.from(raw));
+          } catch (_) {
+            continue;
+          }
+          if (_videos.containsKey(item.id) || !_isBilibiliStreamItem(item)) {
+            continue;
+          }
+          await _deleteVideoFiles(item);
+          removed++;
+        }
+      }
+    } catch (error) {
+      developer.log('Watch-only leftovers not cleaned', error: error);
+    }
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+    return removed;
+  }
 
   Future<String> downloadBilibiliAudioForTranscription(
     String videoId, {
@@ -441,7 +567,9 @@ class LibraryService extends ChangeNotifier {
     final recycledCols = _collections.values
         .where((c) => c.isRecycled)
         .toList();
-    final recycledVideos = _videos.values.where((v) => v.isRecycled).toList();
+    final recycledVideos = _videos.values
+        .where((v) => v.isRecycled && !v.isTransient)
+        .toList();
 
     // Logic: Only show items whose parent is NOT recycled (or has no parent).
     // If a parent is recycled, its children are implicitly recycled and hidden from top-level bin view.
@@ -506,10 +634,16 @@ class LibraryService extends ChangeNotifier {
   LibraryActivityProjection get activityProjection {
     return LibraryActivityProjection(
       store: _activity,
-      videoOf: getVideo,
+      videoOf: _libraryVideo,
       collectionOf: getCollection,
-      allVideos: () => _videos.values,
+      allVideos: () => _videos.values.where((item) => !item.isTransient),
     );
+  }
+
+  /// Library card [id]; null for unknown ids and watch-only cards.
+  VideoItem? _libraryVideo(String id) {
+    final item = _videos[id];
+    return item == null || item.isTransient ? null : item;
   }
 
   MediaActivityRecord? mediaActivity(String id) => _activity.media[id];
@@ -728,7 +862,7 @@ class LibraryService extends ChangeNotifier {
     int? lastPlayedAtMs,
   }) {
     if (!_canMutateActivity || deltaWatchMs <= 0) return;
-    if (!_videos.containsKey(mediaId)) return;
+    if (_libraryVideo(mediaId) == null) return;
     final record = _activity.ensureMedia(mediaId);
     record.accumulatedWatchMs += deltaWatchMs;
     if (lastPlayedAtMs != null) {
@@ -741,7 +875,7 @@ class LibraryService extends ChangeNotifier {
     String mediaId, {
     int? completedAtMs,
   }) async {
-    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    if (!_canMutateActivity || _libraryVideo(mediaId) == null) return;
     final record = _activity.ensureMedia(mediaId);
     record.completed = true;
     if (completedAtMs != null) {
@@ -762,7 +896,7 @@ class LibraryService extends ChangeNotifier {
     bool completed = false,
     int? completedAtMs,
   }) async {
-    if (!_canMutateActivity || !_videos.containsKey(mediaId)) return;
+    if (!_canMutateActivity || _libraryVideo(mediaId) == null) return;
     // First history stamp and first continue-enrollment persist immediately.
     // Later lastPlayedAt ticks stay on the progress debounce.
     final existing = _activity.media[mediaId];
@@ -843,7 +977,7 @@ class LibraryService extends ChangeNotifier {
     final List<VideoItem> result = [];
     for (var id in sourceIds) {
       final video = _videos[id];
-      if (video != null && !video.isRecycled) {
+      if (video != null && !video.isRecycled && !video.isTransient) {
         result.add(video);
       }
     }
@@ -1089,7 +1223,8 @@ class LibraryService extends ChangeNotifier {
   /// Durable evidence of an existing library. Recycled items still count so
   /// first-open warmup or a late JSON read is never treated as a new install.
   bool get hasExistingLibraryContent =>
-      _videos.isNotEmpty || _collections.isNotEmpty;
+      _videos.values.any((item) => !item.isTransient) ||
+      _collections.isNotEmpty;
 
   /// Nearest living (not recycled) ancestor, or null for the root grid.
   String? resolveLivingFolderId(String? folderId) {
@@ -1189,6 +1324,9 @@ class LibraryService extends ChangeNotifier {
     }
 
     _initialized = true;
+    // File clean-up only touches paths inside the data root once the service
+    // counts as initialized, so leftovers are purged after the flag is set.
+    await _purgeTransientLeftovers();
     notifyListeners();
     _scheduleDurationBackfill();
     _scheduleChapterBackfill();
@@ -1845,6 +1983,8 @@ class LibraryService extends ChangeNotifier {
     _collections = {};
     _videos = {};
     _rootChildrenIds = [];
+    _progressObservers.clear();
+    _transientLedgerWrite = Future<void>.value();
     _activity = LibraryActivityStore.empty();
     _openImportBatches.clear();
     _activityUnknownFuture = false;
@@ -1900,7 +2040,10 @@ class LibraryService extends ChangeNotifier {
 
     final data = {
       'collections': _collections.values.map((e) => e.toJson()).toList(),
-      'videos': _videos.values.map((e) => e.toJson()).toList(),
+      'videos': _videos.values
+          .where((e) => !e.isTransient)
+          .map((e) => e.toJson())
+          .toList(),
       'rootChildrenIds': _rootChildrenIds,
       'schemaVersion': _currentLibrarySchemaVersion,
       LibraryActivityStore.snapshotKey: _activitySnapshotForWrite(),
@@ -1931,7 +2074,17 @@ class LibraryService extends ChangeNotifier {
     if (_activityUnknownFuture && _preservedActivityRaw != null) {
       return _preservedActivityRaw!;
     }
-    return _activity.toJson();
+    final snapshot = _activity.toJson();
+    final watchOnlyIds = <String>{
+      for (final item in _videos.values)
+        if (item.isTransient) item.id,
+    };
+    if (watchOnlyIds.isEmpty) return snapshot;
+    snapshot['media'] = <Object?>[
+      for (final record in snapshot['media'] as List<dynamic>)
+        if (record is! Map || !watchOnlyIds.contains(record['id'])) record,
+    ];
+    return snapshot;
   }
 
   void _recordPersistenceFailure(Object error) {
@@ -1991,7 +2144,7 @@ class LibraryService extends ChangeNotifier {
         if (!col.isRecycled) results.add(col);
       } else if (_videos.containsKey(id)) {
         final vid = _videos[id]!;
-        if (!vid.isRecycled) results.add(vid);
+        if (!vid.isRecycled && !vid.isTransient) results.add(vid);
       }
     }
 
@@ -2048,7 +2201,9 @@ class LibraryService extends ChangeNotifier {
             searchQuery.matchesTitle(collection.name),
       ),
       ..._videos.values.where((video) {
-        if (video.isRecycled || hasRecycledAncestor(video.parentId)) {
+        if (video.isTransient ||
+            video.isRecycled ||
+            hasRecycledAncestor(video.parentId)) {
           return false;
         }
         return searchQuery.matchesTitle(video.title);
@@ -5041,8 +5196,22 @@ class LibraryService extends ChangeNotifier {
     final item = _videos[id];
     if (item != null) {
       item.lastPositionMs = positionMs;
-      item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
-      _scheduleDebouncedSave();
+      // A watch-only card is never saved; its progress goes to observers.
+      // Its lastUpdated stays at the creation time, which the clean-up uses
+      // to tell a card that is about to open from one that was just closed.
+      if (!item.isTransient) {
+        item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+        _scheduleDebouncedSave();
+      }
+      for (final observer in List<LibraryProgressObserver>.of(
+        _progressObservers,
+      )) {
+        try {
+          observer(item, positionMs);
+        } catch (error) {
+          developer.log('Progress observer failed', error: error);
+        }
+      }
     }
   }
 

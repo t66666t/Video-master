@@ -5,7 +5,7 @@ import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_account_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
@@ -29,11 +29,15 @@ class BilibiliHomePage extends StatefulWidget {
     required this.isActive,
     this.api,
     this.bottomPadding = 0,
+    this.onWatch,
   });
 
   final bool isActive;
   final BilibiliPublicApiService? api;
   final double bottomPadding;
+
+  /// Plays a tapped video or pasted link; defaults to [watchBilibiliVideo].
+  final BilibiliVideoWatcher? onWatch;
 
   @override
   State<BilibiliHomePage> createState() => _BilibiliHomePageState();
@@ -288,13 +292,22 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       }
     }
     if (!mounted) return;
-    await openBilibiliVideoDetail(
-      context,
-      bvid: resolved.bvid,
-      aid: resolved.aid,
-      initialPage: resolved.pageOrFirst,
-      api: _api,
-    );
+    final bvid =
+        resolved.bvid ??
+        (resolved.aid != null ? bvidFromAid(resolved.aid!) : null);
+    if (bvid == null) {
+      AppToast.show(
+        BilibiliShortLinkFailure.noVideo.message,
+        type: AppToastType.error,
+      );
+      return;
+    }
+    await _watch(bvid, page: resolved.page, startAt: resolved.startAt);
+  }
+
+  Future<void> _watch(String bvid, {int? page, Duration? startAt}) {
+    final watch = widget.onWatch ?? watchBilibiliVideo;
+    return watch(context, bvid: bvid, page: page, startAt: startAt);
   }
 
   _SearchResults<Object?> _resultsFor(int tab) =>
@@ -806,7 +819,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       final hint = _buildHint(
         Icons.travel_explore,
         '输入关键词搜索 B 站内容',
-        '也可以直接粘贴 BV 号或视频链接打开详情',
+        '也可以直接粘贴 BV 号或视频链接播放',
       );
       if (!_hasVisibleSearchHistory) return hint;
       return ListView(
@@ -916,8 +929,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       if (video.publishedAt != null) formatBilibiliDate(video.publishedAt),
     ].join(' · ');
     return InkWell(
-      onTap: () =>
-          openBilibiliVideoDetail(context, bvid: video.bvid, api: _api),
+      onTap: () => unawaited(_watch(video.bvid)),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         child: Row(
@@ -997,8 +1009,8 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     );
   }
 
-  /// The UP name opens the uploader page; the rest of the tile opens the
-  /// video detail.
+  /// The UP name opens the uploader page; the rest of the tile plays the
+  /// video.
   Widget _buildAuthor(BilibiliSearchVideo video) {
     final text = Text(
       video.author.isEmpty ? '未知 UP 主' : video.author,

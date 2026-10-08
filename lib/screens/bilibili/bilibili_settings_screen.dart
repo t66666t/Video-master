@@ -192,6 +192,26 @@ class _BilibiliSettingsScreenState extends State<BilibiliSettingsScreen> {
                 ),
               ),
             ),
+            const _SectionTitle('播放'),
+            _card(
+              SwitchListTile.adaptive(
+                key: const ValueKey('bilibili-setting-auto-import'),
+                value: _settings.bilibiliAutoImportOnPlay,
+                activeThumbColor: AppTokens.brandBilibili,
+                contentPadding: _tilePadding,
+                title: const Text('播放时自动导入媒体库', style: _titleStyle),
+                subtitle: const _Description(
+                  '关闭时只看不入库：从 B 站页播放的视频不进媒体库，关掉播放后自动清理，进度记在观看历史里。'
+                  '开启后播放即按 BV 和分P 复用或新建媒体库卡片。',
+                ),
+                onChanged: (value) => unawaited(
+                  _settings.updateSetting<bool>(
+                    'bilibiliAutoImportOnPlay',
+                    value,
+                  ),
+                ),
+              ),
+            ),
             const _SectionTitle('历史记录'),
             _card(
               Column(
@@ -227,7 +247,9 @@ class _BilibiliSettingsScreenState extends State<BilibiliSettingsScreen> {
                     activeThumbColor: AppTokens.brandBilibili,
                     contentPadding: _tilePadding,
                     title: const Text('记录观看历史', style: _titleStyle),
-                    subtitle: const _Description('关闭后从 B 站页播放不再新增观看记录；已有记录保留。'),
+                    subtitle: const _Description(
+                      '关闭后从 B 站页播放不再记录观看和进度，也不从上次的位置接着播；已有记录保留。',
+                    ),
                     onChanged: (value) => unawaited(
                       _settings.updateSetting<bool>(
                         'bilibiliRecordWatchHistory',

@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_uploader_models.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_uploader_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
@@ -139,6 +139,7 @@ class BilibiliUploaderScreen extends StatefulWidget {
     this.api,
     this.service,
     this.openExternal,
+    this.onWatch,
   });
 
   final int mid;
@@ -146,12 +147,15 @@ class BilibiliUploaderScreen extends StatefulWidget {
   /// Shown until the profile has loaded.
   final String initialName;
 
-  /// Cookie-free client, also handed to the video detail page.
+  /// Cookie-free client of the uploader requests.
   final BilibiliPublicApiService? api;
   final BilibiliUploaderService? service;
 
   /// Opens an article page outside the app; defaults to the system browser.
   final Future<bool> Function(Uri uri)? openExternal;
+
+  /// Plays a tapped video; defaults to [watchBilibiliVideo].
+  final BilibiliVideoWatcher? onWatch;
 
   @override
   State<BilibiliUploaderScreen> createState() => _BilibiliUploaderScreenState();
@@ -264,7 +268,8 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
   }
 
   void _openVideo(BilibiliUploaderVideo video) {
-    unawaited(openBilibiliVideoDetail(context, bvid: video.bvid, api: _api));
+    final watch = widget.onWatch ?? watchBilibiliVideo;
+    unawaited(watch(context, bvid: video.bvid));
   }
 
   void _openCollection(BilibiliUploaderCollection collection) {
@@ -276,6 +281,7 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
             collection: collection,
             api: _api,
             service: _service,
+            onWatch: widget.onWatch,
           ),
         ),
       ),
@@ -569,7 +575,7 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
   }
 }
 
-/// Videos of one collection, page by page; a tap opens the detail page.
+/// Videos of one collection, page by page; a tap plays the video.
 class BilibiliUploaderCollectionScreen extends StatefulWidget {
   const BilibiliUploaderCollectionScreen({
     super.key,
@@ -577,12 +583,16 @@ class BilibiliUploaderCollectionScreen extends StatefulWidget {
     required this.collection,
     required this.api,
     required this.service,
+    this.onWatch,
   });
 
   final int mid;
   final BilibiliUploaderCollection collection;
   final BilibiliPublicApiService api;
   final BilibiliUploaderService service;
+
+  /// Plays a tapped video; defaults to [watchBilibiliVideo].
+  final BilibiliVideoWatcher? onWatch;
 
   @override
   State<BilibiliUploaderCollectionScreen> createState() =>
@@ -633,7 +643,7 @@ class _BilibiliUploaderCollectionScreenState
         itemBuilder: (video) => BilibiliUploaderVideoTile(
           video: video,
           onTap: (v) => unawaited(
-            openBilibiliVideoDetail(context, bvid: v.bvid, api: widget.api),
+            (widget.onWatch ?? watchBilibiliVideo)(context, bvid: v.bvid),
           ),
         ),
       ),

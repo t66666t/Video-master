@@ -3690,6 +3690,80 @@ class BilibiliDownloadService extends ChangeNotifier {
     );
   }
 
+  /// Watch-only entry of the in-app Bilibili pages: the card that plays
+  /// [bvid] part [page] without adding anything to the media library.
+  ///
+  /// A live library card for the same BV + part is returned as is, and so is
+  /// a watch-only card that is still alive (for example in the mini player).
+  /// Otherwise a new watch-only card is built with the same player data as a
+  /// library card and registered through [LibraryService.addTransientVideo];
+  /// concurrent calls for the same part share one creation.
+  Future<BilibiliStreamCardResult> obtainWatchCard(
+    LibraryService library, {
+    required String bvid,
+    required int page,
+    BilibiliVideoInfo? videoInfo,
+  }) async {
+    final info = videoInfo ?? await apiService.fetchVideoInfo(bvid);
+    final videoBvid = info.bvid.trim().isNotEmpty ? info.bvid.trim() : bvid;
+    BilibiliPage? part;
+    for (final candidate in info.pages) {
+      if (candidate.page == page) {
+        part = candidate;
+        break;
+      }
+    }
+    if (part == null) {
+      throw StateError('找不到对应的分P，无法创建在线播放卡片');
+    }
+    final existing =
+        findStreamCard(library, bvid: videoBvid, page: part) ??
+        findBilibiliStreamCard(
+          library.transientVideos,
+          bvid: videoBvid,
+          page: part.page,
+          cid: part.cid,
+          collectionOf: library.getCollection,
+        );
+    if (existing != null) {
+      // A reused watch-only card restarts its clean-up grace, so it is not
+      // swept away between here and the playback page opening.
+      if (existing.isTransient) {
+        existing.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+      }
+      return BilibiliStreamCardResult(item: existing, created: false);
+    }
+    final key = 'watch:$videoBvid#${part.page}';
+    final inFlight = _streamCardsInFlight[key];
+    if (inFlight != null) {
+      final shared = await inFlight;
+      return BilibiliStreamCardResult(item: shared.item, created: false);
+    }
+    final future = _createStreamCard(
+      library,
+      videoInfo: info,
+      page: part,
+      episodeBvid: videoBvid,
+      episode: null,
+      originalSourceValue: info.pages.length > 1
+          ? 'https://www.bilibili.com/video/$videoBvid?p=${part.page}'
+          : 'https://www.bilibili.com/video/$videoBvid',
+      activityBatchId: null,
+      resolveParentId: null,
+      directories: null,
+      onStage: null,
+      transient: true,
+    );
+    _streamCardsInFlight[key] = future;
+    try {
+      return await future;
+    } finally {
+      if (identical(_streamCardsInFlight[key], future)) {
+        _streamCardsInFlight.remove(key);
+      }
+    }
+  }
+
   /// Entry for the in-app Bilibili pages (search / video detail): makes sure
   /// online cards exist for [pages] (1-based part numbers) of [bvid], reusing
   /// any live card for the same BV + part.
@@ -3937,6 +4011,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     required Future<String?> Function()? resolveParentId,
     required BilibiliStreamCardDirectories? directories,
     required void Function(String status, double weight)? onStage,
+    bool transient = false,
   }) async {
     onStage?.call('正在准备视频信息...', 0.12);
     final metadata = await apiService.fetchPlayerMetadata(
@@ -4080,7 +4155,12 @@ class BilibiliDownloadService extends ChangeNotifier {
       bilibiliVideoShot: videoShot,
       chapters: metadata.chapters,
       hasProbedChapters: true,
+      isTransient: transient,
     );
+    if (transient) {
+      await library.addTransientVideo(item);
+      return BilibiliStreamCardResult(item: item, created: true);
+    }
     onStage?.call('正在写入媒体库...', 0.86);
     await library.addSingleVideo(
       item,

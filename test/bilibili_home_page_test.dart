@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_home_page.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
@@ -147,15 +148,26 @@ void main() {
     expect(history.searchHistory, isEmpty);
   });
 
-  testWidgets('search shows videos and opens the detail page', (tester) async {
+  testWidgets('search shows videos and a tap plays without the detail page', (
+    tester,
+  ) async {
     tester.view.physicalSize = const Size(900, 2400);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
     final adapter = _FakeAdapter();
     final api = BilibiliPublicApiService(httpClientAdapter: adapter);
+    final watched = <(String, int?)>[];
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: BilibiliHomePage(isActive: true, api: api)),
+        home: Scaffold(
+          body: BilibiliHomePage(
+            isActive: true,
+            api: api,
+            onWatch: (context, {required bvid, page, startAt}) async {
+              watched.add((bvid, page));
+            },
+          ),
+        ),
       ),
     );
     expect(find.text('输入关键词搜索 B 站内容'), findsOneWidget);
@@ -172,12 +184,12 @@ void main() {
     await tester.tap(find.text('测试视频'));
     await tester.pumpAndSettle();
 
-    expect(find.text('详情标题'), findsOneWidget);
-    expect(find.text('播放'), findsOneWidget);
-    expect(find.text('导入为卡片'), findsOneWidget);
-    expect(find.text('下载'), findsOneWidget);
-    expect(find.text('分P（2）'), findsOneWidget);
-    expect(find.text('标签一'), findsOneWidget);
+    expect(watched, <(String, int?)>[(_bvid, null)]);
+    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
+    expect(
+      adapter.requests.where((r) => r.path.endsWith('/x/web-interface/view')),
+      isEmpty,
+    );
     for (final request in adapter.requests) {
       expect(
         request.headers.keys.map((k) => k.toLowerCase()),
@@ -186,21 +198,36 @@ void main() {
     }
   });
 
-  testWidgets('a BV id opens detail directly without searching', (
+  testWidgets('a pasted BV link plays directly without searching', (
     tester,
   ) async {
     final adapter = _FakeAdapter();
     final api = BilibiliPublicApiService(httpClientAdapter: adapter);
+    final watched = <(String, int?, Duration?)>[];
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: BilibiliHomePage(isActive: true, api: api)),
+        home: Scaffold(
+          body: BilibiliHomePage(
+            isActive: true,
+            api: api,
+            onWatch: (context, {required bvid, page, startAt}) async {
+              watched.add((bvid, page, startAt));
+            },
+          ),
+        ),
       ),
     );
-    await tester.enterText(find.byType(TextField), _bvid);
+    await tester.enterText(
+      find.byType(TextField),
+      'https://www.bilibili.com/video/$_bvid?p=2&t=75',
+    );
     await tester.testTextInput.receiveAction(TextInputAction.search);
     await tester.pumpAndSettle();
 
-    expect(find.text('详情标题'), findsOneWidget);
+    expect(watched, <(String, int?, Duration?)>[
+      (_bvid, 2, const Duration(seconds: 75)),
+    ]);
+    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
     expect(
       adapter.requests.where((r) => r.path.endsWith('/wbi/search/type')),
       isEmpty,

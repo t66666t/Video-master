@@ -176,7 +176,8 @@ class BilibiliCacheManager extends ChangeNotifier {
   }) {
     final prefs = settings ?? SettingsService();
     Future<void> removeEntry(String name, Directory dir) async {
-      for (final item in library.bilibiliStreamItems) {
+      // Watch-only cards count against the cap like library cards.
+      for (final item in library.onlineCacheItems) {
         if (BilibiliStreamingService.cacheEntryName(item.id) == name) {
           // Lease-aware: material still in use is deleted later.
           await library.clearOnlineCacheForItem(item.id);
@@ -206,7 +207,7 @@ class BilibiliCacheManager extends ChangeNotifier {
       clearEverything: () async {
         // Same order as the media library cache section: per card through
         // the lease-aware path, then sweep what is left.
-        for (final item in library.bilibiliStreamItems) {
+        for (final item in library.onlineCacheItems) {
           try {
             await library.clearOnlineCacheForItem(item.id);
           } catch (_) {}

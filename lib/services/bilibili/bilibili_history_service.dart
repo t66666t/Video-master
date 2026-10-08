@@ -24,6 +24,9 @@ class BilibiliWatchHistoryEntry {
   final String partTitle;
   final DateTime watchedAt;
 
+  /// Playback position in [page] when last saved, in milliseconds.
+  final int positionMs;
+
   const BilibiliWatchHistoryEntry({
     required this.bvid,
     required this.title,
@@ -32,17 +35,28 @@ class BilibiliWatchHistoryEntry {
     this.coverUrl = '',
     this.page = 1,
     this.partTitle = '',
+    this.positionMs = 0,
   });
 
-  BilibiliWatchHistoryEntry copyWith({String? coverUrl, DateTime? watchedAt}) {
+  /// Whole seconds of [positionMs].
+  int get positionSeconds => positionMs ~/ 1000;
+
+  BilibiliWatchHistoryEntry copyWith({
+    String? coverUrl,
+    DateTime? watchedAt,
+    int? page,
+    String? partTitle,
+    int? positionMs,
+  }) {
     return BilibiliWatchHistoryEntry(
       bvid: bvid,
       title: title,
       ownerName: ownerName,
       coverUrl: coverUrl ?? this.coverUrl,
-      page: page,
-      partTitle: partTitle,
+      page: page ?? this.page,
+      partTitle: partTitle ?? this.partTitle,
       watchedAt: watchedAt ?? this.watchedAt,
+      positionMs: positionMs ?? this.positionMs,
     );
   }
 
@@ -54,6 +68,7 @@ class BilibiliWatchHistoryEntry {
     'page': page,
     'part': partTitle,
     'at': watchedAt.millisecondsSinceEpoch,
+    'pos': positionMs,
   };
 
   static BilibiliWatchHistoryEntry? fromJson(Object? raw) {
@@ -63,6 +78,7 @@ class BilibiliWatchHistoryEntry {
     if (bvid is! String || bvid.isEmpty || at is! int) return null;
     String text(String key) => raw[key] is String ? raw[key] as String : '';
     final page = raw['page'];
+    final position = raw['pos'];
     return BilibiliWatchHistoryEntry(
       bvid: bvid,
       title: text('title'),
@@ -71,6 +87,7 @@ class BilibiliWatchHistoryEntry {
       page: page is int && page > 0 ? page : 1,
       partTitle: text('part'),
       watchedAt: DateTime.fromMillisecondsSinceEpoch(at),
+      positionMs: position is int && position > 0 ? position : 0,
     );
   }
 }
@@ -209,6 +226,45 @@ class BilibiliHistoryService extends ChangeNotifier {
         next,
         ..._watch.where((e) => e.bvid != entry.bvid),
       ].take(maxWatchEntries),
+    );
+    notifyListeners();
+    await _saveWatch();
+  }
+
+  /// The entry of [bvid], or null. Loaded entries only; call
+  /// [ensureLoaded] first.
+  BilibiliWatchHistoryEntry? watchEntryOf(String bvid) {
+    for (final entry in _watch) {
+      if (entry.bvid == bvid) return entry;
+    }
+    return null;
+  }
+
+  /// Saves where playback of [bvid] stands: part [page] at [positionMs]. Only
+  /// an entry that already exists is updated (it is created when the video
+  /// is opened) and it moves to the top. Does nothing while watch history is
+  /// off.
+  Future<void> recordProgress({
+    required String bvid,
+    required int page,
+    required int positionMs,
+    String? partTitle,
+    DateTime? at,
+  }) async {
+    if (bvid.isEmpty || !SettingsService().bilibiliRecordWatchHistory) return;
+    await ensureLoaded();
+    final old = watchEntryOf(bvid);
+    if (old == null) return;
+    final position = positionMs < 0 ? 0 : positionMs;
+    final samePart = old.page == page;
+    final next = old.copyWith(
+      page: page,
+      partTitle: samePart ? old.partTitle : (partTitle ?? ''),
+      positionMs: position,
+      watchedAt: at ?? DateTime.now(),
+    );
+    _watch = List<BilibiliWatchHistoryEntry>.unmodifiable(
+      <BilibiliWatchHistoryEntry>[next, ..._watch.where((e) => e.bvid != bvid)],
     );
     notifyListeners();
     await _saveWatch();

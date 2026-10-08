@@ -133,10 +133,13 @@ class _FakeBili implements HttpClientAdapter {
 }
 
 class _Env {
-  _Env(this.bili, this.opened);
+  _Env(this.bili, this.opened, this.watched);
 
   final _FakeBili bili;
   final List<Uri> opened;
+
+  /// BV ids handed to the play entry, in tap order.
+  final List<String> watched;
 }
 
 Future<_Env> _pumpUploader(
@@ -149,6 +152,7 @@ Future<_Env> _pumpUploader(
   final bili = _FakeBili();
   configure?.call(bili);
   final opened = <Uri>[];
+  final watched = <String>[];
   await tester.pumpWidget(
     MaterialApp(
       home: BilibiliUploaderScreen(
@@ -159,11 +163,14 @@ Future<_Env> _pumpUploader(
           opened.add(uri);
           return true;
         },
+        onWatch: (context, {required bvid, page, startAt}) async {
+          watched.add(bvid);
+        },
       ),
     ),
   );
   await tester.pumpAndSettle();
-  return _Env(bili, opened);
+  return _Env(bili, opened, watched);
 }
 
 /// Lets plain-async fakes complete (outside widget tests).
@@ -501,13 +508,15 @@ void main() {
     expect(find.text('还没有投稿'), findsOneWidget);
   });
 
-  testWidgets('tapping a video opens the detail page', (tester) async {
-    await _pumpUploader(tester);
+  testWidgets('tapping a video plays it instead of opening the detail page', (
+    tester,
+  ) async {
+    final env = await _pumpUploader(tester);
     await tester.tap(find.text('投稿 1-0'));
     await tester.pumpAndSettle();
-    expect(find.byType(BilibiliVideoDetailScreen), findsOneWidget);
-    expect(find.text('详情标题'), findsOneWidget);
-    expect(find.text('播放'), findsOneWidget);
+    expect(env.watched, hasLength(1));
+    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
+    expect(find.byType(BilibiliUploaderScreen), findsOneWidget);
   });
 
   testWidgets('articles open their https bilibili.com page', (tester) async {
@@ -542,7 +551,7 @@ void main() {
     }
   });
 
-  testWidgets('collections open a paged video list, then the detail page', (
+  testWidgets('collections open a paged video list; a video plays directly', (
     tester,
   ) async {
     final env = await _pumpUploader(
@@ -596,7 +605,9 @@ void main() {
 
     await tester.tap(find.text('合集视频一'));
     await tester.pumpAndSettle();
-    expect(find.text('详情标题'), findsOneWidget);
+    expect(env.watched, <String>[_detailBvid]);
+    expect(find.byType(BilibiliVideoDetailScreen), findsNothing);
+    expect(find.byType(BilibiliUploaderCollectionScreen), findsOneWidget);
   });
 
   testWidgets('the UP block on the detail page opens the uploader page', (

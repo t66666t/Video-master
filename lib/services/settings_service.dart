@@ -828,6 +828,12 @@ class SettingsService extends ChangeNotifier {
   /// history. Turning it off keeps existing entries.
   bool bilibiliRecordWatchHistory = true;
 
+  /// Whether playing from the Bilibili pages also imports the video: on, the
+  /// library card for the BV + part is reused or created as before; off (the
+  /// default), playback uses a watch-only card that never enters the media
+  /// library.
+  bool bilibiliAutoImportOnPlay = false;
+
   /// Bilibili account read-only mode, on by default. While on, nothing that
   /// changes the account (like, coin, favourite, follow, ...) may be sent to
   /// Bilibili. Callers that would write check [bilibiliAccountWritesAllowed]
@@ -1708,6 +1714,11 @@ class SettingsService extends ChangeNotifier {
         apply: (service, value) => service.bilibiliRecordWatchHistory = value,
       ),
       _boolSetting(
+        key: 'bilibiliAutoImportOnPlay',
+        defaultValue: false,
+        apply: (service, value) => service.bilibiliAutoImportOnPlay = value,
+      ),
+      _boolSetting(
         key: 'bilibiliAccountReadOnly',
         defaultValue: true,
         apply: (service, value) => service.bilibiliAccountReadOnly = value,
@@ -2222,6 +2233,7 @@ class SettingsService extends ChangeNotifier {
     clipboardLastHandledText = null;
     bilibiliRecordSearchHistory = true;
     bilibiliRecordWatchHistory = true;
+    bilibiliAutoImportOnPlay = false;
     bilibiliAccountReadOnly = true;
     bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
@@ -3611,6 +3623,7 @@ class SettingsService extends ChangeNotifier {
         'skipRepeatedClipboardText': skipRepeatedClipboardText,
         'bilibiliRecordSearchHistory': bilibiliRecordSearchHistory,
         'bilibiliRecordWatchHistory': bilibiliRecordWatchHistory,
+        'bilibiliAutoImportOnPlay': bilibiliAutoImportOnPlay,
         'bilibiliAccountReadOnly': bilibiliAccountReadOnly,
         'bilibiliCacheLimitBytes': bilibiliCacheLimitBytes,
         'structuredImportSortField': structuredImportSortField,
