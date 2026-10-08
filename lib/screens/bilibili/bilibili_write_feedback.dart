@@ -53,6 +53,7 @@ void showBilibiliWriteFeedback(
       );
     case BilibiliWriteOutcome.riskControlled ||
         BilibiliWriteOutcome.failed ||
+        BilibiliWriteOutcome.invalidRequest ||
         BilibiliWriteOutcome.networkError:
       AppToast.show(result.message, type: AppToastType.error);
   }

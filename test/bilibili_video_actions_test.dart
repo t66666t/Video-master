@@ -21,6 +21,10 @@ const _upMid = 9527;
 
 /// Answers the cookie-free detail requests.
 class _DetailAdapter implements HttpClientAdapter {
+  _DetailAdapter({this.copyright = 1});
+
+  final int copyright;
+
   @override
   Future<ResponseBody> fetch(
     RequestOptions options,
@@ -34,6 +38,7 @@ class _DetailAdapter implements HttpClientAdapter {
               'bvid': _bvid,
               'aid': _aid,
               'title': '详情标题',
+              'copyright': copyright,
               'owner': {'mid': _upMid, 'name': 'UP甲'},
               'stat': {'view': 100, 'like': 20, 'coin': 5, 'favorite': 3},
               'pages': [
@@ -147,6 +152,74 @@ void main() {
       expect(BilibiliVideoActions.coinsLeft(5), 0);
     });
 
+    test('coin cap: original 2, reprint 1, unknown counts as 2', () {
+      expect(BilibiliVideoActions.coinLimit(1), 2);
+      expect(BilibiliVideoActions.coinLimit(2), 1);
+      expect(BilibiliVideoActions.coinLimit(0), 2);
+      expect(BilibiliVideoActions.coinsLeft(0, copyright: 1), 2);
+      expect(BilibiliVideoActions.coinsLeft(1, copyright: 1), 1);
+      expect(BilibiliVideoActions.coinsLeft(0, copyright: 2), 1);
+      expect(BilibiliVideoActions.coinsLeft(1, copyright: 2), 0);
+    });
+
+    test(
+      'out-of-range coin counts fail at run time with zero requests',
+      () async {
+        final h = _Harness();
+        final cases = <({int count, int copyright, int given})>[
+          (count: 0, copyright: 1, given: 0),
+          (count: 3, copyright: 1, given: 0),
+          (count: -1, copyright: 1, given: 0),
+          (count: 2, copyright: 2, given: 0), // reprint cap is 1
+          (count: 1, copyright: 2, given: 1), // reprint already full
+          (count: 2, copyright: 1, given: 1), // only one left
+          (count: 1, copyright: 1, given: 2), // original already full
+        ];
+        for (final c in cases) {
+          final result = await h.actions.addCoins(
+            aid: _aid,
+            count: c.count,
+            copyright: c.copyright,
+            alreadyGiven: c.given,
+          );
+          expect(
+            result.outcome,
+            BilibiliWriteOutcome.invalidRequest,
+            reason: '$c',
+          );
+          expect(result.isSuccess, isFalse, reason: '$c');
+          expect(result.requestSent, isFalse, reason: '$c');
+        }
+        expect(h.writes.requests, isEmpty);
+
+        final ok = await h.actions.addCoins(aid: _aid, count: 1, copyright: 2);
+        expect(ok.isSuccess, isTrue);
+        expect(h.writes.forms.single['multiply'], '1');
+      },
+    );
+
+    test(
+      'other writes reject bad ids at run time with zero requests',
+      () async {
+        final h = _Harness();
+        final results = [
+          await h.actions.setLiked(aid: 0, liked: true),
+          await h.actions.addCoins(aid: 0, count: 1),
+          await h.actions.setFollowing(mid: 0, following: true),
+          (await h.actions.updateFavorites(aid: 0, before: {}, after: {11}))!,
+          (await h.actions.updateFavorites(
+            aid: _aid,
+            before: {},
+            after: {-3},
+          ))!,
+        ];
+        for (final r in results) {
+          expect(r.outcome, BilibiliWriteOutcome.invalidRequest);
+        }
+        expect(h.writes.requests, isEmpty);
+      },
+    );
+
     test('favourites send only what changed, nothing when unchanged', () async {
       final h = _Harness();
       expect(
@@ -209,7 +282,11 @@ void main() {
   });
 
   group('detail page', () {
-    Future<void> pumpDetail(WidgetTester tester, _Harness h) async {
+    Future<void> pumpDetail(
+      WidgetTester tester,
+      _Harness h, {
+      int copyright = 1,
+    }) async {
       tester.view.physicalSize = const Size(900, 2000);
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.reset);
@@ -223,7 +300,9 @@ void main() {
           navigatorKey: AppToast.navigatorKey,
           home: BilibiliVideoDetailScreen(
             bvid: _bvid,
-            api: BilibiliPublicApiService(httpClientAdapter: _DetailAdapter()),
+            api: BilibiliPublicApiService(
+              httpClientAdapter: _DetailAdapter(copyright: copyright),
+            ),
             actions: h.actions,
           ),
         ),
@@ -360,7 +439,7 @@ void main() {
       expect(h.writes.requests.single.uri.path, '/x/web-interface/coin/add');
       expect(h.writes.forms.single['multiply'], '1');
       expect(h.writes.forms.single['select_like'], '0');
-      expect(button(tester, 'coin').label, '已投币');
+      expect(button(tester, 'coin').label, '已投满');
       expect(find.text('6 投币'), findsOneWidget);
 
       // Full: no dialog, no request.
@@ -368,6 +447,41 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.byType(AlertDialog), findsNothing);
       expect(h.writes.requests, hasLength(1));
+      await finish(tester);
+    });
+
+    testWidgets('reprint: only the 1-coin option; one given shows full', (
+      tester,
+    ) async {
+      final h = _Harness();
+      await pumpDetail(tester, h, copyright: 2);
+      await tester.tap(find.byKey(const ValueKey('bilibili-action-coin')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('bilibili-coin-option-1')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('bilibili-coin-option-2')),
+        findsNothing,
+      );
+      expect(find.text('转载视频每人只能投 1 枚'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('bilibili-coin-confirm')));
+      await tester.pumpAndSettle();
+      expect(h.writes.forms.single['multiply'], '1');
+      expect(button(tester, 'coin').label, '已投满');
+      await finish(tester);
+
+      final full = _Harness()
+        ..readAnswers['/x/web-interface/archive/coins'] = {'multiply': 1};
+      await pumpDetail(tester, full, copyright: 2);
+      expect(button(tester, 'coin').label, '已投满');
+      await tester.tap(find.byKey(const ValueKey('bilibili-action-coin')));
+      await tester.pump();
+      await tester.pump();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(find.text('转载视频只能投 1 枚硬币，已经投满了'), findsOneWidget);
+      expect(full.writes.requests, isEmpty);
       await finish(tester);
     });
 

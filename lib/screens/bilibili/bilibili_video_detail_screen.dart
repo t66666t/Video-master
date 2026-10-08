@@ -308,7 +308,7 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
           children: [
             AspectRatio(
               aspectRatio: 16 / 10,
-              child: BilibiliCoverImage(url: detail.coverUrl, borderRadius: 10),
+              child: BilibiliSharpCoverImage(url: detail.coverUrl),
             ),
             const SizedBox(height: 14),
             SelectableText(

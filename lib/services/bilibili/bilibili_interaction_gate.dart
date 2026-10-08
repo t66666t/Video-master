@@ -20,6 +20,10 @@ enum BilibiliWriteOutcome {
   /// Logged in but without bili_jct, so there is no csrf; nothing was sent.
   missingCsrf,
 
+  /// The write's own parameters were out of range (checked at run time, also
+  /// in release builds); nothing was sent.
+  invalidRequest,
+
   /// Bilibili answered -101. The stored login is kept as it is.
   loginExpired,
 
@@ -59,7 +63,8 @@ class BilibiliWriteResult {
   bool get requestSent => switch (outcome) {
     BilibiliWriteOutcome.readOnly ||
     BilibiliWriteOutcome.notLoggedIn ||
-    BilibiliWriteOutcome.missingCsrf => false,
+    BilibiliWriteOutcome.missingCsrf ||
+    BilibiliWriteOutcome.invalidRequest => false,
     _ => true,
   };
 

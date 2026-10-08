@@ -76,7 +76,23 @@ void main() {
       expect(detail.parts.single.cid, 99);
       expect(detail.season, isNull);
       expect(detail.tags, isEmpty);
+      expect(detail.copyright, 0);
+      expect(detail.isReprint, isFalse);
       expect(BilibiliVideoDetail.tryParse({'title': 'no id'}), isNull);
+    });
+
+    test('detail keeps copyright through withTags', () {
+      final reprint = BilibiliVideoDetail.tryParse({
+        'bvid': _bvid,
+        'copyright': 2,
+      })!;
+      expect(reprint.isReprint, isTrue);
+      expect(reprint.withTags(const ['a']).copyright, 2);
+      final original = BilibiliVideoDetail.tryParse({
+        'bvid': _bvid,
+        'copyright': '1',
+      })!;
+      expect(original.copyright, 1);
     });
 
     test('detail parses parts, season and stats', () {
@@ -182,6 +198,40 @@ void main() {
         'javascript:alert(1)',
       ]) {
         expect(bilibiliCoverThumbnailUrl(bad), isNull, reason: '$bad');
+      }
+    });
+
+    test('sharp detail cover follows width x devicePixelRatio', () {
+      const raw = '//i0.hdslb.com/bfs/archive/a.jpg';
+      const base = 'https://i0.hdslb.com/bfs/archive/a.jpg';
+      expect(bilibiliCoverSharpUrl(raw, 300), '$base@672w_378h_1c.webp');
+      expect(bilibiliCoverSharpUrl(raw, 672), '$base@672w_378h_1c.webp');
+      expect(bilibiliCoverSharpUrl(raw, 673), '$base@960w_540h_1c.webp');
+      expect(bilibiliCoverSharpUrl(raw, 788 * 1.5), '$base@1280w_720h_1c.webp');
+      // Wider than every tier: the original image, no suffix.
+      expect(bilibiliCoverSharpUrl(raw, 788 * 2.0), base);
+      // A thumbnail URL is upgraded from the same image path.
+      expect(
+        bilibiliCoverSharpUrl(bilibiliCoverThumbnailUrl(raw), 900),
+        '$base@960w_540h_1c.webp',
+      );
+      // List thumbnails are untouched.
+      expect(bilibiliCoverThumbnailUrl(raw), '$base@320w_200h_1c.webp');
+    });
+
+    test('sharp detail cover keeps the host rules', () {
+      expect(
+        bilibiliCoverSharpUrl('http://archive.biliimg.com/bfs/a.png', 500),
+        'https://archive.biliimg.com/bfs/a.png@672w_378h_1c.webp',
+      );
+      for (final bad in [
+        null,
+        'https://evil.com/a.jpg',
+        'https://hdslb.com.evil.com/a.jpg',
+        'https://user@i0.hdslb.com/a.jpg',
+        'ftp://i0.hdslb.com/a.jpg',
+      ]) {
+        expect(bilibiliCoverSharpUrl(bad, 800), isNull, reason: '$bad');
       }
     });
 

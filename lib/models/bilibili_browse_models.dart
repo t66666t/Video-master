@@ -378,6 +378,9 @@ class BilibiliVideoDetail {
   final BilibiliVideoSeason? season;
   final List<String> tags;
 
+  /// `copyright` of the view answer: 1 original, 2 reprint, 0 unknown.
+  final int copyright;
+
   const BilibiliVideoDetail({
     required this.bvid,
     this.aid = 0,
@@ -392,7 +395,10 @@ class BilibiliVideoDetail {
     this.parts = const <BilibiliVideoPart>[],
     this.season,
     this.tags = const <String>[],
+    this.copyright = 0,
   });
+
+  bool get isReprint => copyright == 2;
 
   BilibiliVideoDetail withTags(List<String> value) => BilibiliVideoDetail(
     bvid: bvid,
@@ -408,6 +414,7 @@ class BilibiliVideoDetail {
     parts: parts,
     season: season,
     tags: List<String>.unmodifiable(value),
+    copyright: copyright,
   );
 
   /// Parses the `data` object of `/x/web-interface/view`.
@@ -459,6 +466,7 @@ class BilibiliVideoDetail {
       durationSeconds: duration,
       parts: List<BilibiliVideoPart>.unmodifiable(parts),
       season: BilibiliVideoSeason.tryParse(data['ugc_season']),
+      copyright: readBiliInt(data['copyright']),
     );
   }
 }

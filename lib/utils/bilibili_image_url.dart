@@ -7,8 +7,16 @@ library;
 
 const List<String> _allowedImageDomains = <String>['hdslb.com', 'biliimg.com'];
 
-/// Small cover variant used by lists and the detail header.
+/// Small cover variant used by lists (and as the detail header placeholder).
 const String bilibiliCoverThumbnailSuffix = '@320w_200h_1c.webp';
+
+/// Sharper 16:9 cover sizes for the detail header, smallest first. Wider
+/// than the last one loads the original image without a suffix.
+const List<(int, String)> bilibiliCoverSharpTiers = <(int, String)>[
+  (672, '@672w_378h_1c.webp'),
+  (960, '@960w_540h_1c.webp'),
+  (1280, '@1280w_720h_1c.webp'),
+];
 
 final RegExp _hostPattern = RegExp(r'^[a-z0-9-]+(?:\.[a-z0-9-]+)+$');
 
@@ -58,6 +66,25 @@ String? bilibiliCoverThumbnailUrl(String? raw) {
     host: uri.host,
     path: '$path$bilibiliCoverThumbnailSuffix',
   ).toString();
+}
+
+/// Detail header cover sized for [pixelWidth] physical pixels (display
+/// width × devicePixelRatio): the smallest tier that covers it, never below
+/// 672w, or the original image when even 1280w is too small. Same host rules
+/// as [normalizeBilibiliImageUrl]; null means "keep the placeholder".
+String? bilibiliCoverSharpUrl(String? raw, double pixelWidth) {
+  final normalized = normalizeBilibiliImageUrl(raw);
+  if (normalized == null) return null;
+  final uri = Uri.parse(normalized);
+  final path = _stripProcessingSuffix(uri.path);
+  var suffix = '';
+  for (final (width, tierSuffix) in bilibiliCoverSharpTiers) {
+    if (!pixelWidth.isFinite || pixelWidth <= width) {
+      suffix = tierSuffix;
+      break;
+    }
+  }
+  return Uri(scheme: 'https', host: uri.host, path: '$path$suffix').toString();
 }
 
 /// Avatar: normalized only. No crop suffix, so the original framing is kept.

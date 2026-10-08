@@ -298,6 +298,48 @@ class BilibiliPublicApiService {
     return _anonymousBuvid3;
   }
 
+  // ------------------------------------------------------- other readers
+
+  /// Cookie-free GET for other public readers (e.g. uploader data) on
+  /// `api.bilibili.com`. [path] starts with `/x/`.
+  ///
+  /// [signed] adds WBI signing with the shared [WbiSigner] (falls back to
+  /// the plain query when the keys are unavailable). [anonymousDevice] sends
+  /// only the public `buvid3` device id, never the login cookie.
+  ///
+  /// HTTP 412 comes back as `{'code': -412}` so callers can treat it as risk
+  /// control; see [isRiskControlPayload]. Network, other HTTP and parse
+  /// failures throw [BilibiliPublicApiException].
+  Future<Map<String, dynamic>> getPublicJson(
+    String path, {
+    Map<String, dynamic> query = const <String, dynamic>{},
+    required String referer,
+    required String what,
+    bool signed = false,
+    bool anonymousDevice = false,
+  }) async {
+    if (!path.startsWith('/x/')) {
+      throw BilibiliPublicApiException('$what请求地址无效');
+    }
+    return _getJson(
+      '$_api$path',
+      query: signed ? await _signedQuery(query) : query,
+      referer: referer,
+      what: what,
+      anonymousCookie: anonymousDevice ? await _ensureAnonymousBuvid() : null,
+      allowRiskStatus: true,
+    );
+  }
+
+  /// Risk control / rate limiting: -352, -412, -799 or HTTP 412.
+  static bool isRiskControlPayload(Map<String, dynamic> payload) {
+    final code = payload['code'];
+    return code == -352 ||
+        code == -412 ||
+        code == -799 ||
+        payload['__http'] == 412;
+  }
+
   // ------------------------------------------------------------ short link
 
   /// Resolves a b23.tv short link without the login cookie: https only, at

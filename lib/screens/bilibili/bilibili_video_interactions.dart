@@ -57,6 +57,9 @@ class BilibiliVideoInteractions extends ChangeNotifier {
 
   bool get hasOwner => detail.owner.mid > 0;
 
+  /// Coin cap of this video (1 for a reprint, otherwise 2).
+  int get coinLimit => BilibiliVideoActions.coinLimit(detail.copyright);
+
   void _changed() {
     if (!_disposed) notifyListeners();
   }
@@ -149,13 +152,20 @@ class BilibiliVideoInteractions extends ChangeNotifier {
           showBilibiliWriteFeedback(context, blocked);
           return;
         }
-        final left = BilibiliVideoActions.coinsLeft(coins);
+        final limit = coinLimit;
+        final left = BilibiliVideoActions.coinsLeft(
+          coins,
+          copyright: detail.copyright,
+        );
         if (left == 0) {
-          AppToast.show('这个视频已经投过 ${BilibiliVideoActions.maxCoins} 枚硬币了');
+          AppToast.show(
+            detail.isReprint ? '转载视频只能投 1 枚硬币，已经投满了' : '这个视频已经投满 $limit 枚硬币了',
+          );
           return;
         }
         final choice = await showBilibiliCoinDialog(
           context,
+          limit: limit,
           maxCoins: left,
           canAlsoLike: liked != true,
         );
@@ -166,6 +176,8 @@ class BilibiliVideoInteractions extends ChangeNotifier {
             aid: detail.aid,
             count: choice.count,
             alsoLike: choice.alsoLike,
+            copyright: detail.copyright,
+            alreadyGiven: coins ?? 0,
           ),
         );
         if (result.isSuccess) {
@@ -290,21 +302,34 @@ class BilibiliCoinChoice {
 /// Coin confirmation. Coins are real and cannot be returned, so only
 /// 「确认投币」 returns a choice; cancel, tapping outside and back all return
 /// null. One coin is selected by default.
+///
+/// [limit] is the video's cap (1 for a reprint, so only one option is
+/// offered); [maxCoins] is what is still left of it.
 Future<BilibiliCoinChoice?> showBilibiliCoinDialog(
   BuildContext context, {
+  int limit = BilibiliVideoActions.maxCoins,
   required int maxCoins,
   required bool canAlsoLike,
 }) {
+  final cap = limit.clamp(1, BilibiliVideoActions.maxCoins);
   return showDialog<BilibiliCoinChoice>(
     context: context,
-    builder: (_) =>
-        _CoinDialog(maxCoins: maxCoins.clamp(1, 2), canAlsoLike: canAlsoLike),
+    builder: (_) => _CoinDialog(
+      limit: cap,
+      maxCoins: maxCoins.clamp(1, cap),
+      canAlsoLike: canAlsoLike,
+    ),
   );
 }
 
 class _CoinDialog extends StatefulWidget {
-  const _CoinDialog({required this.maxCoins, required this.canAlsoLike});
+  const _CoinDialog({
+    required this.limit,
+    required this.maxCoins,
+    required this.canAlsoLike,
+  });
 
+  final int limit;
   final int maxCoins;
   final bool canAlsoLike;
 
@@ -327,7 +352,7 @@ class _CoinDialogState extends State<_CoinDialog> {
           Wrap(
             spacing: 10,
             children: [
-              for (final n in const [1, 2])
+              for (var n = 1; n <= widget.limit; n++)
                 ChoiceChip(
                   key: ValueKey('bilibili-coin-option-$n'),
                   label: Text('$n 枚'),
@@ -342,7 +367,15 @@ class _CoinDialogState extends State<_CoinDialog> {
                 ),
             ],
           ),
-          if (widget.maxCoins < 2)
+          if (widget.limit < BilibiliVideoActions.maxCoins)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                '转载视频每人只能投 1 枚',
+                style: TextStyle(color: AppTokens.text2, fontSize: 12),
+              ),
+            )
+          else if (widget.maxCoins < widget.limit)
             const Padding(
               padding: EdgeInsets.only(top: 6),
               child: Text(
@@ -613,9 +646,8 @@ class BilibiliVideoInteractionBar extends StatelessWidget {
     final s = interactions;
     final coins = s.coins;
     final coinLabel = switch (coins) {
-      null => '投币',
-      0 => '投币',
-      >= BilibiliVideoActions.maxCoins => '已投币',
+      null || 0 => '投币',
+      final int n when n >= s.coinLimit => '已投满',
       _ => '已投 $coins',
     };
     return Wrap(

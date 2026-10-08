@@ -45,8 +45,11 @@ class BilibiliVideoActions {
     );
   }
 
-  /// Coins one account may give one video.
+  /// Most coins one account may give an original video.
   static const int maxCoins = 2;
+
+  /// Most coins for a reprint (`copyright == 2`).
+  static const int maxCoinsReprint = 1;
 
   static const String _host = 'api.bilibili.com';
 
@@ -64,9 +67,15 @@ class BilibiliVideoActions {
     }
   }
 
-  /// Coins still allowed: [maxCoins] minus what was already given.
-  static int coinsLeft(int? given) {
-    final left = maxCoins - (given ?? 0);
+  /// Coin cap for a video: 1 for a reprint (`copyright == 2`), otherwise 2.
+  /// An unknown copyright counts as original; Bilibili still refuses a
+  /// second coin on a reprint.
+  static int coinLimit(int copyright) =>
+      copyright == 2 ? maxCoinsReprint : maxCoins;
+
+  /// Coins still allowed: the cap for [copyright] minus what was given.
+  static int coinsLeft(int? given, {int copyright = 0}) {
+    final left = coinLimit(copyright) - (given ?? 0);
     return left < 0 ? 0 : left;
   }
 
@@ -135,25 +144,49 @@ class BilibiliVideoActions {
   }
 
   // ----------------------------------------------------------------- writes
+  //
+  // Parameters are checked at run time (not with asserts, which release
+  // builds drop). A bad value returns [BilibiliWriteOutcome.invalidRequest]
+  // without touching the network.
+
+  static BilibiliWriteResult _invalid(String message) => BilibiliWriteResult(
+    BilibiliWriteOutcome.invalidRequest,
+    message: message,
+  );
+
+  static const String _badVideo = '视频信息不完整，操作未发送';
 
   Future<BilibiliWriteResult> setLiked({
     required int aid,
     required bool liked,
-  }) {
+  }) async {
+    if (aid <= 0) return _invalid(_badVideo);
     return gate.post(
       Uri.https(_host, '/x/web-interface/archive/like'),
       form: {'aid': '$aid', 'like': liked ? '1' : '2'},
     );
   }
 
-  /// Gives [count] coins (1 or 2). Coins cannot be taken back; the page asks
-  /// for an explicit confirmation before calling this.
+  /// Gives [count] coins. Coins cannot be taken back; the page asks for an
+  /// explicit confirmation before calling this.
+  ///
+  /// [count] must be within 1..(cap for [copyright] − [alreadyGiven]);
+  /// anything else returns a failed result and sends nothing.
   Future<BilibiliWriteResult> addCoins({
     required int aid,
     required int count,
     bool alsoLike = false,
-  }) {
-    assert(count == 1 || count == 2);
+    int copyright = 0,
+    int alreadyGiven = 0,
+  }) async {
+    if (aid <= 0) return _invalid(_badVideo);
+    final left = coinsLeft(alreadyGiven, copyright: copyright);
+    if (left <= 0) {
+      return _invalid('这个视频最多投 ${coinLimit(copyright)} 枚硬币，已经投满了');
+    }
+    if (count < 1 || count > left) {
+      return _invalid('投币数量不正确（这次最多 $left 枚），操作未发送');
+    }
     return gate.post(
       Uri.https(_host, '/x/web-interface/coin/add'),
       form: {
@@ -174,6 +207,10 @@ class BilibiliVideoActions {
     final added = after.difference(before);
     final removed = before.difference(after);
     if (added.isEmpty && removed.isEmpty) return null;
+    if (aid <= 0) return _invalid(_badVideo);
+    if (added.any((id) => id <= 0) || removed.any((id) => id <= 0)) {
+      return _invalid('收藏夹信息不正确，操作未发送');
+    }
     return gate.post(
       Uri.https(_host, '/x/v3/fav/resource/deal'),
       form: {
@@ -188,7 +225,8 @@ class BilibiliVideoActions {
   Future<BilibiliWriteResult> setFollowing({
     required int mid,
     required bool following,
-  }) {
+  }) async {
+    if (mid <= 0) return _invalid('UP 主信息不完整，操作未发送');
     return gate.post(
       Uri.https(_host, '/x/relation/modify'),
       form: {'fid': '$mid', 'act': following ? '1' : '2', 're_src': '11'},
