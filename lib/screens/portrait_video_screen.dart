@@ -18,6 +18,7 @@ import '../services/bilibili/bilibili_player_panel_memory.dart';
 import '../services/bilibili/bilibili_player_panel_policy.dart';
 import '../services/bilibili/bilibili_player_video.dart';
 import '../widgets/bilibili_player_panel.dart';
+import '../widgets/bilibili_subtitle_tracks_section.dart';
 import '../widgets/bilibili_portrait_tabs.dart';
 import '../services/bilibili/bilibili_video_shot_backfill.dart';
 import '../services/library_service.dart';
@@ -5160,6 +5161,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           associatedSubtitles: associatedSubtitlesForSheet,
           localSubtitles: localSubtitlesForSheet,
           initialSelectedPaths: selectedPathsForSheet,
+          bilibiliTracks: bilibiliSubtitleTracksFor(context, _currentItem),
           onSubtitleChanged: () {
             // Reload if needed or handled by logic
           },

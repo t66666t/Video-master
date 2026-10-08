@@ -386,7 +386,7 @@ class BilibiliSubtitleTracks extends ChangeNotifier {
   static (BilibiliDownloadService, LibraryService, BilibiliSubtitleTracks)?
   _app;
 
-  @visibleForTesting
+  /// Used instead of the app instance when set (tests put fakes here).
   static BilibiliSubtitleTracks? overrideForTesting;
 
   final BilibiliSubtitleTrackSource source;

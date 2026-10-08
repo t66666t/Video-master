@@ -18,6 +18,8 @@ import '../utils/app_toast.dart';
 import '../utils/reveal_in_file_manager.dart';
 import '../utils/subtitle_parser.dart';
 import '../utils/subtitle_file_matcher.dart';
+import '../services/bilibili/bilibili_subtitle_tracks.dart';
+import 'bilibili_subtitle_tracks_section.dart';
 import 'landscape_sidebar_layout.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
@@ -77,6 +79,10 @@ class SubtitleManagementSheet extends StatefulWidget {
   final List<String> initialSelectedPaths;
   final bool showEmbeddedSubtitles;
 
+  /// The Bilibili subtitle tracks of the video, listed as「B 站字幕」in place
+  /// of the bound download subtitles. Null for other videos.
+  final BilibiliSubtitleTracks? bilibiliTracks;
+
   const SubtitleManagementSheet({
     super.key,
     required this.videoPath,
@@ -90,6 +96,7 @@ class SubtitleManagementSheet extends StatefulWidget {
     this.localSubtitles,
     this.initialSelectedPaths = const [],
     this.showEmbeddedSubtitles = true,
+    this.bilibiliTracks,
   });
 
   @override
@@ -1667,6 +1674,12 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     }
   }
 
+  /// A Bilibili track that was just fetched becomes selected (never
+  /// unselected, should it already be).
+  void _selectFetchedSubtitle(String path) {
+    if (!_selectedContains(path)) _handleSelection(path);
+  }
+
   void _handleSelection(String path) {
     final normalizedPath = p.normalize(path);
     setState(() {
@@ -1684,6 +1697,104 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     if (widget.onSubtitleSelected != null) {
       widget.onSubtitleSelected!(_selectedPaths);
     }
+  }
+
+  /// A subtitle file bound to the card (download or Bilibili track), with
+  /// its export and translate actions. [isAi] adds the「AI」mark.
+  Widget _buildAssociatedRow({
+    required String label,
+    required String path,
+    bool isAi = false,
+  }) {
+    final exists = File(path).existsSync();
+    return Container(
+      margin: const EdgeInsets.only(bottom: 4),
+      decoration: BoxDecoration(
+        color: Colors.purpleAccent.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.purpleAccent.withValues(alpha: 0.2)),
+      ),
+      child: Column(
+        children: [
+          // Its own surface, so the selected colour and the tap ripple
+          // show above the row colour.
+          Material(
+            type: MaterialType.transparency,
+            child: ListTile(
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 0,
+              ),
+              leading: const Icon(
+                Icons.subtitles,
+                color: Colors.purpleAccent,
+                size: 20,
+              ),
+              title: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      label,
+                      style: TextStyle(
+                        color: _selectedIndexOf(path) == 0
+                            ? Colors.blueAccent
+                            : (_selectedIndexOf(path) == 1
+                                  ? Colors.orangeAccent
+                                  : Colors.white),
+                        fontSize: 13,
+                        fontWeight: _selectedContains(path)
+                            ? FontWeight.bold
+                            : FontWeight.normal,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  if (isAi) ...[
+                    const SizedBox(width: 6),
+                    const BilibiliAiBadge(),
+                  ],
+                  const SizedBox(width: 8),
+                  _buildSelectionBadge(path),
+                ],
+              ),
+              subtitle: Text(
+                exists ? "已就绪" : "文件丢失",
+                style: TextStyle(
+                  color: exists ? Colors.white30 : Colors.redAccent,
+                  fontSize: 11,
+                ),
+              ),
+              selected: _selectedContains(path),
+              selectedTileColor: Colors.white10,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(
+                      Icons.download_outlined,
+                      color: Colors.white70,
+                      size: 18,
+                    ),
+                    onPressed: exists
+                        ? () => _downloadSubtitleFile(path)
+                        : null,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                  const SizedBox(width: 6),
+                  _buildTranslateAction(path: path, enabled: exists),
+                ],
+              ),
+              onTap: exists ? () => _handleSelection(path) : null,
+            ),
+          ),
+          _buildTranslationPanel(path: path, enabled: exists),
+        ],
+      ),
+    );
   }
 
   Widget _buildSelectionBadge(String path) {
@@ -3095,6 +3206,18 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
     final associatedSubtitles = <String, String>{
       ...?widget.associatedSubtitles,
     };
+    final bilibiliTracks = widget.bilibiliTracks;
+    final bilibiliItemId = widget.videoId;
+    final showBilibiliTracks = bilibiliTracks != null && bilibiliItemId != null;
+    if (showBilibiliTracks) {
+      // The group lists every file bound to the card (also ones saved after
+      // the page last rebuilt), so no other group shows them again.
+      final item = bilibiliTracks.store.itemOf(bilibiliItemId);
+      associatedSubtitles.addAll(
+        item?.downloadAssociatedSubtitles ?? const <String, String>{},
+      );
+      shownPaths.addAll(associatedSubtitles.values.map(_normalizePath));
+    }
     final classification = SubtitleClassificationIndex(
       downloadAssociatedPaths: associatedSubtitles.values,
       extractedEmbeddedPaths: _extractedTrackPaths.values,
@@ -3238,6 +3361,7 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                 (_subtitleFiles.isEmpty &&
                     !hasEmbeddedContent &&
                     associatedSubtitles.isEmpty &&
+                    !showBilibiliTracks &&
                     !_isScanningFiles &&
                     !_isScanningEmbedded)
                 ? const Center(
@@ -3276,8 +3400,24 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                             ],
                           ),
                         ),
-                      // 1. Subtitles created and bound by a download task.
-                      if (associatedSubtitles.isNotEmpty) ...[
+                      // 1. Subtitles created and bound by a download task;
+                      // for a Bilibili video, all of its tracks.
+                      if (showBilibiliTracks) ...[
+                        BilibiliSubtitleTracksSection(
+                          itemId: bilibiliItemId,
+                          tracks: bilibiliTracks,
+                          onPick: _selectFetchedSubtitle,
+                          savedRow: (track) => _buildAssociatedRow(
+                            label: track.label,
+                            path: track.path!,
+                            isAi: track.isAi,
+                          ),
+                        ),
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 4),
+                          child: Divider(color: Colors.white10, height: 1),
+                        ),
+                      ] else if (associatedSubtitles.isNotEmpty) ...[
                         const Padding(
                           padding: EdgeInsets.only(bottom: 4, top: 4),
                           child: Text(
@@ -3294,117 +3434,15 @@ class _SubtitleManagementSheetState extends State<SubtitleManagementSheet> {
                               (entry) =>
                                   shownPaths.add(_normalizePath(entry.value)),
                             )
-                            .map((entry) {
-                              final label = _displayNameForPath(
-                                entry.value,
-                                fallback: entry.key,
-                              );
-                              final path = entry.value;
-                              final file = File(path);
-                              final exists = file.existsSync();
-
-                              return Container(
-                                margin: const EdgeInsets.only(bottom: 4),
-                                decoration: BoxDecoration(
-                                  color: Colors.purpleAccent.withValues(
-                                    alpha: 0.1,
-                                  ),
-                                  borderRadius: BorderRadius.circular(6),
-                                  border: Border.all(
-                                    color: Colors.purpleAccent.withValues(
-                                      alpha: 0.2,
-                                    ),
-                                  ),
+                            .map(
+                              (entry) => _buildAssociatedRow(
+                                label: _displayNameForPath(
+                                  entry.value,
+                                  fallback: entry.key,
                                 ),
-                                child: Column(
-                                  children: [
-                                    ListTile(
-                                      dense: true,
-                                      visualDensity: VisualDensity.compact,
-                                      contentPadding:
-                                          const EdgeInsets.symmetric(
-                                            horizontal: 12,
-                                            vertical: 0,
-                                          ),
-                                      leading: const Icon(
-                                        Icons.subtitles,
-                                        color: Colors.purpleAccent,
-                                        size: 20,
-                                      ),
-                                      title: Row(
-                                        children: [
-                                          Expanded(
-                                            child: Text(
-                                              label,
-                                              style: TextStyle(
-                                                color:
-                                                    _selectedIndexOf(path) == 0
-                                                    ? Colors.blueAccent
-                                                    : (_selectedIndexOf(path) ==
-                                                              1
-                                                          ? Colors.orangeAccent
-                                                          : Colors.white),
-                                                fontSize: 13,
-                                                fontWeight:
-                                                    _selectedContains(path)
-                                                    ? FontWeight.bold
-                                                    : FontWeight.normal,
-                                              ),
-                                              maxLines: 1,
-                                              overflow: TextOverflow.ellipsis,
-                                            ),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          _buildSelectionBadge(path),
-                                        ],
-                                      ),
-                                      subtitle: Text(
-                                        exists ? "已就绪" : "文件丢失",
-                                        style: TextStyle(
-                                          color: exists
-                                              ? Colors.white30
-                                              : Colors.redAccent,
-                                          fontSize: 11,
-                                        ),
-                                      ),
-                                      selected: _selectedContains(path),
-                                      selectedTileColor: Colors.white10,
-                                      trailing: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          IconButton(
-                                            icon: const Icon(
-                                              Icons.download_outlined,
-                                              color: Colors.white70,
-                                              size: 18,
-                                            ),
-                                            onPressed: exists
-                                                ? () => _downloadSubtitleFile(
-                                                    path,
-                                                  )
-                                                : null,
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
-                                          ),
-                                          const SizedBox(width: 6),
-                                          _buildTranslateAction(
-                                            path: path,
-                                            enabled: exists,
-                                          ),
-                                        ],
-                                      ),
-                                      onTap: exists
-                                          ? () => _handleSelection(path)
-                                          : null,
-                                    ),
-                                    _buildTranslationPanel(
-                                      path: path,
-                                      enabled: exists,
-                                    ),
-                                  ],
-                                ),
-                              );
-                            }),
+                                path: entry.value,
+                              ),
+                            ),
                         const Padding(
                           padding: EdgeInsets.symmetric(vertical: 4),
                           child: Divider(color: Colors.white10, height: 1),

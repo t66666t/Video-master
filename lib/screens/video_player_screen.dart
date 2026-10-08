@@ -60,6 +60,7 @@ import '../widgets/landscape_sidebar_layout.dart';
 import '../widgets/desktop_player_sidebar.dart';
 import '../widgets/bilibili_panel_overlay.dart';
 import '../widgets/bilibili_player_panel.dart';
+import '../widgets/bilibili_subtitle_tracks_section.dart';
 import '../services/transcription_manager.dart';
 import '../services/ocr_subtitle_manager.dart';
 import '../services/bilibili/bilibili_player_panel_memory.dart';
@@ -6736,6 +6737,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           associatedSubtitles: associatedSubtitlesForSheet,
           localSubtitles: localSubtitlesForSheet,
           initialSelectedPaths: selectedPathsForSheet,
+          bilibiliTracks: bilibiliSubtitleTracksFor(context, _currentItem),
           onSubtitleChanged: () {
             // Logic to refresh if needed
           },
