@@ -12,6 +12,7 @@ import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
+import 'package:video_player_app/widgets/bilibili_adaptive_list.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 
 /// Opens the read-only uploader (UP 主) page for [mid].
@@ -739,15 +740,11 @@ class BilibiliUploaderPagedList<T> extends StatelessWidget {
           onNotification: (n) => _onScroll(n.metrics),
           child: NotificationListener<ScrollUpdateNotification>(
             onNotification: (n) => _onScroll(n.metrics),
-            child: ListView.builder(
+            child: BilibiliAdaptiveList(
               padding: const EdgeInsets.only(top: 4, bottom: 24),
-              itemCount: pager.items.length + 1,
-              itemBuilder: (context, index) {
-                if (index < pager.items.length) {
-                  return itemBuilder(pager.items[index]);
-                }
-                return _buildFooter();
-              },
+              itemCount: pager.items.length,
+              itemBuilder: (context, index) => itemBuilder(pager.items[index]),
+              footer: (context) => _buildFooter(),
             ),
           ),
         );

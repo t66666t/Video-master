@@ -9,6 +9,7 @@ import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
+import 'package:video_player_app/widgets/bilibili_adaptive_list.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 
 /// Opens a watch history entry. The default plays it through
@@ -146,7 +147,7 @@ class _BilibiliWatchHistoryScreenState
           ),
           body: entries.isEmpty
               ? const _EmptyHistory()
-              : ListView.builder(
+              : BilibiliAdaptiveList(
                   padding: const EdgeInsets.only(top: 4, bottom: 24),
                   itemCount: entries.length,
                   itemBuilder: (context, index) => _buildTile(entries[index]),

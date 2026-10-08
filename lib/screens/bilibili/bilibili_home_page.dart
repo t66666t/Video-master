@@ -19,6 +19,7 @@ import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
+import 'package:video_player_app/widgets/bilibili_adaptive_list.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 
 /// Fourth root page: Bilibili search with video/user results.
@@ -864,16 +865,20 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       }
       return _buildHint(Icons.search_off, '没有找到相关结果', '换个关键词试试');
     }
-    return ListView.builder(
-      controller: controller,
-      padding: EdgeInsets.only(bottom: 16 + widget.bottomPadding),
-      itemCount: results.items.length + 1,
-      itemBuilder: (context, index) {
-        if (index < results.items.length) {
-          return itemBuilder(results.items[index]);
-        }
-        return _buildFooter(results, tab);
+    // Wide windows show the results in columns: a page may then no longer
+    // fill the list, so check for more whenever its size changes.
+    return NotificationListener<ScrollMetricsNotification>(
+      onNotification: (_) {
+        _maybeLoadMore(tab);
+        return false;
       },
+      child: BilibiliAdaptiveList(
+        controller: controller,
+        padding: EdgeInsets.only(bottom: 16 + widget.bottomPadding),
+        itemCount: results.items.length,
+        itemBuilder: (context, index) => itemBuilder(results.items[index]),
+        footer: (context) => _buildFooter(results, tab),
+      ),
     );
   }
 
