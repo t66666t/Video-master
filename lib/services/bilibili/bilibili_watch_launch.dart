@@ -329,6 +329,10 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
   final List<T> _held = <T>[];
   T? _ready;
 
+  /// Given-up results cleaned up while [_ready] kept part of them (a retry
+  /// reused their cards).
+  final List<T> _keptByReady = <T>[];
+
   BilibiliWatchLaunchPhase get phase => _phase;
 
   /// Why the last try failed, for the page.
@@ -409,7 +413,7 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
 
   void _abandon(T result) {
     if (_settled) {
-      unawaited(_discard(result, _ready));
+      _discardGivenUp(result);
     } else {
       _held.add(result);
     }
@@ -418,8 +422,27 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
   void _releaseHeld() {
     final held = List<T>.of(_held);
     _held.clear();
-    for (final result in held) {
-      unawaited(_discard(result, _ready));
+    held.forEach(_discardGivenUp);
+  }
+
+  void _discardGivenUp(T result) {
+    final kept = _ready;
+    if (kept != null) _keptByReady.add(result);
+    unawaited(_discard(result, kept));
+  }
+
+  /// The ready result is not used after all (the page was left before the
+  /// playback page opened): it is cleaned up at once, together with what
+  /// given-up tries left only because it reused it.
+  void discardReady() {
+    final ready = _ready;
+    if (ready == null) return;
+    _ready = null;
+    unawaited(_discard(ready, null));
+    final again = List<T>.of(_keptByReady);
+    _keptByReady.clear();
+    for (final result in again) {
+      unawaited(_discard(result, null));
     }
   }
 

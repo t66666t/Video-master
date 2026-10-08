@@ -107,8 +107,9 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
       route = mounted ? ModalRoute.of(context) : null;
     }
     if (!mounted || route == null || !route.isActive) {
-      final discard = widget.discard;
-      if (discard != null) unawaited(discard(plan, null));
+      // Left in the instant between ready and open: what this watch made,
+      // including cards a retry took over from a given-up try, goes now.
+      _launch.discardReady();
       return;
     }
     _opening = true;

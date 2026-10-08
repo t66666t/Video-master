@@ -202,7 +202,11 @@ Future<void> _openLoadingPage(
           ),
           discard: (plan, kept) => discardAbandonedWatch(
             plan,
-            keep: kept?.itemIds ?? const <String>{},
+            keep: <String>{
+              ...?kept?.itemIds,
+              // The Bilibili playlist's entries stay.
+              ...?BilibiliWatchPlaylistSession.instance?.queuedItemIds(),
+            },
             library: library,
             playingItemId: playback.currentItem?.id,
             openPageItemIds: _openPlaybackPageItemIds(),

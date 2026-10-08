@@ -458,6 +458,10 @@ void main() {
       required List<BilibiliWatchPlan> opened,
       BilibiliVideoInfo? info,
       Duration timeLimit = kBilibiliWatchTimeLimit,
+      bool openOnReady = true,
+      String? playingItemId,
+      Iterable<String> openPageItemIds = const <String>[],
+      Iterable<String> Function()? listed,
     }) {
       var tries = 0;
       final launch = BilibiliWatchLaunch<BilibiliWatchPlan>(
@@ -475,13 +479,16 @@ void main() {
           )(attempt);
         },
         onReady: (plan, _) {
+          if (!openOnReady) return;
           opened.add(plan);
           unawaited(noteOpenedWatch(plan, history: history));
         },
         discard: (plan, kept) => discardAbandonedWatch(
           plan,
           library: library,
-          keep: kept?.itemIds ?? const <String>{},
+          playingItemId: playingItemId,
+          openPageItemIds: openPageItemIds,
+          keep: <String>{...?kept?.itemIds, ...?listed?.call()},
         ),
       );
       addTearDown(launch.dispose);
@@ -585,6 +592,92 @@ void main() {
         BilibiliPage(cid: 102, page: 2, part: '下', duration: 600),
       ],
     );
+
+    for (final lateFirst in <bool>[true, false]) {
+      test('time limit, retry, then back in the instant between ready and '
+          'open (the given-up try answers ${lateFirst ? 'before' : 'after'}): '
+          'every card goes at once', () async {
+        final service = newService();
+        final firstWarm = Completer<void>();
+        final opened = <BilibiliWatchPlan>[];
+        final launch = launchOf(
+          service,
+          info: twoParts(),
+          timeLimit: const Duration(milliseconds: 200),
+          warm: (attempt) => attempt == 1 ? firstWarm.future : Future.value(),
+          opened: opened,
+          openOnReady: false,
+        )..start();
+        await until(() => library.transientVideos.length == 2);
+        await until(() => launch.phase == BilibiliWatchLaunchPhase.failed);
+        if (lateFirst) firstWarm.complete();
+        launch.retry();
+        await until(() => launch.phase == BilibiliWatchLaunchPhase.ready);
+        if (!lateFirst) firstWarm.complete();
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        // The retry took over the cards of the given-up try.
+        expect(library.transientVideos, hasLength(2));
+
+        launch.discardReady();
+        await until(() => library.transientVideos.isEmpty);
+        expect(opened, isEmpty);
+        expect(entriesOf(_bvid), 0);
+      });
+    }
+
+    test('back in that instant spares what plays, what another page shows '
+        'and the Bilibili playlist\'s entries', () async {
+      final service = newService();
+      final firstWarm = Completer<void>();
+      final protected = <String>{};
+      String? playing;
+      final pages = <String>[];
+      final launch = launchOf(
+        service,
+        info: twoParts(),
+        timeLimit: const Duration(milliseconds: 200),
+        warm: (attempt) => attempt == 1 ? firstWarm.future : Future.value(),
+        opened: <BilibiliWatchPlan>[],
+        openOnReady: false,
+        listed: () => protected,
+      )..start();
+      await until(() => library.transientVideos.length == 2);
+      await until(() => launch.phase == BilibiliWatchLaunchPhase.failed);
+      firstWarm.complete();
+      launch.retry();
+      await until(() => launch.phase == BilibiliWatchLaunchPhase.ready);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      final ids = library.transientVideos.map((v) => v.id).toList();
+      expect(ids, hasLength(2));
+      // Part 2 sits in the Bilibili playlist.
+      protected.add(ids.last);
+      launch.discardReady();
+      await until(() => library.transientVideos.length == 1);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(library.transientVideos.single.id, ids.last);
+
+      // Playing and open-page cards stay too.
+      final plan = BilibiliWatchPlan(
+        item: library.transientVideos.single,
+        videoInfo: twoParts(),
+        imported: false,
+        createdItemIds: <String>{ids.last},
+      );
+      playing = ids.last;
+      pages.add(ids.last);
+      protected.clear();
+      await discardAbandonedWatch(
+        plan,
+        library: library,
+        playingItemId: playing,
+      );
+      await discardAbandonedWatch(
+        plan,
+        library: library,
+        openPageItemIds: pages,
+      );
+      expect(library.transientVideos.single.id, ids.last);
+    });
 
     for (final lateFirst in <bool>[true, false]) {
       test('time limit, then retry (the given-up try answers '
@@ -723,6 +816,7 @@ void main() {
       Future<BilibiliWatchPlan> Function(BilibiliWatchAttempt) load, {
       required List<BilibiliWatchPlan> opened,
       List<BilibiliWatchPlan>? discarded,
+      List<String>? discardLog,
       BilibiliWatchPreview? preview = const BilibiliWatchPreview(
         title: '测试视频',
         coverUrl: _cover,
@@ -748,7 +842,10 @@ void main() {
                   ),
                 );
               },
-              discard: (plan, _) async => discarded?.add(plan),
+              discard: (plan, kept) async {
+                discarded?.add(plan);
+                discardLog?.add('${plan.item.id}<-${kept?.item.id}');
+              },
             ),
           ),
         ),
@@ -843,6 +940,56 @@ void main() {
       await tester.pumpAndSettle();
       expect(opened.single.item.id, 'watch-2');
       expect(discarded.single.item.id, 'late');
+    });
+
+    testWidgets('back in the instant between ready and open cleans up the '
+        'ready try and what it took over, at once', (tester) async {
+      await pumpHost(tester);
+      final cover = File(
+        '${Directory.systemTemp.createTempSync('bilibili_cover_').path}'
+        '/cover.jpg',
+      )..writeAsBytesSync(<int>[1, 2, 3, 4]);
+      addTearDown(() => cover.parent.deleteSync(recursive: true));
+      final answers = <Completer<BilibiliWatchPlan>>[];
+      final opened = <BilibiliWatchPlan>[];
+      final log = <String>[];
+      push(
+        (attempt) {
+          final answer = Completer<BilibiliWatchPlan>();
+          answers.add(answer);
+          return answer.future;
+        },
+        opened: opened,
+        discardLog: log,
+      );
+      await showRoute(tester);
+      await tester.pump(kBilibiliWatchTimeLimit);
+      await tester.tap(find.byKey(const ValueKey('bilibili-watch-retry')));
+      await tester.pump();
+      // Ready: the page now waits for the cover to be decoded.
+      final ready = _plan('watch-2');
+      ready.item.thumbnailPath = cover.path;
+      answers.last.complete(ready);
+      await tester.pump();
+      answers.first.complete(_plan('late'));
+      await tester.pump();
+      expect(log, <String>['late<-watch-2']);
+
+      await tester.tap(
+        find.byKey(const ValueKey('bilibili-watch-loading-back')),
+      );
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(opened, isEmpty);
+      expect(find.text('list'), findsOneWidget);
+      expect(
+        log,
+        unorderedEquals(<String>[
+          'late<-watch-2',
+          'watch-2<-null',
+          'late<-null',
+        ]),
+      );
     });
 
     testWidgets('a failure shows its reason instead of spinning on', (

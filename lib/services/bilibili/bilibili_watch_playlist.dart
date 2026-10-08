@@ -232,6 +232,12 @@ class BilibiliWatchPlaylistSession {
     return title.isEmpty ? item.title : title;
   }
 
+  /// Every entry of the list's queue while it is the playback queue.
+  Iterable<String> queuedItemIds() {
+    if (!isActive) return const <String>[];
+    return List<String>.of(_queueIds!);
+  }
+
   /// Entries of the list's queue that have no files yet; they stay while
   /// the list plays on (the mini player's previous / next use them).
   Iterable<String> placeholderIds() {
