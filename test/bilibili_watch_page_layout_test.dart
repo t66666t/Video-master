@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_loading_page.dart';
@@ -14,6 +15,8 @@ import 'package:video_player_app/screens/portrait_video_screen.dart';
 import 'package:video_player_app/screens/video_player_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_open_timeline.dart';
+import 'package:video_player_app/services/bilibili/bilibili_player_panel_memory.dart';
+import 'package:video_player_app/services/bilibili/bilibili_player_panel_policy.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
@@ -25,6 +28,8 @@ import 'package:video_player_app/services/playlist_manager.dart';
 import 'package:video_player_app/services/progress_tracker.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/services/transcription_manager.dart';
+import 'package:video_player_app/widgets/bilibili_player_panel.dart';
+import 'package:video_player_app/widgets/bilibili_portrait_tabs.dart';
 
 import 'test_dir_cleanup.dart';
 
@@ -179,6 +184,7 @@ void main() {
       Provider.debugCheckInvalidValueType = null;
       SharedPreferences.setMockInitialValues(<String, Object>{});
       settings.resetForTest();
+      await settings.init();
       root = await Directory.systemTemp.createTemp('bilibili_watch_layout_');
       originalPaths = PathProviderPlatform.instance;
       PathProviderPlatform.instance = _Paths(root.path);
@@ -195,6 +201,7 @@ void main() {
     });
 
     tearDown(() async {
+      BilibiliPortraitTabMemory.takeHandOff(_item().id);
       settings
         ..isLeftHandedMode = false
         ..bilibiliPlayerPanelOpen = true
@@ -410,6 +417,187 @@ void main() {
       await close(tester);
     });
 
+    testWidgets('the loading page shows the player\'s own Bilibili panel; '
+        'collapsing it there is remembered as in the player', (tester) async {
+      window(tester, const Size(1280, 720));
+      settings.bilibiliPlayerPanelOpen = true;
+      final load = Completer<BilibiliWatchPlan>();
+      await tester.pumpWidget(
+        host(
+          BilibiliWatchLoadingPage(
+            bvid: _bvid,
+            preview: const BilibiliWatchPreview(title: _title),
+            load: (_) => load.future,
+            open: (_, _, _, _) async {},
+            timeline: () => BilibiliOpenTimeline(_bvid),
+          ),
+        ),
+      );
+      await tester.pump();
+      final sidebar = find.byKey(
+        const ValueKey('bilibili-watch-loading-sidebar-bilibili'),
+      );
+      expect(
+        find.descendant(
+          of: sidebar,
+          matching: find.byType(BilibiliPlayerPanel),
+        ),
+        findsOneWidget,
+      );
+      await tester.tap(find.byKey(const ValueKey('bilibili-panel-collapse')));
+      await tester.pump();
+      expect(sidebar, findsNothing);
+      expect(settings.bilibiliPlayerPanelOpen, isFalse);
+      expect(
+        find.byKey(const ValueKey('bilibili-watch-loading-sidebar-subtitles')),
+        findsOneWidget,
+      );
+      await close(tester);
+    });
+
+    /// Rects of the portrait lower area: the switch and the whole area.
+    Future<(Rect, Rect)> portraitLowerArea(WidgetTester tester) async {
+      final tabs = find.byType(BilibiliPortraitTabs);
+      return (
+        tester.getRect(
+          find.descendant(
+            of: tabs,
+            matching: find.byKey(const ValueKey('bilibili-portrait-tab-bar')),
+          ),
+        ),
+        tester.getRect(tabs),
+      );
+    }
+
+    for (final size in const <Size>[Size(412, 915), Size(800, 1280)]) {
+      testWidgets('portrait ${size.width.toInt()} wide: the 详情 | 字幕 area '
+          'starts and ends where the player\'s does', (tester) async {
+        window(
+          tester,
+          size,
+          padding: const EdgeInsets.only(top: 30, bottom: 20),
+        );
+        await tester.pumpWidget(
+          host(PortraitVideoScreen(videoItem: _item(), autoPlayOnEntry: false)),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 400));
+        final player = await portraitLowerArea(tester);
+        expect(
+          tester
+              .widget<BilibiliPortraitTabs>(find.byType(BilibiliPortraitTabs))
+              .tab,
+          PortraitBilibiliTab.details,
+        );
+        await close(tester);
+
+        final load = Completer<BilibiliWatchPlan>();
+        await tester.pumpWidget(
+          host(
+            BilibiliWatchLoadingPage(
+              bvid: _bvid,
+              preview: const BilibiliWatchPreview(title: _title),
+              load: (_) => load.future,
+              open: (_, _, _, _) async {},
+              timeline: () => BilibiliOpenTimeline(_bvid),
+              shape: const BilibiliWatchPageShape(landscape: false),
+            ),
+          ),
+        );
+        await tester.pump();
+        final loading = await portraitLowerArea(tester);
+        expect(loading.$1, player.$1);
+        expect(loading.$2, player.$2);
+        // The details tab: the panel the player shows, its outline while
+        // the detail loads.
+        expect(find.byType(BilibiliPlayerPanel), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('bilibili-watch-loading-controls')),
+          findsOneWidget,
+        );
+        await close(tester);
+      });
+    }
+
+    testWidgets('the tab picked on the loading page carries over to the '
+        'player, which does not snap back; nothing is remembered', (
+      tester,
+    ) async {
+      window(tester, const Size(412, 915));
+      expect(settings.bilibiliPortraitShowsSubtitles, isFalse);
+      final load = Completer<BilibiliWatchPlan>();
+      await tester.pumpWidget(
+        host(
+          BilibiliWatchLoadingPage(
+            bvid: _bvid,
+            preview: const BilibiliWatchPreview(title: _title),
+            load: (_) => load.future,
+            open: (navigator, page, plan, _) async {
+              navigator.replace(
+                oldRoute: page,
+                newRoute: MaterialPageRoute<void>(
+                  builder: (_) => PortraitVideoScreen(
+                    videoItem: plan.item,
+                    autoPlayOnEntry: false,
+                  ),
+                ),
+              );
+            },
+            timeline: () => BilibiliOpenTimeline(_bvid),
+            shape: const BilibiliWatchPageShape(landscape: false),
+          ),
+        ),
+      );
+      await tester.pump();
+      PortraitBilibiliTab shown() => tester
+          .widget<BilibiliPortraitTabs>(find.byType(BilibiliPortraitTabs))
+          .tab;
+      expect(shown(), PortraitBilibiliTab.details);
+
+      await tester.tap(
+        find.byKey(const ValueKey('bilibili-portrait-tab-subtitles')),
+      );
+      await tester.pump();
+      expect(shown(), PortraitBilibiliTab.subtitles);
+      expect(settings.bilibiliPortraitShowsSubtitles, isFalse);
+
+      load.complete(_plan());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(find.byType(BilibiliWatchLoadingPage), findsNothing);
+      expect(find.byType(PortraitVideoScreen), findsOneWidget);
+      expect(shown(), PortraitBilibiliTab.subtitles);
+      expect(settings.bilibiliPortraitShowsSubtitles, isFalse);
+      await close(tester);
+    });
+
+    testWidgets('a tab picked on the loading page that is not opened '
+        'changes nothing', (tester) async {
+      window(tester, const Size(412, 915));
+      final load = Completer<BilibiliWatchPlan>();
+      await tester.pumpWidget(
+        host(
+          BilibiliWatchLoadingPage(
+            bvid: _bvid,
+            preview: const BilibiliWatchPreview(title: _title),
+            load: (_) => load.future,
+            open: (_, _, _, _) async {},
+            timeline: () => BilibiliOpenTimeline(_bvid),
+            shape: const BilibiliWatchPageShape(landscape: false),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.tap(
+        find.byKey(const ValueKey('bilibili-portrait-tab-subtitles')),
+      );
+      await tester.pump();
+      await close(tester);
+      expect(settings.bilibiliPortraitShowsSubtitles, isFalse);
+      expect(BilibiliPortraitTabMemory.takeHandOff(_item().id), isNull);
+    });
+
     for (final size in const <Size>[Size(412, 915), Size(800, 1280)]) {
       testWidgets('portrait ${size.width.toInt()} wide', (tester) async {
         window(
@@ -463,6 +651,31 @@ VideoItem _item() => VideoItem(
     bvid: _bvid,
     cid: 101,
     page: 1,
+  ),
+);
+
+BilibiliWatchPlan _plan() => BilibiliWatchPlan(
+  item: _item(),
+  imported: false,
+  videoInfo: BilibiliVideoInfo(
+    title: _title,
+    desc: '',
+    pic: '',
+    bvid: _bvid,
+    aid: '123',
+    ownerName: 'UP',
+    ownerMid: '1',
+    pubDate: 0,
+    pages: <BilibiliPage>[
+      BilibiliPage(
+        cid: 101,
+        page: 1,
+        part: '第 1 部分',
+        duration: 600,
+        bvid: _bvid,
+        aid: '123',
+      ),
+    ],
   ),
 );
 

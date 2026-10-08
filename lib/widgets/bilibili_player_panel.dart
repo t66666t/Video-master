@@ -500,7 +500,7 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
               ),
             ],
           )
-        else
+        else ...[
           const Row(
             children: [
               SizedBox(
@@ -518,6 +518,9 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
               ),
             ],
           ),
+          const SizedBox(height: 14),
+          _DetailSkeleton(showOwner: owner.isEmpty),
+        ],
         if (description.isNotEmpty) ...[
           const SizedBox(height: 18),
           _sectionTitle('简介'),
@@ -812,6 +815,81 @@ class _OfflineActionBar extends StatelessWidget {
         button(Icons.thumb_up_alt_outlined, '点赞'),
         button(Icons.monetization_on_outlined, '投币'),
         button(Icons.star_border, '收藏'),
+      ],
+    );
+  }
+}
+
+/// Grey outlines of the uploader row, the counts, the action buttons and
+/// the description, where the detail will show once it is there.
+class _DetailSkeleton extends StatelessWidget {
+  const _DetailSkeleton({required this.showOwner});
+
+  final bool showOwner;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget bar(double widthFactor, {double height = 10}) => Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: FractionallySizedBox(
+        alignment: Alignment.centerLeft,
+        widthFactor: widthFactor,
+        child: Container(
+          height: height,
+          decoration: BoxDecoration(
+            color: AppTokens.bgCard,
+            borderRadius: BorderRadius.circular(5),
+          ),
+        ),
+      ),
+    );
+    Widget block(double width) => Container(
+      width: width,
+      height: 30,
+      decoration: BoxDecoration(
+        color: AppTokens.bgCard,
+        borderRadius: BorderRadius.circular(15),
+      ),
+    );
+    return Column(
+      key: const ValueKey('bilibili-panel-skeleton'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (showOwner) ...[
+          Row(
+            children: [
+              Container(
+                width: 32,
+                height: 32,
+                decoration: const BoxDecoration(
+                  color: AppTokens.bgCard,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Container(
+                width: 96,
+                height: 12,
+                decoration: BoxDecoration(
+                  color: AppTokens.bgCard,
+                  borderRadius: BorderRadius.circular(6),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+        ],
+        bar(0.6),
+        const SizedBox(height: 4),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [block(72), block(72), block(72), block(88)],
+        ),
+        const SizedBox(height: 22),
+        bar(0.9),
+        bar(0.75),
+        bar(0.5),
       ],
     );
   }
