@@ -3,13 +3,15 @@ import 'dart:developer' as developer;
 
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:video_player_app/models/video_item.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_watch_loading_page.dart';
 import 'package:video_player_app/screens/bilibili_download_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_open_timeline.dart';
 import 'package:video_player_app/services/bilibili/bilibili_quick_import.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
@@ -17,22 +19,31 @@ import 'package:video_player_app/services/playlist_manager.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/utils/app_toast.dart';
+import 'package:video_player_app/utils/bilibili_image_url.dart';
 
-bool _cardActionRunning = false;
+/// True while a loading page of a tapped video is open, so a second tap
+/// does not open another.
+bool _watchLaunchOpen = false;
 
 /// Opens a video from a Bilibili page on the playback page. Pages take one
 /// of these so tests can check the tap without starting playback.
+/// [preview] is the title and cover the tapped entry shows.
 typedef BilibiliVideoWatcher =
     Future<void> Function(
       BuildContext context, {
       required String bvid,
       int? page,
       Duration? startAt,
+      BilibiliWatchPreview? preview,
     });
 
 /// The tap on a video in search results, watch history, an uploader's posts,
-/// a collection or a pasted link: plays [bvid] right away on the regular
-/// playback page.
+/// a collection or a pasted link: plays [bvid] on the regular playback page.
+///
+/// A loading page opens right away with [preview] (or what is already known
+/// of the video) and the video gets ready behind it; then the playback page
+/// takes its place. Back on the loading page drops the request. See
+/// [BilibiliWatchLoader] for the order of the steps.
 ///
 /// By default a watch-only card is used (or the library card when one exists
 /// for the BV + part) and nothing is added to the media library; with "auto
@@ -51,49 +62,215 @@ Future<void> watchBilibiliVideo(
   int? page,
   Duration? startAt,
   bool? replaceCurrent,
-}) async {
-  if (_cardActionRunning) return;
-  _cardActionRunning = true;
+  BilibiliWatchPreview? preview,
+}) {
   final service = context.read<BilibiliDownloadService>();
   final library = context.read<LibraryService>();
   final playback = context.read<MediaPlaybackService>();
+  final sources = BilibiliWatchSources.current;
   final replace =
       replaceCurrent ?? PlaybackNavigationService.instance.hasPlaybackPage;
-  final loading = AppToast.showLoading('正在准备播放…');
-  BilibiliWatchPlan plan;
-  try {
-    await service.init();
-    if (replace) await saveCurrentWatchPosition(playback);
-    plan = await prepareBilibiliWatch(
-      service: service,
-      library: library,
-      bvid: bvid,
-      page: page,
-      startAt: startAt,
-      settings: SettingsService(),
-      cards: BilibiliWatchCards.instance,
-      playingItemId: playback.currentItem?.id,
-    );
-  } catch (error, stack) {
-    developer.log('Playing $bvid failed', error: error, stackTrace: stack);
-    await loading.dismiss(immediate: true);
-    AppToast.show(_failureText('播放准备失败', error), type: AppToastType.error);
-    return;
-  } finally {
-    _cardActionRunning = false;
+  return _openLoadingPage(
+    context,
+    bvid: bvid,
+    preview: preview ?? sources.previewOf(bvid) ?? _historyPreview(bvid),
+    replace: replace,
+    load: (attempt) async {
+      await service.init();
+      if (replace) await saveCurrentWatchPosition(playback);
+      final loader = BilibiliWatchLoader(
+        service: service,
+        library: library,
+        bvid: bvid,
+        page: page,
+        startAt: startAt,
+        playingItemId: playback.currentItem?.id,
+        settings: SettingsService(),
+        cards: BilibiliWatchCards.instance,
+        details: sources.details,
+        infoCache: sources.infoCache,
+        fetchInfo: sources.fetchInfo,
+        warmPlayUrl: sources.warmPlayUrl ?? bilibiliPlayUrlWarmer(service),
+        warmSigning: sources.warmSigning
+            ? service.apiService.warmUpSigning
+            : null,
+      );
+      return loader(attempt);
+    },
+  );
+}
+
+/// "Play" on an in-app Bilibili page: reuse or create the online card for
+/// [bvid] part [page], then open it on the regular playback page (through
+/// the same loading page as [watchBilibiliVideo]).
+Future<void> playBilibiliVideoAsCard(
+  BuildContext context, {
+  required String bvid,
+  required int page,
+}) {
+  final service = context.read<BilibiliDownloadService>();
+  final library = context.read<LibraryService>();
+  return _openLoadingPage(
+    context,
+    bvid: bvid,
+    preview: BilibiliWatchSources.current.previewOf(bvid),
+    replace: PlaybackNavigationService.instance.hasPlaybackPage,
+    load: (attempt) async {
+      await service.init();
+      final batch = await obtainBilibiliPlaybackCard(
+        service,
+        library,
+        bvid: bvid,
+        page: page,
+      );
+      final item = batch.cards.first.item;
+      BilibiliWatchCards.instance?.track(item);
+      attempt.timeline.mark('card ready');
+      return BilibiliWatchPlan(
+        item: item,
+        videoInfo: batch.videoInfo,
+        imported: true,
+      );
+    },
+  );
+}
+
+BilibiliWatchPreview? _historyPreview(String bvid) {
+  final entry = BilibiliHistoryService.instance.watchEntryOf(bvid);
+  if (entry == null) return null;
+  return BilibiliWatchPreview(
+    title: entry.title,
+    coverUrl: bilibiliCoverThumbnailUrl(entry.coverUrl),
+  );
+}
+
+Future<void> _openLoadingPage(
+  BuildContext context, {
+  required String bvid,
+  required BilibiliWatchPreview? preview,
+  required bool replace,
+  required Future<BilibiliWatchPlan> Function(BilibiliWatchAttempt attempt)
+  load,
+}) {
+  if (_watchLaunchOpen) return Future<void>.value();
+  final service = context.read<BilibiliDownloadService>();
+  final library = context.read<LibraryService>();
+  final playback = context.read<MediaPlaybackService>();
+  final playlist = context.read<PlaylistManager>();
+  final tapped = BilibiliOpenTimeline(bvid)..mark('tap');
+  var firstTry = true;
+  BilibiliOpenTimeline timeline() {
+    if (!firstTry) return BilibiliOpenTimeline(bvid)..mark('retry');
+    firstTry = false;
+    return tapped;
   }
-  await loading.dismiss(immediate: true);
-  if (!context.mounted) return;
+
+  final closed = Completer<void>();
+  _watchLaunchOpen = true;
+  unawaited(
+    Navigator.of(context).push(
+      AppMaterialPageRoute<void>(
+        settings: RouteSettings(
+          name: BilibiliWatchLoadingPage.routeName,
+          arguments: bvid,
+        ),
+        builder: (_) => BilibiliWatchLoadingPage(
+          bvid: bvid,
+          preview: preview,
+          timeline: timeline,
+          load: load,
+          open: (navigator, page, plan, timeline) => _openWatchPlan(
+            navigator,
+            page,
+            plan,
+            timeline,
+            replace: replace,
+            bvid: bvid,
+            service: service,
+            library: library,
+            playback: playback,
+            playlist: playlist,
+          ),
+          discard: (plan) => discardAbandonedWatch(
+            plan,
+            library: library,
+            playingItemId: playback.currentItem?.id,
+            openPageItemIds: _openPlaybackPageItemIds(),
+            cards: BilibiliWatchCards.instance,
+          ),
+          onClosed: () {
+            _watchLaunchOpen = false;
+            if (!closed.isCompleted) closed.complete();
+          },
+        ),
+      ),
+    ),
+  );
+  return closed.future;
+}
+
+Iterable<String> _openPlaybackPageItemIds() sync* {
+  for (final route in PlaybackNavigationService.instance.observer.routes) {
+    final id = route.settings.arguments;
+    if (PlaybackNavigationService.isPlaybackRouteName(route.settings.name) &&
+        id is String) {
+      yield id;
+    }
+  }
+}
+
+/// The ready video takes the place of the loading page [page] on the
+/// regular playback page, or of the open playback page when [replace].
+Future<void> _openWatchPlan(
+  NavigatorState navigator,
+  Route<dynamic> page,
+  BilibiliWatchPlan plan,
+  BilibiliOpenTimeline timeline, {
+  required bool replace,
+  required String bvid,
+  required BilibiliDownloadService service,
+  required LibraryService library,
+  required MediaPlaybackService playback,
+  required PlaylistManager playlist,
+}) async {
+  final item = plan.item;
+  timeline.attachTo(item.id);
+  timeline.followPlayback(playback, item.id);
+  final existingController = playback.currentItem?.id == item.id
+      ? playback.controller
+      : null;
+  playlist.prepareLibraryPlayback(
+    item,
+    searchItems: plan.queue,
+    useSearchResultsAsQueue: plan.queue != null,
+  );
+  final navigation = PlaybackNavigationService.instance;
+  navigation.primeLibraryPlaybackEntry(
+    playbackService: playback,
+    item: item,
+    existingController: existingController,
+  );
   if (replace) {
-    replaceLibraryItemPlayback(context, plan.item, queue: plan.queue);
+    // Every playback page goes and one for [item] is pushed above this
+    // page, which is then removed from under it.
+    await navigation.replaceCurrentPlayback(item);
+    if (page.isActive) navigator.removeRoute(page);
   } else {
-    openLibraryItemPlayback(context, plan.item, queue: plan.queue);
+    final entry = PlaybackNavigationService.buildPlaybackEntryRoute(
+      item,
+      existingController: existingController,
+    );
+    if (page.isCurrent) {
+      unawaited(navigator.pushReplacement(entry));
+    } else if (page.isActive) {
+      navigator.replace(oldRoute: page, newRoute: entry);
+    }
   }
+  timeline.mark('playback page pushed');
   if (!plan.imported) return;
 
   final partCount = plan.videoInfo.pages.length;
   if (partCount > 1 && partCount <= kBilibiliAutoFillPartLimit) {
-    final playlist = context.read<PlaylistManager>();
     unawaited(
       _fillRemainingParts(
         service,
@@ -102,60 +279,11 @@ Future<void> watchBilibiliVideo(
         BilibiliStreamCardBatch(
           videoInfo: plan.videoInfo,
           cards: <BilibiliStreamCardResult>[
-            BilibiliStreamCardResult(item: plan.item, created: false),
+            BilibiliStreamCardResult(item: item, created: false),
           ],
         ),
         bvid: bvid,
       ),
-    );
-  } else if (partCount > kBilibiliAutoFillPartLimit) {
-    AppToast.show('该视频分P较多，可用「导入」旁的位置按钮选择「全部分P」补全选集');
-  }
-}
-
-/// "Play" on an in-app Bilibili page: reuse or create the online card for
-/// [bvid] part [page], then open it on the regular playback page.
-Future<void> playBilibiliVideoAsCard(
-  BuildContext context, {
-  required String bvid,
-  required int page,
-}) async {
-  if (_cardActionRunning) return;
-  _cardActionRunning = true;
-  final service = context.read<BilibiliDownloadService>();
-  final library = context.read<LibraryService>();
-  final loading = AppToast.showLoading('正在准备在线播放…');
-  BilibiliStreamCardBatch batch;
-  try {
-    await service.init();
-    batch = await obtainBilibiliPlaybackCard(
-      service,
-      library,
-      bvid: bvid,
-      page: page,
-    );
-  } catch (error, stack) {
-    developer.log(
-      'Online play for $bvid failed',
-      error: error,
-      stackTrace: stack,
-    );
-    await loading.dismiss(immediate: true);
-    AppToast.show(_failureText('在线播放准备失败', error), type: AppToastType.error);
-    return;
-  } finally {
-    _cardActionRunning = false;
-  }
-  await loading.dismiss(immediate: true);
-  BilibiliWatchCards.instance?.track(batch.cards.first.item);
-  if (!context.mounted) return;
-  openLibraryItemPlayback(context, batch.cards.first.item);
-
-  final partCount = batch.videoInfo.pages.length;
-  if (partCount > 1 && partCount <= kBilibiliAutoFillPartLimit) {
-    final playlist = context.read<PlaylistManager>();
-    unawaited(
-      _fillRemainingParts(service, library, playlist, batch, bvid: bvid),
     );
   } else if (partCount > kBilibiliAutoFillPartLimit) {
     AppToast.show('该视频分P较多，可用「导入」旁的位置按钮选择「全部分P」补全选集');
@@ -229,61 +357,6 @@ Future<void> _fillRemainingParts(
   }
 }
 
-/// Opens a card on the regular playback page (portrait or landscape per
-/// settings), with its folder as the episode queue, or [queue] when given (a
-/// watch-only card has no folder and plays alone).
-void openLibraryItemPlayback(
-  BuildContext context,
-  VideoItem item, {
-  List<VideoItem>? queue,
-}) {
-  final playback = context.read<MediaPlaybackService>();
-  final existingController = playback.currentItem?.id == item.id
-      ? playback.controller
-      : null;
-  context.read<PlaylistManager>().prepareLibraryPlayback(
-    item,
-    searchItems: queue,
-    useSearchResultsAsQueue: queue != null,
-  );
-  PlaybackNavigationService.instance.primeLibraryPlaybackEntry(
-    playbackService: playback,
-    item: item,
-    existingController: existingController,
-  );
-  Navigator.of(context).push(
-    PlaybackNavigationService.buildPlaybackEntryRoute(
-      item,
-      existingController: existingController,
-    ),
-  );
-}
-
-/// [openLibraryItemPlayback] on a page that takes the place of the open
-/// playback page (see [PlaybackNavigationService.replaceCurrentPlayback]).
-void replaceLibraryItemPlayback(
-  BuildContext context,
-  VideoItem item, {
-  List<VideoItem>? queue,
-}) {
-  final playback = context.read<MediaPlaybackService>();
-  final existingController = playback.currentItem?.id == item.id
-      ? playback.controller
-      : null;
-  context.read<PlaylistManager>().prepareLibraryPlayback(
-    item,
-    searchItems: queue,
-    useSearchResultsAsQueue: queue != null,
-  );
-  final navigation = PlaybackNavigationService.instance;
-  navigation.primeLibraryPlaybackEntry(
-    playbackService: playback,
-    item: item,
-    existingController: existingController,
-  );
-  unawaited(navigation.replaceCurrentPlayback(item));
-}
-
 /// Saves where the current video is before another one takes its page: the
 /// card's position, and for a Bilibili video its watch history entry. The
 /// left watch-only card is then removed by the usual clean-up once its page
@@ -319,9 +392,4 @@ Future<void> openBilibiliVideoDownload(
           BilibiliDownloadScreen(initialInput: input, initialPage: page),
     ),
   );
-}
-
-String _failureText(String prefix, Object error) {
-  if (error is StateError) return '$prefix：${error.message}';
-  return '$prefix，请检查网络或 B 站登录状态';
 }

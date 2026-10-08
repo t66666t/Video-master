@@ -12,6 +12,7 @@ import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -311,9 +312,20 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     await _watch(bvid, page: resolved.page, startAt: resolved.startAt);
   }
 
-  Future<void> _watch(String bvid, {int? page, Duration? startAt}) {
+  Future<void> _watch(
+    String bvid, {
+    int? page,
+    Duration? startAt,
+    BilibiliWatchPreview? preview,
+  }) {
     final watch = widget.onWatch ?? watchBilibiliVideo;
-    return watch(context, bvid: bvid, page: page, startAt: startAt);
+    return watch(
+      context,
+      bvid: bvid,
+      page: page,
+      startAt: startAt,
+      preview: preview,
+    );
   }
 
   _SearchResults<Object?> _resultsFor(int tab) =>
@@ -935,7 +947,15 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       if (video.publishedAt != null) formatBilibiliDate(video.publishedAt),
     ].join(' · ');
     return InkWell(
-      onTap: () => unawaited(_watch(video.bvid)),
+      onTap: () => unawaited(
+        _watch(
+          video.bvid,
+          preview: BilibiliWatchPreview(
+            title: video.title,
+            coverUrl: bilibiliCoverThumbnailUrl(video.coverUrl),
+          ),
+        ),
+      ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
         child: Row(

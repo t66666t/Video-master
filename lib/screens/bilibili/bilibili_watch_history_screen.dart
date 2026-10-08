@@ -5,6 +5,7 @@ import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
@@ -33,7 +34,15 @@ Future<void> _openThroughCard(
   BuildContext context,
   BilibiliWatchHistoryEntry entry,
 ) {
-  return watchBilibiliVideo(context, bvid: entry.bvid, page: entry.page);
+  return watchBilibiliVideo(
+    context,
+    bvid: entry.bvid,
+    page: entry.page,
+    preview: BilibiliWatchPreview(
+      title: entry.title,
+      coverUrl: bilibiliCoverThumbnailUrl(entry.coverUrl),
+    ),
+  );
 }
 
 /// Videos watched from the Bilibili pages, newest first.

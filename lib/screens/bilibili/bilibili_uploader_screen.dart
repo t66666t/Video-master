@@ -7,6 +7,7 @@ import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_uploader_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -274,7 +275,16 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
 
   void _openVideo(BilibiliUploaderVideo video) {
     final watch = widget.onWatch ?? watchBilibiliVideo;
-    unawaited(watch(context, bvid: video.bvid));
+    unawaited(
+      watch(
+        context,
+        bvid: video.bvid,
+        preview: BilibiliWatchPreview(
+          title: video.title,
+          coverUrl: video.coverUrl,
+        ),
+      ),
+    );
   }
 
   void _openCollection(BilibiliUploaderCollection collection) {
@@ -656,7 +666,14 @@ class _BilibiliUploaderCollectionScreenState
         itemBuilder: (video) => BilibiliUploaderVideoTile(
           video: video,
           onTap: (v) => unawaited(
-            (widget.onWatch ?? watchBilibiliVideo)(context, bvid: v.bvid),
+            (widget.onWatch ?? watchBilibiliVideo)(
+              context,
+              bvid: v.bvid,
+              preview: BilibiliWatchPreview(
+                title: v.title,
+                coverUrl: v.coverUrl,
+              ),
+            ),
           ),
           onImport: widget.onImport,
         ),

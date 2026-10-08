@@ -22,6 +22,7 @@ import 'services/embedded_subtitle_service.dart';
 import 'services/bilibili/bilibili_download_service.dart';
 import 'services/bilibili/bilibili_streaming_service.dart';
 import 'services/bilibili/bilibili_watch_cards.dart';
+import 'services/bilibili/bilibili_watch_launch.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/playback_navigation_service.dart';
@@ -458,8 +459,12 @@ Future<void> _initializeDeferredServices({
       currentItemId: () => mediaPlaybackService.currentItem?.id,
       openPageItemIds: _openPlaybackPageItemIds,
       queueItemIds: () => playlistManager.playlist.map((item) => item.id),
-      prepareCurrentItem: (itemId) =>
-          bilibiliService.completeWatchPart(library, itemId),
+      prepareCurrentItem: (itemId) => completeAndApplyWatchCard(
+        service: bilibiliService,
+        library: library,
+        playback: mediaPlaybackService,
+        itemId: itemId,
+      ),
     ),
   );
 }

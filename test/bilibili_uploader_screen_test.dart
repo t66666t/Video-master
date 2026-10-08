@@ -163,7 +163,7 @@ Future<_Env> _pumpUploader(
           opened.add(uri);
           return true;
         },
-        onWatch: (context, {required bvid, page, startAt}) async {
+        onWatch: (context, {required bvid, page, startAt, preview}) async {
           watched.add(bvid);
         },
       ),

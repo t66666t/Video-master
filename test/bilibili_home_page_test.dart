@@ -163,7 +163,7 @@ void main() {
           body: BilibiliHomePage(
             isActive: true,
             api: api,
-            onWatch: (context, {required bvid, page, startAt}) async {
+            onWatch: (context, {required bvid, page, startAt, preview}) async {
               watched.add((bvid, page));
             },
           ),
@@ -210,7 +210,7 @@ void main() {
           body: BilibiliHomePage(
             isActive: true,
             api: api,
-            onWatch: (context, {required bvid, page, startAt}) async {
+            onWatch: (context, {required bvid, page, startAt, preview}) async {
               watched.add((bvid, page, startAt));
             },
           ),

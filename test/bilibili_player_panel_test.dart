@@ -83,9 +83,10 @@ void main() {
             actions: actions,
             onCollapse: onCollapse,
             onOpenEpisodes: onOpenEpisodes,
-            onWatchVideo: (context, {required bvid, page, startAt}) async {
-              watched?.add('$bvid#${page ?? 0}');
-            },
+            onWatchVideo:
+                (context, {required bvid, page, startAt, preview}) async {
+                  watched?.add('$bvid#${page ?? 0}');
+                },
           ),
         ),
       ),

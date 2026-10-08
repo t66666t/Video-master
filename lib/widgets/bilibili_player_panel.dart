@@ -14,6 +14,7 @@ import 'package:video_player_app/services/bilibili/bilibili_download_service.dar
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -28,12 +29,14 @@ Future<void> _watchInPlace(
   required String bvid,
   int? page,
   Duration? startAt,
+  BilibiliWatchPreview? preview,
 }) => watchBilibiliVideo(
   context,
   bvid: bvid,
   page: page,
   startAt: startAt,
   replaceCurrent: true,
+  preview: preview,
 );
 
 /// The playback page's Bilibili panel: what the video is (title, UP, counts,
@@ -189,9 +192,20 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
     return parts < 1 ? 1 : parts;
   }
 
-  Future<void> _watch(String bvid, {int? page, Duration? startAt}) {
+  Future<void> _watch(
+    String bvid, {
+    int? page,
+    Duration? startAt,
+    BilibiliWatchPreview? preview,
+  }) {
     final watch = widget.onWatchVideo ?? _watchInPlace;
-    return watch(context, bvid: bvid, page: page, startAt: startAt);
+    return watch(
+      context,
+      bvid: bvid,
+      page: page,
+      startAt: startAt,
+      preview: preview,
+    );
   }
 
   Future<void> _download() async {
@@ -621,7 +635,16 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
                   textColor: AppTokens.text1,
                   onTap: ep.bvid == detail.bvid
                       ? null
-                      : () => unawaited(_watch(ep.bvid, page: 1)),
+                      : () => unawaited(
+                          _watch(
+                            ep.bvid,
+                            page: 1,
+                            preview: BilibiliWatchPreview(
+                              title: ep.title,
+                              coverUrl: ep.coverUrl,
+                            ),
+                          ),
+                        ),
                   leading: Text(
                     '${index + 1}',
                     style: const TextStyle(
