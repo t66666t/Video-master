@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../../debug/developer_log.dart' as developer;
 import '../../models/bilibili_browse_models.dart';
@@ -26,18 +27,22 @@ class BilibiliPublicApiException implements Exception {
 /// (`buvid3` from the public fingerprint endpoint), which is not an account
 /// credential.
 class BilibiliPublicApiService {
-  BilibiliPublicApiService({HttpClientAdapter? httpClientAdapter, Dio? dio})
-    : _dio =
-          dio ??
-          Dio(
-            BaseOptions(
-              connectTimeout: const Duration(seconds: 10),
-              receiveTimeout: const Duration(seconds: 20),
-              headers: const {'User-Agent': userAgent},
-              // Status codes are interpreted by this service.
-              validateStatus: (_) => true,
-            ),
-          ) {
+  BilibiliPublicApiService({
+    HttpClientAdapter? httpClientAdapter,
+    Dio? dio,
+    @visibleForTesting DateTime Function()? clock,
+  }) : _clock = clock ?? DateTime.now,
+       _dio =
+           dio ??
+           Dio(
+             BaseOptions(
+               connectTimeout: const Duration(seconds: 10),
+               receiveTimeout: const Duration(seconds: 20),
+               headers: const {'User-Agent': userAgent},
+               // Status codes are interpreted by this service.
+               validateStatus: (_) => true,
+             ),
+           ) {
     if (httpClientAdapter != null) _dio.httpClientAdapter = httpClientAdapter;
   }
 
@@ -49,9 +54,17 @@ class BilibiliPublicApiService {
   static const int maxSuggestions = 10;
 
   final Dio _dio;
+  final DateTime Function() _clock;
   String? _anonymousBuvid3;
+  Future<String?>? _buvidLoading;
   String? _imgKey;
   String? _subKey;
+  DateTime? _wbiKeysAt;
+  Future<void>? _wbiKeysLoading;
+
+  /// How long the WBI signing keys are reused before `nav` is asked again
+  /// (Bilibili rotates them about once a day).
+  static const Duration wbiKeyLifetime = Duration(hours: 6);
 
   static String videoReferer(String bvid) =>
       'https://www.bilibili.com/video/$bvid/';
@@ -259,31 +272,69 @@ class BilibiliPublicApiService {
 
   Future<Map<String, dynamic>> _signedQuery(Map<String, dynamic> query) async {
     try {
-      if (_imgKey == null || _subKey == null) {
-        // nav answers -101 when signed out but still returns the WBI keys.
-        final nav = await _getJson(
-          '$_api/x/web-interface/nav',
-          referer: _rootReferer,
-          what: '签名密钥',
-        );
-        final wbi = readBiliMap(readBiliMap(nav['data'])['wbi_img']);
-        String keyOf(Object? url) =>
-            readBiliText(url).split('/').last.split('.').first;
-        final img = keyOf(wbi['img_url']);
-        final sub = keyOf(wbi['sub_url']);
-        if (img.length + sub.length < 64) return query;
-        _imgKey = img;
-        _subKey = sub;
-      }
-      return WbiSigner.sign(query, _imgKey!, _subKey!);
+      await _ensureWbiKeys();
+      final img = _imgKey;
+      final sub = _subKey;
+      if (img == null || sub == null) return query;
+      return WbiSigner.sign(query, img, sub);
     } catch (e) {
       developer.log('Bilibili WBI keys unavailable', error: e.runtimeType);
       return query;
     }
   }
 
-  Future<String?> _ensureAnonymousBuvid() async {
-    if (_anonymousBuvid3 != null) return _anonymousBuvid3;
+  /// The WBI keys, reused for [wbiKeyLifetime]; concurrent callers share one
+  /// `nav` request.
+  Future<void> _ensureWbiKeys() {
+    final at = _wbiKeysAt;
+    if (_imgKey != null &&
+        _subKey != null &&
+        at != null &&
+        _clock().difference(at) < wbiKeyLifetime) {
+      return Future<void>.value();
+    }
+    final running = _wbiKeysLoading;
+    if (running != null) return running;
+    final loading = _fetchWbiKeys();
+    _wbiKeysLoading = loading;
+    return loading.whenComplete(() {
+      if (identical(_wbiKeysLoading, loading)) _wbiKeysLoading = null;
+    });
+  }
+
+  Future<void> _fetchWbiKeys() async {
+    // nav answers -101 when signed out but still returns the WBI keys.
+    final nav = await _getJson(
+      '$_api/x/web-interface/nav',
+      referer: _rootReferer,
+      what: '签名密钥',
+    );
+    final wbi = readBiliMap(readBiliMap(nav['data'])['wbi_img']);
+    String keyOf(Object? url) =>
+        readBiliText(url).split('/').last.split('.').first;
+    final img = keyOf(wbi['img_url']);
+    final sub = keyOf(wbi['sub_url']);
+    if (img.length + sub.length < 64) return;
+    _imgKey = img;
+    _subKey = sub;
+    _wbiKeysAt = _clock();
+  }
+
+  /// The public device id, asked once per run; concurrent callers share one
+  /// request and a failure is asked again next time.
+  Future<String?> _ensureAnonymousBuvid() {
+    final known = _anonymousBuvid3;
+    if (known != null) return Future<String?>.value(known);
+    final running = _buvidLoading;
+    if (running != null) return running;
+    final loading = _fetchAnonymousBuvid();
+    _buvidLoading = loading;
+    return loading.whenComplete(() {
+      if (identical(_buvidLoading, loading)) _buvidLoading = null;
+    });
+  }
+
+  Future<String?> _fetchAnonymousBuvid() async {
     try {
       final spi = await _getJson(
         '$_api/x/frontend/finger/spi',

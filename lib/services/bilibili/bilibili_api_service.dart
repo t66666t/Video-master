@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
 import 'dart:convert';
@@ -87,6 +88,14 @@ class BilibiliApiService {
   Future<void>? _initFuture;
   String? _imgKey;
   String? _subKey;
+  DateTime? _wbiKeysAt;
+  Future<void>? _wbiKeysLoading;
+  final DateTime Function() _clock;
+
+  /// How long the WBI signing keys are reused before `nav` is asked again.
+  /// Bilibili rotates them about once a day; a rejected signature refreshes
+  /// them at once.
+  static const Duration wbiKeyLifetime = Duration(hours: 6);
 
   static const String _navUrl = "https://api.bilibili.com/x/web-interface/nav";
   static final Uri _cookieUri = Uri.parse("https://api.bilibili.com");
@@ -98,7 +107,9 @@ class BilibiliApiService {
   BilibiliApiService({
     BilibiliCookieStore? cookieStore,
     HttpClientAdapter? httpClientAdapter,
-  }) : _cookieStore = cookieStore ?? BilibiliCookieStore() {
+    @visibleForTesting DateTime Function()? clock,
+  }) : _cookieStore = cookieStore ?? BilibiliCookieStore(),
+       _clock = clock ?? DateTime.now {
     BaseOptions options() => BaseOptions(
       headers: {"User-Agent": _userAgent, "Referer": _referer},
       connectTimeout: const Duration(seconds: 10),
@@ -477,6 +488,37 @@ class BilibiliApiService {
     }
   }
 
+  /// The WBI keys, fetched once and reused for [wbiKeyLifetime]; callers
+  /// asking at the same time share one `nav` request. [refresh] asks again
+  /// even when the keys are still young (a rejected signature).
+  Future<void> _ensureWbiKeys({bool refresh = false}) {
+    final at = _wbiKeysAt;
+    final fresh =
+        _imgKey != null &&
+        _subKey != null &&
+        at != null &&
+        _clock().difference(at) < wbiKeyLifetime;
+    if (fresh && !refresh) return Future<void>.value();
+    final running = _wbiKeysLoading;
+    if (running != null) return running;
+    final loading = _fetchWbiKeys();
+    _wbiKeysLoading = loading;
+    return loading.whenComplete(() {
+      if (identical(_wbiKeysLoading, loading)) _wbiKeysLoading = null;
+    });
+  }
+
+  /// Fetches the WBI keys ahead of a signed request (a tapped video asks for
+  /// its play address right after its info). Failures are left to that
+  /// request.
+  Future<void> warmUpSigning() async {
+    try {
+      await _ensureWbiKeys();
+    } catch (_) {
+      // The signed request asks again and reports the reason.
+    }
+  }
+
   Future<void> _fetchWbiKeys() async {
     try {
       final response = await _dio.get(
@@ -489,6 +531,7 @@ class BilibiliApiService {
 
       _imgKey = imgUrl.split('/').last.split('.').first;
       _subKey = subUrl.split('/').last.split('.').first;
+      _wbiKeysAt = _clock();
     } catch (e) {
       developer.log('Error fetching WBI keys', error: e);
       rethrow;
@@ -565,9 +608,7 @@ class BilibiliApiService {
   }
 
   Future<BilibiliStreamInfo> fetchPlayUrl(String bvid, int cid) async {
-    if (_imgKey == null || _subKey == null) {
-      await _fetchWbiKeys();
-    }
+    await _ensureWbiKeys();
 
     // Check if we have cookies (roughly)
     final cookies = await _cookieJar.loadForRequest(
@@ -610,9 +651,7 @@ class BilibiliApiService {
         // Only a signature failure refreshes WBI, and only once. Account,
         // payment and region restrictions are deterministic results.
         if (attempt == 0 && code == -403) {
-          _imgKey = null;
-          _subKey = null;
-          await _fetchWbiKeys();
+          await _ensureWbiKeys(refresh: true);
           continue;
         }
         break;
@@ -709,9 +748,7 @@ class BilibiliApiService {
 
       // Step 1: Request x/player/wbi/v2 (Signed, most reliable)
       try {
-        if (_imgKey == null || _subKey == null) {
-          await _fetchWbiKeys();
-        }
+        await _ensureWbiKeys();
 
         final Map<String, dynamic> params = {'cid': cid};
         if (bvid.isNotEmpty) {
