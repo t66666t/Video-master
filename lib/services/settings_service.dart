@@ -913,6 +913,12 @@ class SettingsService extends ChangeNotifier {
 
   bool isLandscapeSubtitleSidebarVisible = true;
 
+  /// Whether the landscape player's Bilibili panel was left open (one choice
+  /// for all Bilibili videos). Only the panel button, its shortcut and the
+  /// panel's collapse button change it; panels shown over it for a moment do
+  /// not.
+  bool bilibiliPlayerPanelOpen = true;
+
   // New: AI Model Selection
   String lastSelectedModelType = 'base';
 
@@ -1838,6 +1844,11 @@ class SettingsService extends ChangeNotifier {
             service.isLandscapeSubtitleSidebarVisible = value,
       ),
       _boolSetting(
+        key: 'bilibiliPlayerPanelOpen',
+        defaultValue: true,
+        apply: (service, value) => service.bilibiliPlayerPanelOpen = value,
+      ),
+      _boolSetting(
         key: 'isGhostModeEnabled',
         defaultValue: true,
         apply: (service, value) => service.isGhostModeEnabled = value,
@@ -2247,6 +2258,7 @@ class SettingsService extends ChangeNotifier {
     bilibiliAutoImportOnPlay = false;
     bilibiliImportTarget = '';
     bilibiliAccountReadOnly = true;
+    bilibiliPlayerPanelOpen = true;
     bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
     importSourceFolderNamesJson = '{}';
@@ -3124,6 +3136,10 @@ class SettingsService extends ChangeNotifier {
       value,
       notify: notify,
     );
+  }
+
+  Future<void> saveBilibiliPlayerPanelOpen(bool value) async {
+    await _updateRegisteredSetting<bool>('bilibiliPlayerPanelOpen', value);
   }
 
   bool isSamePlaybackSpeed(double first, double second) {

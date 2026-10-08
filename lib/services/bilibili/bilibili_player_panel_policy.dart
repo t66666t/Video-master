@@ -82,6 +82,59 @@ LandscapeSidebarTarget landscapeSidebarAfterClose({
   }
 }
 
+/// Narrowest video area the landscape player keeps beside the Bilibili panel
+/// when it opens the panel by itself.
+const double kBilibiliPanelMinVideoWidth = 640;
+
+/// Screens whose short side is below this are phones; larger mobile screens
+/// are tablets and dock the panel like a desktop window.
+const double kBilibiliPanelPhoneShortestSide = 600;
+
+/// Whether the landscape player may open the Bilibili panel by itself
+/// (the `allowAutoOpen` of [landscapeDefaultSidebar]).
+///
+/// Desktop windows and tablets dock it at the side when at least
+/// [kBilibiliPanelMinVideoWidth] of video stays beside it; phones in
+/// landscape never open it by themselves. Opening it by hand always works.
+bool bilibiliPanelMayAutoOpen({
+  required double windowWidth,
+  required double panelWidth,
+  required bool isMobilePlatform,
+  required double shortestSide,
+}) {
+  if (isMobilePlatform && shortestSide < kBilibiliPanelPhoneShortestSide) {
+    return false;
+  }
+  return windowWidth - panelWidth >= kBilibiliPanelMinVideoWidth;
+}
+
+/// The landscape panel after the video changed on the same page (next part,
+/// episode list); null keeps the panel that is shown.
+///
+/// The Bilibili panel stays for another Bilibili video and gives way to
+/// [newDefault] otherwise. A page showing its default panel before the change
+/// shows the new default, so a Bilibili video reached from a local one gets
+/// its panel when it was left open.
+LandscapeSidebarTarget? landscapeSidebarOnVideoChange({
+  required bool showingBilibili,
+  required bool showingDefaultBefore,
+  required bool isBilibiliVideo,
+  required LandscapeSidebarTarget newDefault,
+}) {
+  if (showingBilibili) return isBilibiliVideo ? null : newDefault;
+  if (showingDefaultBefore) return newDefault;
+  return null;
+}
+
+/// The landscape panel after the Bilibili panel was closed by hand (its
+/// button, shortcut or collapse button); the remembered choice is "closed"
+/// from then on.
+LandscapeSidebarTarget landscapeSidebarAfterBilibiliClosed({
+  required bool subtitleSidebarRemembered,
+}) => landscapeDefaultSidebar(
+  subtitleSidebarRemembered: subtitleSidebarRemembered,
+);
+
 /// What closed in the portrait player.
 enum PortraitPanelClosing {
   /// A tool panel: settings, subtitle style, subtitle editor or manager, AI
