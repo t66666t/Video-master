@@ -9,6 +9,7 @@ import 'package:path_provider_platform_interface/path_provider_platform_interfac
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/features/portable_transfer/portable_media_selection.dart';
 import 'package:video_player_app/features/portable_transfer/zip_export_plan.dart';
+import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/library_activity.dart';
 import 'package:video_player_app/models/media_source_ref.dart';
@@ -924,6 +925,79 @@ void main() {
       expect(library.transientLedgerFileForTesting.existsSync(), isFalse);
     });
 
+    test('the arriving data keeps the subtitle the user already chose, '
+        'and its tracks keep their language code', () async {
+      final service = newService(
+        _FakeApi(
+          pages: 3,
+          subtitles: <BilibiliSubtitle>[
+            BilibiliSubtitle(
+              id: '1',
+              lan: 'zh-CN',
+              lanDoc: '中文',
+              url: 'https://aisubtitle.hdslb.com/zh.json',
+              isAi: false,
+            ),
+            BilibiliSubtitle(
+              id: '2',
+              lan: 'ai-en',
+              lanDoc: '英语（自动生成）',
+              url: 'https://aisubtitle.hdslb.com/ai-en.json',
+              isAi: true,
+            ),
+          ],
+        ),
+      );
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 1,
+      );
+      final queue = plan.queue!;
+      // No choice yet: the preferred track becomes the subtitle.
+      expect(await service.completeWatchPart(library, queue[1].id), isTrue);
+      final plain = library.getVideo(queue[1].id)!;
+      expect(plain.subtitlePath, isNotNull);
+      expect(
+        plain.managedSubtitleAssets.map((a) => a.language),
+        unorderedEquals(<String>['zh-CN', 'ai-en']),
+      );
+
+      // Picked before the data came: it stays.
+      final picked = library.getVideo(queue[2].id)!..subtitlePath = '/mine.srt';
+      expect(await service.completeWatchPart(library, picked.id), isTrue);
+      expect(library.getVideo(picked.id)!.subtitlePath, '/mine.srt');
+      expect(library.getVideo(picked.id)!.additionalSubtitles, hasLength(2));
+    });
+
+    test('a part turned off before its data came stays off', () async {
+      final service = newService(
+        _FakeApi(
+          pages: 2,
+          subtitles: <BilibiliSubtitle>[
+            BilibiliSubtitle(
+              id: '1',
+              lan: 'zh-CN',
+              lanDoc: '中文',
+              url: 'https://aisubtitle.hdslb.com/zh.json',
+              isAi: false,
+            ),
+          ],
+        ),
+      );
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 1,
+      );
+      final off = library.getVideo(plan.queue![1].id)!
+        ..blockAutoAssociatedSubtitleSelection = true;
+      expect(await service.completeWatchPart(library, off.id), isTrue);
+      expect(library.getVideo(off.id)!.subtitlePath, isNull);
+    });
+
     test('a part removed while it was being built leaves no files', () async {
       final service = newService(_FakeApi(pages: 2));
       final plan = await prepareBilibiliWatch(
@@ -1142,10 +1216,18 @@ VideoItem _streamCard({
 }
 
 class _FakeApi extends BilibiliApiService {
-  _FakeApi({required this.pages});
+  _FakeApi({required this.pages, this.subtitles = const <BilibiliSubtitle>[]});
 
   final int pages;
+  final List<BilibiliSubtitle> subtitles;
   int metadataRequests = 0;
+
+  @override
+  Future<dynamic> fetchSubtitleContent(String url) async => <String, Object?>{
+    'body': <Object?>[
+      <String, Object?>{'from': 0.0, 'to': 1.0, 'content': url},
+    ],
+  };
 
   @override
   Future<BilibiliVideoInfo> fetchVideoInfo(String bvid, {String? aid}) async {
@@ -1181,7 +1263,7 @@ class _FakeApi extends BilibiliApiService {
     int durationSeconds = 0,
   }) async {
     metadataRequests++;
-    return const BilibiliPlayerMetadata();
+    return BilibiliPlayerMetadata(subtitles: subtitles);
   }
 
   @override

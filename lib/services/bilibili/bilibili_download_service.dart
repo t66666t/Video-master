@@ -23,6 +23,7 @@ import 'package:video_player_app/services/bilibili/bilibili_interaction_gate.dar
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
+import 'package:video_player_app/services/bilibili/bilibili_subtitle_tracks.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_shot_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_state_manager.dart';
 import 'package:video_player_app/services/bilibili/download_manager.dart';
@@ -2902,13 +2903,8 @@ class BilibiliDownloadService extends ChangeNotifier {
     await source.delete();
   }
 
-  String _bilibiliSubtitleLabel(String lanDoc, String lan) {
-    final doc = lanDoc.trim();
-    if (doc.isNotEmpty) return doc;
-    final code = lan.trim();
-    if (code.isNotEmpty) return code;
-    return '字幕';
-  }
+  String _bilibiliSubtitleLabel(String lanDoc, String lan) =>
+      bilibiliSubtitleLabel(lanDoc, lan);
 
   Future<String> _writeTaskSubtitle({
     required String videoId,
@@ -2951,9 +2947,12 @@ class BilibiliDownloadService extends ChangeNotifier {
     );
   }
 
+  /// [languages] maps a file path to the Bilibili code (`lan`) of its track,
+  /// so the subtitle area can tell the tracks apart (and AI ones) offline.
   List<ManagedSubtitleAsset> _downloadedSubtitleAssets(
-    List<BoundSubtitleLabel> bound,
-  ) {
+    List<BoundSubtitleLabel> bound, {
+    Map<String, String> languages = const <String, String>{},
+  }) {
     final createdAt = DateTime.now().millisecondsSinceEpoch;
     return <ManagedSubtitleAsset>[
       for (final entry in bound)
@@ -2962,9 +2961,15 @@ class BilibiliDownloadService extends ChangeNotifier {
           path: p.normalize(entry.path),
           kind: ManagedSubtitleAssetKind.downloaded,
           displayName: entry.displayName,
+          language: _nonEmpty(languages[entry.path]),
           createdAt: createdAt,
         ),
     ];
+  }
+
+  static String? _nonEmpty(String? value) {
+    final text = value?.trim() ?? '';
+    return text.isEmpty ? null : text;
   }
 
   Future<void> _deleteFileIfExists(String path) async {
@@ -3924,9 +3929,14 @@ class BilibiliDownloadService extends ChangeNotifier {
       await library.discardTransientVideo(itemId);
       return false;
     }
+    // A subtitle the user picked (or turned off) while the data was on its
+    // way stays; only an entry without a choice gets the preferred track.
+    final userChoseSubtitle =
+        target.subtitlePath != null ||
+        target.blockAutoAssociatedSubtitleSelection;
+    if (!userChoseSubtitle) target.subtitlePath = built.subtitlePath;
     target
       ..thumbnailPath = built.thumbnailPath
-      ..subtitlePath = built.subtitlePath
       ..additionalSubtitles = built.additionalSubtitles
       ..managedSubtitleAssets = built.managedSubtitleAssets
       ..usesManagedAssociatedSubtitles = built.usesManagedAssociatedSubtitles
@@ -4331,6 +4341,7 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     final labeledSubtitles = <({String label, String path})>[];
+    final subtitleLanguages = <String, String>{};
     String? defaultSubtitlePath;
     for (final subtitle in metadata.subtitles) {
       try {
@@ -4344,6 +4355,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           contents: srt,
         );
         labeledSubtitles.add((label: label, path: output));
+        subtitleLanguages[output] = subtitle.lan;
         if (selectedSubtitle == subtitle ||
             (selectedSubtitle?.id.isNotEmpty == true &&
                 selectedSubtitle!.id == subtitle.id)) {
@@ -4357,7 +4369,10 @@ class BilibiliDownloadService extends ChangeNotifier {
     final extraSubtitles = <String, String>{
       for (final entry in boundSubtitles) entry.storageKey: entry.path,
     };
-    final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
+    final subtitleAssets = _downloadedSubtitleAssets(
+      boundSubtitles,
+      languages: subtitleLanguages,
+    );
 
     String? danmakuPath;
     try {
@@ -4957,6 +4972,7 @@ class BilibiliDownloadService extends ChangeNotifier {
         }
 
         final labeledSubtitles = <({String label, String path})>[];
+        final subtitleLanguages = <String, String>{};
         final srtPath = ep.outputPath!.replaceAll(RegExp(r'\.mp4$'), '.srt');
         final srtFile = File(srtPath);
         String? defaultSubtitlePath;
@@ -4975,6 +4991,7 @@ class BilibiliDownloadService extends ChangeNotifier {
           );
           defaultSubtitlePath = finalSrtPath;
           labeledSubtitles.add((label: label, path: finalSrtPath));
+          if (selected != null) subtitleLanguages[finalSrtPath] = selected.lan;
           await _deleteTempArtifacts(srtFile.path);
         }
 
@@ -5004,6 +5021,7 @@ class BilibiliDownloadService extends ChangeNotifier {
                   contents: srtContent,
                 );
                 labeledSubtitles.add((label: label, path: subPath));
+                subtitleLanguages[subPath] = sub.lan;
               }
             } catch (e) {
               debugPrint("Failed to download subtitle ${sub.lanDoc}: $e");
@@ -5014,7 +5032,10 @@ class BilibiliDownloadService extends ChangeNotifier {
         final extraSubtitles = <String, String>{
           for (final entry in boundSubtitles) entry.storageKey: entry.path,
         };
-        final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
+        final subtitleAssets = _downloadedSubtitleAssets(
+          boundSubtitles,
+          languages: subtitleLanguages,
+        );
 
         String? finalDanmakuPath;
         final sourceDanmakuPath = ep.danmakuPath;

@@ -518,7 +518,8 @@ Future<void> discardAbandonedWatch(
 
 /// After the cover, subtitles, danmaku and chapters of the watch-only card
 /// [item] arrived while it plays: its subtitle is loaded unless one is
-/// already showing, and the page redraws so the danmaku appear.
+/// already showing or the user turned subtitles off, and the page redraws so
+/// the danmaku appear.
 Future<void> applyCompletedWatchCard({
   required VideoItem item,
   required String? currentItemId,
@@ -530,6 +531,11 @@ Future<void> applyCompletedWatchCard({
   loadSubtitles,
 }) async {
   if (currentItemId != item.id) return;
+  // The user turned subtitles off before they arrived: they stay off.
+  if (loadedSubtitlePaths.isEmpty &&
+      item.blockAutoAssociatedSubtitleSelection) {
+    return;
+  }
   final primary = item.subtitlePath?.trim() ?? '';
   final paths = loadedSubtitlePaths.isNotEmpty
       ? List<String>.of(loadedSubtitlePaths)

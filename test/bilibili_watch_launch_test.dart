@@ -802,6 +802,29 @@ void main() {
       );
       expect(loaded, hasLength(2));
     });
+
+    test(
+      'subtitles the user turned off stay off when the data arrives',
+      () async {
+        final loaded = <List<String>>[];
+        Future<bool> load({
+          required String itemId,
+          required List<String> paths,
+        }) async {
+          loaded.add(paths);
+          return true;
+        }
+
+        await applyCompletedWatchCard(
+          item: card(subtitle: '/subs/zh.srt')
+            ..blockAutoAssociatedSubtitleSelection = true,
+          currentItemId: 'watch-1',
+          loadedSubtitlePaths: const <String>[],
+          loadSubtitles: load,
+        );
+        expect(loaded, isEmpty);
+      },
+    );
   });
 
   group('loading page', () {
