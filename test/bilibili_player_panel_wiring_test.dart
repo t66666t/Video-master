@@ -284,7 +284,10 @@ void main() {
         'writes nothing', () {
       final start = source.indexOf('void didChangeMetrics() {');
       expect(start, greaterThan(0));
-      final metrics = source.substring(start, source.indexOf('\n  }\n', start));
+      // The checkout may use CRLF line endings (Windows).
+      final end = source.indexOf(RegExp(r'\r?\n  }\r?\n'), start);
+      expect(end, greaterThan(start));
+      final metrics = source.substring(start, end);
       expect(metrics, contains('_followRoomForBilibiliPanel();'));
       expect(count(r'_followRoomForBilibiliPanel\(\);'), 1);
       expect(count(r'_bilibiliPanelRoom\.follow\('), 1);
