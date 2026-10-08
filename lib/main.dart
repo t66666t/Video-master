@@ -23,6 +23,7 @@ import 'services/bilibili/bilibili_download_service.dart';
 import 'services/bilibili/bilibili_streaming_service.dart';
 import 'services/bilibili/bilibili_watch_cards.dart';
 import 'services/bilibili/bilibili_watch_launch.dart';
+import 'services/bilibili/bilibili_watch_playlist.dart';
 import 'services/media_playback_service.dart';
 import 'services/playlist_manager.dart';
 import 'services/playback_navigation_service.dart';
@@ -459,12 +460,28 @@ Future<void> _initializeDeferredServices({
       currentItemId: () => mediaPlaybackService.currentItem?.id,
       openPageItemIds: _openPlaybackPageItemIds,
       queueItemIds: () => playlistManager.playlist.map((item) => item.id),
+      keptItemIds: () =>
+          BilibiliWatchPlaylistSession.instance?.placeholderIds() ??
+          const <String>[],
       prepareCurrentItem: (itemId) => completeAndApplyWatchCard(
         service: bilibiliService,
         library: library,
         playback: mediaPlaybackService,
         itemId: itemId,
       ),
+    ),
+  );
+
+  // The temporary playlist of videos opened from the Bilibili pages (in
+  // memory: kept when the playback page closes, empty after a restart).
+  BilibiliWatchPlaylistSession.install(
+    BilibiliWatchPlaylistSession(
+      list: BilibiliWatchPlaylist.instance,
+      service: bilibiliService,
+      library: library,
+      queue: playlistManager,
+      playbackChanges: mediaPlaybackService,
+      currentItem: () => mediaPlaybackService.currentItem,
     ),
   );
 }

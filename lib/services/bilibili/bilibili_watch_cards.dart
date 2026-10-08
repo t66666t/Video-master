@@ -307,7 +307,25 @@ Future<void> _discardCreated(LibraryService library, Set<String> ids) async {
 /// The episode list of a watch-only card: for every part the library card or
 /// a watch-only card still alive, else a lightweight entry that only gets
 /// its player data once it is switched to
-/// ([BilibiliDownloadService.addWatchParts]).
+/// ([BilibiliDownloadService.addWatchParts]). New entries go into [created].
+Future<List<VideoItem>> bilibiliWatchPartsQueue({
+  required BilibiliDownloadService service,
+  required LibraryService library,
+  required BilibiliVideoInfo info,
+  required String bvid,
+  required VideoItem current,
+  required int currentPage,
+  Set<String>? created,
+}) => _watchQueue(
+  service: service,
+  library: library,
+  info: info,
+  bvid: bvid,
+  current: current,
+  currentPage: currentPage,
+  created: created,
+);
+
 Future<List<VideoItem>> _watchQueue({
   required BilibiliDownloadService service,
   required LibraryService library,
@@ -554,13 +572,15 @@ class BilibiliWatchCards {
   /// Connects to the running app. [currentItemId] is the playback service's
   /// current item and [openPageItemIds] the items of playback pages still on
   /// the navigator stack; [playbackChanges] notifies when the current item
-  /// may have changed.
+  /// may have changed. [keptItemIds] are never removed (the temporary
+  /// Bilibili playlist's entries without files).
   factory BilibiliWatchCards.forApp({
     required LibraryService library,
     required Listenable playbackChanges,
     required String? Function() currentItemId,
     required Iterable<String> Function() openPageItemIds,
     Iterable<String> Function()? queueItemIds,
+    Iterable<String> Function()? keptItemIds,
     Future<void> Function(String itemId)? prepareCurrentItem,
     BilibiliHistoryService? history,
   }) {
@@ -577,6 +597,8 @@ class BilibiliWatchCards {
           ...pages,
           // While a playback page is open its episode list stays usable.
           if (pages.isNotEmpty && queueItemIds != null) ...queueItemIds(),
+          // Entries without files that a list still plays on with.
+          ...?keptItemIds?.call(),
         };
       },
       beforeDiscard: (item) => recorder.forget(item.id),

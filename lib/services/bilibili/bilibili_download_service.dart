@@ -3745,10 +3745,21 @@ class BilibiliDownloadService extends ChangeNotifier {
     LibraryService library, {
     required BilibiliVideoInfo videoInfo,
     required Iterable<BilibiliPage> pages,
-  }) async {
-    final videoBvid = videoInfo.bvid.trim();
+  }) {
+    return addWatchEntries(library, <(BilibiliVideoInfo, BilibiliPage)>[
+      for (final page in pages) (videoInfo, page),
+    ]);
+  }
+
+  /// [addWatchParts] for parts of several videos at once, in their order
+  /// (parts without a BV or cid are skipped).
+  Future<List<VideoItem>> addWatchEntries(
+    LibraryService library,
+    Iterable<(BilibiliVideoInfo, BilibiliPage)> parts,
+  ) async {
     final items = <VideoItem>[];
-    for (final page in pages) {
+    for (final (videoInfo, page) in parts) {
+      final videoBvid = videoInfo.bvid.trim();
       final bvid = (page.bvid ?? videoBvid).trim();
       if (bvid.isEmpty || page.cid <= 0) continue;
       final id = _uuid.v4();
@@ -3782,9 +3793,14 @@ class BilibiliDownloadService extends ChangeNotifier {
         bvid: bvid,
       );
     }
-    await library.addTransientVideos(items);
+    if (items.isNotEmpty) await library.addTransientVideos(items);
     return items;
   }
+
+  /// Whether [itemId] is a lightweight entry that has not got its player
+  /// data (cover, subtitles, danmaku) yet, so it has no files of its own.
+  bool isWatchPlaceholder(String itemId) =>
+      _pendingWatchParts.containsKey(itemId);
 
   /// Downloads the cover of the watch part [itemId] that has none yet to the
   /// file its completion writes, so the playback page opened next shows it

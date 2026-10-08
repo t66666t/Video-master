@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../models/video_item.dart';
+import '../services/bilibili/bilibili_watch_playlist.dart';
 import '../services/media_playback_service.dart';
 import '../services/playlist_manager.dart';
 import 'cached_thumbnail_widget.dart';
@@ -193,6 +194,7 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
     final playlistManager = Provider.of<PlaylistManager>(context);
     final playlist = playlistManager.playlist;
     final currentItemId = playbackService.currentItem?.id;
+    final bilibiliList = BilibiliWatchPlaylistSession.instance;
 
     final double panelWidth = widget.panelWidth;
     final double panelHeight = widget.panelHeight;
@@ -294,6 +296,21 @@ class _EpisodePickerPanelState extends State<EpisodePickerPanel> {
                           ),
                         ),
                       ),
+                      // The temporary Bilibili playlist can be emptied; the
+                      // video that plays stays.
+                      if (bilibiliList != null && bilibiliList.isActive)
+                        TextButton(
+                          key: const ValueKey('bilibili-playlist-clear'),
+                          style: TextButton.styleFrom(
+                            foregroundColor: Colors.white70,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          onPressed: () => bilibiliList.clear(),
+                          child: Text(
+                            '清空',
+                            style: TextStyle(fontSize: subFontSize),
+                          ),
+                        ),
                       IconButton(
                         icon: Icon(
                           Icons.skip_previous,

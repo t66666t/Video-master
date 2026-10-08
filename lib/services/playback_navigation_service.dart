@@ -134,6 +134,13 @@ class PlaybackNavigationService {
   @visibleForTesting
   static Route<void> Function(VideoItem item)? entryRouteOverrideForTesting;
 
+  /// Each widget test runs in its own zone: a queue left by an earlier test
+  /// would run its next step in that finished zone, which never comes.
+  @visibleForTesting
+  void resetNavigationQueueForTesting() {
+    _navigationQueue = Future<void>.value();
+  }
+
   /// 视频播放页路由。缩放照常播放，但不把这一页拍成快照。
   ///
   /// 快照会把正在显示的视频纹理从 GPU 读回。Windows 上这次回读会堵住光栅线程，

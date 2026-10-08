@@ -12,6 +12,7 @@ import 'package:video_player_app/services/bilibili/bilibili_quick_import.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_playlist.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
@@ -250,11 +251,18 @@ Future<void> _openWatchPlan(
   final existingController = playback.currentItem?.id == item.id
       ? playback.controller
       : null;
-  playlist.prepareLibraryPlayback(
-    item,
-    searchItems: plan.queue,
-    useSearchResultsAsQueue: plan.queue != null,
-  );
+  final watchList = BilibiliWatchPlaylistSession.instance;
+  if (watchList != null) {
+    // The video joins the temporary Bilibili playlist, which becomes the
+    // queue (before playback starts, which keeps a queue holding it).
+    watchList.opened(plan);
+  } else {
+    playlist.prepareLibraryPlayback(
+      item,
+      searchItems: plan.queue,
+      useSearchResultsAsQueue: plan.queue != null,
+    );
+  }
   final navigation = PlaybackNavigationService.instance;
   navigation.primeLibraryPlaybackEntry(
     playbackService: playback,
@@ -353,7 +361,10 @@ Future<void> _fillRemainingParts(
       pages: [for (final part in batch.videoInfo.pages) part.page],
       videoInfo: batch.videoInfo,
     );
-    if (filled.createdCount > 0) playlist.reloadPlaylist();
+    if (filled.createdCount > 0) {
+      playlist.reloadPlaylist();
+      BilibiliWatchPlaylistSession.instance?.refresh();
+    }
   } catch (error, stack) {
     developer.log(
       'Filling parts of $bvid failed',

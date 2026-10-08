@@ -22,6 +22,7 @@ import 'package:video_player_app/services/bilibili/bilibili_public_api_service.d
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_launch.dart';
+import 'package:video_player_app/services/bilibili/bilibili_watch_playlist.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/playback_navigation_service.dart';
@@ -916,6 +917,7 @@ void main() {
       service = BilibiliDownloadService(apiService: _WatchApi());
       await service.init();
       openedPlayers.clear();
+      PlaybackNavigationService.instance.resetNavigationQueueForTesting();
       PlaybackNavigationService.entryRouteOverrideForTesting = (item) {
         openedPlayers.add(item.id);
         return MaterialPageRoute<void>(
@@ -937,7 +939,27 @@ void main() {
       await deleteTestTempDir(root);
     });
 
+    var queue = PlaylistManager();
+
+    /// The temporary Bilibili playlist as the app installs it.
+    BilibiliWatchPlaylist installWatchList() {
+      final list = BilibiliWatchPlaylist();
+      BilibiliWatchPlaylistSession.install(
+        BilibiliWatchPlaylistSession(
+          list: list,
+          service: service,
+          library: library,
+          queue: queue,
+          playbackChanges: MediaPlaybackService(),
+          currentItem: () => MediaPlaybackService().currentItem,
+        ),
+      );
+      addTearDown(() => BilibiliWatchPlaylistSession.install(null));
+      return list;
+    }
+
     Future<void> pumpList(WidgetTester tester, {bool replace = false}) async {
+      queue = PlaylistManager();
       await tester.pumpWidget(
         MultiProvider(
           providers: [
@@ -948,9 +970,7 @@ void main() {
             ChangeNotifierProvider<MediaPlaybackService>.value(
               value: MediaPlaybackService(),
             ),
-            ChangeNotifierProvider<PlaylistManager>.value(
-              value: PlaylistManager(),
-            ),
+            ChangeNotifierProvider<PlaylistManager>.value(value: queue),
           ],
           child: MaterialApp(
             navigatorKey: AppToast.navigatorKey,
@@ -1175,6 +1195,108 @@ void main() {
         ),
         findsNothing,
       );
+      await closeAll(tester);
+    });
+
+    testWidgets('a given-up load never joins the Bilibili playlist', (
+      tester,
+    ) async {
+      final info = Completer<BilibiliVideoInfo>();
+      final warm = Completer<void>();
+      var infoAsked = 0;
+      var warmStarted = false;
+      BilibiliWatchSources.overrideForTesting = BilibiliWatchSources(
+        fetchInfo: (_) =>
+            ++infoAsked == 1 ? info.future : Future.value(_info()),
+        warmPlayUrl: (_, _) {
+          warmStarted = true;
+          return warm.future;
+        },
+      );
+      await pumpList(tester);
+      final list = installWatchList();
+
+      // Back while the info loads.
+      await tester.tap(find.text('video'));
+      await showRoute(tester);
+      await tester.tap(
+        find.byKey(const ValueKey('bilibili-watch-loading-back')),
+      );
+      await tester.pumpAndSettle();
+      info.complete(_info());
+      await settleUntil(tester, () => true);
+
+      // Back once the card was made, while the play address loads.
+      await tester.tap(find.text('video'));
+      await showRoute(tester);
+      await settleUntil(
+        tester,
+        () => warmStarted && library.transientVideos.isNotEmpty,
+      );
+      await tester.tap(
+        find.byKey(const ValueKey('bilibili-watch-loading-back')),
+      );
+      await tester.pumpAndSettle();
+      warm.complete();
+      await settleUntil(tester, () => library.transientVideos.isEmpty);
+
+      expect(openedPlayers, isEmpty);
+      expect(list.entries, isEmpty);
+    });
+
+    testWidgets('time limit, then retry: only the try that opens joins the '
+        'Bilibili playlist, once', (tester) async {
+      final firstWarm = Completer<void>();
+      var warms = 0;
+      BilibiliWatchSources.overrideForTesting = BilibiliWatchSources(
+        fetchInfo: (_) async => _info(),
+        warmPlayUrl: (_, _) => ++warms == 1 ? firstWarm.future : Future.value(),
+      );
+      await pumpList(tester);
+      final list = installWatchList();
+      await tester.tap(find.text('video'));
+      await showRoute(tester);
+      await settleUntil(tester, () => warms == 1);
+      await tester.pump(kBilibiliWatchTimeLimit);
+      expect(find.byKey(const ValueKey('bilibili-watch-retry')), findsOne);
+      expect(list.entries, isEmpty);
+
+      await tester.tap(find.byKey(const ValueKey('bilibili-watch-retry')));
+      await openPlayer(tester);
+      firstWarm.complete();
+      await settleUntil(tester, () => true);
+
+      expect(openedPlayers, hasLength(1));
+      expect(list.entries.map((e) => e.bvid), <String>[_bvid]);
+      expect(library.transientVideos, hasLength(1));
+      await closeAll(tester);
+    });
+
+    testWidgets('a video opened from the playback page\'s Bilibili panel '
+        '(collection, description link) joins the list too', (tester) async {
+      const other = 'BV1yy411c7mE';
+      BilibiliWatchSources.overrideForTesting = BilibiliWatchSources(
+        fetchInfo: (bvid) async => _info(bvid: bvid),
+        warmPlayUrl: (_, _) async {},
+      );
+      await pumpList(tester);
+      final list = installWatchList();
+      await tester.tap(find.text('video'));
+      await openPlayer(tester);
+      expect(list.entries.map((e) => e.bvid), <String>[_bvid]);
+
+      // What the panel's links do: play in place of the open page.
+      final context = tester.element(find.text('video', skipOffstage: false));
+      openedPlayers.clear();
+      unawaited(watchBilibiliVideo(context, bvid: other, replaceCurrent: true));
+      await openPlayer(tester);
+      expect(list.entries.map((e) => e.bvid), <String>[_bvid, other]);
+      expect(list.currentBvid, other);
+      await settleUntil(tester, () => queue.playlist.length == 2);
+      expect(queue.playlist.map((item) => item.sourceRef?.bvid), <String>[
+        _bvid,
+        other,
+      ]);
       await closeAll(tester);
     });
 
