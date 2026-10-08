@@ -89,16 +89,64 @@ class BilibiliWatchPlan {
   /// keeps its folder as the queue.
   final List<VideoItem>? queue;
 
+  /// The watch history entry to write once the playback page really opens
+  /// ([noteOpenedWatch]); null when it is written already.
+  final BilibiliWatchHistoryEntry? historyEntry;
+
   const BilibiliWatchPlan({
     required this.item,
     required this.videoInfo,
     required this.imported,
     this.queue,
     this.createdItemIds = const <String>{},
+    this.historyEntry,
   });
 
   /// Whether the playback page gets [queue] instead of the folder queue.
   bool get usesOwnQueue => queue != null;
+
+  /// Every entry this watch plays or lists.
+  Set<String> get itemIds => <String>{
+    item.id,
+    for (final entry in queue ?? const <VideoItem>[]) entry.id,
+  };
+}
+
+/// The watch history entry of [info] played at part [page].
+BilibiliWatchHistoryEntry bilibiliWatchHistoryEntry({
+  required BilibiliVideoInfo info,
+  required String bvid,
+  required int page,
+  int positionMs = 0,
+}) {
+  return BilibiliWatchHistoryEntry(
+    bvid: info.bvid.isNotEmpty ? info.bvid : bvid,
+    title: info.title,
+    ownerName: info.ownerName,
+    coverUrl: info.pic,
+    page: page,
+    partTitle: _partTitle(info, page),
+    watchedAt: DateTime.now(),
+    positionMs: positionMs,
+  );
+}
+
+/// The playback page of [plan] opened: its watch history entry is written
+/// now, so a watch that was given up never shows in the history.
+Future<void> noteOpenedWatch(
+  BilibiliWatchPlan plan, {
+  BilibiliHistoryService? history,
+}) async {
+  final entry = plan.historyEntry;
+  if (entry == null) return;
+  try {
+    await (history ?? BilibiliHistoryService.instance).recordWatch(
+      entry.copyWith(watchedAt: DateTime.now()),
+    );
+  } catch (error) {
+    // History is best effort and never blocks playback.
+    developer.log('Watch history not recorded', error: error);
+  }
 }
 
 String _partTitle(BilibiliVideoInfo info, int page) {
@@ -116,7 +164,9 @@ String _partTitle(BilibiliVideoInfo info, int page) {
 /// reused or created as before. Otherwise an existing library card for the
 /// BV + part is reused, or a watch-only card is used. A watch-only card that
 /// is not playing right now starts at the resolved history position through
-/// its regular saved position. The watch history entry is written here.
+/// its regular saved position. The watch history entry is written here, or
+/// with [recordHistory] false handed back in [BilibiliWatchPlan.historyEntry]
+/// for when the playback page opens.
 ///
 /// [loadInfo] replaces the video info request (a cache in front of it).
 /// [onInfo] runs as soon as the info and the part are known, before any card
@@ -141,6 +191,7 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
   bool deferPlayerData = false,
   bool Function()? isCancelled,
   void Function(String step)? onStep,
+  bool recordHistory = true,
 }) async {
   void checkCancelled() {
     if (isCancelled?.call() ?? false) {
@@ -218,31 +269,29 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
     await _discardCreated(library, created);
     throw const BilibiliWatchCancelledException();
   }
-  try {
-    await watchHistory.recordWatch(
-      BilibiliWatchHistoryEntry(
-        bvid: info.bvid.isNotEmpty ? info.bvid : bvid,
-        title: info.title,
-        ownerName: info.ownerName,
-        coverUrl: info.pic,
-        page: playedPage,
-        partTitle: _partTitle(info, playedPage),
-        watchedAt: DateTime.now(),
-        positionMs: item.lastPositionMs,
-      ),
-    );
-  } catch (error) {
-    // History is best effort and never blocks playback.
-    developer.log('Watch history not recorded', error: error);
-  }
-  onStep?.call('history written');
-  return BilibiliWatchPlan(
+  final historyEntry = bilibiliWatchHistoryEntry(
+    info: info,
+    bvid: bvid,
+    page: playedPage,
+    positionMs: item.lastPositionMs,
+  );
+  final plan = BilibiliWatchPlan(
     item: item,
     videoInfo: info,
     imported: imported,
     queue: queue,
     createdItemIds: Set<String>.unmodifiable(created),
+    historyEntry: recordHistory ? null : historyEntry,
   );
+  if (recordHistory) {
+    try {
+      await watchHistory.recordWatch(historyEntry);
+    } catch (error) {
+      developer.log('Watch history not recorded', error: error);
+    }
+    onStep?.call('history written');
+  }
+  return plan;
 }
 
 Future<void> _discardCreated(LibraryService library, Set<String> ids) async {

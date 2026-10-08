@@ -49,7 +49,11 @@ class BilibiliWatchLoadingPage extends StatefulWidget {
   final Future<BilibiliWatchPlan> Function(BilibiliWatchAttempt attempt) load;
   final BilibiliWatchOpener open;
   final BilibiliOpenTimeline Function() timeline;
-  final Future<void> Function(BilibiliWatchPlan plan)? discard;
+
+  /// Cleans up after a try that was given up; [kept] is the plan that
+  /// opened, whose entries stay.
+  final Future<void> Function(BilibiliWatchPlan plan, BilibiliWatchPlan? kept)?
+  discard;
 
   /// Runs when the page goes away, whichever way.
   final VoidCallback? onClosed;
@@ -104,7 +108,7 @@ class _BilibiliWatchLoadingPageState extends State<BilibiliWatchLoadingPage> {
     }
     if (!mounted || route == null || !route.isActive) {
       final discard = widget.discard;
-      if (discard != null) unawaited(discard(plan));
+      if (discard != null) unawaited(discard(plan, null));
       return;
     }
     _opening = true;

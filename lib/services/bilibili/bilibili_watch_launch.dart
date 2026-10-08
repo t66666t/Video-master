@@ -209,6 +209,9 @@ class BilibiliWatchLoader {
       deferPlayerData: true,
       isCancelled: () => attempt.isCancelled,
       onStep: timeline.mark,
+      // Written when the playback page opens: a try given up meanwhile
+      // leaves no history entry.
+      recordHistory: false,
     );
     final waits = <Future<void>>[?warming];
     final cover = warmCover;
@@ -309,8 +312,13 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
   final void Function(T result, BilibiliOpenTimeline timeline)? onReady;
 
   /// Runs with the result of a try that was given up (back, time limit,
-  /// retry) and finished anyway.
-  final Future<void> Function(T result)? discard;
+  /// retry) and finished anyway, once it is clear what to keep: [kept] is the
+  /// result that opened (its entries stay), null when none did.
+  ///
+  /// Until the launch is ready or left, such results are held: a newer try
+  /// may reuse what the given-up one made (or make the same again), and only
+  /// the end tells which of it is not needed.
+  final Future<void> Function(T abandoned, T? kept)? discard;
   final Duration timeLimit;
 
   BilibiliWatchLaunchPhase _phase = BilibiliWatchLaunchPhase.loading;
@@ -318,6 +326,8 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
   BilibiliWatchAttempt? _attempt;
   Timer? _timer;
   bool _disposed = false;
+  final List<T> _held = <T>[];
+  T? _ready;
 
   BilibiliWatchLaunchPhase get phase => _phase;
 
@@ -348,13 +358,15 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
     Future<T>.sync(() => load(attempt)).then(
       (result) {
         if (attempt.isCancelled || !identical(_attempt, attempt) || _disposed) {
-          unawaited(_discard(result));
+          _abandon(result);
           return;
         }
         _timer?.cancel();
         _phase = BilibiliWatchLaunchPhase.ready;
+        _ready = result;
         attempt.timeline.mark('ready');
         _notify();
+        _releaseHeld();
         onReady?.call(result, attempt.timeline);
       },
       onError: (Object error, StackTrace stack) {
@@ -385,12 +397,35 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
     _timer?.cancel();
     if (_phase == BilibiliWatchLaunchPhase.ready) return;
     _phase = BilibiliWatchLaunchPhase.cancelled;
+    _releaseHeld();
     _notify();
   }
 
-  Future<void> _discard(T result) async {
+  /// Whether nothing runs any more that could still use a given-up result.
+  bool get _settled =>
+      _disposed ||
+      _phase == BilibiliWatchLaunchPhase.ready ||
+      _phase == BilibiliWatchLaunchPhase.cancelled;
+
+  void _abandon(T result) {
+    if (_settled) {
+      unawaited(_discard(result, _ready));
+    } else {
+      _held.add(result);
+    }
+  }
+
+  void _releaseHeld() {
+    final held = List<T>.of(_held);
+    _held.clear();
+    for (final result in held) {
+      unawaited(_discard(result, _ready));
+    }
+  }
+
+  Future<void> _discard(T result, T? kept) async {
     try {
-      await discard?.call(result);
+      await discard?.call(result, kept);
     } catch (error) {
       developer.log('Abandoned watch not cleaned up', error: error);
     }
@@ -405,6 +440,7 @@ class BilibiliWatchLaunch<T> extends ChangeNotifier {
     if (_phase == BilibiliWatchLaunchPhase.loading) cancel();
     _disposed = true;
     _timer?.cancel();
+    _releaseHeld();
     super.dispose();
   }
 }
@@ -442,9 +478,10 @@ Future<void> discardAbandonedWatch(
   required LibraryService library,
   String? playingItemId,
   Iterable<String> openPageItemIds = const <String>[],
+  Iterable<String> keep = const <String>[],
   BilibiliWatchCards? cards,
 }) async {
-  final inUse = <String>{?playingItemId, ...openPageItemIds};
+  final inUse = <String>{?playingItemId, ...openPageItemIds, ...keep};
   for (final id in plan.createdItemIds) {
     if (inUse.contains(id)) continue;
     try {

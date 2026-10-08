@@ -416,6 +416,248 @@ void main() {
     });
   });
 
+  group('watch history of given-up tries', () {
+    late Directory root;
+    late LibraryService library;
+    late PathProviderPlatform originalPathProvider;
+    final history = BilibiliHistoryService.instance;
+
+    setUp(() async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      SettingsService().resetForTest();
+      history.resetForTest();
+      root = await Directory.systemTemp.createTemp('bilibili_watch_history_');
+      originalPathProvider = PathProviderPlatform.instance;
+      PathProviderPlatform.instance = _TempPathProvider(root.path);
+      SettingsService().largeDataRootPath = root.path;
+      library = LibraryService()..resetLibraryForTesting();
+      await library.init();
+    });
+
+    tearDown(() async {
+      library.resetLibraryForTesting();
+      SettingsService().resetForTest();
+      SettingsService().largeDataRootPath = null;
+      history.resetForTest();
+      PathProviderPlatform.instance = originalPathProvider;
+      await deleteTestTempDir(root);
+    });
+
+    BilibiliDownloadService newService() {
+      final service = BilibiliDownloadService(apiService: _WatchApi());
+      addTearDown(service.shutdown);
+      return service;
+    }
+
+    /// A launch as the loading page runs it; [opened] gets the plan whose
+    /// playback page opens (with its history entry written as on open).
+    BilibiliWatchLaunch<BilibiliWatchPlan> launchOf(
+      BilibiliDownloadService service, {
+      required Future<void> Function(int attempt) warm,
+      required List<BilibiliWatchPlan> opened,
+      BilibiliVideoInfo? info,
+      Duration timeLimit = kBilibiliWatchTimeLimit,
+    }) {
+      var tries = 0;
+      final launch = BilibiliWatchLaunch<BilibiliWatchPlan>(
+        timelineFor: () => BilibiliOpenTimeline(_bvid),
+        timeLimit: timeLimit,
+        load: (attempt) {
+          final number = ++tries;
+          return BilibiliWatchLoader(
+            service: service,
+            library: library,
+            bvid: _bvid,
+            history: history,
+            fetchInfo: (_) async => info ?? _info(),
+            warmPlayUrl: (_, _) => warm(number),
+          )(attempt);
+        },
+        onReady: (plan, _) {
+          opened.add(plan);
+          unawaited(noteOpenedWatch(plan, history: history));
+        },
+        discard: (plan, kept) => discardAbandonedWatch(
+          plan,
+          library: library,
+          keep: kept?.itemIds ?? const <String>{},
+        ),
+      );
+      addTearDown(launch.dispose);
+      return launch;
+    }
+
+    Future<void> until(bool Function() done) async {
+      for (var i = 0; i < 400 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(done(), isTrue);
+    }
+
+    int entriesOf(String bvid) =>
+        history.watchHistory.where((e) => e.bvid == bvid).length;
+
+    test('back at the moment the video got ready: no entry, no card', () async {
+      await history.recordWatch(
+        BilibiliWatchHistoryEntry(
+          bvid: 'BV1other11111',
+          title: 'other',
+          ownerName: 'UP',
+          coverUrl: '',
+          page: 1,
+          partTitle: '',
+          watchedAt: DateTime(2026, 10, 1),
+        ),
+      );
+      final service = newService();
+      final warm = Completer<void>();
+      final opened = <BilibiliWatchPlan>[];
+      final launch = launchOf(service, warm: (_) => warm.future, opened: opened)
+        ..start();
+      await until(() => library.transientVideos.isNotEmpty);
+
+      // The answer and back meet: back is handled first.
+      warm.complete();
+      launch.cancel();
+      await until(() => library.transientVideos.isEmpty);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(opened, isEmpty);
+      expect(history.watchHistory, hasLength(1));
+      expect(entriesOf(_bvid), 0);
+    });
+
+    test(
+      'a video already in the history keeps one entry, updated on open',
+      () async {
+        await history.recordWatch(
+          BilibiliWatchHistoryEntry(
+            bvid: _bvid,
+            title: '测试视频',
+            ownerName: 'UP',
+            coverUrl: _cover,
+            page: 1,
+            partTitle: '',
+            watchedAt: DateTime(2026, 10, 1),
+            positionMs: 1000,
+          ),
+        );
+        final service = newService();
+
+        // Given up while getting ready: the entry is left as it was.
+        final warm = Completer<void>();
+        final opened = <BilibiliWatchPlan>[];
+        final first = launchOf(
+          service,
+          warm: (_) => warm.future,
+          opened: opened,
+        )..start();
+        await until(() => library.transientVideos.isNotEmpty);
+        warm.complete();
+        first.cancel();
+        await until(() => library.transientVideos.isEmpty);
+        expect(history.watchHistory.single.watchedAt, DateTime(2026, 10, 1));
+
+        // Opened: the same entry moves up, no second one.
+        launchOf(service, warm: (_) async {}, opened: opened).start();
+        await until(() => opened.isNotEmpty);
+        await until(
+          () => history.watchHistory.single.watchedAt != DateTime(2026, 10, 1),
+        );
+        expect(history.watchHistory, hasLength(1));
+        expect(history.watchHistory.single.bvid, _bvid);
+        expect(history.watchHistory.single.positionMs, 1000);
+      },
+    );
+
+    BilibiliVideoInfo twoParts() => BilibiliVideoInfo(
+      title: '测试视频',
+      desc: '',
+      pic: _cover,
+      bvid: _bvid,
+      aid: '123',
+      ownerName: 'UP',
+      ownerMid: '1',
+      pubDate: 0,
+      pages: <BilibiliPage>[
+        BilibiliPage(cid: 101, page: 1, part: '上', duration: 600),
+        BilibiliPage(cid: 102, page: 2, part: '下', duration: 600),
+      ],
+    );
+
+    for (final lateFirst in <bool>[true, false]) {
+      test('time limit, then retry (the given-up try answers '
+          '${lateFirst ? 'before' : 'after'} the retry): one entry, one '
+          'card per part', () async {
+        final service = newService();
+        final firstWarm = Completer<void>();
+        final secondWarm = Completer<void>();
+        final opened = <BilibiliWatchPlan>[];
+        final launch = launchOf(
+          service,
+          info: twoParts(),
+          timeLimit: const Duration(milliseconds: 200),
+          warm: (attempt) =>
+              attempt == 1 ? firstWarm.future : secondWarm.future,
+          opened: opened,
+        )..start();
+        await until(() => launch.phase == BilibiliWatchLaunchPhase.failed);
+        // The first try made the card and the entry of the other part.
+        expect(library.transientVideos, hasLength(2));
+
+        launch.retry();
+        if (lateFirst) {
+          firstWarm.complete();
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          secondWarm.complete();
+        } else {
+          secondWarm.complete();
+          await until(() => opened.isNotEmpty);
+          firstWarm.complete();
+        }
+        await until(() => opened.isNotEmpty);
+        await until(() => entriesOf(_bvid) == 1);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        final plan = opened.single;
+        // The retry reused what the first try made; nothing it plays or
+        // lists was removed, and nothing is left twice.
+        expect(library.transientVideos, hasLength(2));
+        expect(
+          library.transientVideos.map((item) => item.id).toSet(),
+          plan.itemIds,
+        );
+        for (final id in plan.itemIds) {
+          expect(library.getVideo(id), isNotNull);
+        }
+        expect(history.watchHistory, hasLength(1));
+      });
+    }
+
+    test('back after a timed-out try: both tries leave nothing', () async {
+      final service = newService();
+      final firstWarm = Completer<void>();
+      final secondWarm = Completer<void>();
+      final opened = <BilibiliWatchPlan>[];
+      final launch = launchOf(
+        service,
+        timeLimit: const Duration(milliseconds: 200),
+        warm: (attempt) => attempt == 1 ? firstWarm.future : secondWarm.future,
+        opened: opened,
+      )..start();
+      await until(() => launch.phase == BilibiliWatchLaunchPhase.failed);
+      launch.retry();
+      firstWarm.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      launch.cancel();
+      secondWarm.complete();
+      await until(() => library.transientVideos.isEmpty);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(opened, isEmpty);
+      expect(history.watchHistory, isEmpty);
+    });
+  });
+
   group('late player data', () {
     VideoItem card({String? subtitle}) => VideoItem(
       id: 'watch-1',
@@ -505,7 +747,7 @@ void main() {
                   ),
                 );
               },
-              discard: (plan) async => discarded?.add(plan),
+              discard: (plan, _) async => discarded?.add(plan),
             ),
           ),
         ),
@@ -582,11 +824,12 @@ void main() {
       expect(attempts.single.isCancelled, isTrue);
       expectNoLoadingNotice();
 
-      // The given-up try answers late: dropped, nothing opens.
+      // The given-up try answers late: nothing opens, and what it made is
+      // held until the retry shows what the open page keeps.
       answers.first.complete(_plan('late'));
       await tester.pump();
       expect(opened, isEmpty);
-      expect(discarded.single.item.id, 'late');
+      expect(discarded, isEmpty);
 
       await tester.tap(find.byKey(const ValueKey('bilibili-watch-retry')));
       await tester.pump();
@@ -598,6 +841,7 @@ void main() {
       answers.last.complete(_plan('watch-2'));
       await tester.pumpAndSettle();
       expect(opened.single.item.id, 'watch-2');
+      expect(discarded.single.item.id, 'late');
     });
 
     testWidgets('a failure shows its reason instead of spinning on', (
@@ -820,6 +1064,8 @@ void main() {
       expect(openedPlayers, isEmpty);
       expect(navigation.hasPlaybackPage, isFalse);
       expect(library.transientVideos, isEmpty);
+      // A video that never opened is not in the watch history.
+      expect(BilibiliHistoryService.instance.watchHistory, isEmpty);
     });
 
     /// Lets the loading page come in and the video get ready, until the
@@ -867,6 +1113,13 @@ void main() {
           skipOffstage: false,
         ),
         findsNothing,
+      );
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      expect(
+        BilibiliHistoryService.instance.watchHistory.map((e) => e.bvid),
+        <String>[_bvid],
       );
       await closeAll(tester);
     });

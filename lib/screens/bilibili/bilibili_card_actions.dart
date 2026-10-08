@@ -120,11 +120,15 @@ Future<void> playBilibiliVideoAsCard(
     replace: PlaybackNavigationService.instance.hasPlaybackPage,
     load: (attempt) async {
       await service.init();
+      BilibiliWatchHistoryEntry? historyEntry;
       final batch = await obtainBilibiliPlaybackCard(
         service,
         library,
         bvid: bvid,
         page: page,
+        // Written once the playback page opens.
+        recordHistory: false,
+        onHistoryEntry: (entry) => historyEntry = entry,
       );
       final item = batch.cards.first.item;
       BilibiliWatchCards.instance?.track(item);
@@ -133,6 +137,7 @@ Future<void> playBilibiliVideoAsCard(
         item: item,
         videoInfo: batch.videoInfo,
         imported: true,
+        historyEntry: historyEntry,
       );
     },
   );
@@ -194,8 +199,9 @@ Future<void> _openLoadingPage(
             playback: playback,
             playlist: playlist,
           ),
-          discard: (plan) => discardAbandonedWatch(
+          discard: (plan, kept) => discardAbandonedWatch(
             plan,
+            keep: kept?.itemIds ?? const <String>{},
             library: library,
             playingItemId: playback.currentItem?.id,
             openPageItemIds: _openPlaybackPageItemIds(),
@@ -237,6 +243,8 @@ Future<void> _openWatchPlan(
   required PlaylistManager playlist,
 }) async {
   final item = plan.item;
+  // Only a watch that really opens goes into the history.
+  unawaited(noteOpenedWatch(plan));
   timeline.attachTo(item.id);
   timeline.followPlayback(playback, item.id);
   final existingController = playback.currentItem?.id == item.id
@@ -293,45 +301,41 @@ Future<void> _openWatchPlan(
 }
 
 /// Card half of [playBilibiliVideoAsCard]: reuses or creates the online card
-/// for [bvid] part [page] and records the watch history entry. Opening the
-/// playback page is left to the caller.
+/// for [bvid] part [page] and records the watch history entry (or with
+/// [recordHistory] false hands it to [onHistoryEntry]). Opening the playback
+/// page is left to the caller.
 Future<BilibiliStreamCardBatch> obtainBilibiliPlaybackCard(
   BilibiliDownloadService service,
   LibraryService library, {
   required String bvid,
   required int page,
   BilibiliHistoryService? history,
+  bool recordHistory = true,
+  void Function(BilibiliWatchHistoryEntry entry)? onHistoryEntry,
 }) async {
   final batch = await service.obtainStreamCardsForVideo(
     library,
     bvid: bvid,
     pages: <int>[page],
   );
-  final info = batch.videoInfo;
   final card = batch.cards.first.item;
-  final playedPage = card.sourceRef?.page ?? page;
-  var partTitle = '';
-  if (info.pages.length > 1) {
-    for (final part in info.pages) {
-      if (part.page == playedPage) partTitle = part.part;
-    }
-  }
-  try {
-    await (history ?? BilibiliHistoryService.instance).recordWatch(
-      BilibiliWatchHistoryEntry(
-        bvid: info.bvid.isNotEmpty ? info.bvid : bvid,
-        title: info.title,
-        ownerName: info.ownerName,
-        coverUrl: info.pic,
-        page: playedPage,
-        partTitle: partTitle,
-        watchedAt: DateTime.now(),
+  final entry = bilibiliWatchHistoryEntry(
+    info: batch.videoInfo,
+    bvid: bvid,
+    page: card.sourceRef?.page ?? page,
+  );
+  if (recordHistory) {
+    await noteOpenedWatch(
+      BilibiliWatchPlan(
+        item: card,
+        videoInfo: batch.videoInfo,
+        imported: true,
+        historyEntry: entry,
       ),
+      history: history,
     );
-  } catch (error) {
-    // History is best effort and never blocks playback.
-    developer.log('Watch history not recorded', error: error);
   }
+  onHistoryEntry?.call(entry);
   return batch;
 }
 
