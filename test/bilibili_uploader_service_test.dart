@@ -436,5 +436,67 @@ void main() {
       expect(offline.status, BilibiliUploaderStatus.networkError);
       expect(offline.message, isNotEmpty);
     });
+
+    test('collection videos: season and series pages', () async {
+      bili.routes['/x/polymer/web-space/seasons_archives_list'] = (_) => _json({
+        'code': 0,
+        'data': {
+          'archives': [
+            {
+              'bvid': 'BV1xx411c7mA',
+              'title': '合集一',
+              'duration': 125,
+              'pubdate': 1700000000,
+              'stat': {'view': 321, 'reply': 4},
+            },
+          ],
+          'page': {'page_num': 2, 'page_size': 20, 'total': 41},
+        },
+      });
+      bili.routes['/x/series/archives'] = (_) => _json({'code': -400});
+
+      const season = BilibiliUploaderCollection(
+        id: 5,
+        isSeason: true,
+        title: '合集A',
+      );
+      final ok = await service.fetchCollectionVideos(_mid, season, page: 2);
+      expect(ok.isSuccess, isTrue);
+      final video = ok.data!.items.single;
+      expect(video.title, '合集一');
+      expect(video.playCount, 321);
+      expect(video.commentCount, 4);
+      expect(video.durationSeconds, 125);
+      expect(ok.data!.hasMore, isTrue);
+      final q = bili
+          .to('/x/polymer/web-space/seasons_archives_list')
+          .single
+          .uri
+          .queryParameters;
+      expect(q['mid'], '$_mid');
+      expect(q['season_id'], '5');
+      expect(q['page_num'], '2');
+      expect(q['page_size'], '20');
+
+      const series = BilibiliUploaderCollection(
+        id: 8,
+        isSeason: false,
+        title: '系列B',
+      );
+      final bad = await service.fetchCollectionVideos(_mid, series, page: 99);
+      expect(bad.isSuccess, isFalse);
+      expect(bad.status, BilibiliUploaderStatus.failed);
+      final sq = bili.to('/x/series/archives').single.uri.queryParameters;
+      expect(sq['series_id'], '8');
+      expect(sq['pn'], '50');
+      expect(sq['ps'], '20');
+      expectNoLoginCookie();
+
+      final none = await service.fetchCollectionVideos(
+        _mid,
+        const BilibiliUploaderCollection(id: 0, isSeason: true, title: 'x'),
+      );
+      expect(none.isSuccess, isFalse);
+    });
   });
 }

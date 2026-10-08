@@ -267,6 +267,70 @@ class BilibiliUploaderService {
     );
   }
 
+  /// One page of the videos in [collection]: a season (合集) or a series
+  /// (系列), [kBilibiliUploaderPageSize] per page, at most
+  /// [kBilibiliUploaderMaxPages] pages. Never throws.
+  Future<BilibiliUploaderResult<BilibiliUploaderPage<BilibiliUploaderVideo>>>
+  fetchCollectionVideos(
+    int mid,
+    BilibiliUploaderCollection collection, {
+    int page = 1,
+  }) async {
+    if (mid <= 0 || collection.id <= 0) {
+      return const BilibiliUploaderResult.failure(
+        BilibiliUploaderStatus.failed,
+        '无效的合集',
+      );
+    }
+    final pn = clampPage(page);
+    final result = collection.isSeason
+        ? await _read(
+            '/x/polymer/web-space/seasons_archives_list',
+            query: {
+              'mid': mid,
+              'season_id': collection.id,
+              'page_num': pn,
+              'page_size': kBilibiliUploaderPageSize,
+              'sort_reverse': 'false',
+            },
+            referer: spaceReferer(mid),
+            what: '合集视频',
+            anonymousDevice: true,
+          )
+        : await _read(
+            '/x/series/archives',
+            query: {
+              'mid': mid,
+              'series_id': collection.id,
+              'pn': pn,
+              'ps': kBilibiliUploaderPageSize,
+              'only_normal': 'true',
+              'sort': 'desc',
+            },
+            referer: spaceReferer(mid),
+            what: '系列视频',
+            anonymousDevice: true,
+          );
+    if (!result.isSuccess) {
+      return result.cast<BilibiliUploaderPage<BilibiliUploaderVideo>>();
+    }
+    final data = result.data!;
+    final items = <BilibiliUploaderVideo>[];
+    final seen = <String>{};
+    for (final raw in readBiliMapList(data['archives'])) {
+      final item = BilibiliUploaderVideo.tryParse(raw);
+      if (item != null && seen.add(item.bvid)) items.add(item);
+    }
+    final pageInfo = readBiliMap(data['page']);
+    return BilibiliUploaderResult.success(
+      BilibiliUploaderPage<BilibiliUploaderVideo>(
+        items: List<BilibiliUploaderVideo>.unmodifiable(items),
+        page: pn,
+        total: readBiliInt(pageInfo['total']),
+      ),
+    );
+  }
+
   // ----------------------------------------------------------------- shared
 
   /// One request turned into a result carrying `data` on code 0.

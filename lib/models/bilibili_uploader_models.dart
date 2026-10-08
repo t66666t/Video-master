@@ -210,7 +210,8 @@ class BilibiliUploaderVideo {
     this.publishedAt,
   });
 
-  /// An item of `data.list.vlist` of the space video search.
+  /// An item of `data.list.vlist` of the space video search, or of
+  /// `data.archives` of a collection's video list.
   static BilibiliUploaderVideo? tryParse(Map<String, dynamic> json) {
     final bvid = readBiliText(json['bvid']);
     if (!isValidBvid(bvid)) return null;
@@ -224,8 +225,10 @@ class BilibiliUploaderVideo {
       durationSeconds: length is num
           ? readBiliInt(length)
           : parseBilibiliDurationText(readBiliText(length)),
-      playCount: readBiliInt(json['play']),
-      commentCount: readBiliInt(json['comment']),
+      playCount: readBiliInt(json['play'] ?? readBiliMap(json['stat'])['view']),
+      commentCount: readBiliInt(
+        json['comment'] ?? readBiliMap(json['stat'])['reply'],
+      ),
       publishedAt: readBiliUnixTime(json['created'] ?? json['pubdate']),
     );
   }

@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_interactions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
@@ -376,8 +377,16 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
         .map((s) => s.role.isEmpty ? s.name : '${s.name}（${s.role}）')
         .toList();
     return InkWell(
+      key: const ValueKey('bilibili-detail-owner'),
       borderRadius: BorderRadius.circular(8),
-      onTap: () => AppToast.show('UP 主主页将在后续版本提供'),
+      onTap: owner.mid > 0
+          ? () => openBilibiliUploader(
+              context,
+              mid: owner.mid,
+              name: owner.name,
+              api: _api,
+            )
+          : null,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: Row(

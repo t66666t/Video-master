@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_account_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
@@ -975,15 +976,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
                       ),
                     ),
                     const Spacer(),
-                    Text(
-                      video.author.isEmpty ? '未知 UP 主' : video.author,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: AppTokens.text2,
-                        fontSize: 12,
-                      ),
-                    ),
+                    _buildAuthor(video),
                     if (meta.isNotEmpty)
                       Text(
                         meta,
@@ -1004,6 +997,29 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     );
   }
 
+  /// The UP name opens the uploader page; the rest of the tile opens the
+  /// video detail.
+  Widget _buildAuthor(BilibiliSearchVideo video) {
+    final text = Text(
+      video.author.isEmpty ? '未知 UP 主' : video.author,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: AppTokens.text2, fontSize: 12),
+    );
+    if (video.mid <= 0) return text;
+    return GestureDetector(
+      key: ValueKey('bilibili-search-video-author-${video.bvid}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => openBilibiliUploader(
+        context,
+        mid: video.mid,
+        name: video.author,
+        api: _api,
+      ),
+      child: MouseRegion(cursor: SystemMouseCursors.click, child: text),
+    );
+  }
+
   Widget _buildUserTile(BilibiliSearchUser user) {
     final meta = <String>[
       if (user.level > 0) 'Lv${user.level}',
@@ -1014,7 +1030,13 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
         ? user.officialDesc
         : user.sign;
     return InkWell(
-      onTap: () => AppToast.show('UP 主主页将在后续版本提供'),
+      key: ValueKey('bilibili-search-user-${user.mid}'),
+      onTap: () => openBilibiliUploader(
+        context,
+        mid: user.mid,
+        name: user.name,
+        api: _api,
+      ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Row(
