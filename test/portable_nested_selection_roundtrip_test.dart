@@ -11,6 +11,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'test_dir_cleanup.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -29,7 +30,7 @@ void main() {
       addTearDown(() async {
         PathProviderPlatform.instance = originalPathProvider;
         SettingsService().resetForTest();
-        if (await root.exists()) await root.delete(recursive: true);
+        await deleteTestTempDir(root);
       });
 
       Future<File> media(String name) {
@@ -151,7 +152,7 @@ void main() {
       addTearDown(() async {
         PathProviderPlatform.instance = originalPathProvider;
         SettingsService().resetForTest();
-        if (await root.exists()) await root.delete(recursive: true);
+        await deleteTestTempDir(root);
       });
 
       final clip = await File(p.join(root.path, 'clip-c.mp4')).writeAsBytes(

@@ -161,7 +161,7 @@ void main() {
       final result = await quickImport(service);
       expect(result.fellBackToRoot, isTrue);
       expect(result.item.parentId, isNull);
-      expect(result.message, '原默认文件夹已不存在，已导入到 媒体库根目录');
+      expect(result.message, '原默认文件夹已删除或在回收站，已导入到 媒体库根目录');
       expect(settings.bilibiliImportTarget, 'root');
 
       // A folder in the recycle bin counts as deleted too.
@@ -193,7 +193,7 @@ void main() {
         final result = await quickImport(service);
         expect(result.fellBackToRoot, isTrue);
         expect(result.item.parentId, isNull);
-        expect(result.message, '原默认文件夹已不存在，已导入到 媒体库根目录');
+        expect(result.message, '原默认文件夹已删除或在回收站，已导入到 媒体库根目录');
         expect(settings.bilibiliImportTarget, 'root');
         expect(
           library.getContents(null).whereType<VideoItem>().map((v) => v.id),

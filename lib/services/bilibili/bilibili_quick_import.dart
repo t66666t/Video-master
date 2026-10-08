@@ -160,7 +160,7 @@ class BilibiliQuickImportResult {
     final placed = currentPartOnly
         ? '已导入当前P到 $folderLabel（共 $partCount P，要导入全部请点右侧按钮）'
         : '已导入到 $folderLabel';
-    final text = fellBackToRoot ? '原默认文件夹已不存在，$placed' : placed;
+    final text = fellBackToRoot ? '原默认文件夹已删除或在回收站，$placed' : placed;
     return failed > 0 ? '$text，$failed 个分P失败' : text;
   }
 }

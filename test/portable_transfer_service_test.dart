@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:video_player_app/features/portable_transfer/portable_transfer_models.dart';
 import 'package:video_player_app/features/portable_transfer/portable_transfer_service.dart';
 import 'package:video_player_app/services/library_service.dart';
+import 'test_dir_cleanup.dart';
 
 void main() {
   group('PortableTransferService package inspection', () {
@@ -17,9 +18,7 @@ void main() {
     });
 
     tearDown(() async {
-      if (await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
-      }
+      await deleteTestTempDir(tempDir);
     });
 
     test('reads a valid cross-platform package manifest', () async {
@@ -131,9 +130,7 @@ void main() {
 
     tearDown(() async {
       service.clearFinished();
-      if (await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
-      }
+      await deleteTestTempDir(tempDir);
     });
 
     test('deletes the linked file by default', () async {

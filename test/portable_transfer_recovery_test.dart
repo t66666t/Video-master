@@ -12,6 +12,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
+import 'test_dir_cleanup.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -38,7 +39,7 @@ void main() {
   tearDownAll(() async {
     PathProviderPlatform.instance = originalPathProvider;
     SettingsService().resetForTest();
-    await _deleteTempRoot(root);
+    await deleteTestTempDir(root);
   });
 
   test(
@@ -283,23 +284,6 @@ Future<void> _waitForTask(PortableTransferTask task) async {
     await Future<void>.delayed(const Duration(milliseconds: 20));
   }
   expect(task.isActive, isFalse, reason: task.subtitle);
-}
-
-/// Removes the test's temp directory. On Windows a file handle released a
-/// moment earlier can still block the delete (errno 32), so it is retried a
-/// few times; a directory that still cannot be removed is left to the system
-/// temp cleanup rather than failing the run.
-Future<void> _deleteTempRoot(Directory dir) async {
-  const attempts = 5;
-  for (var attempt = 1; attempt <= attempts; attempt++) {
-    try {
-      if (await dir.exists()) await dir.delete(recursive: true);
-      return;
-    } on FileSystemException {
-      if (attempt == attempts) return;
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-    }
-  }
 }
 
 class _FakePathProvider extends PathProviderPlatform {
