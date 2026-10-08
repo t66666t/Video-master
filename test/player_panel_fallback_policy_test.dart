@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:video_player_app/screens/portrait_video_screen.dart'
     show PortraitPanel;
@@ -332,6 +334,53 @@ void main() {
         }
       });
     }
+  });
+
+  group('the pages take every fallback from the policy', () {
+    int count(String source, String pattern) =>
+        RegExp(pattern).allMatches(source).length;
+
+    test('landscape: 16 places, none written out by hand', () {
+      final source = File(
+        'lib/screens/video_player_screen.dart',
+      ).readAsStringSync();
+      expect(
+        count(
+          source,
+          r'_isSubtitleSidebarVisible\s*\?\s*SidebarType\.subtitles',
+        ),
+        0,
+      );
+      expect(
+        count(source, r'_activeSidebar = _previousSidebarType\b(?!\s*;)'),
+        0,
+      );
+      expect(
+        count(source, r'_activeSidebar = _previousSidebarType;'),
+        0,
+        reason: 'going back to the previous panel goes through the policy',
+      );
+      // 14 places that close a panel, plus the definition.
+      expect(count(source, r'_sidebarAfterClosing\('), 15);
+      // Entering the player and _normalizedSidebarForRestore, plus the
+      // definition.
+      expect(count(source, r'_defaultSidebar\b'), 3);
+    });
+
+    test('portrait: 10 places, none written out by hand', () {
+      final source = File(
+        'lib/screens/portrait_video_screen.dart',
+      ).readAsStringSync();
+      expect(count(source, r'_activePanel = PortraitPanel\.subtitles'), 0);
+      expect(count(source, r'\?\s*PortraitPanel\.videoCompose'), 0);
+      expect(
+        count(source, r'_activePanel = _panelOf\(portraitDefaultPanel\(\)\);'),
+        1,
+      );
+      // Style close, manager close, the back key and six panels, plus the
+      // definition.
+      expect(count(source, r'_panelAfterClosing\('), 10);
+    });
   });
 
   group('Bilibili videos', () {

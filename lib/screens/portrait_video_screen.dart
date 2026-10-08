@@ -14,6 +14,7 @@ import '../models/subtitle_model.dart';
 import '../models/subtitle_style.dart';
 import '../models/managed_subtitle_asset.dart';
 import '../models/ocr_subtitle_models.dart';
+import '../services/bilibili/bilibili_player_panel_policy.dart';
 import '../services/bilibili/bilibili_video_shot_backfill.dart';
 import '../services/library_service.dart';
 import '../services/task_subtitle_storage_service.dart';
@@ -195,7 +196,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
   bool _isSubtitleNearCenterX = false;
   bool _isSubtitleNearCenterY = false;
   bool _isStylePanelDragMode = false;
-  PortraitPanel _activePanel = PortraitPanel.subtitles;
+  PortraitPanel _activePanel = _panelOf(portraitDefaultPanel());
   bool get _suppressSubtitleOverlayForOcr =>
       _activePanel == PortraitPanel.ocrSubtitle;
   bool _isSubtitleEditorExpanded = false;
@@ -2062,21 +2063,42 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
     }
   }
 
+  /// The panel [target] stands for on this page.
+  static PortraitPanel _panelOf(PortraitPanelTarget target) {
+    switch (target) {
+      case PortraitPanelTarget.videoCompose:
+        return PortraitPanel.videoCompose;
+      case PortraitPanelTarget.bilibili:
+      // Not offered on this page yet: never asked for.
+      case PortraitPanelTarget.subtitles:
+        return PortraitPanel.subtitles;
+    }
+  }
+
+  /// The panel to show once the open one closes.
+  PortraitPanel _panelAfterClosing([
+    PortraitPanelClosing closing = PortraitPanelClosing.toolPanel,
+  ]) => _panelOf(portraitPanelAfterClose(closing: closing));
+
   void _closeSubtitleStyleSettings() {
     _disableStylePanelDragMode();
     setState(() {
-      _activePanel = _subtitleStyleFromCompose
-          ? PortraitPanel.videoCompose
-          : PortraitPanel.subtitles;
+      _activePanel = _panelAfterClosing(
+        _subtitleStyleFromCompose
+            ? PortraitPanelClosing.fromCompose
+            : PortraitPanelClosing.toolPanel,
+      );
       _subtitleStyleFromCompose = false;
     });
   }
 
   void _closeSubtitleManager() {
     setState(() {
-      _activePanel = _subtitleManagerFromCompose
-          ? PortraitPanel.videoCompose
-          : PortraitPanel.subtitles;
+      _activePanel = _panelAfterClosing(
+        _subtitleManagerFromCompose
+            ? PortraitPanelClosing.fromCompose
+            : PortraitPanelClosing.toolPanel,
+      );
       _subtitleManagerFromCompose = false;
     });
   }
@@ -2595,15 +2617,16 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           _isSubtitleNearCenterX = false;
           _isSubtitleNearCenterY = false;
         }
-        if (_activePanel == PortraitPanel.subtitleStyle &&
-            _subtitleStyleFromCompose) {
-          _activePanel = PortraitPanel.videoCompose;
-        } else if (_activePanel == PortraitPanel.subtitleManager &&
-            _subtitleManagerFromCompose) {
-          _activePanel = PortraitPanel.videoCompose;
-        } else {
-          _activePanel = PortraitPanel.subtitles;
-        }
+        final fromCompose =
+            (_activePanel == PortraitPanel.subtitleStyle &&
+                _subtitleStyleFromCompose) ||
+            (_activePanel == PortraitPanel.subtitleManager &&
+                _subtitleManagerFromCompose);
+        _activePanel = _panelAfterClosing(
+          fromCompose
+              ? PortraitPanelClosing.fromCompose
+              : PortraitPanelClosing.toolPanel,
+        );
         _subtitleStyleFromCompose = false;
         _subtitleManagerFromCompose = false;
         _isSubtitleEditorExpanded = false;
@@ -4168,7 +4191,9 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           IconButton(
             icon: Icon(
               Icons.skip_next,
-              color: playbackService.hasPlayableNext ? Colors.white : Colors.white38,
+              color: playbackService.hasPlayableNext
+                  ? Colors.white
+                  : Colors.white38,
             ),
             onPressed: playbackService.hasPlayableNext
                 ? playbackService.playNext
@@ -5019,7 +5044,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
         return AiTranscriptionPanel(
           videoPath: _currentItem.path,
           videoId: _currentItem.id,
-          onBack: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onBack: () => setState(() => _activePanel = _panelAfterClosing()),
           onCompleted: (path) async {
             final settingsService = Provider.of<SettingsService>(
               context,
@@ -5154,7 +5179,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               panelWidth: constraints.maxWidth,
               panelHeight: constraints.maxHeight,
               onClose: () =>
-                  setState(() => _activePanel = PortraitPanel.subtitles),
+                  setState(() => _activePanel = _panelAfterClosing()),
               isPortrait: true,
             );
           },
@@ -5167,7 +5192,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           availableSubtitleMap: _buildAvailableSubtitleMap(),
           onBack: () {
             _clearVideoComposePreview();
-            setState(() => _activePanel = PortraitPanel.subtitles);
+            setState(() => _activePanel = _panelAfterClosing());
           },
           onOpenSubtitleStyle: () =>
               _openSubtitleStyleSettings(fromCompose: true),
@@ -5197,7 +5222,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           restorePlayback: (wasPlaying) async {
             if (wasPlaying && mounted) await _controller.play();
           },
-          onBack: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onBack: () => setState(() => _activePanel = _panelAfterClosing()),
           onCompleted: _applyCompletedOcrSubtitles,
         );
       case PortraitPanel.subtitleEditor:
@@ -5226,7 +5251,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
           onSubtitlesChanged: _onSubtitleEditorSubtitlesChanged,
           onSeekTo: _seekToSubtitleFast,
           onBack: () => setState(() {
-            _activePanel = PortraitPanel.subtitles;
+            _activePanel = _panelAfterClosing();
             _isSubtitleEditorExpanded = false;
           }),
           isExpanded: _isSubtitleEditorExpanded,
@@ -5350,7 +5375,7 @@ class _PortraitVideoScreenState extends State<PortraitVideoScreen>
               settings.saveEnableHapticFeedback(val),
           isLeftHandedMode: settings.isLeftHandedMode,
           onLeftHandedModeChanged: (val) => settings.saveLeftHandedMode(val),
-          onClose: () => setState(() => _activePanel = PortraitPanel.subtitles),
+          onClose: () => setState(() => _activePanel = _panelAfterClosing()),
           onLoadSubtitle: _pickSubtitle,
           onOpenSubtitleSettings: _openSubtitleStyleSettings,
         );

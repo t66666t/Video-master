@@ -60,6 +60,7 @@ import '../widgets/landscape_sidebar_layout.dart';
 import '../widgets/desktop_player_sidebar.dart';
 import '../services/transcription_manager.dart';
 import '../services/ocr_subtitle_manager.dart';
+import '../services/bilibili/bilibili_player_panel_policy.dart';
 import '../services/subtitle_discovery_service.dart';
 import '../services/video_compose/video_compose_preview_controller.dart';
 import '../utils/app_toast.dart';
@@ -455,11 +456,43 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _presetMoveSurfaceAllowsGhost(context);
   }
 
+  /// The panel [target] stands for on this page.
+  SidebarType _sidebarOf(LandscapeSidebarTarget target) {
+    switch (target) {
+      case LandscapeSidebarTarget.previous:
+        return _previousSidebarType;
+      case LandscapeSidebarTarget.subtitles:
+        return SidebarType.subtitles;
+      case LandscapeSidebarTarget.videoCompose:
+        return SidebarType.videoCompose;
+      case LandscapeSidebarTarget.bilibili:
+      // Not offered on this page yet: never asked for.
+      case LandscapeSidebarTarget.none:
+        return SidebarType.none;
+    }
+  }
+
+  /// The panel shown when no other one is asked for.
+  SidebarType get _defaultSidebar => _sidebarOf(
+    landscapeDefaultSidebar(
+      subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+    ),
+  );
+
+  /// The panel to show once the open one closes.
+  SidebarType _sidebarAfterClosing([
+    LandscapeSidebarClosing closing = LandscapeSidebarClosing.toolPanel,
+  ]) => _sidebarOf(
+    landscapeSidebarAfterClose(
+      closing: closing,
+      hasPrevious: _previousSidebarType != SidebarType.none,
+      subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+    ),
+  );
+
   SidebarType _normalizedSidebarForRestore(SidebarType sidebar) {
     if (sidebar == SidebarType.subtitlePosition) {
-      return _isSubtitleSidebarVisible
-          ? SidebarType.subtitles
-          : SidebarType.none;
+      return _defaultSidebar;
     }
     return sidebar;
   }
@@ -1449,9 +1482,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _enterImmersiveMode();
     final settings = Provider.of<SettingsService>(context, listen: false);
     _isSubtitleSidebarVisible = settings.isLandscapeSubtitleSidebarVisible;
-    _activeSidebar = _isSubtitleSidebarVisible
-        ? SidebarType.subtitles
-        : SidebarType.none;
+    _activeSidebar = _defaultSidebar;
     if (Platform.isAndroid) {
       unawaited(_requestNotificationPermissionForMediaSession());
     }
@@ -4359,13 +4390,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   void _exitSubtitleDragMode() {
     setState(() {
-      if (_previousSidebarType != SidebarType.none) {
-        _activeSidebar = _previousSidebarType;
-      } else {
-        _activeSidebar = _isSubtitleSidebarVisible
-            ? SidebarType.subtitles
-            : SidebarType.none;
-      }
+      _activeSidebar = _sidebarAfterClosing();
       _previousSidebarType = SidebarType.none;
       _isSubtitleDragMode = false;
       _isGhostDragMode = false;
@@ -4414,13 +4439,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         _isSubtitleNearCenterX = false;
         _isSubtitleNearCenterY = false;
         _subtitleStyleFromCompose = false;
-        if (_previousSidebarType != SidebarType.none) {
-          _activeSidebar = _previousSidebarType;
-        } else {
-          _activeSidebar = _isSubtitleSidebarVisible
-              ? SidebarType.subtitles
-              : SidebarType.none;
-        }
+        _activeSidebar = _sidebarAfterClosing();
         _previousSidebarType = SidebarType.none;
       });
       return;
@@ -4503,16 +4522,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           _isSubtitleSnappedY = false;
           _isSubtitleNearCenterX = false;
           _isSubtitleNearCenterY = false;
-          if (_subtitleStyleFromCompose) {
-            _activeSidebar = SidebarType.videoCompose;
-            _subtitleStyleFromCompose = false;
-          } else if (_previousSidebarType != SidebarType.none) {
-            _activeSidebar = _previousSidebarType;
-          } else {
-            _activeSidebar = _isSubtitleSidebarVisible
-                ? SidebarType.subtitles
-                : SidebarType.none;
-          }
+          _activeSidebar = _sidebarAfterClosing(
+            _subtitleStyleFromCompose
+                ? LandscapeSidebarClosing.styleFromCompose
+                : LandscapeSidebarClosing.toolPanel,
+          );
+          _subtitleStyleFromCompose = false;
           _previousSidebarType = SidebarType.none;
         });
         return;
@@ -4522,13 +4537,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           _clearVideoComposePreview();
         }
         setState(() {
-          if (_previousSidebarType != SidebarType.none) {
-            _activeSidebar = _previousSidebarType;
-          } else {
-            _activeSidebar = _isSubtitleSidebarVisible
-                ? SidebarType.subtitles
-                : SidebarType.none;
-          }
+          _activeSidebar = _sidebarAfterClosing();
           _previousSidebarType = SidebarType.none;
         });
         return;
@@ -6139,11 +6148,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   void _toggleChapterSidebar() {
     setState(() {
       if (_activeSidebar == SidebarType.chapters) {
-        _activeSidebar = _previousSidebarType != SidebarType.none
-            ? _previousSidebarType
-            : (_isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none);
+        _activeSidebar = _sidebarAfterClosing();
         _previousSidebarType = SidebarType.none;
       } else {
         _previousSidebarType = _normalizedSidebarForRestore(_activeSidebar);
@@ -6192,9 +6197,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _activeSidebar = SidebarType.settings;
           }),
           onClose: () => setState(
-            () => _activeSidebar = _isSubtitleSidebarVisible
-                ? SidebarType.subtitles
-                : SidebarType.none,
+            () => _activeSidebar = _sidebarAfterClosing(
+              LandscapeSidebarClosing.subtitleList,
+            ),
           ),
           onLoadSubtitle: _pickSubtitle,
           onOpenSubtitleStyle: _toggleFloatingSubtitleSettingsSidebar,
@@ -6302,13 +6307,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _isGhostDragMode = false;
             _isSubtitleSnappedX = false;
             _isSubtitleSnappedY = false;
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
           onBack: () => setState(() {
@@ -6317,13 +6316,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             _isGhostDragMode = false;
             _isSubtitleSnappedX = false;
             _isSubtitleSnappedY = false;
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
         );
@@ -6354,13 +6347,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onSubtitlesChanged: _onSubtitleEditorSubtitlesChanged,
           onSeekTo: _seekToSubtitleFast,
           onClose: () => setState(() {
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
         );
@@ -6393,13 +6380,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           },
           onOpenSubtitleSettings: _toggleFloatingSubtitleSettingsSidebar,
           onClose: () => setState(() {
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
           isPlaybackSpeedLocked: settings.isPlaybackSpeedLocked,
@@ -6652,13 +6633,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             });
           },
           onClose: () => setState(() {
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
         );
@@ -6671,13 +6646,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           videoPath: pathAi,
           videoId: _currentItem?.id,
           onBack: () => setState(() {
-            if (_previousSidebarType != SidebarType.none) {
-              _activeSidebar = _previousSidebarType;
-            } else {
-              _activeSidebar = _isSubtitleSidebarVisible
-                  ? SidebarType.subtitles
-                  : SidebarType.none;
-            }
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
           onCompleted: (srtPath) async {
@@ -6704,11 +6673,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
           onBack: () {
             _clearVideoComposePreview();
             setState(() {
-              _activeSidebar = _previousSidebarType != SidebarType.none
-                  ? _previousSidebarType
-                  : (_isSubtitleSidebarVisible
-                        ? SidebarType.subtitles
-                        : SidebarType.none);
+              _activeSidebar = _sidebarAfterClosing();
               _previousSidebarType = SidebarType.none;
             });
           },
@@ -6742,11 +6707,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
             if (wasPlaying && mounted) await _controller.play();
           },
           onBack: () => setState(() {
-            _activeSidebar = _previousSidebarType != SidebarType.none
-                ? _previousSidebarType
-                : (_isSubtitleSidebarVisible
-                      ? SidebarType.subtitles
-                      : SidebarType.none);
+            _activeSidebar = _sidebarAfterClosing();
             _previousSidebarType = SidebarType.none;
           }),
           onCompleted: _applyCompletedOcrSubtitles,
