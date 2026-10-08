@@ -323,19 +323,40 @@ void main() {
       expect(fake.viewCalls, [101]);
     });
 
-    test('names unavailable (or another part): still a login line, '
-        'claiming nothing', () async {
-      fake
+    test(
+      'names unavailable (or another part): the login line still says '
+      'the video has subtitles (Bilibili asks for a login only then)',
+      () async {
+        fake
+          ..items['a'] = _online('a')
+          ..public[101] = _lockedPlayer
+          ..viewError = const BilibiliPublicApiException('x');
+        final tracks = fake.build();
+        await tracks.ensureLoaded('a');
+        final list = tracks.listFor('a');
+        expect(list.locked, isEmpty);
+        expect(list.needsLogin, isTrue);
+        expect(list.loginMessage, '这个视频有字幕，登录后可加载');
+        expect(list.emptyMessage, isNull);
+        expect(list.failureMessage, isNull);
+      },
+    );
+
+    test('names unavailable with a login Bilibili no longer accepts: the '
+        'same line, asking to log in again', () async {
+      fake = _Fake(dir)
+        ..loggedIn = true
         ..items['a'] = _online('a')
         ..public[101] = _lockedPlayer
+        ..withLogin[101] = _lockedPlayer
         ..viewError = const BilibiliPublicApiException('x');
       final tracks = fake.build();
       await tracks.ensureLoaded('a');
       final list = tracks.listFor('a');
       expect(list.locked, isEmpty);
-      expect(list.loginMessage, '登录后可查看这个视频的字幕');
+      expect(list.loginExpired, isTrue);
+      expect(list.loginMessage, '这个视频有字幕，登录已过期，重新登录后可加载');
       expect(list.emptyMessage, isNull);
-      expect(list.failureMessage, isNull);
     });
 
     test('tracks given without a login are listed, AI needs a login', () async {

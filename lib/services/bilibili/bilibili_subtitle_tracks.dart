@@ -347,12 +347,12 @@ class BilibiliSubtitleTrackList {
   String? get loginMessage {
     if (loading || failed || savedOnly || !listed || loggedIn) return null;
     final again = loginExpired ? '登录已过期，重新登录后' : '登录后';
-    if (tracks.isEmpty && locked.isNotEmpty) {
+    // Bilibili asks for a login (need_login_subtitle) only for videos that
+    // have subtitles, so the line says so even when no names came for this
+    // part (they cover only the first part).
+    if (tracks.isEmpty && (locked.isNotEmpty || needsLogin)) {
       return loginExpired ? '这个视频有字幕，登录已过期，重新登录后可加载' : '这个视频有字幕，登录后可加载';
     }
-    // Bilibili wants a login but named no subtitle for this part (its names
-    // cover only the first part): nothing is claimed either way.
-    if (tracks.isEmpty && needsLogin) return '$again可查看这个视频的字幕';
     if (locked.isNotEmpty || needsLogin) return '$again可加载更多字幕';
     if (tracks.isNotEmpty) return '$again可加载 AI 字幕';
     return null;
