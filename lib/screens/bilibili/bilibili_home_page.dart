@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
-import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_account_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
@@ -17,7 +17,6 @@ import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
 import 'package:video_player_app/utils/bilibili_url_parser.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
-import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 
 /// Fourth root page: Bilibili search with video/user results.
 ///
@@ -144,25 +143,32 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     try {
       await service.apiService.init();
       final state = await service.apiService.fetchLoginState();
-      if (!mounted) return;
-      final account = state.account;
-      setState(() {
-        _loggedIn =
-            state.status == BilibiliLoginStatus.loggedIn ||
-            (state.status == BilibiliLoginStatus.networkError &&
-                account != null);
-        _avatarUrl = _loggedIn ? bilibiliAvatarUrl(account?.avatarUrl) : null;
-      });
+      _applyAccountState(state);
     } catch (_) {
-      // The avatar is decorative; the dialog shows the real state.
+      // The avatar is decorative; the account page shows the real state.
     }
   }
 
+  void _applyAccountState(BilibiliLoginState state) {
+    if (!mounted) return;
+    final account = state.account;
+    setState(() {
+      _loggedIn =
+          state.status == BilibiliLoginStatus.loggedIn ||
+          (state.status == BilibiliLoginStatus.networkError && account != null);
+      _avatarUrl = _loggedIn ? bilibiliAvatarUrl(account?.avatarUrl) : null;
+    });
+  }
+
+  /// The avatar opens the account page; its login changes reach the avatar
+  /// right away.
   Future<void> _openAccount() async {
-    if (_downloadService() == null) return;
     _inputFocus.unfocus();
-    await showBilibiliLoginDialog(context);
-    if (mounted) await _refreshAccount();
+    await openBilibiliAccount(
+      context,
+      api: _downloadService()?.apiService,
+      onStateChanged: _applyAccountState,
+    );
   }
 
   // ------------------------------------------------------------ suggestions
@@ -485,32 +491,10 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
             },
             icon: const Icon(Icons.history, size: 24, color: AppTokens.text2),
           ),
-          PopupMenuButton<_AccountMenuAction>(
-            key: const ValueKey('bilibili-account-menu'),
+          IconButton(
+            key: const ValueKey('bilibili-account-button'),
             tooltip: _loggedIn ? 'B 站账号' : '登录 B 站',
-            color: AppTokens.bgOverlay,
-            onOpened: _inputFocus.unfocus,
-            onSelected: (action) {
-              switch (action) {
-                case _AccountMenuAction.account:
-                  unawaited(_openAccount());
-                case _AccountMenuAction.settings:
-                  unawaited(openBilibiliSettings(context));
-              }
-            },
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: _AccountMenuAction.account,
-                child: _accountMenuItem(
-                  Icons.account_circle_outlined,
-                  _loggedIn ? 'B 站账号' : '登录 B 站',
-                ),
-              ),
-              PopupMenuItem(
-                value: _AccountMenuAction.settings,
-                child: _accountMenuItem(Icons.settings_outlined, 'B 站设置'),
-              ),
-            ],
+            onPressed: _openAccount,
             icon: _avatarUrl == null
                 ? const Icon(
                     Icons.account_circle_outlined,
@@ -521,19 +505,6 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _accountMenuItem(IconData icon, String label) {
-    return Row(
-      children: [
-        Icon(icon, size: 18, color: AppTokens.text2),
-        const SizedBox(width: 10),
-        Text(
-          label,
-          style: const TextStyle(color: AppTokens.text1, fontSize: 14),
-        ),
-      ],
     );
   }
 
@@ -1090,5 +1061,3 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     );
   }
 }
-
-enum _AccountMenuAction { account, settings }

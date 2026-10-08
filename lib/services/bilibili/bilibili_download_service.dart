@@ -19,6 +19,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/app_wakelock_coordinator.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_interaction_gate.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
@@ -71,6 +72,11 @@ class BilibiliDownloadService extends ChangeNotifier {
   );
   static const Duration _baseTaskPersistDebounce = Duration(milliseconds: 900);
   final BilibiliApiService apiService;
+
+  /// The only way to send account writes (like, coin, favourite, follow...)
+  /// to Bilibili; it applies read-only mode, login checks and csrf.
+  late final BilibiliInteractionGate interactionGate =
+      BilibiliInteractionGate.forApi(apiService);
 
   /// Cookie-free client for short-link resolution, created on first use.
   BilibiliPublicApiService? _publicApi;

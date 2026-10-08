@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_account_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_home_page.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_cache_limit_service.dart';
@@ -337,17 +338,19 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('搜索历史'), findsOneWidget);
 
-    // The avatar menu leads to the settings page.
-    await tester.tap(find.byKey(const ValueKey('bilibili-account-menu')));
+    // The avatar opens the account page, which links to the settings page.
+    await tester.tap(find.byKey(const ValueKey('bilibili-account-button')));
     await tester.pumpAndSettle();
-    expect(find.text('B 站设置'), findsOneWidget);
-    await tester.tap(find.text('B 站设置'));
+    expect(find.byType(BilibiliAccountScreen), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('bilibili-account-settings')));
     await tester.pumpAndSettle();
     expect(find.byType(BilibiliSettingsScreen), findsOneWidget);
 
     await tester.tap(
       find.byKey(const ValueKey('bilibili-setting-search-history')),
     );
+    await tester.pumpAndSettle();
+    await tester.pageBack();
     await tester.pumpAndSettle();
     await tester.pageBack();
     await tester.pumpAndSettle();

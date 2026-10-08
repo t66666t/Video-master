@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_qr_login_controller.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 
@@ -271,100 +272,45 @@ class BilibiliQrCodeDialog extends StatefulWidget {
 }
 
 class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
-  String? qrUrl;
-  String? qrKey;
-  String status = '正在生成二维码…';
-  Timer? pollTimer;
-  String? errorMessage;
-  bool _pollInFlight = false;
+  late final BilibiliQrLoginController _qr = BilibiliQrLoginController(
+    api: context.read<BilibiliDownloadService>().apiService,
+    onLoggedIn: (_) => _handleLoggedIn(),
+  )..addListener(_handleQrChanged);
+
+  String? get qrUrl => _qr.qrUrl;
+  String get status => _qr.status;
+  String? get errorMessage => _qr.errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _generateQrCode();
+    unawaited(_qr.start());
   }
 
   @override
   void dispose() {
-    pollTimer?.cancel();
+    _qr.dispose();
     super.dispose();
   }
 
-  Future<void> _generateQrCode() async {
-    if (!mounted) return;
-    setState(() {
-      status = '正在生成二维码…';
-      errorMessage = null;
-      qrUrl = null;
-    });
-    final service = context.read<BilibiliDownloadService>();
-    try {
-      final result = await service.apiService.generateQrCode();
-      if (!mounted) return;
-      setState(() {
-        qrUrl = result['url'];
-        qrKey = result['qrcode_key'];
-        status = '请使用 Bilibili App 扫码登录';
-      });
-      _startPolling();
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        status = '生成二维码失败';
-        errorMessage = '无法获取二维码，请重试';
-      });
-    }
+  void _handleQrChanged() {
+    if (mounted) setState(() {});
   }
 
-  void _startPolling() {
-    if (qrKey == null) return;
-    final service = context.read<BilibiliDownloadService>();
-    pollTimer?.cancel();
-    pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      if (!mounted) {
-        timer.cancel();
-        return;
-      }
-      // A confirmed scan triggers nav verification; never overlap polls.
-      if (_pollInFlight) return;
-      _pollInFlight = true;
-      final Map<String, dynamic> result;
-      try {
-        result = await service.apiService.pollQrCode(qrKey!);
-      } finally {
-        _pollInFlight = false;
-      }
-      if (!mounted || !timer.isActive) return;
-      if (result['success'] == true) {
-        timer.cancel();
-        unawaited(
-          context.read<SettingsService>().updateSetting(
-            'suppressBilibiliRestrictedDialog',
-            false,
-          ),
-        );
-        if (!widget.suppressToasts) {
-          AppToast.show('登录成功！', type: AppToastType.success);
-        }
-        Navigator.of(context).pop();
-      } else if (result['code'] == 86038) {
-        timer.cancel();
-        setState(() {
-          status = '二维码已失效';
-          qrUrl = null;
-        });
-      } else if (result['code'] == 86090) {
-        setState(() => status = '已扫码，请在手机上确认');
-      } else if (result['code'] == -2) {
-        // Scan confirmed but nav verification or secure saving failed.
-        timer.cancel();
-        setState(() {
-          status = '登录未完成';
-          errorMessage = (result['message'] ?? '登录验证失败，请重试').toString();
-          qrUrl = null;
-        });
-      }
-    });
+  void _generateQrCode() => unawaited(_qr.start());
+
+  void _handleLoggedIn() {
+    if (!mounted) return;
+    unawaited(
+      context.read<SettingsService>().updateSetting(
+        'suppressBilibiliRestrictedDialog',
+        false,
+      ),
+    );
+    if (!widget.suppressToasts) {
+      AppToast.show('登录成功！', type: AppToastType.success);
+    }
+    Navigator.of(context).pop();
   }
 
   @override
@@ -466,7 +412,7 @@ class _BilibiliQrCodeDialogState extends State<BilibiliQrCodeDialog> {
         ],
       );
     }
-    if (status == '二维码已失效') {
+    if (_qr.isExpired) {
       return ElevatedButton(
         onPressed: _generateQrCode,
         child: const Text('刷新二维码'),

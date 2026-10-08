@@ -149,6 +149,18 @@ class BilibiliApiService {
     return cookies.any((c) => c.name == "SESSDATA" && c.value.isNotEmpty);
   }
 
+  /// Every cookie of the live login (name to value), for the account write
+  /// gate, which turns them into the Cookie header and csrf of a write
+  /// request. Callers must never log the values.
+  Future<Map<String, String>> readCookiesForWrite() async {
+    await init();
+    final cookies = await _cookieJar.loadForRequest(_cookieUri);
+    return <String, String>{
+      for (final cookie in cookies)
+        if (cookie.value.isNotEmpty) cookie.name: cookie.value,
+    };
+  }
+
   /// Interprets a nav response. Only an explicit "not logged in" from
   /// Bilibili is [BilibiliLoginStatus.expired]; anything unexpected is a
   /// [BilibiliLoginStatus.networkError] so the stored login is kept.
