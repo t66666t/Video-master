@@ -176,6 +176,33 @@ void main() {
       expect(again.item.parentId, isNull);
     });
 
+    test(
+      'a default folder inside a binned folder falls back to the root',
+      () async {
+        final service = newService(_FakeApi());
+        final courses = await library.createCollection('课程', null);
+        final math = await library.createCollection('数学', courses.id);
+        await settings.updateSetting<String>(
+          'bilibiliImportTarget',
+          BilibiliImportTarget.folder(math.id).encode(),
+        );
+        // Only the folder moved to the bin is marked, not the one inside it.
+        await library.moveToRecycleBin([courses.id]);
+        expect(library.getCollection(math.id)?.isRecycled, isFalse);
+
+        final result = await quickImport(service);
+        expect(result.fellBackToRoot, isTrue);
+        expect(result.item.parentId, isNull);
+        expect(result.message, '原默认文件夹已不存在，已导入到 媒体库根目录');
+        expect(settings.bilibiliImportTarget, 'root');
+        expect(
+          library.getContents(null).whereType<VideoItem>().map((v) => v.id),
+          contains(result.item.id),
+          reason: 'visible in the library root',
+        );
+      },
+    );
+
     test('an imported part is not imported twice', () async {
       final api = _FakeApi();
       final service = newService(api);
@@ -272,7 +299,87 @@ void main() {
       // The parts share their own folder inside the target.
       expect(cards.map((c) => c.parentId).toSet(), hasLength(1));
       expect(cards.first.parentId, isNotNull);
+      expect(result.currentPartOnly, isFalse);
+      expect(result.message, '已导入到 媒体库根目录');
     });
+
+    test('multi-part over the limit: only the current part, and the message '
+        'says so', () async {
+      final service = newService(
+        _FakeApi(pages: kBilibiliAutoFillPartLimit + 1),
+      );
+      final result = await quickImport(service, page: 7);
+      expect(library.bilibiliStreamItems, [result.item]);
+      expect(result.item.sourceRef?.page, 7);
+      expect(result.currentPartOnly, isTrue);
+      expect(result.partCount, 51);
+      expect(result.message, '已导入当前P到 媒体库根目录（共 51 P，要导入全部请点右侧按钮）');
+
+      final folder = await library.createCollection('长合集', null);
+      final next = await quickImport(
+        service,
+        bvid: _otherBvid,
+        target: BilibiliImportTarget.picked(folder.id),
+      );
+      expect(next.message, '已导入当前P到 长合集（共 51 P，要导入全部请点右侧按钮）');
+
+      // Asking for one part on purpose keeps the plain message.
+      final picked = await quickImport(
+        service,
+        bvid: 'BV1Q541167Qg',
+        target: BilibiliImportTarget.root,
+        allParts: false,
+      );
+      expect(picked.currentPartOnly, isFalse);
+      expect(picked.message, '已导入到 媒体库根目录');
+    });
+
+    test(
+      'a failed promotion leaves the card watch-only and cleanable',
+      () async {
+        final service = newService(_FakeApi(pages: 1));
+        final plan = await prepareBilibiliWatch(
+          service: service,
+          library: library,
+          bvid: _bvid,
+          history: history,
+        );
+        final watchOnly = plan.item;
+        expect(watchOnly.isTransient, isTrue);
+        final folder = await library.createCollection('学习', null);
+
+        library.failAddSingleVideoAfterInsertForTesting = true;
+        await expectLater(
+          quickImport(
+            service,
+            target: BilibiliImportTarget.picked(folder.id),
+            playingItemId: watchOnly.id,
+          ),
+          throwsStateError,
+        );
+        library.failAddSingleVideoAfterInsertForTesting = false;
+
+        expect(watchOnly.isTransient, isTrue);
+        expect(watchOnly.parentId, isNull);
+        expect(library.transientVideos, [watchOnly]);
+        expect(library.bilibiliStreamItems, isEmpty);
+        expect(library.getContents(folder.id), isEmpty);
+        expect(library.getContents(null).whereType<VideoItem>(), isEmpty);
+        final ledger = await library.transientLedgerFileForTesting
+            .readAsString();
+        expect(ledger, contains(watchOnly.id));
+
+        final janitor = BilibiliTransientCardJanitor(
+          library: library,
+          inUseIds: () => const <String>{},
+          grace: Duration.zero,
+        );
+        addTearDown(janitor.dispose);
+        expect(await janitor.sweep(), 1);
+        expect(library.getVideo(watchOnly.id), isNull);
+        expect(await library.transientLedgerFileForTesting.exists(), isFalse);
+      },
+    );
 
     test('multi-part: "current part only" from the picker', () async {
       final service = newService(_FakeApi(pages: 3));

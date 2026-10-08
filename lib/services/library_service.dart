@@ -381,6 +381,7 @@ class LibraryService extends ChangeNotifier {
   }) async {
     final item = _videos[id];
     if (item == null || !item.isTransient) return null;
+    final lastUpdated = item.lastUpdated;
     _videos.remove(id);
     _activity.media.remove(id);
     item.isTransient = false;
@@ -393,10 +394,29 @@ class LibraryService extends ChangeNotifier {
         activityBatchId: activityBatchId,
         sourceKind: LibraryImportSourceKind.bilibili,
       );
+    } catch (_) {
+      // Put it back as a watch-only card: it stays in the side list, so its
+      // online cache is still cleaned up later instead of being left behind.
+      _undoPromotion(item, lastUpdated);
+      rethrow;
     } finally {
       await _writeTransientLedger();
     }
     return item;
+  }
+
+  void _undoPromotion(VideoItem item, int lastUpdated) {
+    final parent = item.parentId == null ? null : _collections[item.parentId];
+    parent?.childrenIds.remove(item.id);
+    _rootChildrenIds.remove(item.id);
+    _activity.media.remove(item.id);
+    item
+      ..isTransient = true
+      ..parentId = null
+      ..lastUpdated = lastUpdated;
+    _videos[item.id] = item;
+    _invalidateVideoSizeCache(item.id);
+    notifyListeners();
   }
 
   File get _transientLedgerFile =>
@@ -1335,6 +1355,11 @@ class LibraryService extends ChangeNotifier {
   @visibleForTesting
   int? structuredImportFailAfterCountForTesting;
 
+  /// Makes [addSingleVideo] fail right after the card was put into the
+  /// library maps, before anything is saved.
+  @visibleForTesting
+  bool failAddSingleVideoAfterInsertForTesting = false;
+
   LibraryPersistenceStatus get persistenceStatus => _persistenceStatus;
   bool get hasPersistenceFailure =>
       _persistenceStatus != LibraryPersistenceStatus.healthy;
@@ -2031,6 +2056,7 @@ class LibraryService extends ChangeNotifier {
     probeMediaDurationOverrideForTesting = null;
     skipImportSidecarWorkForTesting = false;
     structuredImportFailAfterCountForTesting = null;
+    failAddSingleVideoAfterInsertForTesting = false;
   }
 
   @visibleForTesting
@@ -6256,6 +6282,9 @@ class LibraryService extends ChangeNotifier {
         item.parentId = null;
       }
       _rootChildrenIds.add(item.id);
+    }
+    if (failAddSingleVideoAfterInsertForTesting) {
+      throw StateError('addSingleVideo failed (test)');
     }
 
     if (activityBatchId != null) {

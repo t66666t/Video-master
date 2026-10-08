@@ -127,6 +127,8 @@ class BilibiliQuickImportResult {
     this.batch,
     this.alreadyImported = false,
     this.fellBackToRoot = false,
+    this.partCount = 1,
+    this.currentPartOnly = false,
   });
 
   /// Library card of the part the import was asked for.
@@ -136,9 +138,17 @@ class BilibiliQuickImportResult {
   final BilibiliStreamCardBatch? batch;
   final bool alreadyImported;
 
-  /// The saved default folder no longer exists; the cards went to the root.
+  /// The saved default folder no longer exists or sits in the recycle bin
+  /// (itself or a folder above it); the cards went to the root.
   final bool fellBackToRoot;
   final String folderLabel;
+
+  /// Number of parts of the video.
+  final int partCount;
+
+  /// A long multi-part video (over [kBilibiliAutoFillPartLimit] parts) where
+  /// only the current part was imported because nothing was asked.
+  final bool currentPartOnly;
 
   bool get createdAny => (batch?.createdCount ?? 0) > 0;
 
@@ -147,9 +157,10 @@ class BilibiliQuickImportResult {
       return '已在媒体库中（$folderLabel），未重复导入';
     }
     final failed = batch?.failedPages.length ?? 0;
-    final text = fellBackToRoot
-        ? '原默认文件夹已不存在，已导入到 $folderLabel'
+    final placed = currentPartOnly
+        ? '已导入当前P到 $folderLabel（共 $partCount P，要导入全部请点右侧按钮）'
         : '已导入到 $folderLabel';
+    final text = fellBackToRoot ? '原默认文件夹已不存在，$placed' : placed;
     return failed > 0 ? '$text，$failed 个分P失败' : text;
   }
 }
@@ -159,8 +170,9 @@ class BilibiliQuickImportResult {
 /// * [page] null takes the part being watched or the one in the watch
 ///   history ([bilibiliImportPartOf]).
 /// * [target] null uses the saved default place; a saved folder that no
-///   longer exists falls back to the library root and the default is reset
-///   to the root.
+///   longer exists, or that is in the recycle bin itself or below a folder
+///   in it, falls back to the library root and the default is reset to the
+///   root.
 /// * [allParts] null imports every part of a multi-part video up to
 ///   [kBilibiliAutoFillPartLimit] parts, else only the current part.
 /// * [rememberTarget] stores [target] as the new default.
@@ -207,8 +219,9 @@ Future<BilibiliQuickImportResult> runBilibiliQuickImport({
   var place = target ?? BilibiliImportTarget.parse(config.bilibiliImportTarget);
   var fellBack = false;
   if (place.kind == BilibiliImportTargetKind.folder) {
-    final folder = library.getCollection(place.folderId!);
-    if (folder == null || folder.isRecycled) {
+    // Moving a folder to the recycle bin only marks that folder, so the
+    // folders inside it count as gone too.
+    if (!library.activityProjection.isVisibleCollection(place.folderId!)) {
       place = BilibiliImportTarget.root;
       fellBack = true;
     }
@@ -255,6 +268,8 @@ Future<BilibiliQuickImportResult> runBilibiliQuickImport({
     item: card,
     batch: batch,
     fellBackToRoot: fellBack,
+    partCount: partCount,
+    currentPartOnly: allParts == null && partCount > kBilibiliAutoFillPartLimit,
     folderLabel: createdAny
         ? bilibiliFolderLabel(library, batch.targetFolderId)
         : bilibiliFolderLabel(library, card.parentId),
