@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
@@ -68,53 +69,105 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
     final useReorderableRow = onReorder != null && ordered.length > 1;
     final canDragReorder = useReorderableRow && reorderEnabled;
 
-    final chips = <Widget>[
-      for (var i = 0; i < ordered.length; i++)
-        _chip(
-          index: i,
-          ordered: ordered,
-          highlight: highlight,
-          style: style,
-          useReorderableRow: useReorderableRow,
-          canDragReorder: canDragReorder,
-        ),
-    ];
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // On a narrow screen the titles do not fit beside the toolbar
+        // actions. Shrinking them that far would make them unreadable, so
+        // the row scrolls instead and keeps the selected title in view.
+        // This depends on the width only, so it never flips mid-swipe.
+        final scrollable =
+            constraints.hasBoundedWidth &&
+            _naturalWidth(context, ordered, style) > constraints.maxWidth + 0.5;
+        final chips = <Widget>[
+          for (var i = 0; i < ordered.length; i++)
+            _chip(
+              index: i,
+              ordered: ordered,
+              highlight: highlight,
+              style: style,
+              useReorderableRow: useReorderableRow,
+              canDragReorder: canDragReorder,
+              scrollable: scrollable,
+            ),
+        ];
 
-    final translated = Transform.translate(
-      offset: const Offset(0, mediaLibraryCompactTitleOpticalOffset),
-      child: SizedBox(
-        height: compact ? 32 : 36,
-        child: useReorderableRow
-            ? ReorderableListView(
-                scrollDirection: Axis.horizontal,
-                shrinkWrap: true,
-                primary: false,
-                padding: EdgeInsets.zero,
-                buildDefaultDragHandles: false,
-                physics: const NeverScrollableScrollPhysics(),
-                proxyDecorator: _proxyDecorator,
-                onReorderItem: onReorder!,
-                children: chips,
-              )
-            : Row(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: chips,
-              ),
-      ),
+        final Widget row;
+        if (useReorderableRow) {
+          row = ReorderableListView(
+            scrollDirection: Axis.horizontal,
+            shrinkWrap: true,
+            primary: false,
+            padding: EdgeInsets.zero,
+            buildDefaultDragHandles: false,
+            physics: scrollable
+                ? const ClampingScrollPhysics()
+                : const NeverScrollableScrollPhysics(),
+            proxyDecorator: _proxyDecorator,
+            onReorderItem: onReorder!,
+            children: chips,
+          );
+        } else if (scrollable) {
+          row = SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            primary: false,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: chips,
+            ),
+          );
+        } else {
+          row = Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: chips,
+          );
+        }
+
+        final translated = Transform.translate(
+          offset: const Offset(0, mediaLibraryCompactTitleOpticalOffset),
+          child: SizedBox(height: compact ? 32 : 36, child: row),
+        );
+
+        if (useReorderableRow || scrollable) {
+          return Align(alignment: Alignment.centerLeft, child: translated);
+        }
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: translated,
+          ),
+        );
+      },
     );
+  }
 
-    if (useReorderableRow) {
-      return Align(alignment: Alignment.centerLeft, child: translated);
+  /// Width the chips need at full size: labels, hit padding and gaps.
+  double _naturalWidth(
+    BuildContext context,
+    List<MediaLibraryRootEntry> ordered,
+    TextStyle style,
+  ) {
+    final textStyle = DefaultTextStyle.of(
+      context,
+    ).style.merge(style.copyWith(fontWeight: FontWeight.w500));
+    final scaler = MediaQuery.textScalerOf(context);
+    final padding = _EntryChip.hitPadding(compact).horizontal;
+    var total = 0.0;
+    for (var i = 0; i < ordered.length; i++) {
+      final painter = TextPainter(
+        text: TextSpan(text: ordered[i].label, style: textStyle),
+        textDirection: TextDirection.ltr,
+        textScaler: scaler,
+        maxLines: 1,
+      )..layout();
+      total += painter.width + padding;
+      painter.dispose();
+      if (i < ordered.length - 1) total += _EntryChip.gapAfter(compact);
     }
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: FittedBox(
-        fit: BoxFit.scaleDown,
-        alignment: Alignment.centerLeft,
-        child: translated,
-      ),
-    );
+    return total;
   }
 
   Widget _chip({
@@ -124,6 +177,7 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
     required TextStyle style,
     required bool useReorderableRow,
     required bool canDragReorder,
+    required bool scrollable,
   }) {
     final entry = ordered[index];
     final chip = _EntryChip(
@@ -141,8 +195,19 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
           ? 0
           : _EntryChip.gapAfter(compact),
       canDragReorder: canDragReorder,
+      scrollable: scrollable,
     );
     if (!useReorderableRow) return chip;
+    if (scrollable) {
+      // A horizontal drag scrolls the row here, so reordering waits for a
+      // long press instead.
+      return ReorderableDelayedDragStartListener(
+        key: ValueKey<MediaLibraryRootEntry>(entry),
+        index: index,
+        enabled: canDragReorder,
+        child: chip,
+      );
+    }
     return _ChipReorderDragStartListener(
       key: ValueKey<MediaLibraryRootEntry>(entry),
       index: index,
@@ -159,10 +224,7 @@ class MediaLibraryEntrySwitcher extends StatelessWidget {
     // Same lifted size as the press animation, with no second scale-up.
     // Starting another grow here is what made a short click swell, stall,
     // then snap back when the page changed.
-    return Transform.scale(
-      scale: _kChipPressScale,
-      child: child,
-    );
+    return Transform.scale(scale: _kChipPressScale, child: child);
   }
 }
 
@@ -177,6 +239,7 @@ class _EntryChip extends StatefulWidget {
     required this.onSelected,
     required this.trailingGap,
     required this.canDragReorder,
+    this.scrollable = false,
   });
 
   final MediaLibraryRootEntry entry;
@@ -188,6 +251,10 @@ class _EntryChip extends StatefulWidget {
   final ValueChanged<MediaLibraryRootEntry> onSelected;
   final double trailingGap;
   final bool canDragReorder;
+
+  /// The chip row scrolls (narrow screen): a press selects on release so a
+  /// scroll that starts on a title does not switch to it.
+  final bool scrollable;
 
   /// Inner padding is the clickable box. Keep a 4px dead strip between chips
   /// so a slightly larger target cannot select the neighbor.
@@ -231,6 +298,35 @@ class _EntryChipState extends State<_EntryChip>
       begin: 1,
       end: _kChipPressScale,
     ).animate(_pressCurve);
+    if (widget.selected) _revealIfScrollable();
+  }
+
+  @override
+  void didUpdateWidget(covariant _EntryChip oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.selected &&
+        widget.scrollable &&
+        (!oldWidget.selected || !oldWidget.scrollable)) {
+      _revealIfScrollable();
+    }
+  }
+
+  /// In a scrolling chip row the selected title is kept in view.
+  void _revealIfScrollable() {
+    if (!widget.scrollable) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !widget.selected || !widget.scrollable) return;
+      unawaited(
+        Scrollable.ensureVisible(
+          context,
+          alignment: 0.5,
+          duration: MediaQuery.disableAnimationsOf(context)
+              ? Duration.zero
+              : const Duration(milliseconds: 180),
+          curve: Curves.easeOutCubic,
+        ),
+      );
+    });
   }
 
   bool _isPrimaryPress(PointerDownEvent event) {
@@ -264,7 +360,7 @@ class _EntryChipState extends State<_EntryChip>
     if (!widget.enabled || widget.selected || !_isPrimaryPress(event)) return;
     _beginPress();
     // No reorder is possible, so a press can switch immediately.
-    if (!widget.canDragReorder) {
+    if (!widget.canDragReorder && !widget.scrollable) {
       _select();
       _endPress();
       return;
@@ -340,11 +436,7 @@ class _EntryChipState extends State<_EntryChip>
   Widget build(BuildContext context) {
     final color = !widget.enabled
         ? AppTokens.text4
-        : Color.lerp(
-            AppTokens.text3,
-            AppTokens.text1,
-            widget.highlightWeight,
-          )!;
+        : Color.lerp(AppTokens.text3, AppTokens.text1, widget.highlightWeight)!;
     // One weight for every chip. Swapping w300 and w500 when a swipe
     // commits changes the glyph color's apparent brightness in one frame,
     // so the highlight looks like it jumps instead of crossfading.
@@ -365,40 +457,40 @@ class _EntryChipState extends State<_EntryChip>
           child: RepaintBoundary(
             child: ScaleTransition(
               scale: _pressScale,
-            child: SizedBox(
-              height: widget.compact ? 32 : 36,
-              child: Padding(
-                padding: _EntryChip.hitPadding(widget.compact),
-                child: Column(
-                  children: [
-                    Expanded(
-                      child: Align(
-                        alignment: Alignment.center,
-                        child: Text(
-                          widget.entry.label,
-                          maxLines: 1,
-                          style: widget.style.copyWith(
-                            color: color,
-                            fontWeight: widget.enabled
-                                ? FontWeight.w500
-                                : widget.style.fontWeight,
+              child: SizedBox(
+                height: widget.compact ? 32 : 36,
+                child: Padding(
+                  padding: _EntryChip.hitPadding(widget.compact),
+                  child: Column(
+                    children: [
+                      Expanded(
+                        child: Align(
+                          alignment: Alignment.center,
+                          child: Text(
+                            widget.entry.label,
+                            maxLines: 1,
+                            style: widget.style.copyWith(
+                              color: color,
+                              fontWeight: widget.enabled
+                                  ? FontWeight.w500
+                                  : widget.style.fontWeight,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                    Container(
-                      height: 2,
-                      color: Color.lerp(
-                        Colors.transparent,
-                        AppTokens.text1,
-                        widget.enabled ? widget.highlightWeight : 0,
+                      Container(
+                        height: 2,
+                        color: Color.lerp(
+                          Colors.transparent,
+                          AppTokens.text1,
+                          widget.enabled ? widget.highlightWeight : 0,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
           ),
         ),
       ),
@@ -456,7 +548,10 @@ class _DragAfterSlopRecognizer extends MultiDragGestureRecognizer {
   @override
   void dispose() {
     for (final pointer in _samples.keys.toList()) {
-      GestureBinding.instance.pointerRouter.removeRoute(pointer, _trackPosition);
+      GestureBinding.instance.pointerRouter.removeRoute(
+        pointer,
+        _trackPosition,
+      );
     }
     _samples.clear();
     super.dispose();
@@ -498,7 +593,8 @@ class _DragAfterSlopPointerState extends MultiDragPointerState {
   @override
   void checkForResolutionAfterMove() {
     final travel = _travel;
-    final horizontal = travel.dx.abs() >= travel.dy.abs() && travel.dx.abs() > _arenaSlop;
+    final horizontal =
+        travel.dx.abs() >= travel.dy.abs() && travel.dx.abs() > _arenaSlop;
     if (!_claimedArena && horizontal) {
       _claimedArena = true;
       resolve(GestureDisposition.accepted);
@@ -521,4 +617,3 @@ class _DragAfterSlopPointerState extends MultiDragPointerState {
     _starter!(initialPosition);
   }
 }
-

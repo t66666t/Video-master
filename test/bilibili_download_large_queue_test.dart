@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/bilibili_models.dart';
@@ -47,6 +49,26 @@ BilibiliDownloadTask _standaloneTask(int index) {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  // The download service finds its data folder through path_provider. With
+  // no platform plugin in tests it would fall back to `.local/` under the
+  // project root, so this file points it at a system temp folder instead.
+  late Directory dataRoot;
+  setUpAll(() async {
+    dataRoot = await Directory.systemTemp.createTemp('bilibili_large_queue_');
+    PathProviderPlatform.instance = _TempPathProvider(dataRoot.path);
+  });
+  tearDownAll(() async {
+    // Let debounced saves settle, then remove the folder. The fake stays
+    // installed so a late save cannot reach the project root; each test
+    // file runs in its own isolate.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    try {
+      if (await dataRoot.exists()) await dataRoot.delete(recursive: true);
+    } on FileSystemException {
+      // A file still held open is left to the system temp cleanup.
+    }
+  });
 
   test('500 个独立任务生成稳定的扁平行投影', () {
     final tasks = List.generate(500, _standaloneTask);
@@ -419,4 +441,26 @@ void main() {
       expect(episode.selectedSubtitle, same(aiChinese));
     },
   );
+}
+
+/// Every app folder lives under one temp directory.
+class _TempPathProvider extends PathProviderPlatform {
+  _TempPathProvider(this.rootPath);
+
+  final String rootPath;
+
+  @override
+  Future<String?> getApplicationDocumentsPath() async => rootPath;
+
+  @override
+  Future<String?> getApplicationSupportPath() async => rootPath;
+
+  @override
+  Future<String?> getApplicationCachePath() async => rootPath;
+
+  @override
+  Future<String?> getTemporaryPath() async => rootPath;
+
+  @override
+  Future<String?> getDownloadsPath() async => rootPath;
 }
