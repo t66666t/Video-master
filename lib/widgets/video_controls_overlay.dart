@@ -1,4 +1,5 @@
 import '../widgets/subtitle_debug_speed_gateway.dart';
+import 'player_top_bar.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:io';
@@ -3293,220 +3294,190 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
               constraints: topActionConstraints,
             ),
         ];
-        final List<Widget> topTrailing = [
-          if (!widget.isPreviewMode) ...[
-            if (widget.onOpenSettings != null)
-              IconButton(
-                key: const ValueKey('video-controls-top-settings'),
-                icon: const Icon(Icons.settings, color: Colors.white),
-                tooltip: _tooltipWithShortcut(
-                  "设置",
-                  DesktopPlayerShortcutAction.openSettings,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onOpenSettings!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.onOpenSubtitleManager != null)
-              IconButton(
-                key: const ValueKey('video-controls-top-subtitle-library'),
-                icon: const Icon(Icons.subtitles, color: Colors.white),
-                tooltip: _tooltipWithShortcut(
-                  "字幕库",
-                  DesktopPlayerShortcutAction.openSubtitleLibrary,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onOpenSubtitleManager!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.showSubtitleEditorButton &&
-                widget.onOpenSubtitleEditor != null)
-              IconButton(
-                icon: const Icon(Icons.edit_note, color: Colors.white),
-                tooltip: _tooltipWithShortcut(
-                  "字幕编辑",
-                  DesktopPlayerShortcutAction.openSubtitleEditor,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onOpenSubtitleEditor!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.onOpenVideoCompose != null)
-              IconButton(
-                icon: const Icon(
-                  Icons.movie_creation_outlined,
-                  color: Colors.white,
-                ),
-                tooltip: _tooltipWithShortcut(
-                  "合成视频",
-                  DesktopPlayerShortcutAction.openVideoCompose,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onOpenVideoCompose!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.onOpenOcrSubtitle != null)
-              IconButton(
-                icon: const Icon(
-                  Icons.document_scanner_outlined,
-                  color: Colors.white,
-                ),
-                tooltip: _tooltipWithShortcut(
-                  'OCR 字幕',
-                  DesktopPlayerShortcutAction.openOcrSubtitle,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onOpenOcrSubtitle!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.onToggleBilibiliPanel != null)
-              IconButton(
-                key: const ValueKey('video-controls-top-bilibili-panel'),
-                icon: Icon(
-                  Icons.smart_display_outlined,
-                  color: widget.bilibiliPanelOpen
-                      ? AppTokens.brandBilibili
-                      : Colors.white,
-                ),
-                tooltip: _tooltipWithShortcut(
-                  widget.bilibiliPanelOpen ? '收起哔哩哔哩' : '哔哩哔哩',
-                  DesktopPlayerShortcutAction.toggleBilibiliPanel,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onToggleBilibiliPanel!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            if (widget.onToggleFloatingSubtitleSettings != null)
-              IconButton(
-                icon: const Icon(Icons.style, color: Colors.white),
-                tooltip: _tooltipWithShortcut(
-                  "悬浮字幕设置",
-                  DesktopPlayerShortcutAction.openSubtitleStyle,
-                ),
-                onPressed: () {
-                  _startAutoHideTimer();
-                  widget.onToggleFloatingSubtitleSettings!();
-                },
-                iconSize: topActionIconSize,
-                padding: topActionPadding,
-                constraints: topActionConstraints,
-              ),
-            IconButton(
-              icon: const Icon(Icons.open_with, color: Colors.white),
-              tooltip: _tooltipWithShortcut(
-                "移动字幕",
-                DesktopPlayerShortcutAction.moveSubtitles,
-              ),
+        PlayerTopBarAction topAction(
+          PlayerTopAction action, {
+          Key? key,
+          required IconData icon,
+          Color? iconColor,
+          required String label,
+          required DesktopPlayerShortcutAction shortcut,
+          required VoidCallback run,
+        }) {
+          final String tooltip = _tooltipWithShortcut(label, shortcut);
+          return PlayerTopBarAction(
+            action: action,
+            width: topActionExtent,
+            icon: icon,
+            iconColor: iconColor,
+            label: tooltip,
+            onSelected: run,
+            button: IconButton(
+              key: key,
+              icon: Icon(icon, color: iconColor ?? Colors.white),
+              tooltip: tooltip,
               onPressed: () {
                 _startAutoHideTimer();
-                widget.onMoveSubtitles();
+                run();
               },
               iconSize: topActionIconSize,
               padding: topActionPadding,
               constraints: topActionConstraints,
+            ),
+          );
+        }
+
+        final bool showAspectChip =
+            !widget.isPreviewMode &&
+            widget.onOpenAspectRatio != null &&
+            widget.aspectRatioLabel != null;
+        final String aspectRatioMenuLabel = _tooltipWithShortcut(
+          "画面比例",
+          DesktopPlayerShortcutAction.openAspectRatio,
+        );
+        final List<PlayerTopBarAction> topActions = [
+          if (!widget.isPreviewMode) ...[
+            if (widget.onOpenSettings != null)
+              topAction(
+                PlayerTopAction.settings,
+                key: const ValueKey('video-controls-top-settings'),
+                icon: Icons.settings,
+                label: "设置",
+                shortcut: DesktopPlayerShortcutAction.openSettings,
+                run: widget.onOpenSettings!,
+              ),
+            if (widget.onOpenSubtitleManager != null)
+              topAction(
+                PlayerTopAction.subtitleLibrary,
+                key: const ValueKey('video-controls-top-subtitle-library'),
+                icon: Icons.subtitles,
+                label: "字幕库",
+                shortcut: DesktopPlayerShortcutAction.openSubtitleLibrary,
+                run: widget.onOpenSubtitleManager!,
+              ),
+            if (widget.showSubtitleEditorButton &&
+                widget.onOpenSubtitleEditor != null)
+              topAction(
+                PlayerTopAction.subtitleEditor,
+                icon: Icons.edit_note,
+                label: "字幕编辑",
+                shortcut: DesktopPlayerShortcutAction.openSubtitleEditor,
+                run: widget.onOpenSubtitleEditor!,
+              ),
+            if (widget.onOpenVideoCompose != null)
+              topAction(
+                PlayerTopAction.videoCompose,
+                icon: Icons.movie_creation_outlined,
+                label: "合成视频",
+                shortcut: DesktopPlayerShortcutAction.openVideoCompose,
+                run: widget.onOpenVideoCompose!,
+              ),
+            if (widget.onOpenOcrSubtitle != null)
+              topAction(
+                PlayerTopAction.ocrSubtitle,
+                icon: Icons.document_scanner_outlined,
+                label: 'OCR 字幕',
+                shortcut: DesktopPlayerShortcutAction.openOcrSubtitle,
+                run: widget.onOpenOcrSubtitle!,
+              ),
+            if (widget.onToggleBilibiliPanel != null)
+              topAction(
+                PlayerTopAction.bilibiliPanel,
+                key: const ValueKey('video-controls-top-bilibili-panel'),
+                icon: Icons.smart_display_outlined,
+                iconColor: widget.bilibiliPanelOpen
+                    ? AppTokens.brandBilibili
+                    : Colors.white,
+                label: widget.bilibiliPanelOpen ? '收起哔哩哔哩' : '哔哩哔哩',
+                shortcut: DesktopPlayerShortcutAction.toggleBilibiliPanel,
+                run: widget.onToggleBilibiliPanel!,
+              ),
+            if (widget.onToggleFloatingSubtitleSettings != null)
+              topAction(
+                PlayerTopAction.subtitleStyle,
+                icon: Icons.style,
+                label: "悬浮字幕设置",
+                shortcut: DesktopPlayerShortcutAction.openSubtitleStyle,
+                run: widget.onToggleFloatingSubtitleSettings!,
+              ),
+            topAction(
+              PlayerTopAction.moveSubtitles,
+              icon: Icons.open_with,
+              label: "移动字幕",
+              shortcut: DesktopPlayerShortcutAction.moveSubtitles,
+              run: widget.onMoveSubtitles,
             ),
           ],
           if (!widget.isPreviewMode &&
               !kIsWeb &&
               (Platform.isWindows || Platform.isMacOS || Platform.isLinux))
-            IconButton(
-              icon: Icon(
-                settings.isFullScreen
-                    ? Icons.fullscreen_exit
-                    : Icons.fullscreen,
-                color: Colors.white,
-              ),
-              tooltip: _tooltipWithShortcut(
-                settings.isFullScreen ? "退出全屏" : "全屏",
-                DesktopPlayerShortcutAction.toggleFullScreen,
-              ),
-              onPressed: () {
-                _startAutoHideTimer();
-                widget.onToggleFullScreen!();
-              },
-              iconSize: topActionIconSize,
-              padding: topActionPadding,
-              constraints: topActionConstraints,
+            topAction(
+              PlayerTopAction.fullScreen,
+              icon: settings.isFullScreen
+                  ? Icons.fullscreen_exit
+                  : Icons.fullscreen,
+              label: settings.isFullScreen ? "退出全屏" : "全屏",
+              shortcut: DesktopPlayerShortcutAction.toggleFullScreen,
+              run: () => widget.onToggleFullScreen!(),
             ),
           if (widget.onToggleSidebar != null)
-            IconButton(
-              icon: Icon(
-                widget.isSubtitleSidebarVisible ? Icons.menu_open : Icons.menu,
-                color: Colors.white,
-              ),
-              tooltip: _tooltipWithShortcut(
-                widget.isSubtitleSidebarVisible ? "隐藏字幕边栏" : "显示字幕边栏",
-                DesktopPlayerShortcutAction.toggleSubtitleSidebar,
-              ),
-              onPressed: () {
-                _startAutoHideTimer();
-                widget.onToggleSidebar!();
-              },
-              iconSize: topActionIconSize,
-              padding: topActionPadding,
-              constraints: topActionConstraints,
+            topAction(
+              PlayerTopAction.subtitleSidebar,
+              icon: widget.isSubtitleSidebarVisible
+                  ? Icons.menu_open
+                  : Icons.menu,
+              label: widget.isSubtitleSidebarVisible ? "隐藏字幕边栏" : "显示字幕边栏",
+              shortcut: DesktopPlayerShortcutAction.toggleSubtitleSidebar,
+              run: widget.onToggleSidebar!,
             ),
-          if (!widget.isPreviewMode &&
-              widget.onOpenAspectRatio != null &&
-              widget.aspectRatioLabel != null)
-            Material(
-              color: Colors.black45,
-              borderRadius: BorderRadius.circular(aspectChipRadius),
-              child: Tooltip(
-                message: _tooltipWithShortcut(
-                  "画面比例",
-                  DesktopPlayerShortcutAction.openAspectRatio,
-                ),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(aspectChipRadius),
-                  onTap: () {
-                    _startAutoHideTimer();
-                    widget.onOpenAspectRatio!();
-                  },
-                  child: Padding(
-                    padding: aspectChipPadding,
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          Icons.aspect_ratio,
-                          size: aspectChipIconSize,
-                          color: Colors.white,
-                        ),
-                        SizedBox(width: aspectChipSpacing),
-                        Text(
-                          widget.aspectRatioLabel!,
-                          style: TextStyle(
+          if (showAspectChip)
+            PlayerTopBarAction(
+              action: PlayerTopAction.aspectRatio,
+              width: _aspectChipWidth(
+                context,
+                label: widget.aspectRatioLabel!,
+                padding: aspectChipPadding,
+                iconSize: aspectChipIconSize,
+                spacing: aspectChipSpacing,
+                fontSize: aspectChipTextSize,
+              ),
+              icon: Icons.aspect_ratio,
+              label: '$aspectRatioMenuLabel（${widget.aspectRatioLabel}）',
+              onSelected: widget.onOpenAspectRatio!,
+              button: Material(
+                color: Colors.black45,
+                borderRadius: BorderRadius.circular(aspectChipRadius),
+                child: Tooltip(
+                  message: _tooltipWithShortcut(
+                    "画面比例",
+                    DesktopPlayerShortcutAction.openAspectRatio,
+                  ),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(aspectChipRadius),
+                    onTap: () {
+                      _startAutoHideTimer();
+                      widget.onOpenAspectRatio!();
+                    },
+                    child: Padding(
+                      padding: aspectChipPadding,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.aspect_ratio,
+                            size: aspectChipIconSize,
                             color: Colors.white,
-                            fontSize: aspectChipTextSize,
-                            fontWeight: FontWeight.w600,
                           ),
-                        ),
-                      ],
+                          SizedBox(width: aspectChipSpacing),
+                          Text(
+                            widget.aspectRatioLabel!,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: aspectChipTextSize,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -3985,33 +3956,23 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                 data: IconButtonThemeData(
                                   style: topIconButtonStyle,
                                 ),
-                                child: Row(
-                                  children: [
-                                    if (isLeftHandedMode)
-                                      ...topTrailing
-                                    else
-                                      ...topLeading,
-                                    if (mediaTitle.isNotEmpty) ...[
-                                      SizedBox(
-                                        width: controlMetrics.controlGap,
-                                      ),
-                                      Expanded(
-                                        child: _buildTopBarTitle(
+                                child: PlayerTopBar(
+                                  leading: topLeading,
+                                  leadingWidth: topActionExtent,
+                                  title: mediaTitle.isEmpty
+                                      ? null
+                                      : _buildTopBarTitle(
                                           mediaTitle: mediaTitle,
                                           fontSize: isSmallScreen ? 14 : 16,
                                           alignRight: isLeftHandedMode,
                                         ),
-                                      ),
-                                      SizedBox(
-                                        width: controlMetrics.controlGap,
-                                      ),
-                                    ] else
-                                      const Spacer(),
-                                    if (isLeftHandedMode)
-                                      ...topLeading
-                                    else
-                                      ...topTrailing,
-                                  ],
+                                  gap: controlMetrics.controlGap,
+                                  actions: topActions,
+                                  mirrored: isLeftHandedMode,
+                                  buttonExtent: topActionExtent,
+                                  iconSize: topActionIconSize,
+                                  buttonPadding: topActionPadding,
+                                  onMenuSelected: _startAutoHideTimer,
                                 ),
                               ),
                             ),
@@ -4358,10 +4319,11 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                           (hasQualityButton
                                                               ? controlMetrics
                                                                     .progressHitHeight
-                                                              : controlMetrics.progressAreaHeight(
-                                                                  hasChapterButton:
-                                                                      hasChapterButton,
-                                                                )) +
+                                                              : controlMetrics
+                                                                    .progressAreaHeight(
+                                                                      hasChapterButton:
+                                                                          hasChapterButton,
+                                                                    )) +
                                                           6,
                                                       showThumbnail:
                                                           widget
@@ -5083,48 +5045,50 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
                                                                     .value ??
                                                                 _controllerValue
                                                                     .isPlaying;
-                                                        final isInitialized =
-                                                            _controllerValue
-                                                                .isInitialized;
-                                                        final canTogglePlay =
-                                                            isInitialized ||
-                                                            widget
-                                                                .allowPlayWhenUninitialized;
-                                                        return IconButton(
-                                                          key: const ValueKey(
-                                                            'video-controls-play-pause',
-                                                          ),
-                                                          iconSize: bigIconSize,
-                                                          style:
-                                                              bottomIconButtonStyle,
-                                                          icon: Icon(
-                                                            isPlaying
-                                                                ? Icons
-                                                                      .pause_circle_filled
-                                                                : Icons
-                                                                      .play_circle_fill,
-                                                            color: canTogglePlay
-                                                                ? Colors.white
-                                                                : Colors
-                                                                      .white38,
-                                                          ),
-                                                          onPressed:
-                                                              canTogglePlay
-                                                              ? () {
-                                                                  _startAutoHideTimer();
-                                                                  widget
-                                                                      .onTogglePlay();
-                                                                }
-                                                              : null,
-                                                          tooltip:
-                                                              _tooltipWithShortcut(
+                                                            final isInitialized =
+                                                                _controllerValue
+                                                                    .isInitialized;
+                                                            final canTogglePlay =
+                                                                isInitialized ||
+                                                                widget
+                                                                    .allowPlayWhenUninitialized;
+                                                            return IconButton(
+                                                              key: const ValueKey(
+                                                                'video-controls-play-pause',
+                                                              ),
+                                                              iconSize:
+                                                                  bigIconSize,
+                                                              style:
+                                                                  bottomIconButtonStyle,
+                                                              icon: Icon(
+                                                                isPlaying
+                                                                    ? Icons
+                                                                          .pause_circle_filled
+                                                                    : Icons
+                                                                          .play_circle_fill,
+                                                                color:
+                                                                    canTogglePlay
+                                                                    ? Colors
+                                                                          .white
+                                                                    : Colors
+                                                                          .white38,
+                                                              ),
+                                                              onPressed:
+                                                                  canTogglePlay
+                                                                  ? () {
+                                                                      _startAutoHideTimer();
+                                                                      widget
+                                                                          .onTogglePlay();
+                                                                    }
+                                                                  : null,
+                                                              tooltip: _tooltipWithShortcut(
                                                                 isPlaying
                                                                     ? "暂停"
                                                                     : "播放",
                                                                 DesktopPlayerShortcutAction
                                                                     .playPause,
                                                               ),
-                                                        );
+                                                            );
                                                           },
                                                         );
                                                       },
@@ -5520,30 +5484,55 @@ class VideoControlsOverlayState extends State<VideoControlsOverlay> {
         ? Alignment.centerRight
         : Alignment.centerLeft;
     final TextAlign textAlign = alignRight ? TextAlign.right : TextAlign.left;
-    return ClipRect(
-      child: Align(
-        alignment: alignment,
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          reverse: alignRight,
-          physics: const BouncingScrollPhysics(),
-          child: ExperimentalTapGateway(
-            onTrigger: () => widget.onExperimentalTrigger?.call(),
-            child: Text(
-              mediaTitle,
-              textAlign: textAlign,
-              maxLines: 1,
-              overflow: TextOverflow.visible,
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: fontSize,
-                fontWeight: FontWeight.w500,
-              ),
+    // One line; a title that does not fit ends in an ellipsis and shows in
+    // full in the tooltip.
+    return Align(
+      alignment: alignment,
+      child: Tooltip(
+        message: mediaTitle,
+        waitDuration: const Duration(milliseconds: 600),
+        child: ExperimentalTapGateway(
+          onTrigger: () => widget.onExperimentalTrigger?.call(),
+          child: Text(
+            mediaTitle,
+            textAlign: textAlign,
+            maxLines: 1,
+            softWrap: false,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: fontSize,
+              fontWeight: FontWeight.w500,
             ),
           ),
         ),
       ),
     );
+  }
+
+  /// The width the aspect-ratio chip takes in the top bar.
+  double _aspectChipWidth(
+    BuildContext context, {
+    required String label,
+    required EdgeInsets padding,
+    required double iconSize,
+    required double spacing,
+    required double fontSize,
+  }) {
+    final painter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: DefaultTextStyle.of(context).style.merge(
+          TextStyle(fontSize: fontSize, fontWeight: FontWeight.w600),
+        ),
+      ),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+      maxLines: 1,
+    )..layout();
+    final width = padding.horizontal + iconSize + spacing + painter.width;
+    painter.dispose();
+    return width;
   }
 }
 

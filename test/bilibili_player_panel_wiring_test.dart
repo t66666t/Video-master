@@ -9,6 +9,7 @@ import 'package:video_player_app/models/subtitle_style.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
 import 'package:video_player_app/services/settings_service.dart';
 import 'package:video_player_app/utils/desktop_player_shortcuts.dart';
+import 'package:video_player_app/widgets/player_top_bar.dart';
 import 'package:video_player_app/widgets/video_controls_overlay.dart';
 
 void main() {
@@ -135,11 +136,23 @@ void main() {
     await finish(tester);
   });
 
-  group('phone landscape: the top bar keeps every button and does not '
-      'overflow', () {
+  group('phone landscape: the title stays visible, buttons that do not fit '
+      'go into 更多 by priority, nothing overflows', () {
     Rect buttonRect(WidgetTester tester, Finder icon) => tester.getRect(
       find.ancestor(of: icon, matching: find.byType(IconButton)).first,
     );
+    const icons = <PlayerTopAction, IconData>{
+      PlayerTopAction.settings: Icons.settings,
+      PlayerTopAction.subtitleLibrary: Icons.subtitles,
+      PlayerTopAction.videoCompose: Icons.movie_creation_outlined,
+      PlayerTopAction.ocrSubtitle: Icons.document_scanner_outlined,
+      PlayerTopAction.bilibiliPanel: Icons.smart_display_outlined,
+      PlayerTopAction.subtitleStyle: Icons.style,
+      PlayerTopAction.moveSubtitles: Icons.open_with,
+      PlayerTopAction.fullScreen: Icons.fullscreen,
+      PlayerTopAction.subtitleSidebar: Icons.menu,
+      PlayerTopAction.aspectRatio: Icons.aspect_ratio,
+    };
 
     // The page's video area: the whole window (the Bilibili panel goes over
     // the video), or what a docked subtitle list (262.4 + its 12 handle)
@@ -179,28 +192,43 @@ void main() {
               leftHanded: leftHanded,
             );
             expect(tester.takeException(), isNull);
+            final title = tester.getRect(find.text('一个很长很长的哔哩哔哩视频标题，用来占满顶栏'));
+            expect(
+              title.width,
+              greaterThanOrEqualTo(kPlayerTopTitleMinWidth - 0.5),
+            );
+            final shown = <PlayerTopAction>{
+              for (final entry in icons.entries)
+                if (find.byIcon(entry.value).evaluate().isNotEmpty) entry.key,
+            };
+            final hidden = icons.keys.toSet().difference(shown);
+            // Only the first ones of the priority table went into 更多.
+            expect(
+              hidden,
+              kPlayerTopActionCollapseOrder
+                  .where(icons.containsKey)
+                  .take(hidden.length)
+                  .toSet(),
+            );
+            expect(
+              find.byKey(const ValueKey('video-controls-top-more')),
+              hidden.isEmpty ? findsNothing : findsOneWidget,
+            );
+            expect(shown, contains(PlayerTopAction.bilibiliPanel));
             final bilibili = buttonRect(
               tester,
               find.byIcon(Icons.smart_display_outlined),
             );
-            final ocr = buttonRect(
-              tester,
-              find.byIcon(Icons.document_scanner_outlined),
-            );
-            // Every button is there; the Bilibili one right after OCR.
-            for (final icon in const <IconData>[
-              Icons.settings,
-              Icons.subtitles,
-              Icons.movie_creation_outlined,
-              Icons.style,
-              Icons.open_with,
-              Icons.aspect_ratio,
-            ]) {
-              expect(find.byIcon(icon), findsOneWidget);
-            }
-            expect(bilibili.left, closeTo(ocr.right, 0.5));
             expect(bilibili.left, greaterThanOrEqualTo(0));
             expect(bilibili.right, lessThanOrEqualTo(width));
+            if (shown.contains(PlayerTopAction.ocrSubtitle)) {
+              // Still right after OCR when both are in the bar.
+              final ocr = buttonRect(
+                tester,
+                find.byIcon(Icons.document_scanner_outlined),
+              );
+              expect(bilibili.left, closeTo(ocr.right, 0.5));
+            }
             await finish(tester);
           });
         }
