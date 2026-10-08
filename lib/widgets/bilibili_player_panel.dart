@@ -11,6 +11,7 @@ import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart'
 import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_interactions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_offline_details.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
@@ -58,6 +59,7 @@ class BilibiliPlayerPanel extends StatefulWidget {
     this.cache,
     this.api,
     this.actions,
+    this.offlineDetails,
   });
 
   final String bvid;
@@ -87,6 +89,10 @@ class BilibiliPlayerPanel extends StatefulWidget {
   /// service. Without either, those buttons are not shown.
   final BilibiliVideoActions? actions;
 
+  /// Title, uploader and description last seen online, shown while the
+  /// detail cannot be loaded; defaults to [BilibiliOfflineDetails.instance].
+  final BilibiliOfflineDetails? offlineDetails;
+
   @override
   State<BilibiliPlayerPanel> createState() => _BilibiliPlayerPanelState();
 }
@@ -97,6 +103,12 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
   final SettingsService _settings = SettingsService();
   BilibiliVideoDetail? _detail;
   bool _failed = false;
+
+  /// The last failure got no answer at all: the network is down.
+  bool _offline = false;
+
+  /// What is known about the video without the network.
+  BilibiliOfflineDetail? _known;
   bool _showAllEpisodes = false;
   bool _openingLink = false;
   int _loadGeneration = 0;
@@ -137,7 +149,10 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
     _interactions?.dispose();
     _interactions = null;
     _failed = false;
+    _offline = false;
+    _known = null;
     _detail = _cache.peek(widget.bvid);
+    if (_detail == null) unawaited(_lookUpKnown());
     final kept = _detail;
     if (kept != null) {
       _loadGeneration++;
@@ -147,6 +162,19 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
     }
   }
 
+  Future<void> _lookUpKnown() async {
+    final bvid = widget.bvid;
+    final store = widget.offlineDetails ?? BilibiliOfflineDetails.instance;
+    BilibiliOfflineDetail? known;
+    try {
+      known = await store.lookup(bvid);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || bvid != widget.bvid || known == null) return;
+    setState(() => _known = known);
+  }
+
   Future<void> _load() async {
     final generation = ++_loadGeneration;
     final bvid = widget.bvid;
@@ -154,11 +182,17 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
     try {
       final detail = await _cache.get(bvid);
       if (!mounted || generation != _loadGeneration) return;
-      setState(() => _detail = detail);
+      setState(() {
+        _detail = detail;
+        _offline = false;
+      });
       _startInteractions(detail);
-    } catch (_) {
+    } catch (error) {
       if (!mounted || generation != _loadGeneration) return;
-      setState(() => _failed = true);
+      setState(() {
+        _failed = true;
+        _offline = isBilibiliNetworkFailure(error);
+      });
     }
   }
 
@@ -389,10 +423,17 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
     );
   }
 
-  /// Before the detail is there: what the card knows, then a short loading
-  /// line or, after a failure, a retry.
+  /// Before the detail is there: what the card knows (and what was last
+  /// seen online), then a short loading line or, after a failure, a retry.
+  /// Offline the account actions show greyed out; nothing spins on.
   Widget _buildWithoutDetail() {
-    final title = widget.fallbackTitle.trim();
+    final known = _known;
+    final knownTitle = known?.title.trim() ?? '';
+    final title = knownTitle.isNotEmpty
+        ? knownTitle
+        : widget.fallbackTitle.trim();
+    final owner = known?.ownerName.trim() ?? '';
+    final description = known?.description.trim() ?? '';
     return ListView(
       key: const ValueKey('bilibili-panel-pending'),
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 24),
@@ -407,11 +448,38 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
               height: 1.35,
             ),
           ),
+          const SizedBox(height: 10),
+        ],
+        if (owner.isNotEmpty) ...[
+          Row(
+            key: const ValueKey('bilibili-panel-known-owner'),
+            children: [
+              const BilibiliAvatar(url: null, size: 32),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  owner,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppTokens.brandBilibili,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (_failed && _offline) ...[
+          const _OfflineActionBar(),
           const SizedBox(height: 12),
         ],
         if (_failed)
           Row(
-            key: const ValueKey('bilibili-panel-failed'),
+            key: ValueKey(
+              _offline ? 'bilibili-panel-offline' : 'bilibili-panel-failed',
+            ),
             children: [
               const Icon(
                 Icons.cloud_off_outlined,
@@ -419,10 +487,10 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
                 color: AppTokens.text3,
               ),
               const SizedBox(width: 6),
-              const Expanded(
+              Expanded(
                 child: Text(
-                  '详情暂时加载不了',
-                  style: TextStyle(color: AppTokens.text2, fontSize: 13),
+                  _offline ? '离线，联网后可加载' : '详情暂时加载不了',
+                  style: const TextStyle(color: AppTokens.text2, fontSize: 13),
                 ),
               ),
               TextButton(
@@ -450,6 +518,16 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
               ),
             ],
           ),
+        if (description.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          _sectionTitle('简介'),
+          const SizedBox(height: 8),
+          BilibiliDescriptionText(
+            key: const ValueKey('bilibili-panel-known-description'),
+            text: description,
+            onLinkTap: _openDescriptionLink,
+          ),
+        ],
       ],
     );
   }
@@ -698,6 +776,42 @@ class _BilibiliPlayerPanelState extends State<BilibiliPlayerPanel> {
               style: const TextStyle(color: AppTokens.text2, fontSize: 11),
             ),
           ),
+      ],
+    );
+  }
+}
+
+/// Whether [error] means no answer came back at all (offline, connection
+/// failed, timed out), rather than Bilibili refusing the request.
+bool isBilibiliNetworkFailure(Object error) =>
+    error is TimeoutException ||
+    (error is BilibiliPublicApiException && error.isNetworkError);
+
+/// The like / coin / favourite row while offline: greyed out, not tappable.
+class _OfflineActionBar extends StatelessWidget {
+  const _OfflineActionBar();
+
+  @override
+  Widget build(BuildContext context) {
+    Widget button(IconData icon, String label) => OutlinedButton.icon(
+      style: OutlinedButton.styleFrom(
+        disabledForegroundColor: AppTokens.text3,
+        side: const BorderSide(color: AppTokens.text4),
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+      ),
+      onPressed: null,
+      icon: Icon(icon, size: 17),
+      label: Text(label, style: const TextStyle(fontSize: 13)),
+    );
+    return Wrap(
+      key: const ValueKey('bilibili-panel-offline-actions'),
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        button(Icons.thumb_up_alt_outlined, '点赞'),
+        button(Icons.monetization_on_outlined, '投币'),
+        button(Icons.star_border, '收藏'),
       ],
     );
   }

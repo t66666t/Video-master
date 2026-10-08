@@ -8,6 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_interaction_gate.dart';
+import 'package:video_player_app/services/bilibili/bilibili_offline_details.dart';
+import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_detail_cache.dart';
 import 'package:video_player_app/services/settings_service.dart';
@@ -69,6 +71,7 @@ void main() {
     VoidCallback? onOpenEpisodes,
     List<String>? watched,
     BilibiliVideoActions? actions,
+    BilibiliOfflineDetails? offlineDetails,
   }) async {
     tester.view.physicalSize = const Size(420, 2400);
     tester.view.devicePixelRatio = 1;
@@ -83,6 +86,7 @@ void main() {
             fallbackTitle: '卡片标题',
             cache: cache,
             actions: actions,
+            offlineDetails: offlineDetails ?? BilibiliOfflineDetails(),
             onCollapse: onCollapse,
             onOpenEpisodes: onOpenEpisodes,
             onWatchVideo:
@@ -214,7 +218,11 @@ void main() {
     expect(find.text('正在加载详情…'), findsOneWidget);
     await tester.pump(const Duration(seconds: 6));
     await tester.pump();
-    expect(find.byKey(const ValueKey('bilibili-panel-failed')), findsOneWidget);
+    // No answer at all reads as offline.
+    expect(
+      find.byKey(const ValueKey('bilibili-panel-offline')),
+      findsOneWidget,
+    );
     expect(find.byType(CircularProgressIndicator), findsNothing);
     await finish(tester);
   });
@@ -330,6 +338,116 @@ void main() {
     expect(find.text('已赞'), findsNothing);
     expect(find.text('已关注'), findsNothing);
     await finish(tester);
+  });
+
+  group('offline', () {
+    BilibiliVideoDetailCache offlineCache() => BilibiliVideoDetailCache(
+      fetch: (_) async => throw const BilibiliPublicApiException(
+        '视频详情加载失败，请检查网络后重试',
+        isNetworkError: true,
+      ),
+    );
+
+    testWidgets('a downloaded video shows the title, UP and description it '
+        'had, greyed actions and the offline hint, no error, no spinner', (
+      tester,
+    ) async {
+      final known = BilibiliOfflineDetails();
+      await known.remember(
+        const BilibiliOfflineDetail(
+          bvid: _bvid,
+          title: '离线标题',
+          ownerName: '离线UP',
+          ownerMid: 7,
+          description: '离线简介',
+        ),
+      );
+      final reads = <String>[];
+      await pumpPanel(
+        tester,
+        cache: offlineCache(),
+        actions: _loggedInActions(reads: reads),
+        offlineDetails: known,
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('离线标题'), findsOneWidget);
+      expect(find.text('卡片标题'), findsNothing);
+      expect(find.text('离线UP'), findsOneWidget);
+      expect(find.text('离线简介', findRichText: true), findsOneWidget);
+      expect(find.text('离线，联网后可加载'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(find.byKey(const ValueKey('bilibili-panel-failed')), findsNothing);
+      final bar = find.byKey(const ValueKey('bilibili-panel-offline-actions'));
+      expect(bar, findsOneWidget);
+      final buttons = tester.widgetList<OutlinedButton>(
+        find.descendant(of: bar, matching: find.byType(OutlinedButton)),
+      );
+      expect(buttons, hasLength(3));
+      expect(buttons.every((b) => b.onPressed == null), isTrue);
+      await tester.tap(find.text('点赞'), warnIfMissed: false);
+      await tester.pump();
+      expect(reads, isEmpty, reason: 'nothing is asked while offline');
+      await finish(tester);
+    });
+
+    testWidgets('never seen online: the card title with the offline hint', (
+      tester,
+    ) async {
+      await pumpPanel(tester, cache: offlineCache());
+      await tester.pumpAndSettle();
+      expect(find.text('卡片标题'), findsOneWidget);
+      expect(find.text('离线，联网后可加载'), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      await finish(tester);
+    });
+
+    testWidgets('back online, 重试 shows the full panel', (tester) async {
+      var online = false;
+      final cache = BilibiliVideoDetailCache(
+        fetch: (_) async {
+          if (!online) {
+            throw const BilibiliPublicApiException('x', isNetworkError: true);
+          }
+          return _detail();
+        },
+      );
+      await pumpPanel(tester, cache: cache, actions: _offlineActions());
+      await tester.pumpAndSettle();
+      expect(find.text('离线，联网后可加载'), findsOneWidget);
+      online = true;
+      await tester.tap(find.byKey(const ValueKey('bilibili-panel-retry')));
+      await tester.pumpAndSettle();
+      expect(find.text('面板标题'), findsOneWidget);
+      expect(find.text('离线，联网后可加载'), findsNothing);
+      await finish(tester);
+    });
+
+    test(
+      'details seen online are kept, newest last, up to the capacity',
+      () async {
+        final store = BilibiliOfflineDetails(capacity: 2);
+        await store.rememberDetail(_detail());
+        await store.remember(
+          const BilibiliOfflineDetail(bvid: 'BV1bb411c7mB', title: '二'),
+        );
+        await store.remember(
+          const BilibiliOfflineDetail(bvid: 'BV1cc411c7mC', title: '三'),
+        );
+        // A new instance reads what was saved.
+        final again = BilibiliOfflineDetails(capacity: 2);
+        expect(await again.lookup(_bvid), isNull);
+        expect((await again.lookup('BV1bb411c7mB'))!.title, '二');
+        expect((await again.lookup('BV1cc411c7mC'))!.title, '三');
+
+        await store.rememberDetail(_detail());
+        final third = BilibiliOfflineDetails(capacity: 2);
+        final kept = (await third.lookup(_bvid))!;
+        expect(kept.title, '面板标题');
+        expect(kept.ownerName, '测试UP');
+        expect(kept.description, '简介正文');
+      },
+    );
   });
 
   testWidgets('reopening the panel uses the kept detail', (tester) async {

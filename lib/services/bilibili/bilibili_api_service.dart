@@ -2,6 +2,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
+import 'dart:async';
 import 'dart:convert';
 import '../../debug/developer_log.dart' as developer;
 import 'dart:io' show ZLibDecoder, gzip;
@@ -9,6 +10,7 @@ import 'package:video_player_app/models/bilibili_models.dart';
 import 'package:video_player_app/models/bilibili_download_task.dart';
 import 'package:video_player_app/models/media_chapter.dart';
 import 'package:video_player_app/services/bilibili/bilibili_cookie_store.dart';
+import 'package:video_player_app/services/bilibili/bilibili_offline_details.dart';
 import 'package:video_player_app/services/bilibili/wbi_signer.dart';
 import 'package:video_player_app/utils/subtitle_util.dart';
 
@@ -580,7 +582,10 @@ class BilibiliApiService {
         "https://api.bilibili.com/x/web-interface/view",
         queryParameters: params,
       );
-      return BilibiliVideoInfo.fromJson(response.data);
+      final info = BilibiliVideoInfo.fromJson(response.data);
+      // Kept for the panel of a downloaded video when offline.
+      unawaited(BilibiliOfflineDetails.instance.rememberInfo(info));
+      return info;
     } catch (e) {
       developer.log('Error fetching video info', error: e);
       rethrow;

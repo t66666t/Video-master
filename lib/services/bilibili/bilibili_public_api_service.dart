@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
@@ -6,13 +7,18 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import '../../debug/developer_log.dart' as developer;
 import '../../models/bilibili_browse_models.dart';
 import '../../utils/bilibili_url_parser.dart';
+import 'bilibili_offline_details.dart';
 import 'wbi_signer.dart';
 
 /// User-facing error from a public Bilibili request. [message] is Chinese.
 class BilibiliPublicApiException implements Exception {
   final String message;
 
-  const BilibiliPublicApiException(this.message);
+  /// True when no answer came back at all (offline, connection failed or
+  /// timed out), as opposed to Bilibili refusing the request.
+  final bool isNetworkError;
+
+  const BilibiliPublicApiException(this.message, {this.isNetworkError = false});
 
   @override
   String toString() => message;
@@ -111,7 +117,10 @@ class BilibiliPublicApiService {
       throw const BilibiliPublicApiException('视频详情数据不完整');
     }
     final tags = await fetchVideoTags(detail.bvid);
-    return tags.isEmpty ? detail : detail.withTags(tags);
+    final complete = tags.isEmpty ? detail : detail.withTags(tags);
+    // Kept for the panel of a downloaded video when offline.
+    unawaited(BilibiliOfflineDetails.instance.rememberDetail(complete));
+    return complete;
   }
 
   /// Never throws; returns an empty list on any failure.
@@ -465,7 +474,13 @@ class BilibiliPublicApiService {
       );
     } on DioException catch (e) {
       developer.log('Bilibili public request failed: $what', error: e.type);
-      throw BilibiliPublicApiException('$what加载失败，请检查网络后重试');
+      throw BilibiliPublicApiException(
+        '$what加载失败，请检查网络后重试',
+        isNetworkError:
+            e.type != DioExceptionType.badResponse &&
+            e.type != DioExceptionType.cancel &&
+            e.type != DioExceptionType.badCertificate,
+      );
     }
     final status = response.statusCode ?? 0;
     if (status == 412 && allowRiskStatus) {
