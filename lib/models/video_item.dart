@@ -50,8 +50,9 @@ class VideoItem {
 
   /// A watch-only card: playable like any other card, but never part of the
   /// media library (no folder, no lists, not saved). It is removed with its
-  /// cache once nothing plays it any more.
-  final bool isTransient;
+  /// cache once nothing plays it any more. Importing it clears the flag
+  /// ([LibraryService.promoteTransientVideo]).
+  bool isTransient;
 
   VideoItem({
     required this.id,

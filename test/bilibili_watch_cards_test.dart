@@ -20,6 +20,8 @@ import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_cache_limit_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_quick_import.dart';
+import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_watch_cards.dart';
 import 'package:video_player_app/services/library_service.dart';
@@ -372,6 +374,58 @@ void main() {
       expect(history.watchEntryOf(_bvid)?.positionMs, 47000);
     });
 
+    test('closing the mini player saves the position and removes the card '
+        'right away', () async {
+      final history = BilibiliHistoryService.instance;
+      final playback = _FakePlayback();
+      final cards = BilibiliWatchCards.forApp(
+        library: library,
+        playbackChanges: playback,
+        currentItemId: () => playback.currentId,
+        openPageItemIds: () => const <String>[],
+        history: history,
+      );
+      addTearDown(cards.dispose);
+      final service = newService(_FakeApi(pages: 2));
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 2,
+        history: history,
+        cards: cards,
+      );
+      // Watched for a while: past the clean-up grace of new cards (the
+      // episode-list entry of P1 included).
+      for (final entry in plan.queue!) {
+        entry.lastUpdated = DateTime.now()
+            .subtract(const Duration(minutes: 5))
+            .millisecondsSinceEpoch;
+      }
+      // Playing in the mini player, no playback page on screen.
+      playback.change(plan.item.id);
+      await library.updateVideoProgress(plan.item.id, 20000);
+      await pumpEventQueue();
+      await library.updateVideoProgress(plan.item.id, 26000);
+      await pumpEventQueue();
+      expect(
+        history.watchEntryOf(_bvid)?.positionMs,
+        20000,
+        reason: 'throttled',
+      );
+
+      // Closing the mini player stops playback: the current item goes away.
+      playback.change(null);
+      await pumpEventQueue();
+      expect(history.watchEntryOf(_bvid)?.positionMs, 26000);
+      expect(history.watchEntryOf(_bvid)?.page, 2);
+      await Future<void>.delayed(
+        cards.janitor.sweepDelay + const Duration(milliseconds: 200),
+      );
+      expect(library.getVideo(plan.item.id), isNull);
+      expect(library.transientVideos, isEmpty);
+    });
+
     test('startup removes cards left by the previous run', () async {
       final left = await addWatchOnlyCard(id: 'watch-left');
       final ledger = library.transientLedgerFileForTesting;
@@ -464,7 +518,7 @@ void main() {
         page: 2,
       );
       expect(plan.item, same(formal));
-      expect(plan.playsAlone, isFalse);
+      expect(plan.usesOwnQueue, isFalse);
       expect(library.transientVideos, isEmpty);
       expect(api.metadataRequests, 0, reason: 'no card was built');
     });
@@ -482,9 +536,12 @@ void main() {
         );
         expect(plan.imported, isFalse);
         expect(plan.item.isTransient, isTrue);
-        expect(plan.playsAlone, isTrue);
+        expect(plan.usesOwnQueue, isTrue);
         expect(plan.item.sourceRef?.page, 2);
-        expect(library.transientVideos, [plan.item]);
+        expect(plan.queue?.map((v) => v.sourceRef?.page), [1, 2]);
+        expect(plan.queue?[1], same(plan.item));
+        expect(library.transientVideos, hasLength(2));
+        expect(library.transientVideos, contains(plan.item));
         expect(library.bilibiliStreamItems, isEmpty);
         expect(library.getContents(null), isEmpty);
 
@@ -496,6 +553,8 @@ void main() {
           page: 2,
         );
         expect(again.item, same(plan.item));
+        expect(again.queue?.first, same(plan.queue?.first));
+        expect(library.transientVideos, hasLength(2));
         expect(api.metadataRequests, 1);
       },
     );
@@ -511,7 +570,7 @@ void main() {
       );
       expect(plan.imported, isTrue);
       expect(plan.item.isTransient, isFalse);
-      expect(plan.playsAlone, isFalse);
+      expect(plan.usesOwnQueue, isFalse);
       expect(library.transientVideos, isEmpty);
       expect(library.bilibiliStreamItems, [plan.item]);
     });
@@ -607,7 +666,8 @@ void main() {
         grace: Duration.zero,
       );
       addTearDown(janitor.dispose);
-      expect(await janitor.sweep(), 1);
+      // The opened part and the two episode-list entries.
+      expect(await janitor.sweep(), 3);
       expect(library.transientVideos, isEmpty);
       final entry = history.watchEntryOf(_bvid)!;
       expect(entry.page, 2);
@@ -701,6 +761,286 @@ void main() {
       final entry = history.watchEntryOf(_bvid)!;
       expect(entry.positionMs, 90000, reason: 'kept, not updated');
       expect(entry.title, 'old');
+    });
+  });
+
+  group('multi-part episode list (parts built on demand)', () {
+    Future<void> waitFor(bool Function() done) async {
+      for (var i = 0; i < 100 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(done(), isTrue);
+    }
+
+    Iterable<VideoItem> watchOnlyOf(String bvid) =>
+        library.transientVideos.where((v) => bilibiliStreamCardBvid(v) == bvid);
+
+    test('switching parts builds only those parts; closing the page removes '
+        'them all with their files', () async {
+      final history = BilibiliHistoryService.instance;
+      final api = _FakeApi(pages: 3);
+      final service = newService(api);
+      final playback = _FakePlayback();
+      var openPages = <String>[];
+      var queue = <VideoItem>[];
+      final cards = BilibiliWatchCards.forApp(
+        library: library,
+        playbackChanges: playback,
+        currentItemId: () => playback.currentId,
+        openPageItemIds: () => openPages,
+        queueItemIds: () => queue.map((v) => v.id),
+        prepareCurrentItem: (id) => service.completeWatchPart(library, id),
+        history: history,
+      );
+      addTearDown(cards.dispose);
+
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 1,
+        history: history,
+        cards: cards,
+      );
+      queue = plan.queue!;
+      expect(queue.map((v) => v.sourceRef?.page), [1, 2, 3]);
+      expect(queue.first, same(plan.item));
+      expect(queue.every((v) => v.isTransient), isTrue);
+      expect(api.metadataRequests, 1, reason: 'only the opened part');
+      expect(queue[1].danmakuPath, isNull);
+      expect(service.isPendingWatchPart(queue[1].id), isTrue);
+      expect(service.isPendingWatchPart(queue[2].id), isTrue);
+
+      // The playback page opens on P1 and plays it.
+      openPages = <String>[plan.item.id];
+      playback.change(plan.item.id);
+      await library.updateVideoProgress(plan.item.id, 30000);
+      await pumpEventQueue();
+
+      // Episode list: P1 → P3 → P2.
+      playback.change(queue[2].id);
+      await waitFor(() => queue[2].danmakuPath != null);
+      expect(api.metadataRequests, 2);
+      expect(service.isPendingWatchPart(queue[1].id), isTrue);
+      await library.updateVideoProgress(queue[2].id, 5000);
+      playback.change(queue[1].id);
+      await waitFor(() => queue[1].danmakuPath != null);
+      expect(api.metadataRequests, 3);
+      await library.updateVideoProgress(queue[1].id, 12000);
+      await pumpEventQueue();
+      final danmakuFiles = [for (final v in queue) File(v.danmakuPath!)];
+      expect(danmakuFiles.every((f) => f.existsSync()), isTrue);
+
+      // One history entry for the video: the last part and second.
+      expect(history.watchHistory.where((e) => e.bvid == _bvid), hasLength(1));
+      final entry = history.watchEntryOf(_bvid)!;
+      expect(entry.page, 2);
+      expect(entry.positionMs, 12000);
+      expect(entry.partTitle, '第 2 部分');
+
+      // All their caches count toward the cap.
+      expect(
+        library.onlineCacheItems.map((v) => v.id).toSet(),
+        queue.map((v) => v.id).toSet(),
+      );
+      // Never in recent / continue / search / folders.
+      final projection = library.activityProjection;
+      final recent = projection.recentAddedMediaIds();
+      final ids = queue.map((v) => v.id).toSet();
+      expect(
+        {...recent.datedIds, ...recent.unknownAddedIds}.intersection(ids),
+        isEmpty,
+      );
+      expect(
+        projection
+            .continueLearningGroups()
+            .expand((g) => g.mediaIds)
+            .toSet()
+            .intersection(ids),
+        isEmpty,
+      );
+      expect(library.searchContents('部分'), isEmpty);
+      expect(library.getContents(null), isEmpty);
+      expect(library.bilibiliStreamItems, isEmpty);
+
+      // While the page is open the whole episode list survives a sweep.
+      for (final v in queue) {
+        v.lastUpdated = DateTime.now()
+            .subtract(const Duration(minutes: 5))
+            .millisecondsSinceEpoch;
+      }
+      await cards.janitor.sweep();
+      expect(watchOnlyOf(_bvid), hasLength(3));
+
+      // Closing the playback page (and the player) removes every part.
+      openPages = <String>[];
+      playback.change(null);
+      await Future<void>.delayed(
+        cards.janitor.sweepDelay + const Duration(milliseconds: 300),
+      );
+      expect(library.transientVideos, isEmpty);
+      expect(danmakuFiles.any((f) => f.existsSync()), isFalse);
+      expect(library.transientLedgerFileForTesting.existsSync(), isFalse);
+      expect(history.watchEntryOf(_bvid)?.positionMs, 12000);
+
+      // Next start: nothing left.
+      library.resetLibraryForTesting();
+      await library.init();
+      expect(library.transientVideos, isEmpty);
+      expect(library.onlineCacheItems, isEmpty);
+    });
+
+    test('parts left by a crash are removed at the next start', () async {
+      final api = _FakeApi(pages: 3);
+      final service = newService(api);
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 2,
+      );
+      final queue = plan.queue!;
+      expect(await service.completeWatchPart(library, queue[2].id), isTrue);
+      final files = [File(queue[1].danmakuPath!), File(queue[2].danmakuPath!)];
+      final cacheDirs = <Directory>[];
+      for (final v in queue) {
+        final dir = Directory(
+          p.join(
+            root.path,
+            'bilibili_stream_cache',
+            BilibiliStreamingService.cacheEntryName(v.id),
+          ),
+        );
+        await dir.create(recursive: true);
+        await File(p.join(dir.path, 'piece.m4s')).writeAsBytes([1]);
+        cacheDirs.add(dir);
+      }
+      expect(files.every((f) => f.existsSync()), isTrue);
+
+      library.resetLibraryForTesting();
+      await library.init();
+      expect(library.transientVideos, isEmpty);
+      expect(files.any((f) => f.existsSync()), isFalse);
+      expect(cacheDirs.any((d) => d.existsSync()), isFalse);
+      expect(library.transientLedgerFileForTesting.existsSync(), isFalse);
+    });
+
+    test('a part removed while it was being built leaves no files', () async {
+      final service = newService(_FakeApi(pages: 2));
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 1,
+      );
+      final other = plan.queue![1];
+      final building = service.completeWatchPart(library, other.id);
+      await library.discardTransientVideo(other.id);
+      expect(await building, isFalse);
+      expect(library.getVideo(other.id), isNull);
+      final danmakuDir = Directory(p.join(root.path, 'danmaku'));
+      final names = danmakuDir.existsSync()
+          ? danmakuDir.listSync().map((e) => p.basename(e.path)).toList()
+          : const <String>[];
+      expect(names.where((n) => n.startsWith(other.id)), isEmpty);
+    });
+
+    test('importing while watching: watched parts become library cards in '
+        'place with their progress, the rest is created, order and folder as '
+        'a normal import', () async {
+      final history = BilibiliHistoryService.instance;
+      // Reference: a normal import of the whole video.
+      final reference = await runBilibiliQuickImport(
+        service: newService(_FakeApi(pages: 3)),
+        library: library,
+        bvid: _bvid,
+        page: 2,
+        target: BilibiliImportTarget.automatic,
+        history: history,
+      );
+      final refFolder = library.getCollection(reference.item.parentId!)!;
+      final refFolderName = refFolder.name;
+      final refFolderParent = refFolder.parentId;
+      final refOrder = library
+          .getVideosInFolder(refFolder.id)
+          .map((v) => v.sourceRef?.page)
+          .toList();
+      expect(refOrder, [1, 2, 3]);
+
+      // Fresh library for the same video.
+      library.resetLibraryForTesting();
+      for (final name in ['library.json', 'library.json.bak']) {
+        final file = File(p.join(root.path, name));
+        if (file.existsSync()) await file.delete();
+      }
+      await library.init();
+      history.resetForTest();
+      expect(library.bilibiliStreamItems, isEmpty);
+      expect(library.getContents(null), isEmpty);
+
+      final api = _FakeApi(pages: 3);
+      final service = newService(api);
+      final plan = await prepareBilibiliWatch(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 1,
+        history: history,
+      );
+      final queue = plan.queue!;
+      expect(await service.completeWatchPart(library, queue[1].id), isTrue);
+      await library.updateVideoProgress(queue[0].id, 40000);
+      await library.updateVideoProgress(queue[1].id, 15000);
+      expect(service.isPendingWatchPart(queue[2].id), isTrue);
+
+      final result = await runBilibiliQuickImport(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        page: 2,
+        target: BilibiliImportTarget.automatic,
+        history: history,
+        playingItemId: queue[1].id,
+      );
+      expect(result.alreadyImported, isFalse);
+
+      // No watch-only card and no duplicate left for the video.
+      expect(watchOnlyOf(_bvid), isEmpty);
+      final cardsNow = library.bilibiliStreamItems
+          .where((v) => bilibiliStreamCardBvid(v) == _bvid)
+          .toList();
+      expect(cardsNow, hasLength(3));
+      expect(cardsNow.map((v) => v.sourceRef?.page).toSet(), {1, 2, 3});
+
+      // Watched parts: same card, own progress.
+      expect(library.getVideo(queue[0].id), same(queue[0]));
+      expect(queue[0].isTransient, isFalse);
+      expect(queue[0].lastPositionMs, 40000);
+      expect(library.getVideo(queue[1].id), same(queue[1]));
+      expect(queue[1].lastPositionMs, 15000);
+      // The part never opened is a complete library card.
+      final third = cardsNow.firstWhere((v) => v.sourceRef?.page == 3);
+      expect(third.isTransient, isFalse);
+      expect(third.danmakuPath, isNotNull);
+
+      // Same folder and order as the normal import.
+      final folder = library.getCollection(queue[0].parentId!)!;
+      expect(folder.name, refFolderName);
+      expect(folder.parentId, refFolderParent);
+      expect(cardsNow.every((v) => v.parentId == folder.id), isTrue);
+      expect(
+        library
+            .getVideosInFolder(folder.id)
+            .map((v) => v.sourceRef?.page)
+            .toList(),
+        refOrder,
+      );
+      // And they now show up where library cards do.
+      final recent = library.activityProjection.recentAddedMediaIds();
+      expect({
+        ...recent.datedIds,
+        ...recent.unknownAddedIds,
+      }, containsAll(cardsNow.map((v) => v.id)));
     });
   });
 

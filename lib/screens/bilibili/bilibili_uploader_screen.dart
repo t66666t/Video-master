@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_uploader_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_uploader_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
@@ -140,6 +141,7 @@ class BilibiliUploaderScreen extends StatefulWidget {
     this.service,
     this.openExternal,
     this.onWatch,
+    this.onImport,
   });
 
   final int mid;
@@ -156,6 +158,9 @@ class BilibiliUploaderScreen extends StatefulWidget {
 
   /// Plays a tapped video; defaults to [watchBilibiliVideo].
   final BilibiliVideoWatcher? onWatch;
+
+  /// Runs the import buttons; defaults to [importBilibiliVideoQuick].
+  final BilibiliQuickImporter? onImport;
 
   @override
   State<BilibiliUploaderScreen> createState() => _BilibiliUploaderScreenState();
@@ -282,6 +287,7 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
             api: _api,
             service: _service,
             onWatch: widget.onWatch,
+            onImport: widget.onImport,
           ),
         ),
       ),
@@ -542,8 +548,11 @@ class _BilibiliUploaderScreenState extends State<BilibiliUploaderScreen>
             key: const PageStorageKey('bilibili-uploader-videos'),
             pager: _videos,
             emptyText: _keyword.isEmpty ? '还没有投稿' : '没有找到相关投稿',
-            itemBuilder: (video) =>
-                BilibiliUploaderVideoTile(video: video, onTap: _openVideo),
+            itemBuilder: (video) => BilibiliUploaderVideoTile(
+              video: video,
+              onTap: _openVideo,
+              onImport: widget.onImport,
+            ),
           ),
         ),
       ],
@@ -584,6 +593,7 @@ class BilibiliUploaderCollectionScreen extends StatefulWidget {
     required this.api,
     required this.service,
     this.onWatch,
+    this.onImport,
   });
 
   final int mid;
@@ -593,6 +603,9 @@ class BilibiliUploaderCollectionScreen extends StatefulWidget {
 
   /// Plays a tapped video; defaults to [watchBilibiliVideo].
   final BilibiliVideoWatcher? onWatch;
+
+  /// Runs the import buttons; defaults to [importBilibiliVideoQuick].
+  final BilibiliQuickImporter? onImport;
 
   @override
   State<BilibiliUploaderCollectionScreen> createState() =>
@@ -645,6 +658,7 @@ class _BilibiliUploaderCollectionScreenState
           onTap: (v) => unawaited(
             (widget.onWatch ?? watchBilibiliVideo)(context, bvid: v.bvid),
           ),
+          onImport: widget.onImport,
         ),
       ),
     );
@@ -815,10 +829,14 @@ class BilibiliUploaderVideoTile extends StatelessWidget {
     super.key,
     required this.video,
     required this.onTap,
+    this.onImport,
   });
 
   final BilibiliUploaderVideo video;
   final ValueChanged<BilibiliUploaderVideo> onTap;
+
+  /// Runs the import buttons; defaults to [importBilibiliVideoQuick].
+  final BilibiliQuickImporter? onImport;
 
   @override
   Widget build(BuildContext context) {
@@ -896,6 +914,16 @@ class BilibiliUploaderVideoTile extends StatelessWidget {
                         ),
                       ),
                   ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            SizedBox(
+              height: 80,
+              child: Center(
+                child: BilibiliImportButtons(
+                  bvid: video.bvid,
+                  onImport: onImport,
                 ),
               ),
             ),

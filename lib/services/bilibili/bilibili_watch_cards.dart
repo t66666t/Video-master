@@ -71,14 +71,20 @@ class BilibiliWatchPlan {
   /// on play" is on.
   final bool imported;
 
+  /// Episode queue of a watch-only card, one entry per part in part order
+  /// (just [item] for a single-part video); null for a library card, which
+  /// keeps its folder as the queue.
+  final List<VideoItem>? queue;
+
   const BilibiliWatchPlan({
     required this.item,
     required this.videoInfo,
     required this.imported,
+    this.queue,
   });
 
-  /// A watch-only card plays alone; a library card keeps its folder queue.
-  bool get playsAlone => item.isTransient;
+  /// Whether the playback page gets [queue] instead of the folder queue.
+  bool get usesOwnQueue => queue != null;
 }
 
 String _partTitle(BilibiliVideoInfo info, int page) {
@@ -146,6 +152,20 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
   cards?.track(item);
 
   final playedPage = item.sourceRef?.page ?? start.page;
+  List<VideoItem>? queue;
+  if (item.isTransient) {
+    queue = await _watchQueue(
+      service: service,
+      library: library,
+      info: info,
+      bvid: bvid,
+      current: item,
+      currentPage: playedPage,
+    );
+    for (final entry in queue) {
+      cards?.track(entry);
+    }
+  }
   try {
     await watchHistory.recordWatch(
       BilibiliWatchHistoryEntry(
@@ -163,14 +183,68 @@ Future<BilibiliWatchPlan> prepareBilibiliWatch({
     // History is best effort and never blocks playback.
     developer.log('Watch history not recorded', error: error);
   }
-  return BilibiliWatchPlan(item: item, videoInfo: info, imported: imported);
+  return BilibiliWatchPlan(
+    item: item,
+    videoInfo: info,
+    imported: imported,
+    queue: queue,
+  );
+}
+
+/// The episode list of a watch-only card: for every part the library card or
+/// a watch-only card still alive, else a lightweight entry that only gets
+/// its player data once it is switched to
+/// ([BilibiliDownloadService.addWatchParts]).
+Future<List<VideoItem>> _watchQueue({
+  required BilibiliDownloadService service,
+  required LibraryService library,
+  required BilibiliVideoInfo info,
+  required String bvid,
+  required VideoItem current,
+  required int currentPage,
+}) async {
+  if (info.pages.length <= 1) return <VideoItem>[current];
+  final videoBvid = info.bvid.trim().isNotEmpty ? info.bvid.trim() : bvid;
+  final slots = <int, VideoItem>{currentPage: current};
+  final missing = <BilibiliPage>[];
+  for (final part in info.pages) {
+    if (slots.containsKey(part.page)) continue;
+    final existing =
+        service.findStreamCard(library, bvid: videoBvid, page: part) ??
+        findBilibiliStreamCard(
+          library.transientVideos,
+          bvid: videoBvid,
+          page: part.page,
+          cid: part.cid,
+          collectionOf: library.getCollection,
+        );
+    if (existing != null) {
+      slots[part.page] = existing;
+    } else {
+      missing.add(part);
+    }
+  }
+  for (final entry in await service.addWatchParts(
+    library,
+    videoInfo: info,
+    pages: missing,
+  )) {
+    final page = entry.sourceRef?.page;
+    if (page != null) slots[page] = entry;
+  }
+  return <VideoItem>[for (final part in info.pages) ?slots[part.page]];
 }
 
 bool _isOnlineCard(VideoItem item) =>
     item.sourceRef?.kind == MediaSourceKind.bilibiliStream ||
     item.path.startsWith('bilibili://stream/');
 
-typedef _PendingProgress = ({String bvid, int page, int positionMs});
+typedef _PendingProgress = ({
+  String bvid,
+  int page,
+  int positionMs,
+  String title,
+});
 
 /// Writes the playback position of cards opened from the Bilibili pages into
 /// the watch history: at most once per [interval] while playing, and right
@@ -221,6 +295,7 @@ class BilibiliWatchProgressRecorder {
       bvid: bvid,
       page: item.sourceRef?.page ?? 1,
       positionMs: positionMs,
+      title: item.title,
     );
     final last = _lastWrite[item.id];
     if (last == null || _now().difference(last) >= interval) {
@@ -253,6 +328,7 @@ class BilibiliWatchProgressRecorder {
         bvid: pending.bvid,
         page: pending.page,
         positionMs: pending.positionMs,
+        partTitle: pending.title,
       );
     } catch (error) {
       developer.log('Watch progress not saved', error: error);
@@ -369,6 +445,8 @@ class BilibiliWatchCards {
     required Listenable playbackChanges,
     required String? Function() currentItemId,
     required Iterable<String> Function() openPageItemIds,
+    Iterable<String> Function()? queueItemIds,
+    Future<void> Function(String itemId)? prepareCurrentItem,
     BilibiliHistoryService? history,
   }) {
     final recorder = BilibiliWatchProgressRecorder(
@@ -377,7 +455,15 @@ class BilibiliWatchCards {
     )..attach();
     final janitor = BilibiliTransientCardJanitor(
       library: library,
-      inUseIds: () => <String>{?currentItemId(), ...openPageItemIds()},
+      inUseIds: () {
+        final pages = openPageItemIds().toSet();
+        return <String>{
+          ?currentItemId(),
+          ...pages,
+          // While a playback page is open its episode list stays usable.
+          if (pages.isNotEmpty && queueItemIds != null) ...queueItemIds(),
+        };
+      },
       beforeDiscard: (item) => recorder.forget(item.id),
     );
     final cards = BilibiliWatchCards(recorder: recorder, janitor: janitor);
@@ -386,6 +472,14 @@ class BilibiliWatchCards {
       final current = currentItemId();
       if (current == lastCurrent) return;
       lastCurrent = current;
+      // Playback stopped (for example the mini player was closed): save the
+      // last positions now rather than on the next start.
+      if (current == null) {
+        unawaited(recorder.flushAll());
+      } else if (prepareCurrentItem != null) {
+        // A part switched to in the episode list gets its player data now.
+        unawaited(prepareCurrentItem(current));
+      }
       janitor.scheduleSweep();
     }
 

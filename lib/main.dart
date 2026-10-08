@@ -450,13 +450,16 @@ Future<void> _initializeDeferredServices({
   );
 
   // Watch-only Bilibili cards: progress into the watch history, removed once
-  // neither playing nor shown on a playback page.
+  // neither playing nor shown on a playback page (or in its episode list).
   BilibiliWatchCards.install(
     BilibiliWatchCards.forApp(
       library: library,
       playbackChanges: mediaPlaybackService,
       currentItemId: () => mediaPlaybackService.currentItem?.id,
       openPageItemIds: _openPlaybackPageItemIds,
+      queueItemIds: () => playlistManager.playlist.map((item) => item.id),
+      prepareCurrentItem: (itemId) =>
+          bilibiliService.completeWatchPart(library, itemId),
     ),
   );
 }

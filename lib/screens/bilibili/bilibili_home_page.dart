@@ -6,6 +6,7 @@ import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_account_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
@@ -30,6 +31,7 @@ class BilibiliHomePage extends StatefulWidget {
     this.api,
     this.bottomPadding = 0,
     this.onWatch,
+    this.onImport,
   });
 
   final bool isActive;
@@ -38,6 +40,10 @@ class BilibiliHomePage extends StatefulWidget {
 
   /// Plays a tapped video or pasted link; defaults to [watchBilibiliVideo].
   final BilibiliVideoWatcher? onWatch;
+
+  /// Runs the import buttons of the results; defaults to
+  /// [importBilibiliVideoQuick].
+  final BilibiliQuickImporter? onImport;
 
   @override
   State<BilibiliHomePage> createState() => _BilibiliHomePageState();
@@ -1000,6 +1006,16 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
                         ),
                       ),
                   ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            SizedBox(
+              height: 80,
+              child: Center(
+                child: BilibiliImportButtons(
+                  bvid: video.bvid,
+                  onImport: widget.onImport,
                 ),
               ),
             ),

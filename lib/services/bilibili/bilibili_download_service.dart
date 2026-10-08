@@ -3655,18 +3655,34 @@ class BilibiliDownloadService extends ChangeNotifier {
         (result) => BilibiliStreamCardResult(item: result.item, created: false),
       );
     }
-    final future = _createStreamCard(
-      library,
-      videoInfo: videoInfo,
-      page: page,
-      episodeBvid: episodeBvid,
-      episode: episode,
-      originalSourceValue: originalSourceValue,
-      activityBatchId: activityBatchId,
-      resolveParentId: resolveParentId,
-      directories: directories,
-      onStage: onStage,
+    // A watch-only card of this part (for example the one playing) becomes
+    // the library card instead of a second card being built next to it.
+    final watchOnly = findBilibiliStreamCard(
+      library.transientVideos,
+      bvid: cardBvid,
+      page: page.page,
+      cid: page.cid,
+      collectionOf: library.getCollection,
     );
+    final future = watchOnly != null
+        ? _promoteWatchCard(
+            library,
+            watchOnly,
+            activityBatchId: activityBatchId,
+            resolveParentId: resolveParentId,
+          )
+        : _createStreamCard(
+            library,
+            videoInfo: videoInfo,
+            page: page,
+            episodeBvid: episodeBvid,
+            episode: episode,
+            originalSourceValue: originalSourceValue,
+            activityBatchId: activityBatchId,
+            resolveParentId: resolveParentId,
+            directories: directories,
+            onStage: onStage,
+          );
     _streamCardsInFlight[key] = future;
     return future.whenComplete(() {
       if (identical(_streamCardsInFlight[key], future)) {
@@ -3688,6 +3704,156 @@ class BilibiliDownloadService extends ChangeNotifier {
       cid: page.cid,
       collectionOf: library.getCollection,
     );
+  }
+
+  /// Makes [watchOnly] the library card of its part, in the folder the
+  /// import would have used for a new card.
+  Future<BilibiliStreamCardResult> _promoteWatchCard(
+    LibraryService library,
+    VideoItem watchOnly, {
+    required String? activityBatchId,
+    required Future<String?> Function()? resolveParentId,
+  }) async {
+    // An episode-list entry that was never opened gets its player data
+    // first, so the library card is complete.
+    if (isPendingWatchPart(watchOnly.id) &&
+        !await completeWatchPart(library, watchOnly.id)) {
+      throw StateError('分P信息准备失败，无法导入');
+    }
+    final parentId = resolveParentId == null ? null : await resolveParentId();
+    final promoted = await library.promoteTransientVideo(
+      watchOnly.id,
+      parentId: parentId,
+      activityBatchId: activityBatchId,
+    );
+    if (promoted == null) {
+      throw StateError('只看卡片已被清理，请重新导入');
+    }
+    return BilibiliStreamCardResult(item: promoted, created: true);
+  }
+
+  final Map<String, _PendingWatchPart> _pendingWatchParts =
+      <String, _PendingWatchPart>{};
+  final Map<String, Future<bool>> _watchPartsInFlight =
+      <String, Future<bool>>{};
+
+  /// Episode-list entries for the parts of a multi-part video that are not
+  /// watched yet: watch-only cards holding only what the video info already
+  /// says (title, part, duration). Nothing is requested and no file is
+  /// written until a part is switched to ([completeWatchPart]).
+  Future<List<VideoItem>> addWatchParts(
+    LibraryService library, {
+    required BilibiliVideoInfo videoInfo,
+    required Iterable<BilibiliPage> pages,
+  }) async {
+    final videoBvid = videoInfo.bvid.trim();
+    final items = <VideoItem>[];
+    for (final page in pages) {
+      final bvid = (page.bvid ?? videoBvid).trim();
+      if (bvid.isEmpty || page.cid <= 0) continue;
+      final id = _uuid.v4();
+      final multiPart = videoInfo.pages.length > 1;
+      items.add(
+        VideoItem(
+          id: id,
+          path: 'bilibili://stream/$bvid?cid=${page.cid}',
+          title: multiPart ? page.part : videoInfo.title,
+          durationMs: page.duration * 1000,
+          lastUpdated: DateTime.now().millisecondsSinceEpoch,
+          sourceFingerprint: 'bilibili-stream-card:$id',
+          isBilibiliExported: true,
+          isTransient: true,
+          sourceRef: MediaSourceRef(
+            value: bvid,
+            kind: MediaSourceKind.bilibiliStream,
+            originalValue: multiPart
+                ? 'https://www.bilibili.com/video/$bvid?p=${page.page}'
+                : 'https://www.bilibili.com/video/$bvid',
+            bvid: bvid,
+            aid: page.aid ?? videoInfo.aid,
+            cid: page.cid,
+            page: page.page,
+          ),
+        ),
+      );
+      _pendingWatchParts[id] = _PendingWatchPart(
+        videoInfo: videoInfo,
+        page: page,
+        bvid: bvid,
+      );
+    }
+    await library.addTransientVideos(items);
+    return items;
+  }
+
+  /// Whether [itemId] is an episode-list entry still without player data.
+  bool isPendingWatchPart(String itemId) =>
+      _pendingWatchParts.containsKey(itemId);
+
+  /// Gives the episode-list entry [itemId] the same player data a new card
+  /// gets (cover, subtitles, chapters, danmaku, preview frames), in place.
+  /// Returns false when [itemId] is no such entry or the requests failed
+  /// (it stays pending and can be tried again). If the entry was removed in
+  /// the meantime, whatever was written is removed too.
+  Future<bool> completeWatchPart(LibraryService library, String itemId) {
+    if (!_pendingWatchParts.containsKey(itemId)) {
+      return Future<bool>.value(false);
+    }
+    return _watchPartsInFlight[itemId] ??= _completeWatchPart(library, itemId)
+        .whenComplete(() {
+          _watchPartsInFlight.remove(itemId);
+        });
+  }
+
+  Future<bool> _completeWatchPart(LibraryService library, String itemId) async {
+    final pending = _pendingWatchParts[itemId]!;
+    final VideoItem built;
+    try {
+      built = (await _createStreamCard(
+        library,
+        videoInfo: pending.videoInfo,
+        page: pending.page,
+        episodeBvid: pending.bvid,
+        episode: null,
+        originalSourceValue: pending.videoInfo.pages.length > 1
+            ? 'https://www.bilibili.com/video/${pending.bvid}?p=${pending.page.page}'
+            : 'https://www.bilibili.com/video/${pending.bvid}',
+        activityBatchId: null,
+        resolveParentId: null,
+        directories: null,
+        onStage: null,
+        transient: true,
+        cardId: itemId,
+        register: false,
+      )).item;
+    } catch (error, stack) {
+      developer.log(
+        'Preparing part ${pending.page.page} of ${pending.bvid} failed',
+        error: error,
+        stackTrace: stack,
+      );
+      return false;
+    }
+    _pendingWatchParts.remove(itemId);
+    final target = library.getVideo(itemId);
+    if (target == null) {
+      // Cleaned up while the requests ran: drop the files written for it.
+      await library.addTransientVideo(built);
+      await library.discardTransientVideo(itemId);
+      return false;
+    }
+    target
+      ..thumbnailPath = built.thumbnailPath
+      ..subtitlePath = built.subtitlePath
+      ..additionalSubtitles = built.additionalSubtitles
+      ..managedSubtitleAssets = built.managedSubtitleAssets
+      ..usesManagedAssociatedSubtitles = built.usesManagedAssociatedSubtitles
+      ..danmakuPath = built.danmakuPath
+      ..bilibiliVideoShot = built.bilibiliVideoShot
+      ..chapters = built.chapters
+      ..hasProbedChapters = built.hasProbedChapters;
+    await library.noteCardDataChanged(itemId);
+    return true;
   }
 
   /// Watch-only entry of the in-app Bilibili pages: the card that plays
@@ -3730,6 +3896,8 @@ class BilibiliDownloadService extends ChangeNotifier {
       // swept away between here and the playback page opening.
       if (existing.isTransient) {
         existing.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+        // An episode-list entry opened directly gets its player data first.
+        await completeWatchPart(library, existing.id);
       }
       return BilibiliStreamCardResult(item: existing, created: false);
     }
@@ -3904,6 +4072,7 @@ class BilibiliDownloadService extends ChangeNotifier {
         videoInfo: info,
         cards: results,
         failedPages: failedPages,
+        targetFolderId: rootFolderId,
       );
     } finally {
       if (!publishedBatch && batchId != null) {
@@ -4012,6 +4181,8 @@ class BilibiliDownloadService extends ChangeNotifier {
     required BilibiliStreamCardDirectories? directories,
     required void Function(String status, double weight)? onStage,
     bool transient = false,
+    String? cardId,
+    bool register = true,
   }) async {
     onStage?.call('正在准备视频信息...', 0.12);
     final metadata = await apiService.fetchPlayerMetadata(
@@ -4035,7 +4206,7 @@ class BilibiliDownloadService extends ChangeNotifier {
         ? null
         : await resolveParentId();
 
-    final uuid = _uuid.v4();
+    final uuid = cardId ?? _uuid.v4();
     String? thumbPath;
     final coverUrl = videoInfo.pic.trim();
     if (coverUrl.isNotEmpty) {
@@ -4158,7 +4329,7 @@ class BilibiliDownloadService extends ChangeNotifier {
       isTransient: transient,
     );
     if (transient) {
-      await library.addTransientVideo(item);
+      if (register) await library.addTransientVideo(item);
       return BilibiliStreamCardResult(item: item, created: true);
     }
     onStage?.call('正在写入媒体库...', 0.86);
@@ -4923,4 +5094,17 @@ class BilibiliDownloadService extends ChangeNotifier {
         : await settings.getDefaultLargeDataRootPath();
     return Directory(p.join(rootPath, 'imported_videos'));
   }
+}
+
+/// What an episode-list entry needs to be completed later.
+class _PendingWatchPart {
+  const _PendingWatchPart({
+    required this.videoInfo,
+    required this.page,
+    required this.bvid,
+  });
+
+  final BilibiliVideoInfo videoInfo;
+  final BilibiliPage page;
+  final String bvid;
 }

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
@@ -43,11 +44,15 @@ class BilibiliWatchHistoryScreen extends StatefulWidget {
     this.history,
     this.onOpen,
     this.fetchCover,
+    this.onImport,
   });
 
   final BilibiliPublicApiService? api;
   final BilibiliHistoryService? history;
   final BilibiliWatchHistoryOpener? onOpen;
+
+  /// Runs the import buttons; defaults to [importBilibiliVideoQuick].
+  final BilibiliQuickImporter? onImport;
 
   /// Cover lookup for entries without one; defaults to the cookie-free
   /// video detail request.
@@ -204,6 +209,18 @@ class _BilibiliWatchHistoryScreenState
                       ),
                     ),
                   ],
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            SizedBox(
+              height: 80,
+              child: Center(
+                child: BilibiliImportButtons(
+                  bvid: entry.bvid,
+                  page: entry.page,
+                  history: _history,
+                  onImport: widget.onImport,
                 ),
               ),
             ),

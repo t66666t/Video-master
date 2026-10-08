@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_import_buttons.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_settings_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_uploader_screen.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_interactions.dart';
@@ -158,17 +159,6 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
     final bvid = _detail?.bvid;
     if (bvid == null || bvid.isEmpty) return;
     await playBilibiliVideoAsCard(context, bvid: bvid, page: _selectedPage);
-  }
-
-  Future<void> _importAsCard() async {
-    final bvid = _detail?.bvid;
-    if (bvid == null || bvid.isEmpty) return;
-    await importBilibiliVideoAsCards(
-      context,
-      bvid: bvid,
-      page: _selectedPage,
-      partCount: _partCount,
-    );
   }
 
   Future<void> _download() async {
@@ -501,12 +491,8 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
           icon: const Icon(Icons.play_arrow, size: 18),
           label: const Text('播放'),
         ),
-        OutlinedButton.icon(
-          style: OutlinedButton.styleFrom(foregroundColor: AppTokens.text1),
-          onPressed: _importAsCard,
-          icon: const Icon(Icons.library_add_outlined, size: 18),
-          label: const Text('导入为卡片'),
-        ),
+        if (_detail?.bvid case final bvid? when bvid.isNotEmpty)
+          BilibiliImportButtons(bvid: bvid, page: _selectedPage, large: true),
         OutlinedButton.icon(
           style: OutlinedButton.styleFrom(foregroundColor: AppTokens.text1),
           onPressed: _download,

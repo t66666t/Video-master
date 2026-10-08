@@ -30,10 +30,16 @@ class BilibiliStreamCardBatch {
   /// Part numbers whose card could not be created.
   final List<int> failedPages;
 
+  /// Folder the new cards were imported into (a multi-part video gets its
+  /// own folder inside it); null for the library root, or when nothing had
+  /// to be created.
+  final String? targetFolderId;
+
   const BilibiliStreamCardBatch({
     required this.videoInfo,
     required this.cards,
     this.failedPages = const <int>[],
+    this.targetFolderId,
   });
 
   int get createdCount => cards.where((card) => card.created).length;

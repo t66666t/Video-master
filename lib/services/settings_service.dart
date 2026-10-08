@@ -834,6 +834,12 @@ class SettingsService extends ChangeNotifier {
   /// library.
   bool bilibiliAutoImportOnPlay = false;
 
+  /// Where the Bilibili "import" button puts cards: empty until a place is
+  /// picked (the import placement rules decide, as before), `root` for the
+  /// library root or `folder:<id>` for a folder. Read through
+  /// `BilibiliImportTarget`.
+  String bilibiliImportTarget = '';
+
   /// Bilibili account read-only mode, on by default. While on, nothing that
   /// changes the account (like, coin, favourite, follow, ...) may be sent to
   /// Bilibili. Callers that would write check [bilibiliAccountWritesAllowed]
@@ -1718,6 +1724,11 @@ class SettingsService extends ChangeNotifier {
         defaultValue: false,
         apply: (service, value) => service.bilibiliAutoImportOnPlay = value,
       ),
+      _stringSetting(
+        key: 'bilibiliImportTarget',
+        defaultValue: '',
+        apply: (service, value) => service.bilibiliImportTarget = value,
+      ),
       _boolSetting(
         key: 'bilibiliAccountReadOnly',
         defaultValue: true,
@@ -2234,6 +2245,7 @@ class SettingsService extends ChangeNotifier {
     bilibiliRecordSearchHistory = true;
     bilibiliRecordWatchHistory = true;
     bilibiliAutoImportOnPlay = false;
+    bilibiliImportTarget = '';
     bilibiliAccountReadOnly = true;
     bilibiliCacheLimitBytes = bilibiliCacheLimitDefault;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
@@ -3624,6 +3636,7 @@ class SettingsService extends ChangeNotifier {
         'bilibiliRecordSearchHistory': bilibiliRecordSearchHistory,
         'bilibiliRecordWatchHistory': bilibiliRecordWatchHistory,
         'bilibiliAutoImportOnPlay': bilibiliAutoImportOnPlay,
+        'bilibiliImportTarget': bilibiliImportTarget,
         'bilibiliAccountReadOnly': bilibiliAccountReadOnly,
         'bilibiliCacheLimitBytes': bilibiliCacheLimitBytes,
         'structuredImportSortField': structuredImportSortField,

@@ -327,6 +327,34 @@ class LibraryService extends ChangeNotifier {
     await _writeTransientLedger();
   }
 
+  /// Registers several watch-only cards at once (one side-list write).
+  Future<void> addTransientVideos(Iterable<VideoItem> items) async {
+    for (final item in items) {
+      if (!item.isTransient) {
+        throw ArgumentError.value(item.id, 'items', 'not a watch-only card');
+      }
+      item.parentId = null;
+      _videos[item.id] = item;
+      _invalidateVideoSizeCache(item.id);
+    }
+    await _writeTransientLedger();
+  }
+
+  /// Call after filling in data of the card [id] in place (cover, danmaku,
+  /// subtitles, ...): a watch-only card's side list is rewritten so its new
+  /// files are cleaned up after a crash, a library card is saved.
+  Future<void> noteCardDataChanged(String id) async {
+    final item = _videos[id];
+    if (item == null) return;
+    _invalidateVideoSizeCache(id);
+    if (item.isTransient) {
+      await _writeTransientLedger();
+    } else {
+      await _saveLibrary();
+    }
+    notifyListeners();
+  }
+
   /// Removes a watch-only card together with everything it wrote: online
   /// cache, cover, danmaku, subtitles and preview frames. Library cards are
   /// never touched; returns false for them.
@@ -339,6 +367,36 @@ class LibraryService extends ChangeNotifier {
     await _deleteVideoFiles(item);
     await _writeTransientLedger();
     return true;
+  }
+
+  /// Turns the watch-only card [id] into a regular library card in
+  /// [parentId] (null: library root), keeping the same id, position and
+  /// files, so a card that is playing goes on playing as the library card.
+  /// It is saved and shows up in 最近添加 like any new import. Returns null
+  /// when [id] is not a watch-only card.
+  Future<VideoItem?> promoteTransientVideo(
+    String id, {
+    String? parentId,
+    String? activityBatchId,
+  }) async {
+    final item = _videos[id];
+    if (item == null || !item.isTransient) return null;
+    _videos.remove(id);
+    _activity.media.remove(id);
+    item.isTransient = false;
+    item.parentId = parentId;
+    item.lastUpdated = DateTime.now().millisecondsSinceEpoch;
+    try {
+      await addSingleVideo(
+        item,
+        reuseExistingItem: false,
+        activityBatchId: activityBatchId,
+        sourceKind: LibraryImportSourceKind.bilibili,
+      );
+    } finally {
+      await _writeTransientLedger();
+    }
+    return item;
   }
 
   File get _transientLedgerFile =>
