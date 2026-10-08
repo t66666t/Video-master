@@ -33,11 +33,15 @@ class BilibiliDownloadScreen extends StatefulWidget {
   final String? initialInput;
   final String? targetFolderId;
   final bool initialStreamingMode;
+
+  /// Part (1-based) to keep selected after [initialInput] is parsed.
+  final int? initialPage;
   const BilibiliDownloadScreen({
     super.key,
     this.initialInput,
     this.targetFolderId,
     this.initialStreamingMode = false,
+    this.initialPage,
   });
 
   @override
@@ -520,6 +524,10 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
   Future<void> _parseVideo(BilibiliDownloadService service) async {
     final rawInput = _inputController.text;
     if (rawInput.trim().isEmpty) return;
+    // Only the input handed over on open carries a preferred part.
+    final preferredPage = rawInput == widget.initialInput
+        ? widget.initialPage
+        : null;
 
     final hasCookie = await service.apiService.hasCookie();
     if (!hasCookie) {
@@ -536,6 +544,7 @@ class _BilibiliDownloadScreenState extends State<BilibiliDownloadScreen>
     final success = await service.parseVideo(
       rawInput,
       asStreamingImport: _streamingMode,
+      preferredPage: preferredPage,
       onConfirmCollection: (title) async {
         // Show Dialog
         return await showDialog<bool>(

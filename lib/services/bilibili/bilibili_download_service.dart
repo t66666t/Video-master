@@ -20,6 +20,7 @@ import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/app_wakelock_coordinator.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_shot_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_state_manager.dart';
 import 'package:video_player_app/services/bilibili/download_manager.dart';
@@ -88,6 +89,10 @@ class BilibiliDownloadService extends ChangeNotifier {
       Map<BilibiliDownloadEpisode, String>.identity();
   final Set<BilibiliDownloadEpisode> _pendingProgressEpisodes =
       Set<BilibiliDownloadEpisode>.identity();
+  final Map<String, Future<BilibiliStreamCardResult>> _streamCardsInFlight =
+      <String, Future<BilibiliStreamCardResult>>{};
+  final Map<String, Future<String?>> _videoPartFoldersInFlight =
+      <String, Future<String?>>{};
   final Set<BilibiliDownloadEpisode> _streamingImportingEpisodes =
       Set<BilibiliDownloadEpisode>.identity();
   final Map<String, Map<String, dynamic>> _taskJsonSnapshots =
@@ -1047,10 +1052,13 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   // --- Parsing ---
 
+  /// [preferredPage] (1-based) keeps only that part selected when the input
+  /// resolves to a single multi-part video; other tasks are unaffected.
   Future<bool> parseVideo(
     String rawInput, {
     Future<bool> Function(String title)? onConfirmCollection,
     bool asStreamingImport = false,
+    int? preferredPage,
   }) async {
     if (rawInput.trim().isEmpty) return false;
 
@@ -1073,6 +1081,7 @@ class BilibiliDownloadService extends ChangeNotifier {
         );
         if (task != null) {
           task.isStreamingImport = asStreamingImport;
+          if (preferredPage != null) _selectOnlyPage(task, preferredPage);
           newTasks.add(task);
           hasSuccess = true;
           // Auto-fetch logic handled by caller or explicit call
@@ -1103,6 +1112,17 @@ class BilibiliDownloadService extends ChangeNotifier {
     }
 
     return hasSuccess;
+  }
+
+  void _selectOnlyPage(BilibiliDownloadTask task, int page) {
+    if (task.collectionInfo != null || task.videos.length != 1) return;
+    final episodes = task.videos.single.episodes;
+    if (episodes.length < 2 || !episodes.any((ep) => ep.page.page == page)) {
+      return;
+    }
+    for (final ep in episodes) {
+      ep.isSelected = ep.page.page == page;
+    }
   }
 
   Future<BilibiliDownloadTask?> parseSingleLine(
@@ -3555,6 +3575,497 @@ class BilibiliDownloadService extends ChangeNotifier {
 
   // --- Import ---
 
+  /// Single entry for Bilibili online cards (`MediaSourceKind.bilibiliStream`),
+  /// keyed by BV id + part number.
+  ///
+  /// With [reuseExisting] a live card for the same BV and part is returned as
+  /// is (no request, no new card); concurrent calls for the same part share one
+  /// creation. Otherwise, or when none exists, a new card is built: player
+  /// metadata, cover, subtitles, danmaku and preview frames, then it is added
+  /// to the library under the folder returned by [resolveParentId].
+  ///
+  /// [episode] is the parse-list row being exported, if any; it receives the
+  /// subtitle/danmaku state exactly as before. [onStage] reports the coarse
+  /// stages with their progress weight inside one card (0.12 / 0.48 / 0.86).
+  Future<BilibiliStreamCardResult> obtainStreamCard(
+    LibraryService library, {
+    required BilibiliVideoInfo videoInfo,
+    required BilibiliPage page,
+    required bool reuseExisting,
+    BilibiliDownloadEpisode? episode,
+    String? originalSourceValue,
+    String? activityBatchId,
+    Future<String?> Function()? resolveParentId,
+    BilibiliStreamCardDirectories? directories,
+    void Function(String status, double weight)? onStage,
+  }) {
+    final episodeBvid = episode?.bvid ?? page.bvid ?? videoInfo.bvid;
+    if (!reuseExisting) {
+      return _createStreamCard(
+        library,
+        videoInfo: videoInfo,
+        page: page,
+        episodeBvid: episodeBvid,
+        episode: episode,
+        originalSourceValue: originalSourceValue,
+        activityBatchId: activityBatchId,
+        resolveParentId: resolveParentId,
+        directories: directories,
+        onStage: onStage,
+      );
+    }
+    final cardBvid = episodeBvid.trim().isNotEmpty
+        ? episodeBvid.trim()
+        : videoInfo.bvid.trim();
+    final existing = findStreamCard(library, bvid: cardBvid, page: page);
+    if (existing != null) {
+      return Future<BilibiliStreamCardResult>.value(
+        BilibiliStreamCardResult(item: existing, created: false),
+      );
+    }
+    final key = '$cardBvid#${page.page}';
+    final inFlight = _streamCardsInFlight[key];
+    if (inFlight != null) {
+      return inFlight.then(
+        (result) => BilibiliStreamCardResult(item: result.item, created: false),
+      );
+    }
+    final future = _createStreamCard(
+      library,
+      videoInfo: videoInfo,
+      page: page,
+      episodeBvid: episodeBvid,
+      episode: episode,
+      originalSourceValue: originalSourceValue,
+      activityBatchId: activityBatchId,
+      resolveParentId: resolveParentId,
+      directories: directories,
+      onStage: onStage,
+    );
+    _streamCardsInFlight[key] = future;
+    return future.whenComplete(() {
+      if (identical(_streamCardsInFlight[key], future)) {
+        _streamCardsInFlight.remove(key);
+      }
+    });
+  }
+
+  /// Live (not recycled) online card for [bvid] + [page], or null.
+  VideoItem? findStreamCard(
+    LibraryService library, {
+    required String bvid,
+    required BilibiliPage page,
+  }) {
+    return findBilibiliStreamCard(
+      library.bilibiliStreamItems,
+      bvid: bvid,
+      page: page.page,
+      cid: page.cid,
+      collectionOf: library.getCollection,
+    );
+  }
+
+  /// Entry for the in-app Bilibili pages (search / video detail): makes sure
+  /// online cards exist for [pages] (1-based part numbers) of [bvid], reusing
+  /// any live card for the same BV + part.
+  ///
+  /// New cards go to the default import location of online cards, or to
+  /// [targetFolderId] (null = library root) when [useDefaultLocation] is
+  /// false. Parts of a multi-part video stay in one folder: an existing sibling
+  /// card's folder is used, otherwise a folder named after the video is
+  /// created like the parse-list export does. A failing part is skipped and
+  /// reported in [BilibiliStreamCardBatch.failedPages]; when no requested part
+  /// is available at all the first error is rethrown.
+  Future<BilibiliStreamCardBatch> obtainStreamCardsForVideo(
+    LibraryService library, {
+    required String bvid,
+    required List<int> pages,
+    BilibiliVideoInfo? videoInfo,
+    bool useDefaultLocation = true,
+    String? targetFolderId,
+  }) async {
+    final info = videoInfo ?? await apiService.fetchVideoInfo(bvid);
+    final videoBvid = info.bvid.trim().isNotEmpty ? info.bvid.trim() : bvid;
+    final wanted = <BilibiliPage>[];
+    final seenPages = <int>{};
+    for (final number in pages) {
+      if (!seenPages.add(number)) continue;
+      for (final part in info.pages) {
+        if (part.page == number) {
+          wanted.add(part);
+          break;
+        }
+      }
+    }
+    if (wanted.isEmpty) {
+      throw StateError('找不到对应的分P，无法创建在线播放卡片');
+    }
+
+    final reused = <BilibiliStreamCardResult>[
+      for (final part in wanted)
+        if (findStreamCard(library, bvid: videoBvid, page: part)
+            case final existing?)
+          BilibiliStreamCardResult(item: existing, created: false),
+    ];
+    if (reused.length == wanted.length) {
+      return BilibiliStreamCardBatch(videoInfo: info, cards: reused);
+    }
+
+    final String? rootFolderId;
+    if (useDefaultLocation) {
+      rootFolderId = await _resolveOpenedImportFolder(
+        library: library,
+        feature: ImportCardFeature.bilibiliOnline,
+        explicitFolderId: null,
+        folderExplicit: false,
+      );
+    } else {
+      rootFolderId =
+          targetFolderId != null &&
+              library.getCollection(targetFolderId) != null
+          ? targetFolderId
+          : null;
+    }
+
+    final batchId = library.beginImportBatch(
+      title: wanted.length == 1 ? 'B站在线播放' : 'B站在线 ${wanted.length} 项',
+      sourceKind: LibraryImportSourceKind.bilibili,
+      targetCollectionId: rootFolderId,
+    );
+    var ownsLibraryProgress = false;
+    var publishedBatch = false;
+    void reportLibraryProgress(double progress, String status) {
+      if (library.hasActiveImport && !ownsLibraryProgress) return;
+      ownsLibraryProgress = library.reportTransientImportProgress(
+        progress: progress,
+        status: status,
+      );
+    }
+
+    try {
+      final dirs = await _resolveStreamCardDirectories();
+      Future<String?>? parentFolder;
+      Future<String?> resolveParentId() => parentFolder ??= _videoPartsFolder(
+        library,
+        info: info,
+        bvid: videoBvid,
+        rootFolderId: rootFolderId,
+        thumbDir: dirs.thumbDir,
+        batchId: batchId,
+      );
+
+      final results = <BilibiliStreamCardResult>[];
+      final failedPages = <int>[];
+      Object? firstError;
+      StackTrace? firstStack;
+      for (var i = 0; i < wanted.length; i++) {
+        final part = wanted[i];
+        try {
+          results.add(
+            await obtainStreamCard(
+              library,
+              videoInfo: info,
+              page: part,
+              reuseExisting: true,
+              originalSourceValue: info.pages.length > 1
+                  ? 'https://www.bilibili.com/video/$videoBvid?p=${part.page}'
+                  : 'https://www.bilibili.com/video/$videoBvid',
+              activityBatchId: batchId,
+              resolveParentId: resolveParentId,
+              directories: dirs,
+              onStage: (status, weight) => reportLibraryProgress(
+                ((i + weight) / wanted.length).clamp(0.02, 0.99),
+                status,
+              ),
+            ),
+          );
+        } catch (error, stack) {
+          developer.log(
+            'Online card for ${part.page}P of $videoBvid failed',
+            error: error,
+            stackTrace: stack,
+          );
+          failedPages.add(part.page);
+          firstError ??= error;
+          firstStack ??= stack;
+        }
+      }
+      if (results.isEmpty && firstError != null) {
+        Error.throwWithStackTrace(firstError, firstStack!);
+      }
+      final createdAny = results.any((card) => card.created);
+      if (createdAny && info.pages.length > 1) {
+        await _sortVideoPartCards(library, results.first.item.parentId);
+      }
+      if (createdAny && batchId != null) {
+        await library.completeImportBatch(batchId);
+        publishedBatch = true;
+      }
+      return BilibiliStreamCardBatch(
+        videoInfo: info,
+        cards: results,
+        failedPages: failedPages,
+      );
+    } finally {
+      if (!publishedBatch && batchId != null) {
+        library.abortImportBatch(batchId);
+      }
+      if (ownsLibraryProgress) library.clearTransientImportProgress();
+    }
+  }
+
+  /// Folder holding the part cards of one multi-part video.
+  Future<String?> _videoPartsFolder(
+    LibraryService library, {
+    required BilibiliVideoInfo info,
+    required String bvid,
+    required String? rootFolderId,
+    required Directory thumbDir,
+    required String? batchId,
+  }) {
+    if (info.pages.length <= 1) return Future<String?>.value(rootFolderId);
+    final siblings = findBilibiliStreamCardsOfVideo(
+      library.bilibiliStreamItems,
+      bvid: bvid,
+      collectionOf: library.getCollection,
+    );
+    if (siblings.isNotEmpty) {
+      return Future<String?>.value(siblings.first.parentId);
+    }
+    final inFlight = _videoPartFoldersInFlight[bvid];
+    if (inFlight != null) return inFlight;
+    final Future<String?> future = () async {
+      final collection = await library.createCollection(
+        info.title,
+        rootFolderId,
+        sourceRef: _buildVideoSourceRef(
+          bvid,
+          MediaSourceRef(value: bvid, kind: MediaSourceKind.bilibiliBv),
+        ),
+      );
+      await _ensureCollectionThumbnail(
+        library,
+        thumbDir,
+        collection.id,
+        info.pic,
+      );
+      library.noteImportedCollection(collection.id, batchId: batchId);
+      return collection.id;
+    }();
+    _videoPartFoldersInFlight[bvid] = future;
+    return future.whenComplete(() {
+      if (identical(_videoPartFoldersInFlight[bvid], future)) {
+        _videoPartFoldersInFlight.remove(bvid);
+      }
+    });
+  }
+
+  /// Keeps part cards in part order when a folder holds only cards of one
+  /// video, so the player's episode list follows 1P, 2P, ...
+  Future<void> _sortVideoPartCards(
+    LibraryService library,
+    String? folderId,
+  ) async {
+    if (folderId == null) return;
+    final visible = library.getContents(folderId);
+    if (visible.length < 2) return;
+    final cards = visible.whereType<VideoItem>().toList();
+    if (cards.length != visible.length) return;
+    final bvids = cards.map(bilibiliStreamCardBvid).toSet();
+    if (bvids.length != 1 || bvids.first == null) return;
+    int pageOf(VideoItem item) => item.sourceRef?.page ?? 1;
+    final sorted = List<VideoItem>.of(cards)
+      ..sort((a, b) => pageOf(a).compareTo(pageOf(b)));
+    var inOrder = true;
+    for (var i = 0; i < cards.length; i++) {
+      if (!identical(cards[i], sorted[i])) {
+        inOrder = false;
+        break;
+      }
+    }
+    if (inOrder) return;
+    await library.reorderMultipleItems(
+      folderId,
+      sorted.map((item) => item.id).toList(growable: false),
+      0,
+      visible.length - 1,
+    );
+  }
+
+  Future<BilibiliStreamCardDirectories> _resolveStreamCardDirectories() async {
+    final dataRoot = await SettingsService().resolveLargeDataRootDir();
+    final thumbDir = Directory(p.join(dataRoot.path, 'thumbnails'));
+    if (!await thumbDir.exists()) await thumbDir.create(recursive: true);
+    final danmakuDir = Directory(p.join(dataRoot.path, 'danmaku'));
+    if (!await danmakuDir.exists()) await danmakuDir.create(recursive: true);
+    return (dataRoot: dataRoot, thumbDir: thumbDir, danmakuDir: danmakuDir);
+  }
+
+  Future<BilibiliStreamCardResult> _createStreamCard(
+    LibraryService library, {
+    required BilibiliVideoInfo videoInfo,
+    required BilibiliPage page,
+    required String episodeBvid,
+    required BilibiliDownloadEpisode? episode,
+    required String? originalSourceValue,
+    required String? activityBatchId,
+    required Future<String?> Function()? resolveParentId,
+    required BilibiliStreamCardDirectories? directories,
+    required void Function(String status, double weight)? onStage,
+  }) async {
+    onStage?.call('正在准备视频信息...', 0.12);
+    final metadata = await apiService.fetchPlayerMetadata(
+      episodeBvid,
+      page.cid,
+      aid: page.aid ?? videoInfo.aid,
+      skipAiSubtitles: false,
+      durationSeconds: page.duration,
+    );
+    var selectedSubtitle = _selectBestSubtitle(metadata.subtitles);
+    if (episode != null) {
+      episode
+        ..availableSubtitles = metadata.subtitles
+        ..chapters = metadata.chapters;
+      episode.selectedSubtitle ??= selectedSubtitle;
+      selectedSubtitle = episode.selectedSubtitle;
+    }
+    onStage?.call('正在导出附加内容...', 0.48);
+    final dirs = directories ?? await _resolveStreamCardDirectories();
+    final targetParentId = resolveParentId == null
+        ? null
+        : await resolveParentId();
+
+    final uuid = _uuid.v4();
+    String? thumbPath;
+    final coverUrl = videoInfo.pic.trim();
+    if (coverUrl.isNotEmpty) {
+      try {
+        final response = await apiService.dio.get<List<int>>(
+          coverUrl,
+          options: Options(responseType: ResponseType.bytes),
+        );
+        final bytes = response.data;
+        if (bytes != null && bytes.isNotEmpty) {
+          final rawExt = p.extension(Uri.parse(coverUrl).path).toLowerCase();
+          final ext = RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt)
+              ? rawExt
+              : '.jpg';
+          thumbPath = p.join(dirs.thumbDir.path, '$uuid$ext');
+          await File(thumbPath).writeAsBytes(bytes, flush: true);
+        }
+      } catch (error) {
+        debugPrint('Bilibili stream cover download failed: $error');
+      }
+    }
+
+    final labeledSubtitles = <({String label, String path})>[];
+    String? defaultSubtitlePath;
+    for (final subtitle in metadata.subtitles) {
+      try {
+        final payload = await apiService.fetchSubtitleContent(subtitle.url);
+        final srt = SubtitleUtil.convertJsonToSrt(payload);
+        if (srt.isEmpty) continue;
+        final label = _bilibiliSubtitleLabel(subtitle.lanDoc, subtitle.lan);
+        final output = await _writeTaskSubtitle(
+          videoId: uuid,
+          label: label,
+          contents: srt,
+        );
+        labeledSubtitles.add((label: label, path: output));
+        if (selectedSubtitle == subtitle ||
+            (selectedSubtitle?.id.isNotEmpty == true &&
+                selectedSubtitle!.id == subtitle.id)) {
+          defaultSubtitlePath = output;
+        }
+      } catch (error) {
+        debugPrint('Bilibili stream subtitle export failed: $error');
+      }
+    }
+    final boundSubtitles = bindSubtitleLabels(labeledSubtitles);
+    final extraSubtitles = <String, String>{
+      for (final entry in boundSubtitles) entry.storageKey: entry.path,
+    };
+    final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
+
+    String? danmakuPath;
+    try {
+      final xml = await apiService.fetchDanmakuXml(page.cid);
+      final ass = BilibiliDanmakuAss.xmlToAss(xml);
+      danmakuPath = p.join(dirs.danmakuDir.path, '${uuid}_danmaku.ass');
+      await File(danmakuPath).writeAsString(ass, flush: true);
+      episode
+        ?..danmakuPath = danmakuPath
+        ..danmakuError = null;
+    } catch (error, stack) {
+      developer.log(
+        'Streaming import danmaku download failed for cid=${page.cid}',
+        error: error,
+        stackTrace: stack,
+      );
+      episode
+        ?..danmakuPath = null
+        ..danmakuError = 'download_failed';
+      danmakuPath = null;
+    }
+
+    final bvid = episodeBvid.trim().isNotEmpty
+        ? episodeBvid.trim()
+        : videoInfo.bvid.trim();
+    if (bvid.isEmpty || page.cid <= 0) {
+      throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
+    }
+    final videoShot = await BilibiliVideoShotService.instance.downloadForCard(
+      apiService: apiService,
+      videoId: uuid,
+      bvid: bvid,
+      cid: page.cid,
+      dataRootOverride: dirs.dataRoot,
+    );
+    final sourceRef = MediaSourceRef(
+      value: bvid,
+      kind: MediaSourceKind.bilibiliStream,
+      originalValue: originalSourceValue,
+      bvid: bvid,
+      aid: page.aid ?? videoInfo.aid,
+      cid: page.cid,
+      page: page.page,
+    );
+    final displayTitle = videoInfo.pages.length > 1
+        ? page.part
+        : videoInfo.title;
+    final item = VideoItem(
+      id: uuid,
+      path: 'bilibili://stream/$bvid?cid=${page.cid}',
+      title: displayTitle,
+      thumbnailPath: thumbPath,
+      durationMs: page.duration * 1000,
+      lastUpdated: DateTime.now().millisecondsSinceEpoch,
+      // An online card is an instance, not a deduplication key. Keeping a
+      // card-scoped fingerprint protects it from any future caller that
+      // enables reuseExistingItem for imported media.
+      sourceFingerprint: 'bilibili-stream-card:$uuid',
+      parentId: targetParentId,
+      subtitlePath: defaultSubtitlePath,
+      additionalSubtitles: extraSubtitles,
+      managedSubtitleAssets: subtitleAssets,
+      danmakuPath: danmakuPath,
+      usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
+      isBilibiliExported: true,
+      sourceRef: sourceRef,
+      bilibiliVideoShot: videoShot,
+      chapters: metadata.chapters,
+      hasProbedChapters: true,
+    );
+    onStage?.call('正在写入媒体库...', 0.86);
+    await library.addSingleVideo(
+      item,
+      reuseExistingItem: false,
+      activityBatchId: activityBatchId,
+      sourceKind: LibraryImportSourceKind.bilibili,
+    );
+    return BilibiliStreamCardResult(item: item, created: true);
+  }
+
   Future<int> importStreamingToLibrary(
     LibraryService library, {
     BilibiliDownloadEpisode? episode,
@@ -3735,202 +4246,79 @@ class BilibiliDownloadService extends ChangeNotifier {
           final video = task.videos.firstWhere(
             (item) => item.episodes.contains(ep),
           );
-          _setStreamingImportProgress(ep, '正在准备视频信息...');
-          reportLibraryProgress(stageProgress(0.12), '正在准备视频信息...');
-          final metadata = await apiService.fetchPlayerMetadata(
-            ep.bvid,
-            ep.page.cid,
-            aid: ep.page.aid ?? video.videoInfo.aid,
-            skipAiSubtitles: false,
-            durationSeconds: ep.page.duration,
-          );
-          ep
-            ..availableSubtitles = metadata.subtitles
-            ..chapters = metadata.chapters;
-          ep.selectedSubtitle ??= _selectBestSubtitle(metadata.subtitles);
-          _setStreamingImportProgress(ep, '正在导出附加内容...');
-          reportLibraryProgress(stageProgress(0.48), '正在导出附加内容...');
-
-          String? rootCollectionId;
-          if (task.collectionInfo != null) {
-            rootCollectionId = await createImportCollection(
-              'task:${task.taskId}:root',
-              task.collectionInfo!.title,
-              targetFolderId,
-              task.sourceRef,
-            );
-            if (ensuredCollectionIds.add(rootCollectionId)) {
-              await _ensureCollectionThumbnail(
-                library,
-                thumbDir,
-                rootCollectionId,
-                task.collectionInfo!.cover,
-              );
-            }
-            library.noteImportedCollection(
-              rootCollectionId,
-              batchId: streamingBatchId,
-            );
-          } else {
-            rootCollectionId = targetFolderId;
-          }
-
-          var targetParentId = rootCollectionId;
-          if (video.videoInfo.pages.length > 1) {
-            final folderId = await (importVideoFolders[video.videoInfo] ??=
-                library
-                    .createCollection(
-                      video.videoInfo.title,
-                      rootCollectionId,
-                      sourceRef: video.sourceRef,
-                    )
-                    .then((collection) => collection.id));
-            targetParentId = folderId;
-            if (ensuredCollectionIds.add(folderId)) {
-              await _ensureCollectionThumbnail(
-                library,
-                thumbDir,
-                folderId,
-                video.videoInfo.pic,
-              );
-            }
-            library.noteImportedCollection(folderId, batchId: streamingBatchId);
-          }
-
-          final uuid = _uuid.v4();
-          String? thumbPath;
-          final coverUrl = video.videoInfo.pic.trim();
-          if (coverUrl.isNotEmpty) {
-            try {
-              final response = await apiService.dio.get<List<int>>(
-                coverUrl,
-                options: Options(responseType: ResponseType.bytes),
-              );
-              final bytes = response.data;
-              if (bytes != null && bytes.isNotEmpty) {
-                final rawExt = p
-                    .extension(Uri.parse(coverUrl).path)
-                    .toLowerCase();
-                final ext = RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt)
-                    ? rawExt
-                    : '.jpg';
-                thumbPath = p.join(thumbDir.path, '$uuid$ext');
-                await File(thumbPath).writeAsBytes(bytes, flush: true);
-              }
-            } catch (error) {
-              debugPrint('Bilibili stream cover download failed: $error');
-            }
-          }
-
-          final labeledSubtitles = <({String label, String path})>[];
-          String? defaultSubtitlePath;
-          for (final subtitle in metadata.subtitles) {
-            try {
-              final payload = await apiService.fetchSubtitleContent(
-                subtitle.url,
-              );
-              final srt = SubtitleUtil.convertJsonToSrt(payload);
-              if (srt.isEmpty) continue;
-              final label = _bilibiliSubtitleLabel(subtitle.lanDoc, subtitle.lan);
-              final output = await _writeTaskSubtitle(
-                videoId: uuid,
-                label: label,
-                contents: srt,
-              );
-              labeledSubtitles.add((label: label, path: output));
-              if (ep.selectedSubtitle == subtitle ||
-                  (ep.selectedSubtitle?.id.isNotEmpty == true &&
-                      ep.selectedSubtitle!.id == subtitle.id)) {
-                defaultSubtitlePath = output;
-              }
-            } catch (error) {
-              debugPrint('Bilibili stream subtitle export failed: $error');
-            }
-          }
-          final boundSubtitles = bindSubtitleLabels(labeledSubtitles);
-          final extraSubtitles = <String, String>{
-            for (final entry in boundSubtitles) entry.storageKey: entry.path,
-          };
-          final subtitleAssets = _downloadedSubtitleAssets(boundSubtitles);
-
-          String? danmakuPath;
-          try {
-            final xml = await apiService.fetchDanmakuXml(ep.page.cid);
-            final ass = BilibiliDanmakuAss.xmlToAss(xml);
-            danmakuPath = p.join(danmakuDir.path, '${uuid}_danmaku.ass');
-            await File(danmakuPath).writeAsString(ass, flush: true);
-            ep
-              ..danmakuPath = danmakuPath
-              ..danmakuError = null;
-          } catch (error, stack) {
-            developer.log(
-              'Streaming import danmaku download failed for cid=${ep.page.cid}',
-              error: error,
-              stackTrace: stack,
-            );
-            ep
-              ..danmakuPath = null
-              ..danmakuError = 'download_failed';
-            danmakuPath = null;
-          }
-
-          final bvid = ep.bvid.trim().isNotEmpty
-              ? ep.bvid.trim()
-              : video.videoInfo.bvid.trim();
-          if (bvid.isEmpty || ep.page.cid <= 0) {
-            throw StateError('缺少 Bilibili bvid/cid，无法创建在线播放条目');
-          }
-          final videoShot = await BilibiliVideoShotService.instance
-              .downloadForCard(
-                apiService: apiService,
-                videoId: uuid,
-                bvid: bvid,
-                cid: ep.page.cid,
-                dataRootOverride: dataRoot,
-              );
-          final sourceRef = MediaSourceRef(
-            value: bvid,
-            kind: MediaSourceKind.bilibiliStream,
-            originalValue: video.sourceRef?.value ?? task.sourceRef?.value,
-            bvid: bvid,
-            aid: ep.page.aid ?? video.videoInfo.aid,
-            cid: ep.page.cid,
-            page: ep.page.page,
-          );
-          final displayTitle = video.videoInfo.pages.length > 1
-              ? ep.page.part
-              : video.videoInfo.title;
-          final item = VideoItem(
-            id: uuid,
-            path: 'bilibili://stream/$bvid?cid=${ep.page.cid}',
-            title: displayTitle,
-            thumbnailPath: thumbPath,
-            durationMs: ep.page.duration * 1000,
-            lastUpdated: DateTime.now().millisecondsSinceEpoch,
-            // An online card is an instance, not a deduplication key. Keeping a
-            // card-scoped fingerprint protects it from any future caller that
-            // enables reuseExistingItem for imported media.
-            sourceFingerprint: 'bilibili-stream-card:$uuid',
-            parentId: targetParentId,
-            subtitlePath: defaultSubtitlePath,
-            additionalSubtitles: extraSubtitles,
-            managedSubtitleAssets: subtitleAssets,
-            danmakuPath: danmakuPath,
-            usesManagedAssociatedSubtitles: extraSubtitles.isNotEmpty,
-            isBilibiliExported: true,
-            sourceRef: sourceRef,
-            bilibiliVideoShot: videoShot,
-            chapters: metadata.chapters,
-            hasProbedChapters: true,
-          );
-          _setStreamingImportProgress(ep, '正在写入媒体库...');
-          reportLibraryProgress(stageProgress(0.86), '正在写入媒体库...');
-          await library.addSingleVideo(
-            item,
-            reuseExistingItem: false,
+          final card = await obtainStreamCard(
+            library,
+            videoInfo: video.videoInfo,
+            page: ep.page,
+            episode: ep,
+            originalSourceValue:
+                video.sourceRef?.value ?? task.sourceRef?.value,
             activityBatchId: streamingBatchId,
-            sourceKind: LibraryImportSourceKind.bilibili,
+            // Online export keeps creating an independent card per run (the
+            // parse-list contract); only the in-app pages reuse by BV + part.
+            reuseExisting: false,
+            directories: (
+              dataRoot: dataRoot,
+              thumbDir: thumbDir,
+              danmakuDir: danmakuDir,
+            ),
+            onStage: (status, weight) {
+              _setStreamingImportProgress(ep, status);
+              reportLibraryProgress(stageProgress(weight), status);
+            },
+            resolveParentId: () async {
+              String? rootCollectionId;
+              if (task.collectionInfo != null) {
+                rootCollectionId = await createImportCollection(
+                  'task:${task.taskId}:root',
+                  task.collectionInfo!.title,
+                  targetFolderId,
+                  task.sourceRef,
+                );
+                if (ensuredCollectionIds.add(rootCollectionId)) {
+                  await _ensureCollectionThumbnail(
+                    library,
+                    thumbDir,
+                    rootCollectionId,
+                    task.collectionInfo!.cover,
+                  );
+                }
+                library.noteImportedCollection(
+                  rootCollectionId,
+                  batchId: streamingBatchId,
+                );
+              } else {
+                rootCollectionId = targetFolderId;
+              }
+
+              var targetParentId = rootCollectionId;
+              if (video.videoInfo.pages.length > 1) {
+                final folderId = await (importVideoFolders[video.videoInfo] ??=
+                    library
+                        .createCollection(
+                          video.videoInfo.title,
+                          rootCollectionId,
+                          sourceRef: video.sourceRef,
+                        )
+                        .then((collection) => collection.id));
+                targetParentId = folderId;
+                if (ensuredCollectionIds.add(folderId)) {
+                  await _ensureCollectionThumbnail(
+                    library,
+                    thumbDir,
+                    folderId,
+                    video.videoInfo.pic,
+                  );
+                }
+                library.noteImportedCollection(
+                  folderId,
+                  batchId: streamingBatchId,
+                );
+              }
+              return targetParentId;
+            },
           );
+          final item = card.item;
           ep
             ..status = DownloadStatus.completed
             ..progress = 1

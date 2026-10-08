@@ -4,6 +4,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_card_actions.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/theme/app_page_transitions.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
@@ -96,8 +97,37 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
     }
   }
 
-  void _placeholderAction(String name) {
-    AppToast.show('「$name」功能将在下一版本接入');
+  int get _partCount {
+    final parts = _detail?.parts.length ?? 0;
+    return parts < 1 ? 1 : parts;
+  }
+
+  Future<void> _play() async {
+    final bvid = _detail?.bvid;
+    if (bvid == null || bvid.isEmpty) return;
+    await playBilibiliVideoAsCard(context, bvid: bvid, page: _selectedPage);
+  }
+
+  Future<void> _importAsCard() async {
+    final bvid = _detail?.bvid;
+    if (bvid == null || bvid.isEmpty) return;
+    await importBilibiliVideoAsCards(
+      context,
+      bvid: bvid,
+      page: _selectedPage,
+      partCount: _partCount,
+    );
+  }
+
+  Future<void> _download() async {
+    final bvid = _detail?.bvid;
+    if (bvid == null || bvid.isEmpty) return;
+    await openBilibiliVideoDownload(
+      context,
+      bvid: bvid,
+      page: _selectedPage,
+      partCount: _partCount,
+    );
   }
 
   Future<void> _openTarget(BilibiliVideoInputTarget target) async {
@@ -385,19 +415,19 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
             backgroundColor: AppTokens.brandBilibili,
             foregroundColor: Colors.white,
           ),
-          onPressed: () => _placeholderAction('播放'),
+          onPressed: _play,
           icon: const Icon(Icons.play_arrow, size: 18),
           label: const Text('播放'),
         ),
         OutlinedButton.icon(
           style: OutlinedButton.styleFrom(foregroundColor: AppTokens.text1),
-          onPressed: () => _placeholderAction('导入为卡片'),
+          onPressed: _importAsCard,
           icon: const Icon(Icons.library_add_outlined, size: 18),
           label: const Text('导入为卡片'),
         ),
         OutlinedButton.icon(
           style: OutlinedButton.styleFrom(foregroundColor: AppTokens.text1),
-          onPressed: () => _placeholderAction('下载'),
+          onPressed: _download,
           icon: const Icon(Icons.download_outlined, size: 18),
           label: const Text('下载'),
         ),
