@@ -820,6 +820,14 @@ class SettingsService extends ChangeNotifier {
   /// not prompt on every launch.
   bool skipRepeatedClipboardText = true;
 
+  /// Whether keyword searches on the Bilibili page are added to the search
+  /// history. Turning it off keeps existing entries.
+  bool bilibiliRecordSearchHistory = true;
+
+  /// Whether videos opened from the Bilibili pages are added to the watch
+  /// history. Turning it off keeps existing entries.
+  bool bilibiliRecordWatchHistory = true;
+
   /// Latest clipboard text whose parse attempt finished. This is not a user
   /// setting and is omitted from settings export so a backup does not carry
   /// clipboard contents to another device.
@@ -1656,6 +1664,16 @@ class SettingsService extends ChangeNotifier {
         defaultValue: true,
         apply: (service, value) => service.skipRepeatedClipboardText = value,
       ),
+      _boolSetting(
+        key: 'bilibiliRecordSearchHistory',
+        defaultValue: true,
+        apply: (service, value) => service.bilibiliRecordSearchHistory = value,
+      ),
+      _boolSetting(
+        key: 'bilibiliRecordWatchHistory',
+        defaultValue: true,
+        apply: (service, value) => service.bilibiliRecordWatchHistory = value,
+      ),
       _stringSetting(
         key: 'structuredImportSortField',
         defaultValue: 'fileName',
@@ -2158,6 +2176,8 @@ class SettingsService extends ChangeNotifier {
     mediaLibraryContinueSeriousOnly = false;
     continueWatchPolicy = ContinueWatchPolicy.defaults;
     clipboardLastHandledText = null;
+    bilibiliRecordSearchHistory = true;
+    bilibiliRecordWatchHistory = true;
     importCardPlacement = ImportCardPlacement.currentFolder.storageValue;
     importSourceFolderNamesJson = '{}';
     importSourceFolderIdsJson = '{}';
@@ -3543,6 +3563,8 @@ class SettingsService extends ChangeNotifier {
         'useSearchResultsAsPlaybackQueue': useSearchResultsAsPlaybackQueue,
         'bilibiliBackgroundAudioOnly': bilibiliBackgroundAudioOnly,
         'skipRepeatedClipboardText': skipRepeatedClipboardText,
+        'bilibiliRecordSearchHistory': bilibiliRecordSearchHistory,
+        'bilibiliRecordWatchHistory': bilibiliRecordWatchHistory,
         'structuredImportSortField': structuredImportSortField,
         'structuredImportSortDirection': structuredImportSortDirection,
       },

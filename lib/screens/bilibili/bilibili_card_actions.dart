@@ -7,6 +7,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/screens/bilibili_download_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/library_service.dart';
 import 'package:video_player_app/services/media_playback_service.dart';
@@ -38,10 +39,11 @@ Future<void> playBilibiliVideoAsCard(
   BilibiliStreamCardBatch batch;
   try {
     await service.init();
-    batch = await service.obtainStreamCardsForVideo(
+    batch = await obtainBilibiliPlaybackCard(
+      service,
       library,
       bvid: bvid,
-      pages: <int>[page],
+      page: page,
     );
   } catch (error, stack) {
     developer.log(
@@ -68,6 +70,49 @@ Future<void> playBilibiliVideoAsCard(
   } else if (partCount > kBilibiliAutoFillPartLimit) {
     AppToast.show('该视频分P较多，可用「导入为卡片」→「全部分P」补全选集');
   }
+}
+
+/// Card half of [playBilibiliVideoAsCard]: reuses or creates the online card
+/// for [bvid] part [page] and records the watch history entry. Opening the
+/// playback page is left to the caller.
+Future<BilibiliStreamCardBatch> obtainBilibiliPlaybackCard(
+  BilibiliDownloadService service,
+  LibraryService library, {
+  required String bvid,
+  required int page,
+  BilibiliHistoryService? history,
+}) async {
+  final batch = await service.obtainStreamCardsForVideo(
+    library,
+    bvid: bvid,
+    pages: <int>[page],
+  );
+  final info = batch.videoInfo;
+  final card = batch.cards.first.item;
+  final playedPage = card.sourceRef?.page ?? page;
+  var partTitle = '';
+  if (info.pages.length > 1) {
+    for (final part in info.pages) {
+      if (part.page == playedPage) partTitle = part.part;
+    }
+  }
+  try {
+    await (history ?? BilibiliHistoryService.instance).recordWatch(
+      BilibiliWatchHistoryEntry(
+        bvid: info.bvid.isNotEmpty ? info.bvid : bvid,
+        title: info.title,
+        ownerName: info.ownerName,
+        coverUrl: info.pic,
+        page: playedPage,
+        partTitle: partTitle,
+        watchedAt: DateTime.now(),
+      ),
+    );
+  } catch (error) {
+    // History is best effort and never blocks playback.
+    developer.log('Watch history not recorded', error: error);
+  }
+  return batch;
 }
 
 Future<void> _fillRemainingParts(

@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_video_detail_screen.dart';
+import 'package:video_player_app/screens/bilibili/bilibili_watch_history_screen.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_download_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
@@ -64,6 +66,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
   final ScrollController _userScroll = ScrollController();
   final _SearchResults<BilibiliSearchVideo> _videos = _SearchResults();
   final _SearchResults<BilibiliSearchUser> _users = _SearchResults();
+  final BilibiliHistoryService _history = BilibiliHistoryService.instance;
 
   Timer? _suggestDebounce;
   List<String> _suggestions = const <String>[];
@@ -83,7 +86,13 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     _videoScroll.addListener(() => _maybeLoadMore(0));
     _userScroll.addListener(() => _maybeLoadMore(1));
     _inputFocus.addListener(_handleFocusChange);
+    _history.addListener(_handleHistoryChanged);
+    unawaited(_history.ensureLoaded());
     if (widget.isActive) _scheduleAccountCheck();
+  }
+
+  void _handleHistoryChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -98,6 +107,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
   @override
   void dispose() {
     _suggestDebounce?.cancel();
+    _history.removeListener(_handleHistoryChanged);
     _input.dispose();
     _inputFocus.dispose();
     _videoScroll.dispose();
@@ -153,6 +163,8 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
   // ------------------------------------------------------------ suggestions
 
   void _handleFocusChange() {
+    // The search history overlay follows focus.
+    if (mounted) setState(() {});
     if (!_inputFocus.hasFocus && _suggestions.isNotEmpty) {
       // Let a tap on a suggestion land before the list disappears.
       Future<void>.delayed(const Duration(milliseconds: 150), () {
@@ -205,6 +217,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       await _openTarget(target);
       return;
     }
+    unawaited(_history.addSearch(text));
     setState(() {
       _keyword = text;
       _videos.reset();
@@ -213,6 +226,20 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     _jumpToTop();
     unawaited(_load(_tab));
   }
+
+  void _searchFromHistory(String keyword) {
+    _input.text = keyword;
+    _input.selection = TextSelection.collapsed(offset: keyword.length);
+    unawaited(_submit(keyword));
+  }
+
+  /// Over the results while the empty search box has focus; before the first
+  /// search the history is part of the page body instead.
+  bool get _showSearchHistoryOverlay =>
+      _keyword.isNotEmpty &&
+      _inputFocus.hasFocus &&
+      _input.text.trim().isEmpty &&
+      _history.searchHistory.isNotEmpty;
 
   void _jumpToTop() {
     for (final controller in [_videoScroll, _userScroll]) {
@@ -364,6 +391,16 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
                     ],
                   ),
                 ),
+                if (_showSearchHistoryOverlay)
+                  Positioned(
+                    left: 12,
+                    right: 12,
+                    top: 0,
+                    // Taps inside count as the search box, so it keeps focus.
+                    child: TextFieldTapRegion(
+                      child: _buildSearchHistory(overlay: true),
+                    ),
+                  ),
                 if (_suggestions.isNotEmpty && _inputFocus.hasFocus)
                   Positioned(
                     left: 12,
@@ -429,6 +466,14 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
             ),
           ),
           const SizedBox(width: 4),
+          IconButton(
+            tooltip: '观看历史',
+            onPressed: () {
+              _inputFocus.unfocus();
+              unawaited(openBilibiliWatchHistory(context, api: _api));
+            },
+            icon: const Icon(Icons.history, size: 24, color: AppTokens.text2),
+          ),
           IconButton(
             tooltip: _loggedIn ? 'B 站账号' : '登录 B 站',
             onPressed: _openAccount,
@@ -530,6 +575,94 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
               ),
             ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSearchHistory({required bool overlay}) {
+    final entries = _history.searchHistory;
+    final content = Padding(
+      padding: const EdgeInsets.fromLTRB(14, 6, 6, 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text(
+                '搜索历史',
+                style: TextStyle(
+                  color: AppTokens.text2,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              TextButton(
+                key: const ValueKey<String>('bilibili-search-history-clear'),
+                onPressed: () => unawaited(_history.clearSearch()),
+                child: const Text(
+                  '清空',
+                  style: TextStyle(color: AppTokens.text3, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [for (final keyword in entries) _historyChip(keyword)],
+          ),
+        ],
+      ),
+    );
+    if (!overlay) return content;
+    return Material(
+      color: AppTokens.bgOverlay,
+      elevation: 6,
+      borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
+      child: content,
+    );
+  }
+
+  Widget _historyChip(String keyword) {
+    return Material(
+      color: AppTokens.bgCard,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        key: ValueKey<String>('bilibili-search-history-$keyword'),
+        borderRadius: BorderRadius.circular(14),
+        onTap: () => _searchFromHistory(keyword),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 5, 4, 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 220),
+                child: Text(
+                  keyword,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: AppTokens.text1, fontSize: 13),
+                ),
+              ),
+              const SizedBox(width: 2),
+              InkResponse(
+                key: ValueKey<String>(
+                  'bilibili-search-history-remove-$keyword',
+                ),
+                radius: 12,
+                onTap: () => unawaited(_history.removeSearch(keyword)),
+                child: const Padding(
+                  padding: EdgeInsets.all(2),
+                  child: Icon(Icons.close, size: 14, color: AppTokens.text3),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -651,10 +784,15 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     required Widget Function(T item) itemBuilder,
   }) {
     if (_keyword.isEmpty) {
-      return _buildHint(
+      final hint = _buildHint(
         Icons.travel_explore,
         '输入关键词搜索 B 站内容',
         '也可以直接粘贴 BV 号或视频链接打开详情',
+      );
+      if (_history.searchHistory.isEmpty) return hint;
+      return ListView(
+        padding: EdgeInsets.only(bottom: 16 + widget.bottomPadding),
+        children: [_buildSearchHistory(overlay: false), hint],
       );
     }
     if (results.items.isEmpty) {

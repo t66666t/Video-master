@@ -19,6 +19,7 @@ import 'package:video_player_app/models/video_collection.dart';
 import 'package:video_player_app/models/video_item.dart';
 import 'package:video_player_app/services/app_wakelock_coordinator.dart';
 import 'package:video_player_app/services/bilibili/bilibili_api_service.dart';
+import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_streaming_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_stream_card.dart';
 import 'package:video_player_app/services/bilibili/bilibili_video_shot_service.dart';
@@ -70,6 +71,11 @@ class BilibiliDownloadService extends ChangeNotifier {
   );
   static const Duration _baseTaskPersistDebounce = Duration(milliseconds: 900);
   final BilibiliApiService apiService;
+
+  /// Cookie-free client for short-link resolution, created on first use.
+  BilibiliPublicApiService? _publicApi;
+  BilibiliPublicApiService get publicApi =>
+      _publicApi ??= BilibiliPublicApiService();
   late final BilibiliStreamingService streamingService;
   late final MediaMaterializationService materializationService;
   final Uuid _uuid = const Uuid();
@@ -137,8 +143,11 @@ class BilibiliDownloadService extends ChangeNotifier {
   bool isParsing = false;
   String? parsingStatus;
 
-  BilibiliDownloadService({BilibiliApiService? apiService})
-    : apiService = apiService ?? BilibiliApiService() {
+  BilibiliDownloadService({
+    BilibiliApiService? apiService,
+    BilibiliPublicApiService? publicApi,
+  }) : apiService = apiService ?? BilibiliApiService(),
+       _publicApi = publicApi {
     _downloadManager = BilibiliDownloadManager(this.apiService);
     streamingService = BilibiliStreamingService(this.apiService);
     materializationService = MediaMaterializationService(this.apiService)
@@ -1138,8 +1147,18 @@ class BilibiliDownloadService extends ChangeNotifier {
     var type = normalizedInput.type;
 
     if (type == BilibiliUrlType.shortLink) {
-      final resolvedUrl = await apiService.resolveShortLink(parseInput);
-      parseInput = resolvedUrl;
+      // Same cookie-free resolver as the clipboard check and search box.
+      final link = Uri.tryParse(parseInput);
+      final resolved = link == null
+          ? null
+          : await publicApi.resolveShortLink(link);
+      final resolvedInput = resolved?.target?.parseInput;
+      if (resolvedInput == null) {
+        throw Exception(
+          resolved?.message ?? BilibiliShortLinkFailure.noVideo.message,
+        );
+      }
+      parseInput = resolvedInput;
       type = BilibiliUrlParser.determineType(parseInput);
     }
 

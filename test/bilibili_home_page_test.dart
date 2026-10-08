@@ -4,8 +4,11 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player_app/screens/bilibili/bilibili_home_page.dart';
+import 'package:video_player_app/services/bilibili/bilibili_history_service.dart';
 import 'package:video_player_app/services/bilibili/bilibili_public_api_service.dart';
+import 'package:video_player_app/services/settings_service.dart';
 
 const _bvid = 'BV1GJ411x7h7';
 
@@ -76,6 +79,74 @@ class _FakeAdapter implements HttpClientAdapter {
 }
 
 void main() {
+  setUp(() {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    SettingsService().resetForTest();
+    BilibiliHistoryService.instance.resetForTest();
+  });
+
+  testWidgets('search history: record, tap to search, remove and clear', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(900, 2400);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final history = BilibiliHistoryService.instance;
+    await history.addSearch('旧词');
+    final adapter = _FakeAdapter();
+    final api = BilibiliPublicApiService(httpClientAdapter: adapter);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(body: BilibiliHomePage(isActive: true, api: api)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Before any search the history sits in the empty page.
+    expect(find.text('搜索历史'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('bilibili-search-history-旧词')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('测试视频'), findsOneWidget);
+    expect(
+      adapter.requests
+          .where((r) => r.path.endsWith('/wbi/search/type'))
+          .single
+          .queryParameters['keyword'],
+      '旧词',
+    );
+
+    await tester.enterText(find.byType(TextField), ' 测试 ');
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pumpAndSettle();
+    expect(history.searchHistory, ['测试', '旧词']);
+
+    // Empty focused box over the results shows the overlay.
+    await tester.tap(find.byTooltip('清空'));
+    await tester.pumpAndSettle();
+    expect(find.text('搜索历史'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey<String>('bilibili-search-history-remove-测试')),
+    );
+    await tester.pumpAndSettle();
+    expect(history.searchHistory, ['旧词']);
+    expect(find.text('搜索历史'), findsOneWidget, reason: 'focus is kept');
+
+    await tester.tap(
+      find.byKey(const ValueKey<String>('bilibili-search-history-clear')),
+    );
+    await tester.pumpAndSettle();
+    expect(history.searchHistory, isEmpty);
+    expect(find.text('搜索历史'), findsNothing);
+
+    SettingsService().bilibiliRecordSearchHistory = false;
+    await tester.enterText(find.byType(TextField), '不记录');
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pumpAndSettle();
+    expect(history.searchHistory, isEmpty);
+  });
+
   testWidgets('search shows videos and opens the detail page', (tester) async {
     tester.view.physicalSize = const Size(900, 2400);
     tester.view.devicePixelRatio = 1;
