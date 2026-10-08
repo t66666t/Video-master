@@ -62,22 +62,24 @@ void main() {
     fetches = 0;
     tracks = BilibiliSubtitleTracks(
       source: BilibiliSubtitleTrackSource(
-        fetchCcTracks: (bvid, cid) async => const [
-          BilibiliSubtitleTrack(
-            lan: 'zh-CN',
-            label: '中文',
-            isAi: false,
-            url: 'https://aisubtitle.hdslb.com/zh.json',
-          ),
-        ],
-        fetchAiTracks: (bvid, cid) async => const [
-          BilibiliSubtitleTrack(
-            lan: 'ai-en',
-            label: '英语（自动生成）',
-            isAi: true,
-            url: 'https://aisubtitle.hdslb.com/ai-en.json',
-          ),
-        ],
+        fetchPublicAnswer: (bvid, cid) async =>
+            const BilibiliSubtitleAnswer(needsLogin: true),
+        fetchLoggedInAnswer: (bvid, cid) async => const BilibiliSubtitleAnswer(
+          tracks: [
+            BilibiliSubtitleTrack(
+              lan: 'zh-CN',
+              label: '中文',
+              isAi: false,
+              url: 'https://aisubtitle.hdslb.com/zh.json',
+            ),
+            BilibiliSubtitleTrack(
+              lan: 'ai-en',
+              label: '英语（自动生成）',
+              isAi: true,
+              url: 'https://aisubtitle.hdslb.com/ai-en.json',
+            ),
+          ],
+        ),
         isLoggedIn: () async => true,
         fetchContent: (url) async {
           fetches++;

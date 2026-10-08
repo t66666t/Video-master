@@ -37,21 +37,41 @@ class _Env {
 
   final Directory dir;
   final Map<String, VideoItem> items = <String, VideoItem>{};
+
+  /// Tracks of the public answer (logged out Bilibili usually gives none).
   final Map<int, List<BilibiliSubtitleTrack>> cc = {};
+
+  /// Tracks of the logged-in answer (CC and AI).
   final Map<int, List<BilibiliSubtitleTrack>> ai = {};
+  final Map<int, List<BilibiliSubtitleTrack>> locked = {};
+  final Set<int> needLogin = <int>{};
+  final login = ValueNotifier<int>(0);
+  Object? publicError;
   bool loggedIn = false;
   int requests = 0;
 
   late final BilibiliSubtitleTracks tracks = BilibiliSubtitleTracks(
     source: BilibiliSubtitleTrackSource(
-      fetchCcTracks: (bvid, cid) async {
+      fetchPublicAnswer: (bvid, cid) async {
         requests++;
-        return cc[cid] ?? const [];
+        final error = publicError;
+        if (error != null) throw error;
+        return BilibiliSubtitleAnswer(
+          tracks: cc[cid] ?? const [],
+          needsLogin: needLogin.contains(cid),
+        );
       },
-      fetchAiTracks: (bvid, cid) async {
+      fetchLoggedInAnswer: (bvid, cid) async {
         requests++;
-        return ai[cid] ?? const [];
+        return BilibiliSubtitleAnswer(
+          tracks: <BilibiliSubtitleTrack>[...?cc[cid], ...?ai[cid]],
+        );
       },
+      fetchLockedTracks: (bvid, cid) async {
+        requests++;
+        return locked[cid] ?? const [];
+      },
+      loginChanges: login,
       isLoggedIn: () async => loggedIn,
       fetchContent: (url) async {
         requests++;
@@ -91,6 +111,15 @@ void main() {
     if (dir.existsSync()) dir.deleteSync(recursive: true);
   });
 
+  var logins = 0;
+
+  Future<void> settle(WidgetTester tester) async {
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 30)),
+    );
+    await tester.pump();
+  }
+
   Future<void> pump(WidgetTester tester, String itemId) async {
     await tester.runAsync(() async {
       await tester.pumpWidget(
@@ -102,6 +131,11 @@ void main() {
                 itemId: itemId,
                 tracks: env.tracks,
                 onPick: picked.add,
+                openLogin: (context) async {
+                  logins++;
+                  env.loggedIn = true;
+                  env.login.value++;
+                },
                 savedRow: (track) => ListTile(
                   key: ValueKey('saved-${track.path}'),
                   title: Row(
@@ -121,6 +155,92 @@ void main() {
     await tester.pump();
   }
 
+  testWidgets('logged out, subtitles kept for logged-in users: greyed '
+      'names and the login line; logging in lists CC and AI', (tester) async {
+    env
+      ..items['a'] = _online('a', 101)
+      ..needLogin.add(101)
+      ..locked[101] = const [
+        BilibiliSubtitleTrack(
+          lan: 'zh-CN',
+          label: '中文（中国）',
+          isAi: false,
+          locked: true,
+        ),
+        BilibiliSubtitleTrack(
+          lan: 'ai-zh',
+          label: '中文（自动生成）',
+          isAi: true,
+          locked: true,
+        ),
+      ]
+      ..ai[101] = [_track('zh-CN', '中文（中国）'), _track('ai-zh', '中文（自动生成）')];
+    logins = 0;
+    await pump(tester, 'a');
+    expect(
+      find.byKey(const ValueKey('bilibili-locked-track-zh-CN-中文（中国）')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('bilibili-locked-track-ai-zh-中文（自动生成）')),
+      findsOneWidget,
+    );
+    expect(find.text('登录后可加载'), findsNWidgets(2));
+    expect(find.text('这个视频有字幕，登录后可加载'), findsOneWidget);
+    expect(find.text('去登录'), findsOneWidget);
+    expect(find.text('这个视频没有字幕'), findsNothing);
+    expect(find.text('点一下加载'), findsNothing);
+
+    // A greyed name opens the login too; the login change asks again.
+    await tester.tap(find.text('中文（中国）'));
+    await tester.pump();
+    await settle(tester);
+    expect(logins, 1);
+    expect(
+      find.byKey(const ValueKey('bilibili-track-zh-CN-中文（中国）')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('bilibili-track-ai-zh-中文（自动生成）')),
+      findsOneWidget,
+    );
+    expect(find.byType(BilibiliAiBadge), findsOneWidget);
+    expect(find.text('点一下加载'), findsNWidgets(2));
+    expect(find.text('这个视频有字幕，登录后可加载'), findsNothing);
+  });
+
+  testWidgets('the login line opens the login', (tester) async {
+    env
+      ..items['a'] = _online('a', 101)
+      ..needLogin.add(101);
+    logins = 0;
+    await pump(tester, 'a');
+    await tester.tap(find.text('去登录'));
+    await tester.pump();
+    await settle(tester);
+    expect(logins, 1);
+    expect(find.text('这个视频没有字幕'), findsOneWidget);
+  });
+
+  testWidgets('a list that could not be had: a retry line, a tap shows the '
+      'list', (tester) async {
+    env
+      ..items['a'] = _online('a', 101)
+      ..cc[101] = [_track('en', '英语')]
+      ..publicError = StateError('down');
+    await pump(tester, 'a');
+    expect(find.text('字幕列表暂时拿不到，点一下重试'), findsOneWidget);
+    expect(find.text('这个视频没有字幕'), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+
+    env.publicError = null;
+    await tester.tap(find.text('字幕列表暂时拿不到，点一下重试'));
+    await tester.pump();
+    await settle(tester);
+    expect(find.text('英语'), findsOneWidget);
+    expect(find.text('字幕列表暂时拿不到，点一下重试'), findsNothing);
+  });
+
   testWidgets('logged out: CC tracks and the login line, no AI', (
     tester,
   ) async {
@@ -139,9 +259,9 @@ void main() {
     env
       ..loggedIn = true
       ..items['a'] = _online('a', 101)
-      ..cc[101] = [_track('zh-CN', '中文')]
-      ..ai[101] = [_track('ai-zh', '中文（自动生成）')];
+      ..ai[101] = [_track('zh-CN', '中文'), _track('ai-zh', '中文（自动生成）')];
     await pump(tester, 'a');
+    expect(find.text('中文'), findsOneWidget);
     expect(find.text('中文（自动生成）'), findsOneWidget);
     expect(find.byType(BilibiliAiBadge), findsOneWidget);
     expect(find.text('登录后可加载 AI 字幕'), findsNothing);

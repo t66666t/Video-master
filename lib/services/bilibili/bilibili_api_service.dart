@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart'
+    show ValueListenable, ValueNotifier, visibleForTesting;
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
 import 'dart:async';
@@ -93,6 +94,11 @@ class BilibiliApiService {
   DateTime? _wbiKeysAt;
   Future<void>? _wbiKeysLoading;
   final DateTime Function() _clock;
+  final ValueNotifier<int> _loginChanges = ValueNotifier<int>(0);
+
+  /// Counts up whenever the stored login is replaced or removed (cookie or
+  /// QR login, logout), so readers that depend on it can ask again.
+  ValueListenable<int> get loginChanges => _loginChanges;
 
   /// How long the WBI signing keys are reused before `nav` is asked again.
   /// Bilibili rotates them about once a day; a rejected signature refreshes
@@ -363,6 +369,7 @@ class BilibiliApiService {
       );
     }
     await _applyCookiesToJar(session);
+    _loginChanges.value++;
     return state.account!;
   }
 
@@ -374,6 +381,7 @@ class BilibiliApiService {
   Future<void> logout() async {
     await _cookieStore.clear();
     await _cookieJar.deleteAll();
+    _loginChanges.value++;
   }
 
   Future<BilibiliLoginState> _requestNavWith(
@@ -807,6 +815,46 @@ class BilibiliApiService {
     } catch (e) {
       developer.log('Error fetching player metadata', error: e);
       return const BilibiliPlayerMetadata();
+    }
+  }
+
+  /// The signed player answer (`x/player/wbi/v2`) of one part, asked with
+  /// the live login and returned whole (`code`, `data`). Unlike
+  /// [fetchPlayerMetadata] nothing is swallowed: a request that fails
+  /// throws, so the subtitle area can tell "could not ask" from "no
+  /// subtitles". A rejected signature refreshes the keys once. Logs carry
+  /// only bvid and cid.
+  Future<Map<String, dynamic>> fetchPlayerAnswer(String bvid, int cid) async {
+    await init();
+    await _ensureWbiKeys();
+    for (var attempt = 0; ; attempt++) {
+      final Response<dynamic> response;
+      try {
+        response = await _dio.get<dynamic>(
+          "https://api.bilibili.com/x/player/wbi/v2",
+          queryParameters: WbiSigner.sign(
+            <String, dynamic>{'bvid': bvid, 'cid': cid},
+            _imgKey!,
+            _subKey!,
+          ),
+        );
+      } catch (e) {
+        developer.log(
+          'Player answer for bvid=$bvid, cid=$cid failed',
+          error: e.runtimeType,
+        );
+        rethrow;
+      }
+      Object? payload = response.data;
+      if (payload is String) payload = jsonDecode(payload);
+      if (payload is! Map) {
+        throw const FormatException('播放器信息无法解析');
+      }
+      if (attempt == 0 && payload['code'] == -403) {
+        await _ensureWbiKeys(refresh: true);
+        continue;
+      }
+      return Map<String, dynamic>.from(payload);
     }
   }
 
