@@ -280,6 +280,34 @@ void main() {
       detailRequest.complete(_detail());
     });
 
+    test('the cover file is ready before the page opens, where the card '
+        'keeps it', () async {
+      final adapter = _FakeAdapter((options) {
+        if (options.uri.toString() == _cover) {
+          return ResponseBody.fromBytes(const <int>[1, 2, 3], 200);
+        }
+        throw StateError('unexpected ${options.uri}');
+      });
+      final service = newService(_WatchApi(httpClientAdapter: adapter));
+      await service.init();
+      final timeline = BilibiliOpenTimeline(_bvid);
+      final plan = await BilibiliWatchLoader(
+        service: service,
+        library: library,
+        bvid: _bvid,
+        fetchInfo: (_) async => _info(),
+        warmPlayUrl: (_, _) async {},
+        warmCover: (item) => service.prefetchWatchCover(library, item.id),
+      )(BilibiliWatchAttempt(timeline));
+
+      final path = library.getVideo(plan.item.id)!.thumbnailPath!;
+      expect(File(path).readAsBytesSync(), const <int>[1, 2, 3]);
+      // The completed card writes its cover to this same file.
+      expect(path.split(Platform.pathSeparator).last, '${plan.item.id}.jpg');
+      expect(timeline.msOf('cover'), isNotNull);
+      expect(adapter.requests, hasLength(1));
+    });
+
     test('a second tap uses the remembered info', () async {
       final api = _WatchApi();
       final service = newService(api);
@@ -499,7 +527,7 @@ void main() {
       await showRoute(tester);
 
       expect(find.byKey(const ValueKey('bilibili-watch-loading')), findsOne);
-      final cover = tester.widget<BilibiliCoverImage>(
+      final cover = tester.widget<BilibiliSharpCoverImage>(
         find.byKey(const ValueKey('bilibili-watch-loading-cover')),
       );
       expect(cover.url, _cover);
@@ -665,7 +693,7 @@ void main() {
       await deleteTestTempDir(root);
     });
 
-    Future<void> pumpList(WidgetTester tester) async {
+    Future<void> pumpList(WidgetTester tester, {bool replace = false}) async {
       await tester.pumpWidget(
         MultiProvider(
           providers: [
@@ -690,7 +718,7 @@ void main() {
                     watchBilibiliVideo(
                       context,
                       bvid: _bvid,
-                      replaceCurrent: false,
+                      replaceCurrent: replace,
                       preview: const BilibiliWatchPreview(
                         title: '列表里的标题',
                         coverUrl: _cover,
@@ -735,7 +763,7 @@ void main() {
       expect(find.text('列表里的标题'), findsOneWidget);
       expect(
         tester
-            .widget<BilibiliCoverImage>(
+            .widget<BilibiliSharpCoverImage>(
               find.byKey(const ValueKey('bilibili-watch-loading-cover')),
             )
             .url,
@@ -792,6 +820,109 @@ void main() {
       expect(openedPlayers, isEmpty);
       expect(navigation.hasPlaybackPage, isFalse);
       expect(library.transientVideos, isEmpty);
+    });
+
+    /// Lets the loading page come in and the video get ready, until the
+    /// playback page is about to take its place.
+    Future<void> openPlayer(WidgetTester tester) async {
+      for (var i = 0; i < 200 && openedPlayers.isEmpty; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 10)),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      expect(openedPlayers, isNotEmpty);
+      await tester.pump();
+    }
+
+    /// Ends playback and lets the open-time measuring run out.
+    Future<void> closeAll(WidgetTester tester) async {
+      // The route observer outlives the test: leave it with no page here.
+      AppToast.navigatorKey.currentState!.popUntil((route) => route.isFirst);
+      await tester.pumpAndSettle();
+      await MediaPlaybackService().stop();
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump(const Duration(minutes: 2));
+    }
+
+    testWidgets('the playback page takes the loading page\'s place without '
+        'a transition', (tester) async {
+      BilibiliWatchSources.overrideForTesting = BilibiliWatchSources(
+        fetchInfo: (_) async => _info(),
+        warmPlayUrl: (_, _) async {},
+      );
+      await pumpList(tester);
+      await tester.tap(find.text('video'));
+      await showRoute(tester);
+      await openPlayer(tester);
+
+      final player = find.text('player ${openedPlayers.single}');
+      expect(player, findsOneWidget);
+      final route = ModalRoute.of(tester.element(player))!;
+      expect(route.animation!.status, AnimationStatus.completed);
+      expect(route.animation!.value, 1.0);
+      expect(
+        find.byKey(
+          const ValueKey('bilibili-watch-loading'),
+          skipOffstage: false,
+        ),
+        findsNothing,
+      );
+      await closeAll(tester);
+    });
+
+    testWidgets('from an open playback page: the new one takes the loading '
+        'page\'s place without a transition, the old one goes', (tester) async {
+      BilibiliWatchSources.overrideForTesting = BilibiliWatchSources(
+        fetchInfo: (_) async => _info(),
+        warmPlayUrl: (_, _) async {},
+      );
+      await pumpList(tester, replace: true);
+      final old = VideoItem(
+        id: 'old-video',
+        path: '/videos/old.mp4',
+        title: 'old',
+        durationMs: 0,
+        lastUpdated: 0,
+      );
+      unawaited(
+        AppToast.navigatorKey.currentState!.push(
+          MaterialPageRoute<void>(
+            settings: PlaybackNavigationService.landscapeRouteSettings(old),
+            builder: (_) => const Text('old player'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final context = tester.element(find.text('video', skipOffstage: false));
+      unawaited(watchBilibiliVideo(context, bvid: _bvid, replaceCurrent: true));
+      await showRoute(tester);
+      await openPlayer(tester);
+
+      final player = find.text('player ${openedPlayers.single}');
+      expect(player, findsOneWidget);
+      final route = ModalRoute.of(tester.element(player))!;
+      expect(route.animation!.status, AnimationStatus.completed);
+      expect(route.animation!.value, 1.0);
+      expect(find.text('old player', skipOffstage: false), findsNothing);
+      expect(
+        navigation.observer.routes
+            .where(
+              (route) => PlaybackNavigationService.isPlaybackRouteName(
+                route.settings.name,
+              ),
+            )
+            .length,
+        1,
+      );
+      expect(
+        find.byKey(
+          const ValueKey('bilibili-watch-loading'),
+          skipOffstage: false,
+        ),
+        findsNothing,
+      );
+      await closeAll(tester);
     });
 
     testWidgets('a second tap while one loads opens no second page', (
@@ -878,6 +1009,8 @@ BilibiliVideoDetail _detail() => const BilibiliVideoDetail(
 );
 
 class _WatchApi extends BilibiliApiService {
+  _WatchApi({super.httpClientAdapter});
+
   int metadataRequests = 0;
   int danmakuRequests = 0;
   int videoShotRequests = 0;

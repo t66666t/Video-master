@@ -159,9 +159,14 @@ class PlaybackNavigationService {
   /// is pushed on top. Playing another video from a page's Bilibili panel, or
   /// from a Bilibili page opened above the player, so never piles playback
   /// pages up. Nothing happens when the top page already shows [item].
-  Future<void> replaceCurrentPlayback(VideoItem item) {
+  /// [inPlaceOf] is the page the new playback page takes the place of at
+  /// once, without a transition (the Bilibili loading page); null pushes it.
+  Future<void> replaceCurrentPlayback(
+    VideoItem item, {
+    Route<dynamic>? inPlaceOf,
+  }) {
     _navigationQueue = _navigationQueue.then(
-      (_) => _openPlaybackInternal(item),
+      (_) => _openPlaybackInternal(item, inPlaceOf: inPlaceOf),
     );
     return _navigationQueue;
   }
@@ -362,11 +367,14 @@ class PlaybackNavigationService {
   Future<void> _openPlaybackInternal(
     VideoItem item, {
     bool notificationEntry = false,
+    Route<dynamic>? inPlaceOf,
   }) async {
     final navigator = await _waitForNavigator();
     if (navigator == null) {
       return;
     }
+    // The page to take the place of was closed in the meantime.
+    if (inPlaceOf != null && !inPlaceOf.isActive) return;
 
     final trackedRoutes = observer.routes;
     final playbackRoutes = trackedRoutes
@@ -412,7 +420,11 @@ class PlaybackNavigationService {
       final route = notificationEntry
           ? buildNotificationPlaybackRoute(item)
           : buildPlaybackEntryRoute(item);
-      unawaited(navigator.push(route));
+      if (inPlaceOf != null) {
+        navigator.replace(oldRoute: inPlaceOf, newRoute: route);
+      } else {
+        unawaited(navigator.push(route));
+      }
     } finally {
       _suppressAutoPauseOnRouteCleanup = false;
     }

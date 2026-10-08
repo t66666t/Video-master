@@ -121,6 +121,9 @@ class BilibiliWatchAttempt {
 ///   the card work, so the player finds it ready;
 /// * the watch-only card is made without waiting for its cover, subtitles,
 ///   danmaku and preview frames, which arrive while it plays.
+/// Longest wait for the cover file before the playback page opens anyway.
+const Duration kBilibiliCoverWait = Duration(seconds: 2);
+
 class BilibiliWatchLoader {
   BilibiliWatchLoader({
     required this.service,
@@ -137,6 +140,7 @@ class BilibiliWatchLoader {
     Future<BilibiliVideoInfo> Function(String bvid)? fetchInfo,
     this.warmPlayUrl,
     this.warmSigning,
+    this.warmCover,
     this.playUrlWait = const Duration(seconds: 6),
   }) : fetchInfo = fetchInfo ?? service.apiService.fetchVideoInfo;
 
@@ -159,6 +163,10 @@ class BilibiliWatchLoader {
   /// Gets the signing keys of the play address request while the video info
   /// is still on its way.
   final Future<void> Function()? warmSigning;
+
+  /// Downloads the cover of the card about to play to its cover file, so the
+  /// playback page shows it in its first frame (see [kBilibiliCoverWait]).
+  final Future<void> Function(VideoItem item)? warmCover;
 
   /// Longest wait for that address before the page opens anyway (the player
   /// then asks for it itself).
@@ -202,9 +210,22 @@ class BilibiliWatchLoader {
       isCancelled: () => attempt.isCancelled,
       onStep: timeline.mark,
     );
-    final pending = warming;
-    if (pending != null) {
-      await pending.timeout(playUrlWait, onTimeout: () {});
+    final waits = <Future<void>>[?warming];
+    final cover = warmCover;
+    if (cover != null && !attempt.isCancelled) {
+      waits.add(
+        cover(plan.item)
+            .then<void>(
+              (_) => timeline.mark('cover'),
+              onError: (Object error) {
+                developer.log('Cover not prefetched', error: error);
+              },
+            )
+            .timeout(kBilibiliCoverWait, onTimeout: () {}),
+      );
+    }
+    if (waits.isNotEmpty) {
+      await Future.wait(waits).timeout(playUrlWait, onTimeout: () => const []);
     }
     return plan;
   }
@@ -492,12 +513,14 @@ class BilibiliWatchSources {
     this.fetchInfo,
     this.warmPlayUrl,
     this.warmSigning = false,
+    this.warmCover = false,
   });
 
   static BilibiliWatchSources get app => BilibiliWatchSources(
     details: BilibiliVideoDetailCache.instance,
     infoCache: BilibiliWatchInfoCache.instance,
     warmSigning: true,
+    warmCover: true,
   );
 
   @visibleForTesting
@@ -516,6 +539,10 @@ class BilibiliWatchSources {
 
   /// Whether the logged-in API fetches its signing keys at the tap.
   final bool warmSigning;
+
+  /// Whether the cover file of the card is downloaded before the playback
+  /// page opens.
+  final bool warmCover;
 
   /// Title and cover of [bvid] when something here already knows them.
   BilibiliWatchPreview? previewOf(String bvid) {

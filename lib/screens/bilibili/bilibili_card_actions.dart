@@ -94,6 +94,9 @@ Future<void> watchBilibiliVideo(
         warmSigning: sources.warmSigning
             ? service.apiService.warmUpSigning
             : null,
+        warmCover: sources.warmCover
+            ? (item) => service.prefetchWatchCover(library, item.id)
+            : null,
       );
       return loader(attempt);
     },
@@ -250,21 +253,20 @@ Future<void> _openWatchPlan(
     item: item,
     existingController: existingController,
   );
+  // The playback page takes the place of this page at once, without a
+  // transition: the loading page already shows the cover where the playback
+  // page shows it.
   if (replace) {
-    // Every playback page goes and one for [item] is pushed above this
-    // page, which is then removed from under it.
-    await navigation.replaceCurrentPlayback(item);
-    if (page.isActive) navigator.removeRoute(page);
-  } else {
-    final entry = PlaybackNavigationService.buildPlaybackEntryRoute(
-      item,
-      existingController: existingController,
+    // Every playback page under this page goes as well.
+    await navigation.replaceCurrentPlayback(item, inPlaceOf: page);
+  } else if (page.isActive) {
+    navigator.replace(
+      oldRoute: page,
+      newRoute: PlaybackNavigationService.buildPlaybackEntryRoute(
+        item,
+        existingController: existingController,
+      ),
     );
-    if (page.isCurrent) {
-      unawaited(navigator.pushReplacement(entry));
-    } else if (page.isActive) {
-      navigator.replace(oldRoute: page, newRoute: entry);
-    }
   }
   timeline.mark('playback page pushed');
   if (!plan.imported) return;

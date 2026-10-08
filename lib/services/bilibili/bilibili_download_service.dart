@@ -3786,6 +3786,52 @@ class BilibiliDownloadService extends ChangeNotifier {
     return items;
   }
 
+  /// Downloads the cover of the watch part [itemId] that has none yet to the
+  /// file its completion writes, so the playback page opened next shows it
+  /// from its first frame. Best effort: failures leave the entry as it was.
+  Future<void> prefetchWatchCover(LibraryService library, String itemId) async {
+    final pending = _pendingWatchParts[itemId];
+    final target = library.getVideo(itemId);
+    if (pending == null || target == null) return;
+    final current = target.thumbnailPath;
+    if (current != null && current.isNotEmpty && File(current).existsSync()) {
+      return;
+    }
+    final coverUrl = pending.videoInfo.pic.trim();
+    if (coverUrl.isEmpty) return;
+    try {
+      final dirs = await _resolveStreamCardDirectories();
+      final response = await apiService.dio.get<List<int>>(
+        coverUrl,
+        options: Options(responseType: ResponseType.bytes),
+      );
+      final bytes = response.data;
+      if (bytes == null || bytes.isEmpty) return;
+      final path = p.join(
+        dirs.thumbDir.path,
+        '$itemId${_coverFileExtension(coverUrl)}',
+      );
+      await File(path).writeAsBytes(bytes, flush: true);
+      final entry = library.getVideo(itemId);
+      if (entry == null) {
+        // Cleaned up meanwhile.
+        try {
+          await File(path).delete();
+        } catch (_) {}
+        return;
+      }
+      entry.thumbnailPath = path;
+      await library.noteCardDataChanged(itemId);
+    } catch (error) {
+      debugPrint('Bilibili cover prefetch failed: $error');
+    }
+  }
+
+  static String _coverFileExtension(String coverUrl) {
+    final rawExt = p.extension(Uri.parse(coverUrl).path).toLowerCase();
+    return RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt) ? rawExt : '.jpg';
+  }
+
   Future<BilibiliStreamCardResult> _addLightWatchCard(
     LibraryService library, {
     required BilibiliVideoInfo info,
@@ -4257,11 +4303,10 @@ class BilibiliDownloadService extends ChangeNotifier {
         );
         final bytes = response.data;
         if (bytes != null && bytes.isNotEmpty) {
-          final rawExt = p.extension(Uri.parse(coverUrl).path).toLowerCase();
-          final ext = RegExp(r'^\.[a-z0-9]{1,5}$').hasMatch(rawExt)
-              ? rawExt
-              : '.jpg';
-          thumbPath = p.join(dirs.thumbDir.path, '$uuid$ext');
+          thumbPath = p.join(
+            dirs.thumbDir.path,
+            '$uuid${_coverFileExtension(coverUrl)}',
+          );
           await File(thumbPath).writeAsBytes(bytes, flush: true);
         }
       } catch (error) {
