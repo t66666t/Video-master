@@ -11,7 +11,7 @@ import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
-import 'package:video_player_app/utils/bilibili_video_input.dart';
+import 'package:video_player_app/utils/bilibili_url_parser.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 import 'package:video_player_app/widgets/bilibili_login_dialogs.dart';
 
@@ -167,7 +167,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     _suggestDebounce?.cancel();
     final token = ++_suggestToken;
     final text = value.trim();
-    if (text.isEmpty || parseBilibiliVideoInput(text) != null) {
+    if (text.isEmpty || (parseBilibiliLink(text)?.isVideo ?? false)) {
       if (_suggestions.isNotEmpty) {
         setState(() => _suggestions = const <String>[]);
       } else {
@@ -200,8 +200,8 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     if (text.isEmpty) return;
     _inputFocus.unfocus();
 
-    final target = parseBilibiliVideoInput(text);
-    if (target != null) {
+    final target = parseBilibiliLink(text);
+    if (target != null && target.isVideo) {
       await _openTarget(target);
       return;
     }
@@ -220,22 +220,23 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
     }
   }
 
-  Future<void> _openTarget(BilibiliVideoInputTarget target) async {
+  Future<void> _openTarget(BilibiliLinkTarget target) async {
     if (_openingTarget) return;
     var resolved = target;
     if (target.needsResolve) {
       _openingTarget = true;
       final handle = AppToast.show('正在解析链接…');
       try {
-        final next = await _api.resolveShortLink(target.shortLink!);
-        if (next == null) {
-          AppToast.show('链接里没有找到视频', type: AppToastType.error);
+        final result = await _api.resolveShortLink(target.shortLink!);
+        final next = result.target;
+        if (next == null || !next.isVideo) {
+          AppToast.show(
+            result.message ?? BilibiliShortLinkFailure.noVideo.message,
+            type: AppToastType.error,
+          );
           return;
         }
         resolved = next;
-      } on BilibiliPublicApiException catch (e) {
-        AppToast.show(e.message, type: AppToastType.error);
-        return;
       } finally {
         _openingTarget = false;
         handle.dismiss();
@@ -246,7 +247,7 @@ class _BilibiliHomePageState extends State<BilibiliHomePage> {
       context,
       bvid: resolved.bvid,
       aid: resolved.aid,
-      initialPage: resolved.page,
+      initialPage: resolved.pageOrFirst,
       api: _api,
     );
   }

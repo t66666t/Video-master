@@ -4,7 +4,7 @@ import 'package:dio/dio.dart';
 
 import '../../debug/developer_log.dart' as developer;
 import '../../models/bilibili_browse_models.dart';
-import '../../utils/bilibili_video_input.dart';
+import '../../utils/bilibili_url_parser.dart';
 import 'wbi_signer.dart';
 
 /// User-facing error from a public Bilibili request. [message] is Chinese.
@@ -47,7 +47,6 @@ class BilibiliPublicApiService {
   static const String _api = 'https://api.bilibili.com';
   static const String _rootReferer = 'https://www.bilibili.com/';
   static const int maxSuggestions = 10;
-  static const int _maxRedirects = 5;
 
   final Dio _dio;
   String? _anonymousBuvid3;
@@ -301,33 +300,38 @@ class BilibiliPublicApiService {
 
   // ------------------------------------------------------------ short link
 
-  /// Follows a b23.tv short link (https only, at most 5 hops) and returns the
-  /// video it points to, or null when it does not lead to a video.
-  Future<BilibiliVideoInputTarget?> resolveShortLink(Uri link) async {
-    var current = link;
-    for (var hop = 0; hop < _maxRedirects; hop++) {
-      if (current.scheme != 'https') return null;
-      final resolved = parseResolvedBilibiliUrl(current);
-      if (resolved != null && !resolved.needsResolve) return resolved;
-      final Response<dynamic> response;
-      try {
-        response = await _dio.getUri<dynamic>(
-          current,
-          options: Options(
-            followRedirects: false,
-            responseType: ResponseType.plain,
-            headers: const {'Referer': _rootReferer},
-          ),
-        );
-      } catch (e) {
-        throw const BilibiliPublicApiException('短链接解析失败，请检查网络');
-      }
-      final status = response.statusCode ?? 0;
-      final location = response.headers.value('location');
-      if (status < 300 || status >= 400 || location == null) return null;
-      current = current.resolve(location);
+  /// Resolves a b23.tv short link without the login cookie: https only, at
+  /// most [kBilibiliShortLinkMaxRedirects] redirects within [timeout], and
+  /// never leaving Bilibili. Never throws; see [BilibiliShortLinkResult].
+  Future<BilibiliShortLinkResult> resolveShortLink(
+    Uri link, {
+    Duration timeout = kBilibiliShortLinkTimeout,
+  }) async {
+    final cancel = CancelToken();
+    try {
+      return await resolveBilibiliShortLink(
+        link,
+        timeout: timeout,
+        fetchRedirect: (url) async {
+          final response = await _dio.getUri<dynamic>(
+            url,
+            cancelToken: cancel,
+            options: Options(
+              followRedirects: false,
+              responseType: ResponseType.plain,
+              headers: const {'Referer': _rootReferer},
+            ),
+          );
+          final status = response.statusCode ?? 0;
+          final location = response.headers.value('location');
+          if (status < 300 || status >= 400 || location == null) return null;
+          return Uri.tryParse(location.trim());
+        },
+      );
+    } finally {
+      // Drops a request still in flight after a timeout.
+      cancel.cancel();
     }
-    return parseResolvedBilibiliUrl(current);
   }
 
   // ---------------------------------------------------------------- shared

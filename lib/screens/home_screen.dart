@@ -56,6 +56,7 @@ import '../features/portable_transfer/portable_transfer_navigation.dart';
 import 'package:flutter/services.dart';
 import '../services/bilibili/bilibili_api_service.dart';
 import '../services/bilibili/bilibili_download_service.dart';
+import '../services/bilibili/bilibili_public_api_service.dart';
 import '../models/bilibili_download_task.dart';
 import '../models/bilibili_models.dart';
 
@@ -100,13 +101,6 @@ class _ClipboardDisplayInfo {
     required this.targetVideo,
     required this.targetEpisode,
   });
-}
-
-class _ClipboardBilibiliTarget {
-  final String? id;
-  final int page;
-
-  const _ClipboardBilibiliTarget({this.id, this.page = 1});
 }
 
 class _BoxSelectionPainter extends CustomPainter {
@@ -187,6 +181,9 @@ class _HomeScreenState extends State<HomeScreen>
   bool _isCheckingClipboard = false;
   bool _isClipboardDialogVisible = false;
   bool _isClipboardExporting = false;
+  // Short links from the clipboard are resolved without the login cookie.
+  final BilibiliPublicApiService _bilibiliPublicApi =
+      BilibiliPublicApiService();
 
   // Added variables for missing definitions
   bool _hasPendingPlaybackState = false;
@@ -2146,16 +2143,11 @@ class _HomeScreenState extends State<HomeScreen>
       final content = data?.text;
       if (content == null || content.trim().isEmpty) return;
 
-      // 3. Avoid duplicate checks. Timeouts and other failures are not
-      // remembered, so a later open can try the same text again.
-      if (!content.contains("bilibili.com") &&
-          !content.contains("b23.tv") &&
-          !content.contains("BV") &&
-          !content.contains("av") &&
-          !content.contains("ss") &&
-          !content.contains("ep")) {
-        return;
-      }
+      // 3. Recognize the link offline; ordinary text stops here. Timeouts and
+      // other failures below are not remembered, so a later open can try the
+      // same text again.
+      final link = parseBilibiliLink(content, findIdInText: true);
+      if (link == null) return;
 
       final settings = Provider.of<SettingsService>(context, listen: false);
       if (shouldSkipClipboardParse(
@@ -2168,10 +2160,29 @@ class _HomeScreenState extends State<HomeScreen>
         return;
       }
 
+      // 4. Short links resolve to a video id before the task is parsed.
+      var target = link;
+      if (link.needsResolve) {
+        final resolved = await _bilibiliPublicApi.resolveShortLink(
+          link.shortLink!,
+        );
+        final next = resolved.target;
+        if (next == null) {
+          debugPrint('剪贴板短链接解析失败: ${resolved.message}');
+          // A link that can never resolve is not retried on every launch.
+          if (!resolved.failure!.isRetryable && mounted) {
+            await _rememberHandledClipboard(settings, content);
+          }
+          return;
+        }
+        target = next;
+      }
+      if (!mounted) return;
+
       BilibiliDownloadTask? task;
       try {
         task = await service
-            .parseSingleLine(content)
+            .parseSingleLine(target.parseInput!)
             .timeout(const Duration(seconds: 5));
       } catch (e) {
         // A finished "this is not a Bilibili link" result should not be
@@ -2186,9 +2197,8 @@ class _HomeScreenState extends State<HomeScreen>
       if (!mounted) return;
       await _rememberHandledClipboard(settings, content);
       if (task != null) {
-        final displayInfo = await _buildClipboardDisplayInfo(content, task);
-        if (!mounted) return;
-        await _showClipboardDialog(content, task, displayInfo);
+        final displayInfo = _buildClipboardDisplayInfo(target, task);
+        await _showClipboardDialog(target, task, displayInfo);
       }
     } catch (e) {
       // Ignore - 不影响应用启动
@@ -2198,27 +2208,26 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
-  Future<_ClipboardDisplayInfo> _buildClipboardDisplayInfo(
-    String content,
+  _ClipboardDisplayInfo _buildClipboardDisplayInfo(
+    BilibiliLinkTarget linkTarget,
     BilibiliDownloadTask task,
-  ) async {
+  ) {
     final collectionTitle = task.collectionInfo?.title;
     final collectionCover = task.collectionInfo?.cover;
     BilibiliVideoItem? targetVideo;
-    final linkTarget = await _extractBilibiliTargetFromContent(content);
     if (task.singleVideoInfo != null) {
       targetVideo = task.videos.isEmpty ? null : task.videos.first;
     } else if (task.collectionInfo != null) {
-      final id = linkTarget.id;
-      if (id != null) {
-        final lowerId = id.toLowerCase();
-        final normalizedAid = lowerId.startsWith('av')
-            ? lowerId.substring(2)
-            : lowerId;
+      final linkBvid = linkTarget.bvid?.toLowerCase();
+      final linkAid =
+          linkTarget.aid ??
+          (linkTarget.bvid == null ? null : aidFromBvid(linkTarget.bvid!));
+      if (linkBvid != null || linkAid != null) {
         for (final video in task.videos) {
           final bvid = video.videoInfo.bvid.toLowerCase();
           final aid = video.videoInfo.aid.toLowerCase();
-          if (bvid == lowerId || aid == normalizedAid) {
+          if ((linkBvid != null && bvid == linkBvid) ||
+              (linkAid != null && aid == '$linkAid')) {
             targetVideo = video;
             break;
           }
@@ -2229,7 +2238,7 @@ class _HomeScreenState extends State<HomeScreen>
     BilibiliDownloadEpisode? targetEpisode;
     if (targetVideo != null && targetVideo.episodes.isNotEmpty) {
       targetEpisode = targetVideo.episodes.firstWhere(
-        (episode) => episode.page.page == linkTarget.page,
+        (episode) => episode.page.page == linkTarget.pageOrFirst,
         orElse: () => targetVideo!.episodes.first,
       );
     }
@@ -2256,65 +2265,8 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Future<_ClipboardBilibiliTarget> _extractBilibiliTargetFromContent(
-    String content,
-  ) async {
-    try {
-      String cleanInput = content.trim();
-      final linkMatch = RegExp(r'(https?://[^\s]+)').firstMatch(content);
-      if (linkMatch != null) {
-        cleanInput = linkMatch.group(0)!;
-        cleanInput = cleanInput.replaceAll(RegExp(r'[.,!?;:")]*$'), '');
-      } else {
-        final bvMatch = RegExp(
-          r'(BV[a-zA-Z0-9]{10})',
-          caseSensitive: false,
-        ).firstMatch(content);
-        if (bvMatch != null) {
-          cleanInput = bvMatch.group(0)!;
-        } else {
-          final ssMatch = RegExp(
-            r'(ss[0-9]+)',
-            caseSensitive: false,
-          ).firstMatch(content);
-          if (ssMatch != null) {
-            cleanInput = ssMatch.group(0)!;
-          } else {
-            final epMatch = RegExp(
-              r'(ep[0-9]+)',
-              caseSensitive: false,
-            ).firstMatch(content);
-            if (epMatch != null) {
-              cleanInput = epMatch.group(0)!;
-            }
-          }
-        }
-      }
-      var type = BilibiliUrlParser.determineType(cleanInput);
-      if (type == BilibiliUrlType.shortLink) {
-        final service = Provider.of<BilibiliDownloadService>(
-          context,
-          listen: false,
-        );
-        final resolvedUrl = await service.apiService.resolveShortLink(
-          cleanInput,
-        );
-        cleanInput = resolvedUrl;
-        type = BilibiliUrlParser.determineType(cleanInput);
-      }
-      final uri = Uri.tryParse(cleanInput);
-      final page = int.tryParse(uri?.queryParameters['p'] ?? '') ?? 1;
-      return _ClipboardBilibiliTarget(
-        id: BilibiliUrlParser.extractId(cleanInput, type),
-        page: page > 0 ? page : 1,
-      );
-    } catch (_) {
-      return const _ClipboardBilibiliTarget();
-    }
-  }
-
   Future<void> _showClipboardDialog(
-    String content,
+    BilibiliLinkTarget linkTarget,
     BilibiliDownloadTask task,
     _ClipboardDisplayInfo displayInfo,
   ) async {
@@ -2484,16 +2436,20 @@ class _HomeScreenState extends State<HomeScreen>
                 if (AppToast.isCurrentRoute(routeName)) {
                   navigator.pushReplacement(
                     AppMaterialPageRoute(
-                      builder: (_) =>
-                          BilibiliDownloadScreen(initialInput: content),
+                      builder: (_) => BilibiliDownloadScreen(
+                        initialInput: linkTarget.parseInput,
+                        initialPage: linkTarget.page,
+                      ),
                       settings: const RouteSettings(name: routeName),
                     ),
                   );
                 } else {
                   navigator.push(
                     AppMaterialPageRoute(
-                      builder: (_) =>
-                          BilibiliDownloadScreen(initialInput: content),
+                      builder: (_) => BilibiliDownloadScreen(
+                        initialInput: linkTarget.parseInput,
+                        initialPage: linkTarget.page,
+                      ),
                       settings: const RouteSettings(name: routeName),
                     ),
                   );

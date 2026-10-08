@@ -11,7 +11,7 @@ import 'package:video_player_app/theme/app_tokens.dart';
 import 'package:video_player_app/utils/app_toast.dart';
 import 'package:video_player_app/utils/bilibili_description_links.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
-import 'package:video_player_app/utils/bilibili_video_input.dart';
+import 'package:video_player_app/utils/bilibili_url_parser.dart';
 import 'package:video_player_app/widgets/bilibili_cover_image.dart';
 
 /// Opens the in-app video detail page for a BV id or av number.
@@ -130,35 +130,38 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
     );
   }
 
-  Future<void> _openTarget(BilibiliVideoInputTarget target) async {
+  Future<void> _openTarget(BilibiliLinkTarget target) async {
     if (_openingLink) return;
     var resolved = target;
     if (target.needsResolve) {
       _openingLink = true;
       try {
-        final next = await _api.resolveShortLink(target.shortLink!);
-        if (next == null) {
-          await _launchExternal(target.shortLink!);
+        final result = await _api.resolveShortLink(target.shortLink!);
+        final next = result.target;
+        if (next == null || !next.isVideo) {
+          if (next != null ||
+              result.failure == BilibiliShortLinkFailure.noVideo) {
+            await _launchExternal(target.shortLink!);
+          } else {
+            AppToast.show(result.message!, type: AppToastType.error);
+          }
           return;
         }
         resolved = next;
-      } on BilibiliPublicApiException catch (e) {
-        AppToast.show(e.message, type: AppToastType.error);
-        return;
       } finally {
         _openingLink = false;
       }
     }
     if (!mounted) return;
     if (resolved.bvid != null && resolved.bvid == _detail?.bvid) {
-      _selectPage(resolved.page);
+      _selectPage(resolved.pageOrFirst);
       return;
     }
     await openBilibiliVideoDetail(
       context,
       bvid: resolved.bvid,
       aid: resolved.aid,
-      initialPage: resolved.page,
+      initialPage: resolved.pageOrFirst,
       api: _api,
     );
   }
@@ -169,12 +172,12 @@ class _BilibiliVideoDetailScreenState extends State<BilibiliVideoDetailScreen> {
         return;
       case BilibiliDescriptionSegmentKind.bvid:
       case BilibiliDescriptionSegmentKind.aid:
-        final target = parseBilibiliVideoInput(segment.text);
-        if (target != null) await _openTarget(target);
+        final target = parseBilibiliLink(segment.text);
+        if (target != null && target.isVideo) await _openTarget(target);
         return;
       case BilibiliDescriptionSegmentKind.url:
-        final target = parseBilibiliVideoInput(segment.text);
-        if (target != null) {
+        final target = parseBilibiliLink(segment.text);
+        if (target != null && target.isVideo) {
           await _openTarget(target);
           return;
         }

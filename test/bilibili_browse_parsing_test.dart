@@ -3,7 +3,7 @@ import 'package:video_player_app/models/bilibili_browse_models.dart';
 import 'package:video_player_app/utils/bilibili_description_links.dart';
 import 'package:video_player_app/utils/bilibili_image_url.dart';
 import 'package:video_player_app/utils/bilibili_text.dart';
-import 'package:video_player_app/utils/bilibili_video_input.dart';
+import 'package:video_player_app/utils/bilibili_url_parser.dart';
 
 const _bvid = 'BV1GJ411x7h7';
 
@@ -196,23 +196,23 @@ void main() {
 
   group('BV and link recognition', () {
     test('bare ids', () {
-      expect(parseBilibiliVideoInput(_bvid)!.bvid, _bvid);
-      expect(parseBilibiliVideoInput('bv1GJ411x7h7')!.bvid, _bvid);
-      expect(parseBilibiliVideoInput(' av170001 ')!.aid, 170001);
+      expect(parseBilibiliLink(_bvid)!.bvid, _bvid);
+      expect(parseBilibiliLink('bv1GJ411x7h7')!.bvid, _bvid);
+      expect(parseBilibiliLink(' av170001 ')!.aid, 170001);
     });
 
     test('video links with part number', () {
-      final target = parseBilibiliVideoInput(
+      final target = parseBilibiliLink(
         '看这个 https://www.bilibili.com/video/$_bvid/?p=3&t=10 很好',
       )!;
       expect(target.bvid, _bvid);
       expect(target.page, 3);
       expect(
-        parseBilibiliVideoInput('https://m.bilibili.com/video/av170001')!.aid,
+        parseBilibiliLink('https://m.bilibili.com/video/av170001')!.aid,
         170001,
       );
       expect(
-        parseBilibiliVideoInput(
+        parseBilibiliLink(
           'https://www.bilibili.com/list/watchlater?bvid=$_bvid',
         )!.bvid,
         _bvid,
@@ -220,7 +220,7 @@ void main() {
     });
 
     test('short links need resolving', () {
-      final target = parseBilibiliVideoInput('【标题】 https://b23.tv/AbCdEf')!;
+      final target = parseBilibiliLink('【标题】 https://b23.tv/AbCdEf')!;
       expect(target.needsResolve, isTrue);
       expect(target.shortLink.toString(), 'https://b23.tv/AbCdEf');
     });
@@ -233,7 +233,7 @@ void main() {
         'https://www.youtube.com/watch?v=$_bvid',
         'https://www.bilibili.com/',
       ]) {
-        expect(parseBilibiliVideoInput(text), isNull, reason: text);
+        expect(parseBilibiliLink(text), isNull, reason: text);
       }
     });
 
