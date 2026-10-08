@@ -75,6 +75,20 @@ void main() {
         current: MediaLibraryRootEntry.recent,
         dx: -40,
       ),
+      MediaLibraryRootEntry.bilibili,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.neighbor(
+        current: MediaLibraryRootEntry.bilibili,
+        dx: 40,
+      ),
+      MediaLibraryRootEntry.recent,
+    );
+    expect(
+      MediaLibraryRootSwipePolicy.neighbor(
+        current: MediaLibraryRootEntry.bilibili,
+        dx: -40,
+      ),
       isNull,
     );
   });

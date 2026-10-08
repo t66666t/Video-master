@@ -12,7 +12,35 @@ void main() {
       MediaLibraryRootEntry.continueLearning,
       MediaLibraryRootEntry.folders,
       MediaLibraryRootEntry.recent,
+      MediaLibraryRootEntry.bilibili,
     ]);
+  });
+
+  test('saved three-page order keeps its order and appends bilibili', () {
+    expect(
+      MediaLibraryRootEntryOrder.parse('recent,folders,continueLearning'),
+      [
+        MediaLibraryRootEntry.recent,
+        MediaLibraryRootEntry.folders,
+        MediaLibraryRootEntry.continueLearning,
+        MediaLibraryRootEntry.bilibili,
+      ],
+    );
+    expect(MediaLibraryRootEntryOrder.parse('bilibili,recent'), [
+      MediaLibraryRootEntry.bilibili,
+      MediaLibraryRootEntry.recent,
+      MediaLibraryRootEntry.continueLearning,
+      MediaLibraryRootEntry.folders,
+    ]);
+    expect(
+      MediaLibraryRootEntryOrder.encode(MediaLibraryRootEntryOrder.defaults),
+      'continueLearning,folders,recent,bilibili',
+    );
+    expect(MediaLibraryRootEntry.bilibili.label, '哔哩哔哩');
+    expect(
+      MediaLibraryRootEntryX.tryParse('bilibili'),
+      MediaLibraryRootEntry.bilibili,
+    );
   });
 
   test('parse fills missing pages and drops unknown tokens', () {
@@ -20,26 +48,23 @@ void main() {
       MediaLibraryRootEntry.recent,
       MediaLibraryRootEntry.continueLearning,
       MediaLibraryRootEntry.folders,
+      MediaLibraryRootEntry.bilibili,
     ]);
   });
 
   test('moved uses Flutter onReorder indices', () {
     final order = MediaLibraryRootEntryOrder.defaults;
-    expect(
-      MediaLibraryRootEntryOrder.moved(order, oldIndex: 1, newIndex: 0),
-      [
-        MediaLibraryRootEntry.folders,
-        MediaLibraryRootEntry.continueLearning,
-        MediaLibraryRootEntry.recent,
-      ],
-    );
-    expect(
-      MediaLibraryRootEntryOrder.moved(order, oldIndex: 0, newIndex: 2),
-      [
-        MediaLibraryRootEntry.folders,
-        MediaLibraryRootEntry.recent,
-        MediaLibraryRootEntry.continueLearning,
-      ],
-    );
+    expect(MediaLibraryRootEntryOrder.moved(order, oldIndex: 1, newIndex: 0), [
+      MediaLibraryRootEntry.folders,
+      MediaLibraryRootEntry.continueLearning,
+      MediaLibraryRootEntry.recent,
+      MediaLibraryRootEntry.bilibili,
+    ]);
+    expect(MediaLibraryRootEntryOrder.moved(order, oldIndex: 0, newIndex: 2), [
+      MediaLibraryRootEntry.folders,
+      MediaLibraryRootEntry.recent,
+      MediaLibraryRootEntry.continueLearning,
+      MediaLibraryRootEntry.bilibili,
+    ]);
   });
 }

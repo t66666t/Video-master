@@ -43,6 +43,7 @@ import '../widgets/media_library_recent_intent.dart';
 import '../widgets/media_library_recent_view.dart';
 import '../widgets/media_library_continue_view.dart';
 import '../widgets/media_library_root_surface_host.dart';
+import 'bilibili/bilibili_home_page.dart';
 import '../models/media_library_root_entry.dart';
 import '../models/media_library_root_entry_order.dart';
 import '../services/media_library_navigation.dart';
@@ -202,6 +203,8 @@ class _HomeScreenState extends State<HomeScreen>
   bool _libraryNavigationScheduled = false;
   final ScrollController _recentScrollController = ScrollController();
   final ScrollController _continueScrollController = ScrollController();
+  // The Bilibili page scrolls its own lists; this one is never attached.
+  final ScrollController _bilibiliScrollController = ScrollController();
   final MediaLibraryVirtualSelectionHost _continueSelectionHost =
       MediaLibraryVirtualSelectionHost();
   final MediaLibraryVirtualSelectionHost _recentSelectionHost =
@@ -221,6 +224,7 @@ class _HomeScreenState extends State<HomeScreen>
     MediaLibraryRootEntry.continueLearning,
     MediaLibraryRootEntry.recent,
     MediaLibraryRootEntry.folders,
+    MediaLibraryRootEntry.bilibili,
   };
 
   Future<void> _openSearch() async {
@@ -554,6 +558,7 @@ class _HomeScreenState extends State<HomeScreen>
       case MediaLibraryRootEntry.recent:
         return _recentSelectionHost;
       case MediaLibraryRootEntry.folders:
+      case MediaLibraryRootEntry.bilibili:
         return null;
     }
   }
@@ -799,6 +804,15 @@ class _HomeScreenState extends State<HomeScreen>
     _selectionAutoScroller?.stop();
   }
 
+  /// Box select and pinch stay off while the online page is shown, so they
+  /// never compete with its text field and lists.
+  _MouseOrPinchScaleRecognizer _createScaleRecognizer() {
+    return _MouseOrPinchScaleRecognizer(
+      isSuspended: () =>
+          _displayedRootEntry() == MediaLibraryRootEntry.bilibili,
+    );
+  }
+
   bool _tryStartMouseBoxSelection({
     required int pointerCount,
     required Offset globalPos,
@@ -809,6 +823,8 @@ class _HomeScreenState extends State<HomeScreen>
     )) {
       return false;
     }
+    // The online page has no library items to box-select.
+    if (_displayedRootEntry() == MediaLibraryRootEntry.bilibili) return false;
     final host = _virtualSelectionHost();
     if (host != null) {
       if (host.hitsCard(globalPos)) return false;
@@ -1170,6 +1186,7 @@ class _HomeScreenState extends State<HomeScreen>
     _shortcutFocusNode.dispose();
     _recentScrollController.dispose();
     _continueScrollController.dispose();
+    _bilibiliScrollController.dispose();
     _rootEntryOverride.dispose();
     _rootSwipeHighlight.dispose();
     _rootSwipeSettled.dispose();
@@ -1298,6 +1315,8 @@ class _HomeScreenState extends State<HomeScreen>
         return _recentScrollController;
       case MediaLibraryRootEntry.folders:
         return _scrollController;
+      case MediaLibraryRootEntry.bilibili:
+        return _bilibiliScrollController;
     }
   }
 
@@ -1524,6 +1543,8 @@ class _HomeScreenState extends State<HomeScreen>
         return MediaLibraryVirtualSelectionActions.forFolders(
           selectedIds: _selectedIds,
         );
+      case MediaLibraryRootEntry.bilibili:
+        return const <MediaLibraryVirtualSelectionAction>[];
     }
   }
 
@@ -1779,6 +1800,11 @@ class _HomeScreenState extends State<HomeScreen>
         key == LogicalKeyboardKey.arrowRight ||
         key == LogicalKeyboardKey.escape;
     if (!isTargetKey && !isManagementActionAvailable) {
+      return KeyEventResult.ignored;
+    }
+    // Library management keys have nothing to act on in the online page.
+    if (managementAction != null &&
+        _displayedRootEntry() == MediaLibraryRootEntry.bilibili) {
       return KeyEventResult.ignored;
     }
     if (event is! KeyDownEvent) return KeyEventResult.handled;
@@ -3118,9 +3144,7 @@ class _HomeScreenState extends State<HomeScreen>
                                     _MouseOrPinchScaleRecognizer:
                                         GestureRecognizerFactoryWithHandlers<
                                           _MouseOrPinchScaleRecognizer
-                                        >(() => _MouseOrPinchScaleRecognizer(), (
-                                          recognizer,
-                                        ) {
+                                        >(_createScaleRecognizer, (recognizer) {
                                           recognizer
                                             ..onStart = (details) {
                                               if (_tryStartMouseBoxSelection(
@@ -3380,6 +3404,13 @@ class _HomeScreenState extends State<HomeScreen>
                                                 cardBottomPadding:
                                                     cardBottomPadding,
                                                 isActive: active,
+                                              );
+                                            },
+                                            bilibiliBuilder: (context, active) {
+                                              return BilibiliHomePage(
+                                                isActive: active,
+                                                bottomPadding:
+                                                    cardBottomPadding,
                                               );
                                             },
                                           );
@@ -4889,7 +4920,19 @@ class _HomeScreenState extends State<HomeScreen>
 /// scrolling and the adjacent-tab swipe. Mouse still uses one pointer for
 /// box select; pinch still needs two fingers.
 class _MouseOrPinchScaleRecognizer extends ScaleGestureRecognizer {
+  _MouseOrPinchScaleRecognizer({this.isSuspended});
+
+  /// True while a page that owns its own gestures (text fields, lists) is
+  /// shown, so box select and pinch never compete with it.
+  final bool Function()? isSuspended;
+
   int _touchPointers = 0;
+
+  @override
+  bool isPointerAllowed(PointerDownEvent event) {
+    if (isSuspended?.call() ?? false) return false;
+    return super.isPointerAllowed(event);
+  }
 
   bool _isTouchLike(PointerDeviceKind kind) {
     return kind == PointerDeviceKind.touch || kind == PointerDeviceKind.stylus;

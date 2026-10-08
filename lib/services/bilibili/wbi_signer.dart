@@ -35,10 +35,13 @@ class WbiSigner {
       final value = newParams[key];
       // Filter reserved characters
       final safeValue = value.toString().replaceAll(RegExp(r"[!'()*]"), "");
+      // The server signs the filtered value, so send that same value.
+      if (safeValue != value.toString()) newParams[key] = safeValue;
       if (query.isNotEmpty) {
         query += '&';
       }
-      query += '$key=$safeValue';
+      // Percent-encoded like the web client; plain ASCII ids are unchanged.
+      query += '${Uri.encodeComponent(key)}=${Uri.encodeComponent(safeValue)}';
     }
 
     final wbiSign = md5.convert(utf8.encode(query + mixinKey)).toString();

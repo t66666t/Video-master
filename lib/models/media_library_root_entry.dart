@@ -3,6 +3,7 @@ enum MediaLibraryRootEntry {
   continueLearning,
   recent,
   folders,
+  bilibili,
 }
 
 extension MediaLibraryRootEntryX on MediaLibraryRootEntry {
@@ -14,6 +15,8 @@ extension MediaLibraryRootEntryX on MediaLibraryRootEntry {
         return 'recent';
       case MediaLibraryRootEntry.folders:
         return 'folders';
+      case MediaLibraryRootEntry.bilibili:
+        return 'bilibili';
     }
   }
 
@@ -25,6 +28,8 @@ extension MediaLibraryRootEntryX on MediaLibraryRootEntry {
         return '最近添加';
       case MediaLibraryRootEntry.folders:
         return '文件夹';
+      case MediaLibraryRootEntry.bilibili:
+        return '哔哩哔哩';
     }
   }
 
@@ -36,6 +41,8 @@ extension MediaLibraryRootEntryX on MediaLibraryRootEntry {
         return MediaLibraryRootEntry.recent;
       case 'folders':
         return MediaLibraryRootEntry.folders;
+      case 'bilibili':
+        return MediaLibraryRootEntry.bilibili;
       default:
         return null;
     }

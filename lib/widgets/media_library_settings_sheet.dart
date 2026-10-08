@@ -156,6 +156,7 @@ void showMediaLibrarySettingsBottomSheet(
                           MediaLibraryRootEntry.folders,
                           MediaLibraryRootEntry.continueLearning,
                           MediaLibraryRootEntry.recent,
+                          MediaLibraryRootEntry.bilibili,
                         ])
                           ListTile(
                             key: ValueKey(

@@ -41,6 +41,7 @@ class MediaLibraryRootSurfaceHost extends StatefulWidget {
     required this.continueBuilder,
     required this.recentBuilder,
     required this.foldersBuilder,
+    this.bilibiliBuilder,
     this.onUserSwipe,
     this.swipeEnabled = true,
     this.swipeHighlightIndex,
@@ -52,6 +53,9 @@ class MediaLibraryRootSurfaceHost extends StatefulWidget {
   final MediaLibraryRootSurfaceBuilder continueBuilder;
   final MediaLibraryRootSurfaceBuilder recentBuilder;
   final MediaLibraryRootSurfaceBuilder foldersBuilder;
+
+  /// Online Bilibili page. Empty when the host is used without it.
+  final MediaLibraryRootSurfaceBuilder? bilibiliBuilder;
 
   /// Fired after an interactive swipe commits, so the chip and prefs match.
   final ValueChanged<MediaLibraryRootEntry>? onUserSwipe;
@@ -656,6 +660,8 @@ class _MediaLibraryRootSurfaceHostState
       MediaLibraryRootEntry.continueLearning => widget.continueBuilder,
       MediaLibraryRootEntry.recent => widget.recentBuilder,
       MediaLibraryRootEntry.folders => widget.foldersBuilder,
+      MediaLibraryRootEntry.bilibili =>
+        widget.bilibiliBuilder ?? _emptyRootSurface,
     };
   }
 
@@ -795,6 +801,9 @@ class MediaLibraryRootSwipeRecognizer extends HorizontalDragGestureRecognizer {
     super.addAllowedPointer(event);
   }
 }
+
+Widget _emptyRootSurface(BuildContext context, bool isActive) =>
+    const SizedBox.shrink();
 
 /// Calls [builder] for the first frame, while visible, and once when hiding.
 /// Hidden frames reuse the last widget so a parent rebuild cannot walk the grid.

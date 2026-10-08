@@ -8,11 +8,13 @@ import 'media_library_root_entry.dart';
 class MediaLibraryRootEntryOrder {
   const MediaLibraryRootEntryOrder._();
 
-  /// Folders sit between the two activity lenses.
+  /// Folders sit between the two activity lenses; Bilibili comes last, and
+  /// a saved order without it gets it appended by [normalize].
   static const List<MediaLibraryRootEntry> defaults = [
     MediaLibraryRootEntry.continueLearning,
     MediaLibraryRootEntry.folders,
     MediaLibraryRootEntry.recent,
+    MediaLibraryRootEntry.bilibili,
   ];
 
   static List<MediaLibraryRootEntry> normalize(

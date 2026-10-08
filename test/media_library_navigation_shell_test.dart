@@ -407,6 +407,7 @@ class _NavHostState extends State<_NavHost> {
       MediaLibraryRootEntry.continueLearning => const Text('continue-body'),
       MediaLibraryRootEntry.recent => const Text('recent-body'),
       MediaLibraryRootEntry.folders => const Text('folders-body'),
+      MediaLibraryRootEntry.bilibili => const Text('bilibili-body'),
     };
 
     return Scaffold(
