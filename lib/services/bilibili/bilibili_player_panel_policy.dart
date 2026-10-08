@@ -108,6 +108,60 @@ bool bilibiliPanelMayAutoOpen({
   return windowWidth - panelWidth >= kBilibiliPanelMinVideoWidth;
 }
 
+/// Follows the room beside the docked landscape Bilibili panel while the
+/// window is resized, goes full screen or turns.
+///
+/// When the panel stops fitting (see [bilibiliPanelMayAutoOpen]) it gives
+/// way to the video for the time being: the page shows what it shows on
+/// narrow windows (the subtitle list when it was left open, else nothing).
+/// Once the window is wide enough again, a page still showing that narrow
+/// default shows the remembered choice again. A panel the user opened in
+/// between stays. The remembered open / closed state is only read, never
+/// written; panels shown over the Bilibili panel for a while (subtitle
+/// manager, settings, ...) go back to what fits when they close.
+///
+/// [T] is the page's panel type; [LandscapeSidebarTarget] works as well.
+class LandscapeSidebarRoom<T> {
+  LandscapeSidebarRoom({required bool fits}) : _fits = fits;
+
+  bool _fits;
+
+  /// Whether the panel fitted when last asked.
+  bool get fits => _fits;
+
+  /// The panels to show now that the panel [fits] or not, or null when
+  /// nothing changes.
+  ///
+  /// [shown] is the open panel and [previous] the one it goes back to when
+  /// it closes; [defaultFor] gives [landscapeDefaultSidebar] for a window
+  /// where the panel fits or not.
+  ({T shown, T previous})? follow({
+    required bool fits,
+    required T shown,
+    required T previous,
+    required T bilibili,
+    required T none,
+    required T Function(bool fits) defaultFor,
+  }) {
+    if (fits == _fits) return null;
+    final before = defaultFor(_fits);
+    _fits = fits;
+    final after = defaultFor(fits);
+    T next(T panel, {required bool isPrevious}) {
+      if (!fits) return panel == bilibili ? after : panel;
+      if (panel == before && panel != after && !(isPrevious && panel == none)) {
+        return after;
+      }
+      return panel;
+    }
+
+    final nextShown = next(shown, isPrevious: false);
+    final nextPrevious = next(previous, isPrevious: true);
+    if (nextShown == shown && nextPrevious == previous) return null;
+    return (shown: nextShown, previous: nextPrevious);
+  }
+}
+
 /// Whether the landscape Bilibili panel slides in over the video instead of
 /// taking room beside it: on a phone, where the video would be left too
 /// narrow. It still only opens from its button.

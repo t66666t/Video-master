@@ -275,7 +275,38 @@ void main() {
 
     test('the panel and closing it hand focus back to the video', () {
       expect(count(r'void _returnFocusToVideo\('), 1);
-      expect(count(r'_returnFocusToVideo\(\);'), 2);
+      // The button, the collapse button and the panel giving way to a
+      // narrow window.
+      expect(count(r'_returnFocusToVideo\(\);'), 3);
+    });
+
+    test('resizing the window follows the room beside the panel and '
+        'writes nothing', () {
+      final start = source.indexOf('void didChangeMetrics() {');
+      expect(start, greaterThan(0));
+      final metrics = source.substring(start, source.indexOf('\n  }\n', start));
+      expect(metrics, contains('_followRoomForBilibiliPanel();'));
+      expect(count(r'_followRoomForBilibiliPanel\(\);'), 1);
+      expect(count(r'_bilibiliPanelRoom\.follow\('), 1);
+      // Seeded once with the room the page opens with.
+      expect(
+        count(
+          r'_bilibiliPanelRoom = LandscapeSidebarRoom<SidebarType>\(\s*'
+          r'fits: _bilibiliPanelMayAutoOpen,',
+        ),
+        1,
+      );
+      final follow = source.substring(
+        source.indexOf('void _followRoomForBilibiliPanel('),
+        source.indexOf(
+          '/// Keeps the Bilibili panel in step after the video changed',
+        ),
+      );
+      expect(follow, contains('_bilibiliPanelMemory.remembered'));
+      expect(follow, isNot(contains('userToggled')));
+      expect(follow, isNot(contains('userCollapsed')));
+      expect(follow, isNot(contains('save')));
+      expect(follow, isNot(contains('_isSubtitleSidebarVisible =')));
     });
   });
 }

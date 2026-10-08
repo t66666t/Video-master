@@ -365,6 +365,49 @@ void main() {
       await expectSameLandscape(tester);
     });
 
+    for (final subtitles in <bool>[false, true]) {
+      testWidgets('dragging the window narrow tucks the docked panel away '
+          'for now, wide brings it back; nothing is remembered '
+          '(subtitle list ${subtitles ? 'left open' : 'closed'})', (
+        tester,
+      ) async {
+        window(tester, const Size(1280, 720));
+        settings
+          ..bilibiliPlayerPanelOpen = true
+          ..isLandscapeSubtitleSidebarVisible = subtitles;
+        await tester.pumpWidget(
+          host(VideoPlayerScreen(videoItem: _item(), autoPlayOnEntry: false)),
+        );
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 50));
+        final surface = find.byKey(const ValueKey('landscape-player-surface'));
+        expect(find.byType(BilibiliPlayerPanel), findsOneWidget);
+        final wideVideo = tester.getRect(surface).width;
+
+        // 900 - panel < 640: the panel gives way to the video.
+        tester.view.physicalSize = const Size(900, 720);
+        await tester.pump();
+        await tester.pump(const Duration(seconds: 1));
+        expect(find.byType(BilibiliPlayerPanel), findsNothing);
+        if (!subtitles) {
+          expect(tester.getRect(surface).width, 900);
+        }
+        expect(settings.bilibiliPlayerPanelOpen, isTrue);
+
+        // Wide again: back as remembered.
+        tester.view.physicalSize = const Size(1280, 720);
+        await tester.pump();
+        await tester.pump(const Duration(seconds: 1));
+        expect(find.byType(BilibiliPlayerPanel), findsOneWidget);
+        expect(tester.getRect(surface).width, wideVideo);
+        expect(settings.bilibiliPlayerPanelOpen, isTrue);
+        expect(settings.isLandscapeSubtitleSidebarVisible, subtitles);
+        final prefs = await SharedPreferences.getInstance();
+        expect(prefs.getBool('bilibiliPlayerPanelOpen'), isNull);
+        await close(tester);
+      });
+    }
+
     testWidgets('left-handed mode', (tester) async {
       window(tester, const Size(1280, 720));
       settings

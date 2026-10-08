@@ -570,6 +570,39 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     _returnFocusToVideo();
   }
 
+  /// Follows the room beside the docked Bilibili panel; see
+  /// [LandscapeSidebarRoom].
+  late final LandscapeSidebarRoom<SidebarType> _bilibiliPanelRoom;
+
+  /// The window was resized: the docked Bilibili panel gives way to the
+  /// video while it does not fit and comes back as remembered. Nothing is
+  /// remembered here.
+  void _followRoomForBilibiliPanel() {
+    if (!mounted) return;
+    final next = _bilibiliPanelRoom.follow(
+      fits: _bilibiliPanelMayAutoOpen,
+      shown: _activeSidebar,
+      previous: _previousSidebarType,
+      bilibili: SidebarType.bilibili,
+      none: SidebarType.none,
+      defaultFor: (fits) => _sidebarOf(
+        landscapeDefaultSidebar(
+          subtitleSidebarRemembered: _isSubtitleSidebarVisible,
+          isBilibiliVideo: _isBilibiliVideo,
+          bilibiliPanelRemembered: _bilibiliPanelMemory.remembered,
+          allowAutoOpen: fits,
+        ),
+      ),
+    );
+    if (next == null) return;
+    final panelChanged = next.shown != _activeSidebar;
+    setState(() {
+      _activeSidebar = next.shown;
+      _previousSidebarType = next.previous;
+    });
+    if (panelChanged) _returnFocusToVideo();
+  }
+
   /// Keeps the Bilibili panel in step after the video changed on this page.
   void _followVideoChangeForBilibiliPanel(bool showingDefaultBefore) {
     final next = landscapeSidebarOnVideoChange(
@@ -1585,6 +1618,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
     final settings = Provider.of<SettingsService>(context, listen: false);
     _isSubtitleSidebarVisible = settings.isLandscapeSubtitleSidebarVisible;
     _activeSidebar = _defaultSidebar;
+    _bilibiliPanelRoom = LandscapeSidebarRoom<SidebarType>(
+      fits: _bilibiliPanelMayAutoOpen,
+    );
     if (Platform.isAndroid) {
       unawaited(_requestNotificationPermissionForMediaSession());
     }
@@ -2553,6 +2589,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       _keyboardInsetBottom.value = nextInset;
     }
     _tryRestoreSubtitleSidebarForCurrentViewport();
+    _followRoomForBilibiliPanel();
   }
 
   @override
