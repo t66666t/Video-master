@@ -108,6 +108,14 @@ bool bilibiliPanelMayAutoOpen({
   return windowWidth - panelWidth >= kBilibiliPanelMinVideoWidth;
 }
 
+/// Whether the landscape Bilibili panel slides in over the video instead of
+/// taking room beside it: on a phone, where the video would be left too
+/// narrow. It still only opens from its button.
+bool bilibiliPanelOverlaysVideo({
+  required bool isMobilePlatform,
+  required double shortestSide,
+}) => isMobilePlatform && shortestSide < kBilibiliPanelPhoneShortestSide;
+
 /// The landscape panel after the video changed on the same page (next part,
 /// episode list); null keeps the panel that is shown.
 ///

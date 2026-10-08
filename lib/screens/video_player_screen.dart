@@ -58,6 +58,7 @@ import '../widgets/ocr_subtitle_panel.dart';
 import '../widgets/chapter_sidebar.dart';
 import '../widgets/landscape_sidebar_layout.dart';
 import '../widgets/desktop_player_sidebar.dart';
+import '../widgets/bilibili_panel_overlay.dart';
 import '../widgets/bilibili_player_panel.dart';
 import '../services/transcription_manager.dart';
 import '../services/ocr_subtitle_manager.dart';
@@ -481,6 +482,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
       bilibiliPlayerVideoOf(_currentItem);
 
   bool get _isBilibiliVideo => _bilibiliVideo != null;
+
+  /// The Bilibili panel is open and, on a phone, shown over the video.
+  bool get _bilibiliPanelOverVideo =>
+      _activeSidebar == SidebarType.bilibili &&
+      bilibiliPanelOverlaysVideo(
+        isMobilePlatform: !kIsWeb && (Platform.isAndroid || Platform.isIOS),
+        shortestSide: MediaQuery.sizeOf(context).shortestSide,
+      );
 
   late final BilibiliPlayerPanelMemory _bilibiliPanelMemory =
       BilibiliPlayerPanelMemory.of(SettingsService());
@@ -4626,6 +4635,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         });
         return;
       }
+      if (_bilibiliPanelOverVideo) {
+        _collapseBilibiliPanel();
+        return;
+      }
       if (_activeSidebar != SidebarType.subtitles &&
           _activeSidebar != SidebarType.bilibili) {
         if (_activeSidebar == SidebarType.videoCompose) {
@@ -4842,6 +4855,9 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         final isDesktop =
             !kIsWeb &&
             (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+        // On a phone the Bilibili panel goes over the video, not beside it.
+        final bool bilibiliOverVideo = !isDesktop && _bilibiliPanelOverVideo;
+        final bool sidebarDocked = _isSidebarOpen && !bilibiliOverVideo;
         final Widget sidebarPanel = isDesktop
             ? const SizedBox.shrink()
             : AnimatedContainer(
@@ -4849,7 +4865,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                     ? Duration.zero
                     : const Duration(milliseconds: 250),
                 curve: Curves.easeOutCubic,
-                width: _isSidebarOpen ? sidebarWidth : 0,
+                width: sidebarDocked ? sidebarWidth : 0,
                 child: RepaintBoundary(
                   child: ClipRect(
                     child: OverflowBox(
@@ -4859,7 +4875,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                           ? Alignment.centerRight
                           : Alignment.centerLeft,
                       child: AnimatedOpacity(
-                        opacity: _isSidebarOpen ? 1.0 : 0.0,
+                        opacity: sidebarDocked ? 1.0 : 0.0,
                         duration: const Duration(milliseconds: 200),
                         curve: Curves.easeOut,
                         child: Padding(
@@ -4869,9 +4885,10 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                             context: context,
                             removeLeft: true,
                             removeRight: true,
-                            child:
-                                (_activeSidebar == SidebarType.subtitles ||
-                                    _activeSidebar == SidebarType.chapters)
+                            child: bilibiliOverVideo
+                                ? const SizedBox.shrink()
+                                : (_activeSidebar == SidebarType.subtitles ||
+                                      _activeSidebar == SidebarType.chapters)
                                 ? (_buildSidebarContent(settings) ??
                                       const SizedBox.shrink())
                                 : LandscapeSidebarTheme(
@@ -5939,6 +5956,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
                             if (!isLeftHandedMode) ...sidebarWidgets,
                           ],
                         ),
+                        if (!isDesktop)
+                          Positioned.fill(
+                            child: BilibiliPanelOverlay(
+                              panel: bilibiliOverVideo
+                                  ? LandscapeSidebarTheme(
+                                      child:
+                                          _buildSidebarContent(settings) ??
+                                          const SizedBox.shrink(),
+                                    )
+                                  : null,
+                              fromLeft: isLeftHandedMode,
+                              width: LandscapeSidebarLayout.functionalWidthFor(
+                                MediaQuery.sizeOf(context),
+                              ),
+                              padding: sidebarSafePadding,
+                              onDismiss: _collapseBilibiliPanel,
+                            ),
+                          ),
                         if (showResizer)
                           Positioned(
                             top: 0,

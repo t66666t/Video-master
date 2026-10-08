@@ -19,12 +19,18 @@ void main() {
     SettingsService().resetForTest();
   });
 
+  tearDown(() => SettingsService().isLeftHandedMode = false);
+
   Future<void> pumpOverlay(
     WidgetTester tester, {
     VoidCallback? onToggleBilibiliPanel,
     bool open = false,
+    Size size = const Size(1280, 720),
+    bool allButtons = false,
+    bool leftHanded = false,
   }) async {
-    await tester.binding.setSurfaceSize(const Size(1280, 720));
+    SettingsService().isLeftHandedMode = leftHanded;
+    await tester.binding.setSurfaceSize(size);
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       MultiProvider(
@@ -60,6 +66,16 @@ void main() {
               allowPlayWhenUninitialized: true,
               onToggleBilibiliPanel: onToggleBilibiliPanel,
               bilibiliPanelOpen: open,
+              mediaTitle: allButtons ? '一个很长很长的哔哩哔哩视频标题，用来占满顶栏' : '',
+              onOpenSettings: allButtons ? () {} : null,
+              onOpenSubtitleManager: allButtons ? () {} : null,
+              onOpenVideoCompose: allButtons ? () {} : null,
+              onOpenOcrSubtitle: allButtons ? () {} : null,
+              onToggleFloatingSubtitleSettings: allButtons ? () {} : null,
+              onToggleSidebar: allButtons ? () {} : null,
+              onToggleFullScreen: allButtons ? () {} : null,
+              onOpenAspectRatio: allButtons ? () {} : null,
+              aspectRatioLabel: allButtons ? '原始' : null,
             ),
           ),
         ),
@@ -117,6 +133,79 @@ void main() {
     pressI(tester, node);
     expect(toggles, 2);
     await finish(tester);
+  });
+
+  group('phone landscape: the top bar keeps every button and does not '
+      'overflow', () {
+    Rect buttonRect(WidgetTester tester, Finder icon) => tester.getRect(
+      find.ancestor(of: icon, matching: find.byType(IconButton)).first,
+    );
+
+    // The page's video area: the whole window (the Bilibili panel goes over
+    // the video), or what a docked subtitle list (262.4 + its 12 handle)
+    // leaves while the panel is closed.
+    for (final window in const <Size>[
+      Size(640, 360),
+      Size(740, 360),
+      Size(800, 360),
+    ]) {
+      for (final surfaceWidth in <double>[window.width, window.width - 274.4]) {
+        for (final leftHanded in const <bool>[false, true]) {
+          testWidgets('${window.width.toInt()}x${window.height.toInt()}, '
+              'video ${surfaceWidth.toStringAsFixed(1)} wide'
+              '${leftHanded ? ', left-handed' : ''}', (tester) async {
+            // Tests run as a desktop, whose bar also has the full-screen
+            // button phones do not get: the bar is given its width on top.
+            await pumpOverlay(
+              tester,
+              onToggleBilibiliPanel: () {},
+              size: Size(surfaceWidth, window.height),
+              allButtons: true,
+              leftHanded: leftHanded,
+            );
+            tester.takeException();
+            final desktopOnly = buttonRect(
+              tester,
+              find.byIcon(Icons.fullscreen),
+            ).width;
+            await finish(tester);
+
+            final width = surfaceWidth + desktopOnly;
+            await pumpOverlay(
+              tester,
+              onToggleBilibiliPanel: () {},
+              size: Size(width, window.height),
+              allButtons: true,
+              leftHanded: leftHanded,
+            );
+            expect(tester.takeException(), isNull);
+            final bilibili = buttonRect(
+              tester,
+              find.byIcon(Icons.smart_display_outlined),
+            );
+            final ocr = buttonRect(
+              tester,
+              find.byIcon(Icons.document_scanner_outlined),
+            );
+            // Every button is there; the Bilibili one right after OCR.
+            for (final icon in const <IconData>[
+              Icons.settings,
+              Icons.subtitles,
+              Icons.movie_creation_outlined,
+              Icons.style,
+              Icons.open_with,
+              Icons.aspect_ratio,
+            ]) {
+              expect(find.byIcon(icon), findsOneWidget);
+            }
+            expect(bilibili.left, closeTo(ocr.right, 0.5));
+            expect(bilibili.left, greaterThanOrEqualTo(0));
+            expect(bilibili.right, lessThanOrEqualTo(width));
+            await finish(tester);
+          });
+        }
+      }
+    }
   });
 
   test('I is the panel shortcut', () {
